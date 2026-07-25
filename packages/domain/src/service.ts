@@ -1415,7 +1415,11 @@ export class CodexDomainService {
       if (!selected) {
         return collaborationUnavailable();
       }
-      const model = asString(selected.model) ?? requestedModel;
+      // The collaboration preset supplies defaults, but an explicit model or
+      // effort chosen in the remote UI must remain authoritative. Otherwise
+      // selecting Default silently replaces e.g. Spark/xhigh with the preset's
+      // Sol/low settings before the first turn is persisted.
+      const model = requestedModel ?? asString(selected.model);
       if (!model) {
         return collaborationUnavailable();
       }
@@ -1426,7 +1430,7 @@ export class CodexDomainService {
           settings: {
             model,
             reasoning_effort:
-              asReasoningEffort(selected.reasoning_effort) ?? requestedEffort ?? null,
+              requestedEffort ?? asReasoningEffort(selected.reasoning_effort) ?? null,
             developer_instructions: null,
           },
         },

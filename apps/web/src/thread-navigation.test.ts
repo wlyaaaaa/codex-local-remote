@@ -60,6 +60,64 @@ describe("新任务详情首屏", () => {
     expect(mergeThreadRefresh(current, stale)).toEqual(current);
   });
 
+  it("首次持久化刷新只替换创建 seed 的临时首轮用户消息", () => {
+    const seed = threadDetail({
+      id: "thread-created",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      items: [{ id: "seed-user", kind: "user-message", text: "执行真实验收" }],
+    });
+    const incomingWithActiveTurn = threadDetail({
+      id: seed.id,
+      updatedAt: "2026-07-25T12:00:01.000Z",
+      state: "complete",
+      items: [
+        { id: "persisted-user", kind: "user-message", text: "执行真实验收" },
+        { id: "assistant-1", kind: "assistant-message", text: "已完成" },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const { activeTurnId: _incomingTurnId, ...incoming } = incomingWithActiveTurn;
+
+    const merged = mergeThreadRefresh(seed, incoming, seed);
+
+    expect(merged.items).toEqual(incoming.items);
+    expect(merged.items.some((item) => item.id === "seed-user")).toBe(false);
+  });
+
+  it("seed 收口不能吞掉用户后续故意发送的相同文本", () => {
+    const seed = threadDetail({
+      id: "thread-created",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      items: [{ id: "seed-user", kind: "user-message", text: "再检查一次" }],
+    });
+    const current = threadDetail({
+      id: seed.id,
+      updatedAt: "2026-07-25T12:00:01.000Z",
+      items: [...seed.items, { id: "later-live-user", kind: "user-message", text: "再检查一次" }],
+    });
+    const incoming = threadDetail({
+      id: seed.id,
+      updatedAt: "2026-07-25T12:00:02.000Z",
+      items: [{ id: "persisted-first-user", kind: "user-message", text: "再检查一次" }],
+    });
+
+    const merged = mergeThreadRefresh(current, incoming, seed);
+    const repeatedMessages = merged.items.filter(
+      (item) => item.kind === "user-message" && item.text === "再检查一次",
+    );
+
+    expect(repeatedMessages.map((item) => item.id)).toEqual([
+      "persisted-first-user",
+      "later-live-user",
+    ]);
+    expect(merged.items.some((item) => item.id === "seed-user")).toBe(false);
+  });
+
   it("较新刷新保留尚未持久化的实时项目，同时采用新的运行状态", () => {
     const current = threadDetail({
       id: "thread-created",

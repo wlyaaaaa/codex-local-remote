@@ -22,6 +22,7 @@ export function threadNavigationState(threadSeed: ThreadDetail): ThreadNavigatio
 export function mergeThreadRefresh(
   current: ThreadDetail | undefined,
   incoming: ThreadDetail,
+  creationSeed?: ThreadDetail,
 ): ThreadDetail {
   if (!current || current.id !== incoming.id) {
     return incoming;
@@ -33,7 +34,8 @@ export function mergeThreadRefresh(
     incomingAdvancesToolLifecycle(current.items, incoming.items) ||
     incomingAdvancesThreadLifecycle(current, incoming);
   const base = preferIncoming ? incoming : current;
-  const items = mergeConversationItems(incoming.items, current.items, preferIncoming);
+  const mergedItems = mergeConversationItems(incoming.items, current.items, preferIncoming);
+  const items = reconcileCreationSeedFirstUserMessage(mergedItems, incoming, creationSeed);
 
   if (base === current && sameItemSequence(items, current.items)) {
     return current;
@@ -42,6 +44,41 @@ export function mergeThreadRefresh(
     return incoming;
   }
   return { ...base, items };
+}
+
+function reconcileCreationSeedFirstUserMessage(
+  mergedItems: readonly ConversationItem[],
+  incoming: ThreadDetail,
+  creationSeed: ThreadDetail | undefined,
+): ConversationItem[] {
+  if (!creationSeed || creationSeed.id !== incoming.id) {
+    return [...mergedItems];
+  }
+  const seededFirstMessage = creationSeed.items.find(
+    (item): item is ConversationItem & { kind: "user-message"; text: string } =>
+      item.kind === "user-message",
+  );
+  const persistedFirstMessage = incoming.items.find(
+    (item): item is ConversationItem & { kind: "user-message"; text: string } =>
+      item.kind === "user-message",
+  );
+  if (
+    !seededFirstMessage ||
+    !persistedFirstMessage ||
+    seededFirstMessage.id === persistedFirstMessage.id ||
+    seededFirstMessage.text !== persistedFirstMessage.text
+  ) {
+    return [...mergedItems];
+  }
+  const seedIndex = mergedItems.findIndex(
+    (item) =>
+      item.kind === "user-message" &&
+      item.id === seededFirstMessage.id &&
+      item.text === seededFirstMessage.text,
+  );
+  return seedIndex < 0
+    ? [...mergedItems]
+    : mergedItems.filter((_item, index) => index !== seedIndex);
 }
 
 function mergeConversationItems(

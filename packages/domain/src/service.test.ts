@@ -116,8 +116,8 @@ describe("CodexDomainService", () => {
               {
                 name: "pair",
                 mode: "default",
-                model: "model-a",
-                reasoning_effort: "high",
+                model: "model-default",
+                reasoning_effort: "low",
               },
             ],
           };

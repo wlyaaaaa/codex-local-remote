@@ -1505,7 +1505,7 @@ function ConversationPage({
                 silent &&
                   (subagentsExtendedRef.current || subagentsMoreInFlightRef.current?.id === id),
               );
-          const mergedDetail = mergeThreadRefresh(threadRef.current, detail);
+          const mergedDetail = mergeThreadRefresh(threadRef.current, detail, routeSeedRef.current);
           threadRef.current = mergedDetail;
           setThread(mergedDetail);
           subagentsRef.current = agents;
