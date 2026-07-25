@@ -18,7 +18,19 @@ function Invoke-RestMethod {
         [string]$Uri,
         [int]$TimeoutSec
     )
-    return [pscustomobject]@{ productName = 'Codex Local Remote' }
+    return [pscustomobject]@{
+        productName = 'Codex Local Remote'
+        configured = $true
+        authenticated = $false
+    }
+}
+
+function Get-ScheduledTask {
+    return [pscustomobject]@{ State = 'Running' }
+}
+
+function Get-NetTCPConnection {
+    return [pscustomobject]@{ LocalAddress = '127.0.0.1' }
 }
 
 $parameters = @{
@@ -32,4 +44,5 @@ if ($ConfirmFalse) {
     $parameters.Confirm = $false
 }
 
-& $TargetScript @parameters
+$result = & $TargetScript @parameters
+$result | ConvertTo-Json -Compress -Depth 20

@@ -53,6 +53,10 @@ Tailscale Serve / Funnel
       └─ 最小化审计元数据
 ```
 
+使用 Funnel 子路径时，配置 target 必须包含同一个 BasePath（默认是
+`http://127.0.0.1:18790/codex-remote`）；Tailscale 会先剥离公网前缀，
+这样 sidecar 最终仍能收到它所服务的前缀路径。
+
 Sidecar 使用 Codex 桌面安装中可发现的 `codex.exe`，不要求用户使用
 Codex CLI。开发环境可以用 PATH 中的 `codex` 作为兼容回退。
 

@@ -76,9 +76,16 @@ node apps/sidecar/dist/cli.js register-project --id my-project --name "我的项
 2. 先只读取得完整 Funnel JSON 快照；
 3. 检查 `/codex-remote` 是否已被其他服务占用；
 4. 验证本机目标确实是 Codex Local Remote；
-5. 在实际修改前备份完整快照，再用 `--set-path` 精确增量添加路径；
+5. 在实际修改前备份完整快照，再用 `--set-path` 精确增量添加路径；由于
+   Tailscale 会在转发前剥离该外部路径，proxy target 会显式保留同一个
+   BasePath，例如
+   `http://127.0.0.1:18790/codex-remote`，避免请求落到 sidecar 根路径；
 6. 验证所有既有 handler 完全未变且新路径指向本项目；任何命令或验证失败
    都会自动把本项目路径回滚到修改前状态。
+
+早期版本若已把同一 BasePath 精确指向同一 loopback 端口但遗漏 target
+BasePath，脚本会在确认该端口确实运行 Codex Local Remote 后原地升级；
+验证失败会恢复旧 handler。其他 target 仍视为外部占用并拒绝覆盖。
 
 可以先做零写入预演；它不会创建备份目录或备份文件：
 
@@ -92,9 +99,10 @@ node apps/sidecar/dist/cli.js register-project --id my-project --name "我的项
 .\scripts\windows\Remove-TailscaleFunnelRoute.ps1
 ```
 
-删除脚本会先确认路由目标为预期 loopback 端口，并实时验证该目标仍标识为
-Codex Local Remote；目标不匹配、服务无法验证或路由属于其他应用时一律
-拒绝删除。删除后还会验证其他 handler 未变，失败时自动恢复本项目路径。
+删除脚本会先确认路由目标为预期 loopback 端口和 BasePath，并实时验证该
+目标仍标识为 Codex Local Remote；目标不匹配、服务无法验证或路由属于其他
+应用时一律拒绝删除。删除后还会验证其他 handler 未变，失败时自动恢复本
+项目路径。
 
 不要使用 `tailscale funnel reset`，它会清空同一台机器上的其他 Funnel
 处理器。

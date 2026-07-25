@@ -59,14 +59,19 @@ if ($null -eq $routeProperty) {
     return
 }
 
-$expectedProxy = "http://127.0.0.1:$Port"
-if ([string]$routeProperty.Value.Proxy -cne $expectedProxy) {
+$loopbackOrigin = "http://127.0.0.1:$Port"
+# --set-path removes the public prefix before forwarding, so this project's
+# owned handler includes BasePath in its target URL.
+$expectedProxy = "$loopbackOrigin$BasePath"
+$legacyProxy = $loopbackOrigin
+$routeProxy = [string]$routeProperty.Value.Proxy
+if ($routeProxy -cne $expectedProxy -and $routeProxy -cne $legacyProxy) {
     throw "Funnel path '$BasePath' targets '$($routeProperty.Value.Proxy)', not this project's expected target '$expectedProxy'; refusing to remove it."
 }
 $routeBeforeJson = ConvertTo-CanonicalJson $routeProperty.Value
 
 $bootstrapUri = Join-BasePathUrl `
-    -Origin $expectedProxy `
+    -Origin $loopbackOrigin `
     -BasePath $BasePath `
     -Suffix 'api/v1/bootstrap'
 try {
@@ -100,7 +105,8 @@ try {
         $null
     }
     if ($null -eq $preRemoveProperty -or
-        [string]$preRemoveProperty.Value.Proxy -cne $expectedProxy) {
+        $preRemoveWebKey -cne $webKeyBefore -or
+        (ConvertTo-CanonicalJson $preRemoveProperty.Value) -cne $routeBeforeJson) {
         throw 'Funnel configuration changed concurrently and the project no longer owns the live route; refusing to remove it.'
     }
 
@@ -146,7 +152,7 @@ try {
                     throw 'Concurrent Funnel conflict: another handler now owns the removal path; automatic rollback was not attempted.'
                 }
             } else {
-                Invoke-FunnelSetPath -Target $expectedProxy
+                Invoke-FunnelSetPath -Target $routeProxy
             }
 
             $rollbackStatus = Get-FunnelStatusSnapshot

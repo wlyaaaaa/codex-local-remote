@@ -45,8 +45,9 @@ try {
         Select-Object -First 1)
     if ($webKey.Count -gt 0) {
         $routeProperty = $funnel.Web.$($webKey[0]).Handlers.PSObject.Properties[$BasePath]
+        $expectedProxy = "http://127.0.0.1:$Port$BasePath"
         $routeMatches = $null -ne $routeProperty -and
-            $routeProperty.Value.Proxy -ceq "http://127.0.0.1:$Port"
+            $routeProperty.Value.Proxy -ceq $expectedProxy
         if ($routeMatches) {
             $publicUrl = Join-BasePathUrl `
                 -Origin "https://$($webKey[0].Split(':')[0])" `

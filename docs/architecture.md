@@ -170,11 +170,12 @@ app-server 没有稳定的桌面 project/list。项目来源按优先级合并�
 推荐：
 
 ```text
-Funnel HTTPS 443 /codex-remote/ → http://127.0.0.1:<sidecar-port>
+Funnel HTTPS 443 /codex-remote/ → http://127.0.0.1:<sidecar-port>/codex-remote
 ```
 
 Sidecar 支持路径前缀，生成的资源、SSE、下载和 Cookie 路径均不能假设
-部署在 `/`。
+部署在 `/`。Tailscale 的 `--set-path` 会剥离外部前缀，因此 target URL
+必须再次带上规范 BasePath，后端才能继续按相同前缀提供资源和 API。
 
 部署脚本必须采用增量路径配置，不能覆盖现有 Funnel 根处理器。
 示例配置使用 `18790` 作为本机端口；实际安装会先检查占用并拒绝覆盖已有

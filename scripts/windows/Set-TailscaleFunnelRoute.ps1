@@ -60,14 +60,27 @@ $existingRouteProperty = if ($null -ne $webKeyBefore) {
     $null
 }
 
-$expectedProxy = "http://127.0.0.1:$Port"
+$loopbackOrigin = "http://127.0.0.1:$Port"
+# Tailscale strips --set-path from the public request before proxying it.
+# Keep the sidecar's configured BasePath in the target URL so the backend sees
+# the same prefixed path that it serves locally.
+$expectedProxy = "$loopbackOrigin$BasePath"
+$legacyProxy = $loopbackOrigin
+$existingProxy = if ($null -ne $existingRouteProperty) {
+    [string]$existingRouteProperty.Value.Proxy
+} else {
+    $null
+}
+$isLegacyUpgrade = $null -ne $existingRouteProperty -and
+    $existingProxy -ceq $legacyProxy
 if ($null -ne $existingRouteProperty -and
-    [string]$existingRouteProperty.Value.Proxy -cne $expectedProxy) {
+    $existingProxy -cne $expectedProxy -and
+    -not $isLegacyUpgrade) {
     throw "Funnel path '$BasePath' is already owned by another target."
 }
 
 $bootstrapUri = Join-BasePathUrl `
-    -Origin $expectedProxy `
+    -Origin $loopbackOrigin `
     -BasePath $BasePath `
     -Suffix 'api/v1/bootstrap'
 try {
@@ -79,7 +92,7 @@ if ([string]$bootstrap.productName -cne 'Codex Local Remote') {
     throw 'The target port does not identify itself as Codex Local Remote.'
 }
 
-if ($null -ne $existingRouteProperty) {
+if ($null -ne $existingRouteProperty -and -not $isLegacyUpgrade) {
     [pscustomobject]@{
         Status = 'already-configured'
         PublicUrl = Join-BasePathUrl `
@@ -156,6 +169,7 @@ try {
         throw 'An existing Funnel handler changed during the incremental update.'
     }
     if ($null -ne $existingRouteProperty -and
+        -not $isLegacyUpgrade -and
         (ConvertTo-CanonicalJson $existingRouteProperty.Value) -cne
         (ConvertTo-CanonicalJson $routeAfterProperty.Value)) {
         throw 'The pre-existing project route changed during the incremental update.'
@@ -186,7 +200,11 @@ try {
                 $rollbackGuardJson -cne $writtenHandlerJson) {
                 throw 'Concurrent Funnel conflict: the project handler no longer matches this script write; automatic rollback was not attempted.'
             }
-            Invoke-FunnelRemovePath
+            if ($isLegacyUpgrade) {
+                Invoke-FunnelSetPath -Target $legacyProxy
+            } else {
+                Invoke-FunnelRemovePath
+            }
             $rollbackSnapshot = Get-FunnelStatusSnapshot
             $rollbackEntries = @(Get-FunnelHandlerEntries -Status $rollbackSnapshot.Status)
             if (-not (Test-FunnelHandlerEntriesEqual -Left $entriesBefore -Right $rollbackEntries)) {

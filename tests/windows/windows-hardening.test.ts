@@ -104,7 +104,7 @@ windowsOnly("Windows script hardening", () => {
   }
 
   function runFunnel(
-    target: "set" | "remove",
+    target: "set" | "remove" | "status",
     arguments_: string[],
     environment: NodeJS.ProcessEnv,
   ) {
@@ -114,7 +114,11 @@ windowsOnly("Windows script hardening", () => {
         "-TargetScript",
         join(
           scripts,
-          target === "set" ? "Set-TailscaleFunnelRoute.ps1" : "Remove-TailscaleFunnelRoute.ps1",
+          target === "set"
+            ? "Set-TailscaleFunnelRoute.ps1"
+            : target === "remove"
+              ? "Remove-TailscaleFunnelRoute.ps1"
+              : "Get-CodexLocalRemoteStatus.ps1",
         ),
         ...arguments_,
       ],
@@ -133,7 +137,7 @@ windowsOnly("Windows script hardening", () => {
             ...(includeProjectRoute
               ? {
                   "/codex-remote": {
-                    Proxy: `http://127.0.0.1:${port}`,
+                    Proxy: `http://127.0.0.1:${port}/codex-remote`,
                   },
                 }
               : {}),
@@ -172,9 +176,62 @@ windowsOnly("Windows script hardening", () => {
     expect(mockHandlers(after)["/"]).toEqual(mockHandlers(before)["/"]);
     expect(mockHandlers(after)["/keep"]).toEqual(mockHandlers(before)["/keep"]);
     expect(mockHandlers(after)["/codex-remote"]).toEqual({
-      Proxy: `http://127.0.0.1:${port}`,
+      Proxy: `http://127.0.0.1:${port}/codex-remote`,
     });
+    expect(readFileSync(logFile, "utf8")).toContain(`"http://127.0.0.1:${port}/codex-remote"`);
     expect(existsSync(join(localAppData, "CodexLocalRemote", "funnel-backups"))).toBe(true);
+  });
+
+  it("upgrades the exact legacy pathless target without changing other handlers", () => {
+    const before = initialState(true);
+    mockHandlers(before)["/codex-remote"] = {
+      Proxy: `http://127.0.0.1:${port}`,
+    };
+    writeJson(stateFile, before);
+
+    const result = runFunnel("set", ["-Port", String(port)], funnelEnvironment());
+    expect(result.status).toBe(0);
+    const after = readJson<FunnelState>(stateFile);
+    expect(mockHandlers(after)["/"]).toEqual(mockHandlers(before)["/"]);
+    expect(mockHandlers(after)["/keep"]).toEqual(mockHandlers(before)["/keep"]);
+    expect(mockHandlers(after)["/codex-remote"]).toEqual({
+      Proxy: `http://127.0.0.1:${port}/codex-remote`,
+    });
+  });
+
+  it("restores the exact legacy target when upgrade verification fails", () => {
+    const before = initialState(true);
+    mockHandlers(before)["/codex-remote"] = {
+      Proxy: `http://127.0.0.1:${port}`,
+    };
+    writeJson(stateFile, before);
+
+    const result = runFunnel(
+      "set",
+      ["-Port", String(port)],
+      funnelEnvironment("wrong-target-on-first-set"),
+    );
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain("rolled back");
+    const after = readJson<FunnelState>(stateFile);
+    delete after._mockSetCalls;
+    expect(after).toEqual(before);
+  });
+
+  it("reports the public route configured only for the prefix-preserving target", () => {
+    writeJson(stateFile, initialState(true));
+    const configured = runFunnel("status", ["-Port", String(port)], funnelEnvironment());
+    expect(configured.status).toBe(0);
+    expect(configured.stdout).toContain('"PublicRoute":"configured"');
+
+    const stale = initialState(true);
+    mockHandlers(stale)["/codex-remote"] = {
+      Proxy: `http://127.0.0.1:${port}`,
+    };
+    writeJson(stateFile, stale);
+    const notConfigured = runFunnel("status", ["-Port", String(port)], funnelEnvironment());
+    expect(notConfigured.status).toBe(0);
+    expect(notConfigured.stdout).toContain('"PublicRoute":"not-configured"');
   });
 
   it("rolls back the project route when post-write verification fails", () => {
@@ -248,6 +305,24 @@ windowsOnly("Windows script hardening", () => {
   it("removes only a live route verified as this project", () => {
     const before = initialState(true);
     writeJson(stateFile, before);
+    const result = runFunnel(
+      "remove",
+      ["-Port", String(port), "-ConfirmFalse"],
+      funnelEnvironment(),
+    );
+    expect(result.status).toBe(0);
+    const after = readJson<FunnelState>(stateFile);
+    expect(mockHandlers(after)["/codex-remote"]).toBeUndefined();
+    expect(mockHandlers(after)["/keep"]).toEqual(mockHandlers(before)["/keep"]);
+  });
+
+  it("can remove the exact verified legacy pathless project route", () => {
+    const before = initialState(true);
+    mockHandlers(before)["/codex-remote"] = {
+      Proxy: `http://127.0.0.1:${port}`,
+    };
+    writeJson(stateFile, before);
+
     const result = runFunnel(
       "remove",
       ["-Port", String(port), "-ConfirmFalse"],
