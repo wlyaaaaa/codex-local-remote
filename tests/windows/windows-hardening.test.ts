@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -66,6 +66,15 @@ function managedTask(state: SchedulerState) {
   return state.Task;
 }
 
+function expectSameFileSystemEntry(actual: string, expected: string) {
+  const actualStat = statSync(actual);
+  const expectedStat = statSync(expected);
+  expect({ dev: actualStat.dev, ino: actualStat.ino }).toEqual({
+    dev: expectedStat.dev,
+    ino: expectedStat.ino,
+  });
+}
+
 windowsOnly("Windows script hardening", () => {
   let sandbox: string;
   let stateFile: string;
@@ -76,11 +85,6 @@ windowsOnly("Windows script hardening", () => {
   beforeEach(() => {
     sandbox = join(tmpdir(), `codex-local-remote-windows-${process.pid}-${crypto.randomUUID()}`);
     mkdirSync(sandbox, { recursive: true });
-    // GitHub-hosted Windows runners can expose TEMP through an 8.3 path
-    // (RUNNER~1), while PowerShell canonicalizes it to the long path when it
-    // resolves scheduled-task arguments. Keep both sides of the assertion in
-    // the same canonical form.
-    sandbox = realpathSync(sandbox);
     stateFile = join(sandbox, "tailscale-state.json");
     logFile = join(sandbox, "tailscale.log");
     localAppData = join(sandbox, "local-app-data");
@@ -388,10 +392,18 @@ windowsOnly("Windows script hardening", () => {
     const registered = readJson<SchedulerState>(stateFile);
     const task = managedTask(registered);
     expect(task.Description).toContain("codex-local-remote/startup-task/v1");
-    expect(task.Actions[0]?.Arguments).toContain(
-      `"${join(installRoot, "apps", "sidecar", "dist", "cli.js")}"`,
-    );
-    expect(task.Actions[0]?.Arguments).toContain(`"${dataDir}"`);
+    const action = task.Actions[0];
+    expect(action).toBeDefined();
+    if (!action) throw new Error("Missing managed scheduler action");
+    const cliMatch = action.Arguments.match(/^"([^"]+)" serve\b/);
+    const dataDirMatch = action.Arguments.match(/--data-dir "([^"]+)"$/);
+    expect(cliMatch).not.toBeNull();
+    expect(dataDirMatch).not.toBeNull();
+    if (!cliMatch?.[1] || !dataDirMatch?.[1]) {
+      throw new Error("Scheduled-task arguments are not safely quoted");
+    }
+    expectSameFileSystemEntry(cliMatch[1], join(installRoot, "apps", "sidecar", "dist", "cli.js"));
+    expectSameFileSystemEntry(dataDirMatch[1], dataDir);
     expect(registered.Operations).toEqual(["register"]);
 
     const removalPreview = runPowerShell(join(fixtures, "scheduler-mock-driver.ps1"), [
