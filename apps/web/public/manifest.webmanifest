@@ -1,0 +1,19 @@
+{
+  "name": "Codex Local Remote",
+  "short_name": "Local Remote",
+  "description": "查看 Desktop 只读任务快照，并实时控制本机托管的 Codex 任务。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0b6b3a",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

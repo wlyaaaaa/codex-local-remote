@@ -1,0 +1,36 @@
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+.turbo/
+.vite/
+*.log
+*.tsbuildinfo
+
+# Local runtime state and secrets
+.local/
+data/
+runtime/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.pid
+*.secret
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+
+# Generated Codex schemas may contain version-specific bulk output.
+packages/app-server-client/generated/
+!packages/app-server-client/generated/.gitkeep
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

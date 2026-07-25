@@ -1,0 +1,30 @@
+{
+  "name": "@codex-local-remote/sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "codex-local-remote": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && esbuild src/cli.ts --bundle --platform=node --target=node24 --format=esm --outfile=dist/cli.js --sourcemap --external:fastify --external:@fastify/static",
+    "dev": "tsx watch src/cli.ts serve",
+    "start": "node dist/cli.js serve",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@codex-local-remote/app-server-client": "workspace:*",
+    "@codex-local-remote/contracts": "workspace:*",
+    "@codex-local-remote/domain": "workspace:*",
+    "@codex-local-remote/security": "workspace:*",
+    "@fastify/static": "10.1.2",
+    "fastify": "5.10.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}
