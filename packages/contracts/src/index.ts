@@ -129,6 +129,7 @@ export type ConversationItem =
   | {
       id: string;
       kind: "tool";
+      operation?: "context-compaction";
       title: string;
       status: "running" | "complete" | "failed";
       summary?: string;

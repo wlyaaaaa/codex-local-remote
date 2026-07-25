@@ -62,6 +62,19 @@ import {
   type ApprovalAnswerDrafts,
 } from "./approval";
 import { canDirectlyCompose } from "./permissions";
+import {
+  applyContextCompactionEvents,
+  beginContextCompactionRequest,
+  canRequestContextCompaction,
+  contextCompactionAttemptFromThread,
+  isContextCompactionBusy,
+  markContextCompactionRecoveryRequired,
+  reconcileContextCompactionSnapshot,
+  type ContextCompactionAttempt,
+  type ContextCompactionRequestFlight,
+  type ContextCompactionRequestState,
+  type ContextCompactionResolution,
+} from "./context-compaction";
 import { PaginationFooter } from "./PaginationFooter";
 import { registeredProjects } from "./project-access";
 import { WORKSPACE_REFRESH_MS, canRefreshDocument, threadRefreshDelay } from "./refresh";
@@ -78,6 +91,11 @@ import {
   applyUsageRemoteEvents,
   detailFromThreadSummary,
 } from "./live-thread";
+import {
+  mergeThreadRefresh,
+  threadNavigationState,
+  threadSeedFromNavigationState,
+} from "./thread-navigation";
 import {
   creditBalanceLabel,
   remainingFromUsedPercent,
@@ -1395,10 +1413,11 @@ function ConversationPage({
 }) {
   const { id = "" } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const summary = threadSummaries.find((candidate) => candidate.id === id);
-  const [thread, setThread] = useState<ThreadDetail | undefined>(() =>
-    summary ? detailFromThreadSummary(summary) : undefined,
-  );
+  const routeSeed = threadSeedFromNavigationState(location.state, id);
+  const initialThread = routeSeed ?? (summary ? detailFromThreadSummary(summary) : undefined);
+  const [thread, setThread] = useState<ThreadDetail | undefined>(initialThread);
   const [subagents, setSubagents] = useState<SubagentSummary[]>([]);
   const [subagentsNextCursor, setSubagentsNextCursor] = useState<string>();
   const [subagentsMoreState, setSubagentsMoreState] = useState<MoreState>("idle");
@@ -1416,17 +1435,42 @@ function ConversationPage({
   const [showUsage, setShowUsage] = useState(false);
   const [actionError, setActionError] = useState("");
   const [actionStatus, setActionStatus] = useState<"steer-accepted" | "turn-interrupted" | "">("");
+  const [compactionRequestState, setCompactionRequestState] =
+    useState<ContextCompactionRequestState>("idle");
+  const [compactionNotice, setCompactionNotice] = useState("");
+  const [compactionError, setCompactionError] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
   const handledLiveDelivery = useRef(0);
   const currentIdRef = useRef(id);
+  const threadRef = useRef(initialThread);
+  const routeSeedRef = useRef(routeSeed);
   const summaryRef = useRef(summary);
   const loadInFlight = useRef<{ id: string; promise: Promise<void> } | undefined>(undefined);
   const subagentsRef = useRef<SubagentSummary[]>([]);
   const subagentsNextCursorRef = useRef<string | undefined>(undefined);
   const subagentsExtendedRef = useRef(false);
   const subagentsMoreInFlightRef = useRef<{ id: string } | undefined>(undefined);
+  const compactionAttemptRef = useRef<ContextCompactionAttempt | undefined>(undefined);
+  const compactionRequestFlightRef = useRef<ContextCompactionRequestFlight | undefined>(undefined);
   currentIdRef.current = id;
+  routeSeedRef.current = routeSeed;
   summaryRef.current = summary;
+
+  const finishContextCompaction = useCallback(
+    (attemptKey: string, resolution: Exclude<ContextCompactionResolution, "pending">) => {
+      if (compactionAttemptRef.current?.idempotencyKey !== attemptKey) return;
+      compactionAttemptRef.current = undefined;
+      setCompactionRequestState("idle");
+      if (resolution === "succeeded") {
+        setCompactionNotice("上下文已压缩，使用量正在刷新");
+        setCompactionError("");
+      } else {
+        setCompactionNotice("");
+        setCompactionError("上下文压缩没有完成，请查看上方状态后重试");
+      }
+    },
+    [],
+  );
 
   const load = useCallback(
     (silent = false) => {
@@ -1461,19 +1505,29 @@ function ConversationPage({
                 silent &&
                   (subagentsExtendedRef.current || subagentsMoreInFlightRef.current?.id === id),
               );
-          setThread(detail);
+          const mergedDetail = mergeThreadRefresh(threadRef.current, detail);
+          threadRef.current = mergedDetail;
+          setThread(mergedDetail);
           subagentsRef.current = agents;
           setSubagents(agents);
           subagentsNextCursorRef.current = nextCursor;
           setSubagentsNextCursor(nextCursor);
           setSubagentsError(agentsResult.error);
           setThreadUsage(usageSnapshot);
-          onThreadLoaded(detail);
+          onThreadLoaded(mergedDetail);
           onSubagentsLoaded(agents);
           onUsageLoaded(usageSnapshot);
-          if (detail.model && models.some((option) => option.id === detail.model))
-            setModel(detail.model);
-          if (detail.reasoningEffort) setEffort(detail.reasoningEffort);
+          const compactionAttempt = compactionAttemptRef.current;
+          if (compactionAttempt?.threadId === detail.id) {
+            const progress = reconcileContextCompactionSnapshot(compactionAttempt, detail);
+            compactionAttemptRef.current = progress.attempt;
+            if (progress.resolution !== "pending") {
+              finishContextCompaction(progress.attempt.idempotencyKey, progress.resolution);
+            }
+          }
+          if (mergedDetail.model && models.some((option) => option.id === mergedDetail.model))
+            setModel(mergedDetail.model);
+          if (mergedDetail.reasoningEffort) setEffort(mergedDetail.reasoningEffort);
           setState("ready");
           setError("");
         } catch (loadError) {
@@ -1491,7 +1545,15 @@ function ConversationPage({
       });
       return promise;
     },
-    [apiClient, id, models, onSubagentsLoaded, onThreadLoaded, onUsageLoaded],
+    [
+      apiClient,
+      finishContextCompaction,
+      id,
+      models,
+      onSubagentsLoaded,
+      onThreadLoaded,
+      onUsageLoaded,
+    ],
   );
 
   useEffect(() => {
@@ -1503,19 +1565,28 @@ function ConversationPage({
     setSubagentsNextCursor(undefined);
     setSubagentsMoreState("idle");
     setSubagentsError("");
-    const fallback = summaryRef.current;
+    setCompactionRequestState("idle");
+    setCompactionNotice("");
+    setCompactionError("");
+    compactionAttemptRef.current = undefined;
+    compactionRequestFlightRef.current = undefined;
+    const fallback =
+      routeSeedRef.current ??
+      (summaryRef.current ? detailFromThreadSummary(summaryRef.current) : undefined);
     if (fallback) {
-      setThread(detailFromThreadSummary(fallback));
+      threadRef.current = fallback;
+      setThread(fallback);
       setState("ready");
       setError("");
     } else {
+      threadRef.current = undefined;
       setThread(undefined);
       setThreadUsage(undefined);
     }
   }, [id]);
 
   useEffect(() => {
-    void load(Boolean(summaryRef.current));
+    void load(Boolean(routeSeedRef.current ?? summaryRef.current));
   }, [load]);
 
   useEffect(() => {
@@ -1593,8 +1664,8 @@ function ConversationPage({
     const relevant = pending.filter(({ event }) => !event.threadId || event.threadId === id);
     const relevantEvents = relevant.map(({ event }) => event);
     if (relevant.length > 0) {
-      setThread((current) => {
-        if (!current) return current;
+      const current = threadRef.current;
+      if (current) {
         let projected = current;
         let group: RemoteEvent[] = [];
         let replayed = relevant[0]?.replayed ?? false;
@@ -1611,9 +1682,19 @@ function ConversationPage({
           group.push(envelope.event);
         }
         flush();
-        return projected;
-      });
+        threadRef.current = projected;
+        setThread(projected);
+      }
       setThreadUsage((current) => applyUsageRemoteEvents(current, id, relevantEvents));
+    }
+
+    const compactionAttempt = compactionAttemptRef.current;
+    if (compactionAttempt) {
+      const progress = applyContextCompactionEvents(compactionAttempt, relevantEvents);
+      compactionAttemptRef.current = progress.attempt;
+      if (progress.resolution !== "pending") {
+        finishContextCompaction(progress.attempt.idempotencyKey, progress.resolution);
+      }
     }
 
     const resetRequested = relevantEvents.some((event) => event.type === "connection.reset");
@@ -1625,10 +1706,15 @@ function ConversationPage({
           : {};
       return payload.state === "idle" || payload.state === "complete" || payload.state === "failed";
     });
+    const pendingCompactionAttempt = compactionAttemptRef.current;
+    if (pendingCompactionAttempt && (missedBufferedEvents || resetRequested)) {
+      compactionAttemptRef.current =
+        markContextCompactionRecoveryRequired(pendingCompactionAttempt);
+    }
     if (missedBufferedEvents || resetRequested || turnFinished) {
       void load(true);
     }
-  }, [id, liveEvents, load, state, thread]);
+  }, [finishContextCompaction, id, liveEvents, load, state, thread]);
 
   useEffect(() => {
     let timer: number | undefined;
@@ -1671,7 +1757,7 @@ function ConversationPage({
     try {
       if (thread.activeTurnId && thread.availableActions.steer) {
         await apiClient.steer(thread.id, thread.activeTurnId, { prompt: draft.trim() });
-        setThread({
+        const updated: ThreadDetail = {
           ...thread,
           items: [
             ...thread.items,
@@ -1681,7 +1767,9 @@ function ConversationPage({
               text: `补充要求：${draft.trim()}`,
             },
           ],
-        });
+        };
+        threadRef.current = updated;
+        setThread(updated);
         setActionStatus("steer-accepted");
       } else {
         const updated = await apiClient.sendTurn(thread.id, {
@@ -1689,6 +1777,7 @@ function ConversationPage({
           model,
           reasoningEffort: normalizeReasoningEffort(models, model, effort),
         });
+        threadRef.current = updated;
         setThread(updated);
         onThreadLoaded(updated);
       }
@@ -1719,6 +1808,7 @@ function ConversationPage({
           steer: false,
         },
       };
+      threadRef.current = updated;
       setThread(updated);
       onThreadLoaded(updated);
       setActionStatus("turn-interrupted");
@@ -1726,6 +1816,57 @@ function ConversationPage({
       setActionError(errorMessage(stopError));
     } finally {
       setSending(false);
+    }
+  }
+
+  async function compactContext() {
+    if (compactionAttemptRef.current || compactionRequestFlightRef.current) {
+      await compactionRequestFlightRef.current?.promise.catch(() => undefined);
+      return;
+    }
+    const currentThread = threadRef.current;
+    if (
+      !currentThread ||
+      !canRequestContextCompaction(currentThread, online, compactionRequestState)
+    ) {
+      return;
+    }
+    const idempotencyKey = crypto.randomUUID();
+    const attempt = contextCompactionAttemptFromThread(currentThread, idempotencyKey);
+    compactionAttemptRef.current = attempt;
+    setCompactionRequestState("requesting");
+    setCompactionNotice("");
+    setCompactionError("");
+    let flight: ContextCompactionRequestFlight | undefined;
+    try {
+      flight = beginContextCompactionRequest(
+        compactionRequestFlightRef.current,
+        (requestKey) => apiClient.compact(currentThread.id, requestKey),
+        () => idempotencyKey,
+      );
+      compactionRequestFlightRef.current = flight;
+      await flight.promise;
+      if (compactionAttemptRef.current?.idempotencyKey !== idempotencyKey) return;
+      setCompactionRequestState("accepted");
+      setCompactionNotice("压缩请求已受理，正在等待 Codex 完成");
+      void load(true);
+    } catch (compactError) {
+      const activeAttempt = compactionAttemptRef.current;
+      if (activeAttempt?.idempotencyKey !== idempotencyKey) return;
+      if (activeAttempt.started) {
+        compactionAttemptRef.current = markContextCompactionRecoveryRequired(activeAttempt);
+        setCompactionRequestState("accepted");
+        setCompactionNotice("连接中断，正在核对 Codex 的压缩状态");
+        void load(true);
+      } else {
+        compactionAttemptRef.current = undefined;
+        setCompactionRequestState("idle");
+        setCompactionError(errorMessage(compactError));
+      }
+    } finally {
+      if (flight && compactionRequestFlightRef.current === flight) {
+        compactionRequestFlightRef.current = undefined;
+      }
     }
   }
 
@@ -1760,7 +1901,8 @@ function ConversationPage({
 
   const isSnapshot = thread.mode === "desktop-snapshot";
   const running = !isSnapshot && Boolean(thread.activeTurnId);
-  const canCompose = canDirectlyCompose(thread);
+  const compactionBusy = isContextCompactionBusy(thread, compactionRequestState);
+  const canCompose = canDirectlyCompose(thread) && !compactionBusy;
   return (
     <div className="conversation-page" data-testid="thread-view">
       {thread.parentThreadId ? (
@@ -1824,9 +1966,9 @@ function ConversationPage({
               <Icon name="close" size={16} />
             </button>
           </div>
-          {threadUsage ? (
-            <div className="conversation-usage-windows" data-testid="usage-window">
-              {threadUsage.windows.map((window) => (
+          <div className="conversation-usage-windows" data-testid="usage-window">
+            {threadUsage ? (
+              threadUsage.windows.map((window) => (
                 <div className="conversation-usage-window" key={window.id}>
                   <span>{window.label}</span>
                   <Progress
@@ -1850,33 +1992,66 @@ function ConversationPage({
                       : "重置时间暂时无法读取"}
                   </small>
                 </div>
-              ))}
-              <div className="conversation-usage-window conversation-usage-window--context">
-                <span>当前上下文</span>
-                <Progress
-                  label="当前线程上下文使用量"
-                  tone={(threadUsage.context?.usedPercent ?? 0) > 80 ? "warning" : "success"}
-                  value={threadUsage.context?.usedPercent}
-                />
-                <small>
-                  {threadUsage.context?.usedTokens !== undefined &&
-                  threadUsage.context.limitTokens !== undefined
-                    ? `${number(threadUsage.context.usedTokens)} / ${number(threadUsage.context.limitTokens)} tokens`
-                    : "token 用量暂时无法读取"}
-                  {" · "}
-                  {usedPercentLabel(threadUsage.context?.usedPercent)}
-                  {" · "}
-                  {remainingPercentLabel(
-                    remainingFromUsedPercent(threadUsage.context?.usedPercent),
-                  )}
-                </small>
+              ))
+            ) : (
+              <div className="mini-empty" data-testid="usage-unavailable">
+                额度暂时无法读取
               </div>
+            )}
+            <div className="conversation-usage-window conversation-usage-window--context">
+              <span>当前上下文</span>
+              <Progress
+                label="当前线程上下文使用量"
+                tone={(threadUsage?.context?.usedPercent ?? 0) > 80 ? "warning" : "success"}
+                value={threadUsage?.context?.usedPercent}
+              />
+              <small>
+                {threadUsage?.context?.usedTokens !== undefined &&
+                threadUsage.context.limitTokens !== undefined
+                  ? `${number(threadUsage.context.usedTokens)} / ${number(threadUsage.context.limitTokens)} tokens`
+                  : "token 用量暂时无法读取"}
+                {" · "}
+                {usedPercentLabel(threadUsage?.context?.usedPercent)}
+                {" · "}
+                {remainingPercentLabel(remainingFromUsedPercent(threadUsage?.context?.usedPercent))}
+              </small>
+              {thread.mode === "managed" && !thread.parentThreadId ? (
+                <div className="context-compaction-actions">
+                  <button
+                    className="context-compaction-button"
+                    data-testid="context-compact"
+                    disabled={!canRequestContextCompaction(thread, online, compactionRequestState)}
+                    onClick={() => void compactContext()}
+                    type="button"
+                  >
+                    <Icon
+                      name={compactionRequestState === "idle" ? "spark" : "activity"}
+                      size={16}
+                    />
+                    {compactionRequestState === "requesting"
+                      ? "正在发送…"
+                      : compactionRequestState === "accepted"
+                        ? "正在压缩…"
+                        : "压缩上下文"}
+                  </button>
+                  {compactionNotice ? (
+                    <small aria-live="polite" data-testid="context-compact-status">
+                      {compactionNotice}
+                    </small>
+                  ) : null}
+                  {compactionError ? (
+                    <small
+                      aria-live="assertive"
+                      className="context-compaction-error"
+                      data-testid="context-compact-error"
+                    >
+                      {compactionError}
+                    </small>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
-          ) : (
-            <div className="mini-empty" data-testid="usage-unavailable">
-              额度暂时无法读取
-            </div>
-          )}
+          </div>
         </section>
       ) : null}
       {isSnapshot ? (
@@ -2102,7 +2277,10 @@ function NewThreadPage({
         ...(model ? { model } : {}),
         ...(collaboration ? { collaborationMode: collaboration } : {}),
       });
-      void navigate(`/threads/${created.id}`, { replace: true });
+      void navigate(`/threads/${created.id}`, {
+        replace: true,
+        state: threadNavigationState(created),
+      });
     } catch (submitError) {
       setError(errorMessage(submitError));
     } finally {

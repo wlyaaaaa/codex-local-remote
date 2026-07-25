@@ -17,10 +17,12 @@ import {
 import type { FastifyInstance } from "fastify";
 
 import type { SidecarConfig } from "./config.js";
+import { createDesktopThreadNotifier } from "./desktop-thread-notifier.js";
 import { createSidecarServer } from "./server.js";
 import { SidecarStateStore } from "./state-store.js";
 
 const SIDECAR_VERSION = "0.1.0";
+const DESKTOP_RECONCILIATION_INTERVAL_MS = 5_000;
 
 export interface RunningSidecar {
   app: FastifyInstance;
@@ -37,17 +39,35 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     clientVersion: SIDECAR_VERSION,
   });
   const projects = new ProjectRegistry(state.listProjects());
+  const notifyManagedThreadCreated = createDesktopThreadNotifier({
+    enabled: config.desktopSyncEnabled,
+  });
   const domain = new CodexDomainService({
+    clearPendingDesktopNotification: async (threadId) => {
+      await state.clearPendingDesktopNotification(threadId);
+    },
     events,
     gateway: supervisor,
     managedThreadIds: state.listManagedThreadIds(),
-    persistManagedThread: async (threadId) => {
-      await state.markManagedThread(threadId);
+    ...(notifyManagedThreadCreated === undefined ? {} : { notifyManagedThreadCreated }),
+    pendingDesktopNotificationThreadIds: state.listPendingDesktopNotificationThreadIds(),
+    persistManagedThread: async (threadId, options) => {
+      await state.markManagedThread(threadId, options);
     },
     projects,
     resolveRegisteredProjectRoot: async (projectId) =>
       await state.authorizeRegisteredProjectRoot(projectId),
   });
+  let backendRunning = false;
+  let stopping = false;
+  const reconcilePendingDesktopNotifications = () => {
+    if (!backendRunning || stopping || notifyManagedThreadCreated === undefined) {
+      return;
+    }
+    void domain.reconcilePendingDesktopNotifications().catch(() => {
+      // The interval and the next running transition retry durable pending IDs.
+    });
+  };
 
   supervisor.on("notification", (notification) => {
     approvals.handleNotification(notification);
@@ -57,9 +77,13 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     approvals.handleServerRequest(request);
   });
   supervisor.on("state", (snapshot) => {
+    backendRunning = snapshot.state === "running";
     if (snapshot.state === "degraded") {
       domain.handleBackendRestart();
       approvals.handleBackendRestart();
+    }
+    if (backendRunning) {
+      reconcilePendingDesktopNotifications();
     }
     events.append("diagnostic", {
       appServerState: snapshot.state,
@@ -78,7 +102,11 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     state,
   });
   await app.listen({ host: config.host, port: config.port });
-  let stopping = false;
+  const reconciliationTimer = setInterval(
+    reconcilePendingDesktopNotifications,
+    DESKTOP_RECONCILIATION_INTERVAL_MS,
+  );
+  reconciliationTimer.unref();
   void supervisor
     .start()
     .then(async () => {
@@ -97,6 +125,7 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     diagnostics,
     stop: async () => {
       stopping = true;
+      clearInterval(reconciliationTimer);
       await app.close();
       await supervisor.stop();
     },

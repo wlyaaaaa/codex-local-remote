@@ -15,6 +15,7 @@ describe("resolveSidecarConfig", () => {
     ).toMatchObject({
       basePath: "/codex-remote",
       dataDir: path.win32.join("C:\\Users\\fixture\\AppData\\Local", "CodexLocalRemote"),
+      desktopSyncEnabled: true,
       host: "127.0.0.1",
       port: 18_790,
     });
@@ -60,6 +61,26 @@ describe("resolveSidecarConfig", () => {
       }),
     ).toThrow("回环地址");
   });
+
+  it("allows an explicit environment opt-out from Desktop thread synchronization", () => {
+    expect(
+      resolveSidecarConfig({
+        environment: {
+          CODEX_REMOTE_DESKTOP_SYNC: "false",
+          LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local",
+        },
+      }),
+    ).toMatchObject({ desktopSyncEnabled: false });
+
+    expect(() =>
+      resolveSidecarConfig({
+        environment: {
+          CODEX_REMOTE_DESKTOP_SYNC: "sometimes",
+          LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local",
+        },
+      }),
+    ).toThrow("桌面端同步开关无效");
+  });
 });
 
 describe("parseCliInvocation", () => {
@@ -91,6 +112,23 @@ describe("parseCliInvocation", () => {
     });
 
     expect(() => parseCliInvocation(["setup-password", "--password", "secret"])).toThrow(
+      "不支持的参数",
+    );
+  });
+
+  it("supports an explicit serve-only Desktop synchronization opt-out", () => {
+    expect(
+      parseCliInvocation(["serve", "--host", "127.0.0.1", "--no-desktop-sync", "--port", "18790"]),
+    ).toEqual({
+      command: "serve",
+      config: {
+        desktopSyncEnabled: false,
+        host: "127.0.0.1",
+        port: 18_790,
+      },
+    });
+
+    expect(() => parseCliInvocation(["setup-password", "--no-desktop-sync"])).toThrow(
       "不支持的参数",
     );
   });

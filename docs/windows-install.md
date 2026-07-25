@@ -30,6 +30,10 @@ node apps/sidecar/dist/cli.js setup-password
 node apps/sidecar/dist/cli.js serve
 ```
 
+Windows 默认会在远程新任务首轮落盘后让 Codex Desktop 载入同一个任务。
+如只希望使用浏览器而不自动切换 Desktop，可给 `serve` 增加
+`--no-desktop-sync`，或设置 `CODEX_REMOTE_DESKTOP_SYNC=false`。
+
 也可以先启动服务，再从电脑本机浏览器打开
 `http://127.0.0.1:18790/codex-remote/` 完成首次设置。首次设置接口只接受
 loopback 请求。

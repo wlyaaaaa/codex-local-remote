@@ -337,11 +337,13 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
     const summary = productString(item.summary, 1_024, true);
     const detail = productString(item.detail, 16_384, true);
     const occurrences = asPositiveInteger(item.occurrences);
+    const operation = item.operation === "context-compaction" ? item.operation : undefined;
     return {
       id,
       kind,
       title,
       status,
+      ...(operation === undefined ? {} : { operation }),
       ...(summary === undefined ? {} : { summary }),
       ...(detail === undefined ? {} : { detail }),
       ...(occurrences === undefined ? {} : { occurrences }),

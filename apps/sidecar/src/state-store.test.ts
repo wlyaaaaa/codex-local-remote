@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, symlink } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -56,16 +56,79 @@ describe("SidecarStateStore", () => {
     });
   });
 
-  it("restores managed-thread ownership after a sidecar restart", async () => {
+  it("atomically restores managed ownership and a pending Desktop notification", async () => {
     const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
       path.join(os.tmpdir(), "codex-local-remote-state-"),
     );
     temporaryDirectories.push(directory);
     const store = await SidecarStateStore.open(directory);
-    await store.markManagedThread("thread-owned-by-phone");
+    await store.markManagedThread("thread-owned-by-phone", {
+      desktopNotificationPending: true,
+    });
+
+    const persisted = JSON.parse(await readFile(path.join(directory, "state.json"), "utf8")) as {
+      managedThreadIds: string[];
+      pendingDesktopNotificationThreadIds: string[];
+    };
+    expect(persisted.managedThreadIds).toEqual(["thread-owned-by-phone"]);
+    expect(persisted.pendingDesktopNotificationThreadIds).toEqual(["thread-owned-by-phone"]);
 
     const reopened = await SidecarStateStore.open(directory);
     expect(reopened.listManagedThreadIds()).toEqual(["thread-owned-by-phone"]);
+    expect(reopened.listPendingDesktopNotificationThreadIds()).toEqual(["thread-owned-by-phone"]);
+
+    await reopened.clearPendingDesktopNotification("thread-owned-by-phone");
+    const delivered = await SidecarStateStore.open(directory);
+    expect(delivered.listManagedThreadIds()).toEqual(["thread-owned-by-phone"]);
+    expect(delivered.listPendingDesktopNotificationThreadIds()).toEqual([]);
+  });
+
+  it.each([1, 2])(
+    "migrates schema v%s without treating historical managed threads as pending",
+    async (schemaVersion) => {
+      const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+        path.join(os.tmpdir(), "codex-local-remote-state-"),
+      );
+      temporaryDirectories.push(directory);
+      await writeFile(
+        path.join(directory, "state.json"),
+        JSON.stringify({
+          managedThreadIds: ["historical-managed-thread"],
+          pendingDesktopNotificationThreadIds: ["must-not-be-trusted-from-an-old-schema"],
+          projects: [],
+          schemaVersion,
+          sessions: {},
+        }),
+        "utf8",
+      );
+
+      const migrated = await SidecarStateStore.open(directory);
+
+      expect(migrated.listManagedThreadIds()).toEqual(["historical-managed-thread"]);
+      expect(migrated.listPendingDesktopNotificationThreadIds()).toEqual([]);
+    },
+  );
+
+  it("keeps only managed pending ids from the current schema", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    await writeFile(
+      path.join(directory, "state.json"),
+      JSON.stringify({
+        managedThreadIds: ["managed-pending-thread"],
+        pendingDesktopNotificationThreadIds: ["managed-pending-thread", "unmanaged-must-not-open"],
+        projects: [],
+        schemaVersion: 3,
+        sessions: {},
+      }),
+      "utf8",
+    );
+
+    const restored = await SidecarStateStore.open(directory);
+
+    expect(restored.listPendingDesktopNotificationThreadIds()).toEqual(["managed-pending-thread"]);
   });
 
   it("binds a registered root to its directory identity across restarts", async () => {
@@ -91,7 +154,7 @@ describe("SidecarStateStore", () => {
       projects: Array<{ rootIdentity?: { dev?: string; ino?: string } }>;
       schemaVersion: number;
     };
-    expect(persisted.schemaVersion).toBe(2);
+    expect(persisted.schemaVersion).toBe(3);
     expect(persisted.projects[0]?.rootIdentity?.dev).toMatch(/^\d+$/u);
     expect(persisted.projects[0]?.rootIdentity?.ino).toMatch(/^\d+$/u);
     await expect(store.authorizeRegisteredProjectRoot("project-1")).resolves.toBeDefined();

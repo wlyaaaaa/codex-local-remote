@@ -31,6 +31,7 @@ import {
 } from "./projection.js";
 
 const SUBAGENT_CURSOR_PREFIX = "clr-subagents-v1.";
+const DESKTOP_RECONCILIATION_BATCH_SIZE = 32;
 
 export interface AppServerGateway {
   request<T = unknown>(method: string, params?: unknown): Promise<T>;
@@ -176,25 +177,47 @@ export class ProjectRegistry {
 }
 
 export interface CodexDomainServiceOptions {
+  clearPendingDesktopNotification?: (threadId: string) => Promise<void>;
   events?: RemoteEventBuffer;
   gateway: AppServerGateway;
   managedThreadIds?: Iterable<string>;
-  persistManagedThread?: (threadId: string) => Promise<void>;
+  notifyManagedThreadCreated?: (threadId: string) => void | Promise<void>;
+  pendingDesktopNotificationThreadIds?: Iterable<string>;
+  persistManagedThread?: (
+    threadId: string,
+    options: { desktopNotificationPending: boolean },
+  ) => Promise<void>;
   projects: ProjectRegistry;
   resolveRegisteredProjectRoot: (projectId: string) => Promise<string | undefined>;
 }
 
+interface CompactionRuntimeState {
+  phase: "observed" | "reserving" | "requested";
+  turnId?: string;
+}
+
 export class CodexDomainService {
+  readonly #clearPendingDesktopNotification: ((threadId: string) => Promise<void>) | undefined;
+  readonly #desktopNotificationAttempts = new Map<string, Promise<void>>();
   readonly #events: RemoteEventBuffer | undefined;
   readonly #gateway: AppServerGateway;
   readonly #managedThreads = new Set<string>();
-  readonly #persistManagedThread: ((threadId: string) => Promise<void>) | undefined;
+  readonly #notifyManagedThreadCreated: ((threadId: string) => void | Promise<void>) | undefined;
+  readonly #persistManagedThread:
+    | ((threadId: string, options: { desktopNotificationPending: boolean }) => Promise<void>)
+    | undefined;
+  readonly #recentlyCompletedCompactionTurns = new Map<string, string>();
   readonly #resolveRegisteredProjectRoot: (projectId: string) => Promise<string | undefined>;
+  readonly #restoredPendingDesktopNotifications = new Set<string>();
   readonly #restoredThreadsNeedingRefresh = new Set<string>();
   readonly #activeTurns = new Map<string, string>();
+  readonly #compactingThreads = new Map<string, CompactionRuntimeState>();
   readonly #directInputThreads = new Set<string>();
   readonly #orphanedActiveTurns = new Set<string>();
   readonly #pendingTurnStarts = new Set<string>();
+  readonly #threadsAwaitingInitialTurnCompletion = new Set<string>();
+  readonly #turnStartsCompletedBeforeResponse = new Map<string, Set<string>>();
+  #desktopReconciliationPromise: Promise<void> | undefined;
   #projectDiscoveryPromise: Promise<void> | undefined;
   #projectsDiscoveredAt = 0;
   readonly #threadRuntimeSettings = new Map<
@@ -206,8 +229,10 @@ export class CodexDomainService {
   readonly projects: ProjectRegistry;
 
   constructor(options: CodexDomainServiceOptions) {
+    this.#clearPendingDesktopNotification = options.clearPendingDesktopNotification;
     this.#events = options.events;
     this.#gateway = options.gateway;
+    this.#notifyManagedThreadCreated = options.notifyManagedThreadCreated;
     this.#persistManagedThread = options.persistManagedThread;
     this.#resolveRegisteredProjectRoot = options.resolveRegisteredProjectRoot;
     for (const threadId of options.managedThreadIds ?? []) {
@@ -215,6 +240,13 @@ export class CodexDomainService {
       if (normalized) {
         this.#managedThreads.add(normalized);
         this.#restoredThreadsNeedingRefresh.add(normalized);
+      }
+    }
+    for (const threadId of options.pendingDesktopNotificationThreadIds ?? []) {
+      const normalized = threadId.trim();
+      if (this.#managedThreads.has(normalized)) {
+        this.#threadsAwaitingInitialTurnCompletion.add(normalized);
+        this.#restoredPendingDesktopNotifications.add(normalized);
       }
     }
     this.projects = options.projects;
@@ -491,13 +523,31 @@ export class CodexDomainService {
     }
     this.#rememberRuntimeSettings(threadId, response);
     const projectId = this.projects.findIdByCwd(thread.cwd);
-    return this.#withControlState(
-      projectThreadDetail(thread, {
-        managed: this.#managedThreads.has(threadId),
-        ...this.#runtimeProjectionOptions(threadId),
-        ...(projectId === undefined ? {} : { projectId }),
-      }),
-    );
+    const detail = projectThreadDetail(thread, {
+      managed: this.#managedThreads.has(threadId),
+      ...this.#runtimeProjectionOptions(threadId),
+      ...(projectId === undefined ? {} : { projectId }),
+    });
+    if (isInitialTurnSafelyTerminal(thread)) {
+      void this.#notifyManagedThreadAfterInitialTurn(threadId);
+    }
+    return this.#withControlState(detail);
+  }
+
+  async reconcilePendingDesktopNotifications(): Promise<void> {
+    if (this.#desktopReconciliationPromise) {
+      await this.#desktopReconciliationPromise;
+      return;
+    }
+    const reconciliation = this.#runDesktopNotificationReconciliation();
+    this.#desktopReconciliationPromise = reconciliation;
+    try {
+      await reconciliation;
+    } finally {
+      if (this.#desktopReconciliationPromise === reconciliation) {
+        this.#desktopReconciliationPromise = undefined;
+      }
+    }
   }
 
   async createThread(input: CreateThreadInput): Promise<ServiceResult<ThreadDetail>> {
@@ -532,7 +582,10 @@ export class CodexDomainService {
     // thread/start only creates an idle shell. Recheck the registered directory
     // identity immediately before the first turn can perform filesystem work.
     await this.#requireAuthorizedProjectRoot(input.projectId);
-    await this.#markManaged(threadId);
+    // Loading the same thread in Desktop while this app-server owns its first
+    // turn can interrupt that turn. Persist visibility together with ownership
+    // now, but open it only after a matching terminal state is observed.
+    await this.#markManaged(threadId, this.#notifyManagedThreadCreated !== undefined);
     this.#rememberDirectInput(threadId, thread);
     this.#rememberRuntimeSettings(threadId, startResponse);
     this.#rememberRuntimeSettings(threadId, {
@@ -551,12 +604,20 @@ export class CodexDomainService {
           ...(input.reasoningEffort === undefined ? {} : { effort: input.reasoningEffort }),
         }),
       );
+    } catch (error) {
+      this.#turnStartsCompletedBeforeResponse.delete(threadId);
+      if (this.#threadsAwaitingInitialTurnCompletion.has(threadId)) {
+        this.#restoredPendingDesktopNotifications.add(threadId);
+        await this.#discardPendingDesktopNotification(threadId);
+      }
+      throw error;
     } finally {
       this.#pendingTurnStarts.delete(threadId);
     }
     const turn = asRecord(turnResponse.turn);
     const turnId = asString(turn.id);
-    if (turnId) {
+    const completedBeforeResponse = this.#consumeTurnCompletionBeforeResponse(threadId, turnId);
+    if (turnId && !completedBeforeResponse) {
       this.#activeTurns.set(threadId, turnId);
       this.#orphanedActiveTurns.delete(threadId);
     }
@@ -630,35 +691,63 @@ export class CodexDomainService {
     });
   }
 
+  async compactThread(threadId: string): Promise<void> {
+    this.#requireManagedThread(threadId);
+    const reservation = this.#reserveCompaction(threadId);
+    try {
+      await this.#refreshRestoredThread(threadId);
+      this.#requireDirectInput(threadId);
+      this.#assertTurnControlAvailable(threadId);
+      await this.#requireAuthorizedThreadProjectRoot(threadId);
+      const state = this.#compactingThreads.get(threadId);
+      if (state !== reservation || state.phase !== "reserving") {
+        throw new DomainError("TURN_MISMATCH", "上下文压缩已经结束，请刷新后重试", 409);
+      }
+      state.phase = "requested";
+      await this.#gateway.request("thread/compact/start", { threadId });
+    } catch (error) {
+      if (this.#compactingThreads.get(threadId) === reservation) {
+        this.#compactingThreads.delete(threadId);
+      }
+      throw error;
+    }
+  }
+
   async startTurn(threadId: string, input: SendTurnInput): Promise<TurnCommandResult> {
     this.#requireManagedThread(threadId);
-    await this.#refreshRestoredThread(threadId);
-    this.#requireDirectInput(threadId);
-    this.#assertTurnControlAvailable(threadId);
-    if (this.#activeTurns.has(threadId)) {
-      throw new DomainError("TURN_MISMATCH", "当前回复尚未结束", 409);
-    }
-    await this.#requireAuthorizedThreadProjectRoot(threadId);
-    this.#pendingTurnStarts.add(threadId);
+    const prompt = requireNonEmpty(input.prompt, "消息");
+    this.#reserveTurnStart(threadId);
     let response: Record<string, unknown>;
     try {
+      await this.#refreshRestoredThread(threadId);
+      this.#requireDirectInput(threadId);
+      this.#assertTurnControlAvailable(threadId);
+      await this.#requireAuthorizedThreadProjectRoot(threadId);
       response = asRecord(
         await this.#gateway.request("turn/start", {
           threadId,
-          input: [textInput(requireNonEmpty(input.prompt, "消息"))],
+          input: [textInput(prompt)],
           ...(input.model === undefined ? {} : { model: input.model }),
           ...(input.reasoningEffort === undefined ? {} : { effort: input.reasoningEffort }),
         }),
       );
+    } catch (error) {
+      this.#turnStartsCompletedBeforeResponse.delete(threadId);
+      throw error;
     } finally {
       this.#pendingTurnStarts.delete(threadId);
     }
     const turnId = asString(asRecord(response.turn).id);
     if (!turnId) {
+      this.#turnStartsCompletedBeforeResponse.delete(threadId);
       throw new DomainError("TURN_MISMATCH", "Codex 没有开始回复", 502);
     }
-    this.#activeTurns.set(threadId, turnId);
-    this.#orphanedActiveTurns.delete(threadId);
+    const completedBeforeResponse = this.#consumeTurnCompletionBeforeResponse(threadId, turnId);
+    this.#recentlyCompletedCompactionTurns.delete(threadId);
+    if (!completedBeforeResponse) {
+      this.#activeTurns.set(threadId, turnId);
+      this.#orphanedActiveTurns.delete(threadId);
+    }
     this.#rememberRuntimeSettings(threadId, {
       ...(input.model === undefined ? {} : { model: input.model }),
       ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
@@ -683,6 +772,7 @@ export class CodexDomainService {
 
   async steerTurn(threadId: string, turnId: string, prompt: string): Promise<TurnCommandResult> {
     this.#requireManagedThread(threadId);
+    this.#assertNotCompacting(threadId);
     await this.#refreshRestoredThread(threadId);
     this.#requireDirectInput(threadId);
     this.#assertTurnControlAvailable(threadId);
@@ -706,6 +796,7 @@ export class CodexDomainService {
 
   async interruptTurn(threadId: string, turnId: string): Promise<TurnCommandResult> {
     this.#requireManagedThread(threadId);
+    this.#assertNotCompacting(threadId);
     await this.#refreshRestoredThread(threadId);
     this.#requireDirectInput(threadId);
     this.#assertTurnControlAvailable(threadId);
@@ -893,17 +984,65 @@ export class CodexDomainService {
     const threadId = asString(params.threadId);
     if (
       threadId &&
-      notification.method === "turn/started" &&
-      this.#pendingTurnStarts.has(threadId)
+      this.#managedThreads.has(threadId) &&
+      notification.method === "item/started" &&
+      asString(asRecord(params.item).type) === "contextCompaction"
     ) {
+      const turnId = asString(params.turnId);
+      if (turnId) {
+        const existing = this.#compactingThreads.get(threadId);
+        if (!existing || existing.phase === "reserving") {
+          this.#compactingThreads.set(threadId, { phase: "observed", turnId });
+        } else if (existing.phase === "requested" && existing.turnId === undefined) {
+          existing.turnId = turnId;
+        }
+      }
+    }
+    if (threadId && notification.method === "turn/started") {
       const turnId = asString(asRecord(params.turn).id);
       if (turnId) {
-        this.#activeTurns.set(threadId, turnId);
+        const compaction = this.#compactingThreads.get(threadId);
+        if (compaction?.phase === "requested") {
+          compaction.turnId = turnId;
+        } else if (this.#pendingTurnStarts.has(threadId)) {
+          this.#recentlyCompletedCompactionTurns.delete(threadId);
+          this.#activeTurns.set(threadId, turnId);
+        }
       }
     }
     if (threadId && notification.method === "turn/completed") {
+      const completedTurnId = asString(asRecord(params.turn).id);
+      if (this.#pendingTurnStarts.has(threadId) && completedTurnId) {
+        const completedTurnIds =
+          this.#turnStartsCompletedBeforeResponse.get(threadId) ?? new Set<string>();
+        completedTurnIds.add(completedTurnId);
+        this.#turnStartsCompletedBeforeResponse.set(threadId, completedTurnIds);
+      }
+      const compaction = this.#compactingThreads.get(threadId);
+      if (compaction?.turnId && compaction.turnId === completedTurnId) {
+        this.#compactingThreads.delete(threadId);
+        this.#recentlyCompletedCompactionTurns.set(threadId, completedTurnId);
+      }
       this.#activeTurns.delete(threadId);
       this.#orphanedActiveTurns.delete(threadId);
+      if (this.#threadsAwaitingInitialTurnCompletion.has(threadId)) {
+        void this.reconcilePendingDesktopNotifications();
+      }
+    }
+    if (threadId && notification.method === "error" && params.willRetry === false) {
+      const failedTurnId = asString(params.turnId);
+      const compaction = this.#compactingThreads.get(threadId);
+      if (
+        compaction !== undefined &&
+        (compaction.turnId === undefined ||
+          failedTurnId === undefined ||
+          compaction.turnId === failedTurnId)
+      ) {
+        this.#compactingThreads.delete(threadId);
+        if (compaction.turnId) {
+          this.#recentlyCompletedCompactionTurns.set(threadId, compaction.turnId);
+        }
+      }
     }
     if (threadId && notification.method === "thread/settings/updated") {
       this.#rememberRuntimeSettings(threadId, asRecord(params.threadSettings));
@@ -934,25 +1073,136 @@ export class CodexDomainService {
 
   handleBackendRestart(): void {
     this.#activeTurns.clear();
+    this.#compactingThreads.clear();
     this.#directInputThreads.clear();
     this.#orphanedActiveTurns.clear();
     this.#pendingTurnStarts.clear();
+    this.#turnStartsCompletedBeforeResponse.clear();
+    this.#recentlyCompletedCompactionTurns.clear();
+    for (const threadId of this.#threadsAwaitingInitialTurnCompletion) {
+      this.#restoredPendingDesktopNotifications.add(threadId);
+    }
     for (const threadId of this.#managedThreads) {
       this.#restoredThreadsNeedingRefresh.add(threadId);
     }
   }
 
-  async #markManaged(threadId: string): Promise<void> {
-    if (this.#managedThreads.has(threadId)) {
-      this.#restoredThreadsNeedingRefresh.delete(threadId);
-      return;
-    }
+  async #markManaged(threadId: string, desktopNotificationPending: boolean): Promise<void> {
+    const alreadyManaged = this.#managedThreads.has(threadId);
     this.#managedThreads.add(threadId);
     try {
-      await this.#persistManagedThread?.(threadId);
+      await this.#persistManagedThread?.(threadId, { desktopNotificationPending });
+      if (desktopNotificationPending) {
+        this.#threadsAwaitingInitialTurnCompletion.add(threadId);
+      }
+      this.#restoredThreadsNeedingRefresh.delete(threadId);
     } catch (error) {
-      this.#managedThreads.delete(threadId);
+      if (!alreadyManaged) {
+        this.#managedThreads.delete(threadId);
+      }
       throw error;
+    }
+  }
+
+  async #deliverPendingDesktopNotification(threadId: string): Promise<void> {
+    try {
+      await this.#notifyManagedThreadCreated?.(threadId);
+      await this.#clearPendingDesktopNotification?.(threadId);
+      this.#threadsAwaitingInitialTurnCompletion.delete(threadId);
+      this.#restoredPendingDesktopNotifications.delete(threadId);
+    } catch {
+      // Keep the durable pending marker so a later bounded reconciliation can
+      // retry. A host integration failure cannot invalidate the real thread.
+    }
+  }
+
+  #notifyManagedThreadAfterInitialTurn(threadId: string): Promise<void> {
+    const existing = this.#desktopNotificationAttempts.get(threadId);
+    if (existing) {
+      return existing;
+    }
+    if (
+      !this.#threadsAwaitingInitialTurnCompletion.has(threadId) ||
+      !this.#notifyManagedThreadCreated
+    ) {
+      return Promise.resolve();
+    }
+    const attempt = this.#deliverPendingDesktopNotification(threadId);
+    this.#desktopNotificationAttempts.set(threadId, attempt);
+    void attempt.finally(() => {
+      if (this.#desktopNotificationAttempts.get(threadId) === attempt) {
+        this.#desktopNotificationAttempts.delete(threadId);
+      }
+    });
+    return attempt;
+  }
+
+  #consumeTurnCompletionBeforeResponse(threadId: string, turnId: string | undefined): boolean {
+    const completedTurnIds = this.#turnStartsCompletedBeforeResponse.get(threadId);
+    this.#turnStartsCompletedBeforeResponse.delete(threadId);
+    return turnId !== undefined && completedTurnIds?.has(turnId) === true;
+  }
+
+  #discardPendingDesktopNotification(threadId: string): Promise<void> {
+    const existing = this.#desktopNotificationAttempts.get(threadId);
+    if (existing) {
+      return existing;
+    }
+    if (!this.#threadsAwaitingInitialTurnCompletion.has(threadId)) {
+      return Promise.resolve();
+    }
+    const attempt = (async () => {
+      try {
+        await this.#clearPendingDesktopNotification?.(threadId);
+        this.#threadsAwaitingInitialTurnCompletion.delete(threadId);
+        this.#restoredPendingDesktopNotifications.delete(threadId);
+      } catch {
+        // Retain the durable marker and retry on a later reconciliation.
+      }
+    })();
+    this.#desktopNotificationAttempts.set(threadId, attempt);
+    void attempt.finally(() => {
+      if (this.#desktopNotificationAttempts.get(threadId) === attempt) {
+        this.#desktopNotificationAttempts.delete(threadId);
+      }
+    });
+    return attempt;
+  }
+
+  async #runDesktopNotificationReconciliation(): Promise<void> {
+    if (!this.#notifyManagedThreadCreated) {
+      return;
+    }
+    const candidates = [...this.#threadsAwaitingInitialTurnCompletion].slice(
+      0,
+      DESKTOP_RECONCILIATION_BATCH_SIZE,
+    );
+    for (const threadId of candidates) {
+      try {
+        const response = asRecord(
+          await this.#gateway.request("thread/read", { includeTurns: true, threadId }),
+        );
+        const thread = asRecord(response.thread);
+        const safelyTerminal = isInitialTurnSafelyTerminal(thread);
+        const restoredWithPersistedItem =
+          this.#restoredPendingDesktopNotifications.has(threadId) && hasPersistedTurnItem(thread);
+        if (asString(thread.id) === threadId && (safelyTerminal || restoredWithPersistedItem)) {
+          await this.#notifyManagedThreadAfterInitialTurn(threadId);
+        } else if (
+          asString(thread.id) === threadId &&
+          this.#restoredPendingDesktopNotifications.has(threadId) &&
+          isIdleThreadWithoutPersistedItem(thread)
+        ) {
+          await this.#discardPendingDesktopNotification(threadId);
+        }
+      } catch {
+        // A later running-state reconciliation retries only the durable pending
+        // IDs; historical managed threads are never opened.
+      } finally {
+        if (this.#threadsAwaitingInitialTurnCompletion.delete(threadId)) {
+          this.#threadsAwaitingInitialTurnCompletion.add(threadId);
+        }
+      }
     }
   }
 
@@ -975,6 +1225,9 @@ export class CodexDomainService {
     });
     this.#restoredThreadsNeedingRefresh.delete(threadId);
     this.#markExistingActiveTurnUncontrollable(detail);
+    if (isInitialTurnSafelyTerminal(thread)) {
+      void this.#notifyManagedThreadAfterInitialTurn(threadId);
+    }
     return detail;
   }
 
@@ -989,6 +1242,35 @@ export class CodexDomainService {
   }
 
   #withControlState(detail: ThreadDetail): ThreadDetail {
+    if (this.#compactingThreads.has(detail.id)) {
+      return {
+        ...detail,
+        availableActions: {
+          changeModelNextTurn: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+        },
+      };
+    }
+    const recentlyCompletedCompaction = this.#recentlyCompletedCompactionTurns.get(detail.id);
+    if (
+      recentlyCompletedCompaction !== undefined &&
+      detail.activeTurnId === recentlyCompletedCompaction
+    ) {
+      return {
+        ...detail,
+        availableActions: {
+          changeModelNextTurn: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+        },
+      };
+    }
+    if (recentlyCompletedCompaction !== undefined) {
+      this.#recentlyCompletedCompactionTurns.delete(detail.id);
+    }
     if (detail.activeTurnId && this.#activeTurns.get(detail.id) !== detail.activeTurnId) {
       this.#orphanedActiveTurns.add(detail.id);
       return {
@@ -1012,6 +1294,37 @@ export class CodexDomainService {
         409,
       );
     }
+  }
+
+  #assertNotCompacting(threadId: string): void {
+    if (this.#compactingThreads.has(threadId)) {
+      throw new DomainError("TURN_MISMATCH", "正在压缩对话上下文，完成后才能继续操作", 409);
+    }
+  }
+
+  #reserveCompaction(threadId: string): CompactionRuntimeState {
+    if (
+      this.#activeTurns.has(threadId) ||
+      this.#pendingTurnStarts.has(threadId) ||
+      this.#compactingThreads.has(threadId)
+    ) {
+      throw new DomainError("TURN_MISMATCH", "当前对话正在执行其他操作，请完成后再压缩上下文", 409);
+    }
+    this.#recentlyCompletedCompactionTurns.delete(threadId);
+    const reservation: CompactionRuntimeState = { phase: "reserving" };
+    this.#compactingThreads.set(threadId, reservation);
+    return reservation;
+  }
+
+  #reserveTurnStart(threadId: string): void {
+    if (
+      this.#activeTurns.has(threadId) ||
+      this.#pendingTurnStarts.has(threadId) ||
+      this.#compactingThreads.has(threadId)
+    ) {
+      throw new DomainError("TURN_MISMATCH", "当前回复尚未结束或正在启动", 409);
+    }
+    this.#pendingTurnStarts.add(threadId);
   }
 
   #rememberDirectInput(threadId: string, thread: Record<string, unknown>): void {
@@ -1482,6 +1795,35 @@ function asRecordArray(value: unknown): Record<string, unknown>[] {
           typeof item === "object" && item !== null && !Array.isArray(item),
       )
     : [];
+}
+
+function isInitialTurnSafelyTerminal(thread: Record<string, unknown>): boolean {
+  const status = asString(asRecord(thread.status).type) ?? asString(thread.status);
+  if (status === "active") {
+    return false;
+  }
+  switch (asString(asRecordArray(thread.turns).at(-1)?.status)) {
+    case "cancelled":
+    case "completed":
+    case "failed":
+    case "interrupted":
+      return hasPersistedTurnItem(thread);
+    default:
+      return false;
+  }
+}
+
+function hasPersistedTurnItem(thread: Record<string, unknown>): boolean {
+  return asRecordArray(thread.turns).some(hasPersistedItemInTurn);
+}
+
+function isIdleThreadWithoutPersistedItem(thread: Record<string, unknown>): boolean {
+  const status = asString(asRecord(thread.status).type) ?? asString(thread.status);
+  return status === "idle" && !hasPersistedTurnItem(thread);
+}
+
+function hasPersistedItemInTurn(turn: Record<string, unknown>): boolean {
+  return asRecordArray(turn.items).length > 0;
 }
 
 function asString(value: unknown): string | undefined {

@@ -60,6 +60,23 @@ test.describe("单密码登录与完整远程旅程", () => {
       ).toBeVisible();
     });
 
+    await test.step("手动压缩复用一次请求，并只把 202 解释为已受理", async () => {
+      const compact = page.getByTestId("context-compact");
+      await expect(compact).toBeEnabled();
+      await compact.evaluate((button) => {
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await expect(page.getByTestId("context-compact-status")).toContainText("已受理");
+      await expect(page.getByTestId("turn-composer")).toHaveCount(0);
+      await expect(page.getByText("压缩对话上下文", { exact: true })).toHaveCount(1);
+      await expect(page.getByTestId("context-compact-status")).toContainText("已压缩", {
+        timeout: 6_000,
+      });
+      await expect(compact).toBeEnabled();
+      await expect(page.getByTestId("turn-composer")).toBeVisible();
+    });
+
     await test.step("可进入并退出任意状态的子智能体", async () => {
       await page.getByTestId("subagents-open").click();
       await expect(page.getByTestId("subagent-tree")).toBeVisible();

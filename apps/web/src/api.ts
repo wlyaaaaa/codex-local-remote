@@ -60,6 +60,7 @@ export interface ApiClient {
   threads(options?: { archived?: boolean; cursor?: string }): Promise<CursorPage<ThreadSummary>>;
   thread(id: string): Promise<ThreadDetail>;
   createThread(input: CreateThreadInput): Promise<ThreadDetail>;
+  compact(threadId: string, idempotencyKey: string): Promise<void>;
   sendTurn(threadId: string, input: SendTurnInput): Promise<ThreadDetail>;
   steer(threadId: string, turnId: string, input: SteerTurnInput): Promise<void>;
   interrupt(threadId: string, turnId: string): Promise<void>;
@@ -94,13 +95,19 @@ class HttpApiClient implements ApiClient {
 
   private async request<T>(
     path: string,
-    options: RequestInit & { mutation?: boolean; idempotent?: boolean } = {},
+    options: RequestInit & {
+      mutation?: boolean;
+      idempotent?: boolean;
+      idempotencyKey?: string;
+    } = {},
   ): Promise<T> {
     const headers = new Headers(options.headers);
     headers.set("Accept", "application/json");
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.mutation && this.csrfToken) headers.set("X-CSRF-Token", this.csrfToken);
-    if (options.idempotent) headers.set("Idempotency-Key", crypto.randomUUID());
+    if (options.idempotent) {
+      headers.set("Idempotency-Key", options.idempotencyKey ?? crypto.randomUUID());
+    }
 
     let response: Response;
     try {
@@ -128,7 +135,8 @@ class HttpApiClient implements ApiClient {
       throw new ApiRequestError(message, response.status, code);
     }
     if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
+    const body = await response.text();
+    return body.length === 0 ? (undefined as T) : (JSON.parse(body) as T);
   }
 
   private async requestPage<T>(path: string): Promise<CursorPage<T>> {
@@ -225,6 +233,15 @@ class HttpApiClient implements ApiClient {
     return this.request<ThreadDetail>("/threads", {
       body: JSON.stringify(input),
       idempotent: true,
+      method: "POST",
+      mutation: true,
+    });
+  }
+
+  compact(threadId: string, idempotencyKey: string) {
+    return this.request<void>(`/threads/${encodeURIComponent(threadId)}/compact`, {
+      idempotent: true,
+      idempotencyKey,
       method: "POST",
       mutation: true,
     });
@@ -508,6 +525,55 @@ class DemoApiClient implements ApiClient {
       },
     };
     return this.later(this.detail);
+  }
+
+  async compact(threadId: string, _idempotencyKey: string) {
+    if (threadId !== this.detail.id) {
+      throw new ApiRequestError("找不到这个对话", 404, "THREAD_NOT_FOUND");
+    }
+    const itemId = `demo-compaction-${Date.now()}`;
+    this.detail = {
+      ...this.detail,
+      activeTurnId: "demo-compaction-turn",
+      state: "running",
+      updatedAt: new Date().toISOString(),
+      items: [
+        ...this.detail.items,
+        {
+          id: itemId,
+          kind: "tool",
+          operation: "context-compaction",
+          status: "running",
+          title: "压缩对话上下文",
+        },
+      ],
+      availableActions: {
+        changeModelNextTurn: false,
+        interrupt: false,
+        reply: false,
+        steer: false,
+      },
+    };
+    window.setTimeout(() => {
+      const { activeTurnId: _activeTurnId, ...detailWithoutActiveTurn } = this.detail;
+      this.detail = {
+        ...detailWithoutActiveTurn,
+        state: "complete",
+        updatedAt: new Date().toISOString(),
+        items: this.detail.items.map((item) =>
+          item.id === itemId && item.kind === "tool"
+            ? { ...item, status: "complete" as const }
+            : item,
+        ),
+        availableActions: {
+          changeModelNextTurn: true,
+          interrupt: false,
+          reply: true,
+          steer: false,
+        },
+      };
+    }, 650);
+    await this.later(undefined);
   }
 
   async steer(_threadId: string, _turnId: string, input: SteerTurnInput) {

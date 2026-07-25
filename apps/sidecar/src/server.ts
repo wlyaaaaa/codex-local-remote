@@ -46,6 +46,7 @@ const PRODUCT_NAME = "Codex Local Remote";
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,128}$/u;
 
 export interface SidecarDomainApi {
+  compactThread(threadId: string): Promise<void>;
   createThread(input: CreateThreadInput): Promise<ServiceResult<ThreadDetail>>;
   getThread(threadId: string): Promise<ThreadDetail>;
   getUsage(threadId?: string): Promise<ServiceResult<UsageSnapshot>>;
@@ -263,6 +264,15 @@ export async function createSidecarServer(
       body: await domain.resumeThread(routeParameter(request, "threadId")),
       status: 200,
     }));
+    return await sendCached(reply, result);
+  });
+
+  app.post(`${api}/threads/:threadId/compact`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      await domain.compactThread(routeParameter(request, "threadId"));
+      return { status: 202 };
+    });
     return await sendCached(reply, result);
   });
 

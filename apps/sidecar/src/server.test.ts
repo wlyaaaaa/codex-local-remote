@@ -41,6 +41,7 @@ async function createFixture(configured = true) {
     await setupPassword(state, password, password);
   }
   const events = new RemoteEventBuffer(8);
+  const compactThread = vi.fn(async () => undefined);
   const listProjects = vi.fn(() => [
     {
       id: "project-1",
@@ -51,6 +52,7 @@ async function createFixture(configured = true) {
   ]);
   const listThreads = vi.fn<SidecarDomainApi["listThreads"]>(async () => ({ data: [] }));
   const domain: SidecarDomainApi = {
+    compactThread,
     createThread: vi.fn(async (_input: CreateThreadInput) => ({
       data: {
         id: "thread-new",
@@ -134,6 +136,7 @@ async function createFixture(configured = true) {
     config: {
       basePath: "/codex-remote",
       dataDir: directory,
+      desktopSyncEnabled: true,
       host: "127.0.0.1",
       port: 18_790,
       webDir: path.join(directory, "missing-web"),
@@ -143,7 +146,7 @@ async function createFixture(configured = true) {
     events,
     state,
   });
-  return { app, domain, events, listProjects, listThreads, password, state };
+  return { app, compactThread, domain, events, listProjects, listThreads, password, state };
 }
 
 describe("sidecar REST surface", () => {
@@ -321,6 +324,82 @@ describe("sidecar REST surface", () => {
     });
     expect(created.statusCode).toBe(201);
     expect(created.json()).toMatchObject({ id: "thread-new" });
+    await fixture.app.close();
+  });
+
+  it("accepts context compaction only as a protected idempotent mutation", async () => {
+    const fixture = await createFixture();
+    const origin = "https://phone.example.test";
+    const forwardedHeaders = {
+      host: "127.0.0.1:18790",
+      "sec-fetch-site": "same-origin",
+      "x-forwarded-host": "phone.example.test",
+      "x-forwarded-proto": "https",
+    };
+    const login = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/api/v1/auth/login",
+      remoteAddress: "127.0.0.1",
+      headers: { ...forwardedHeaders, origin },
+      payload: { password: fixture.password },
+    });
+    const session = login.json<{ csrfToken: string }>();
+    const cookie = cookieFrom(login);
+    const url = "/codex-remote/api/v1/threads/thread-new/compact";
+
+    const crossOrigin = await fixture.app.inject({
+      method: "POST",
+      url,
+      headers: {
+        ...forwardedHeaders,
+        cookie,
+        "idempotency-key": "compact-cross-origin",
+        origin: "https://attacker.example.test",
+        "x-csrf-token": session.csrfToken,
+      },
+    });
+    expect(crossOrigin.statusCode).toBe(403);
+
+    const missingCsrf = await fixture.app.inject({
+      method: "POST",
+      url,
+      headers: {
+        ...forwardedHeaders,
+        cookie,
+        "idempotency-key": "compact-missing-csrf",
+        origin,
+      },
+    });
+    expect(missingCsrf.statusCode).toBe(403);
+
+    const missingKey = await fixture.app.inject({
+      method: "POST",
+      url,
+      headers: {
+        ...forwardedHeaders,
+        cookie,
+        origin,
+        "x-csrf-token": session.csrfToken,
+      },
+    });
+    expect(missingKey.statusCode).toBe(400);
+
+    const headers = {
+      ...forwardedHeaders,
+      cookie,
+      "idempotency-key": "compact-thread-new",
+      origin,
+      "x-csrf-token": session.csrfToken,
+    };
+    const accepted = await fixture.app.inject({ method: "POST", url, headers });
+    const retried = await fixture.app.inject({ method: "POST", url, headers });
+
+    expect(accepted.statusCode).toBe(202);
+    expect(accepted.body).toBe("");
+    expect(retried.statusCode).toBe(202);
+    expect(retried.body).toBe("");
+    expect(fixture.compactThread).toHaveBeenCalledOnce();
+    expect(fixture.compactThread).toHaveBeenCalledWith("thread-new");
     await fixture.app.close();
   });
 

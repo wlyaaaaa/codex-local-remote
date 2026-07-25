@@ -6,6 +6,7 @@ export interface SidecarConfig {
   port: number;
   basePath: string;
   dataDir: string;
+  desktopSyncEnabled: boolean;
   webDir: string;
 }
 
@@ -14,6 +15,7 @@ export interface SidecarConfigOverrides {
   port?: number;
   basePath?: string;
   dataDir?: string;
+  desktopSyncEnabled?: boolean;
   webDir?: string;
 }
 
@@ -59,8 +61,10 @@ export function resolveSidecarConfig(options: ResolveSidecarConfigOptions = {}):
     cli.webDir ??
     environment.CODEX_REMOTE_WEB_DIR ??
     path.resolve(import.meta.dirname, "../../web/dist");
+  const desktopSyncEnabled =
+    cli.desktopSyncEnabled ?? parseBooleanSwitch(environment.CODEX_REMOTE_DESKTOP_SYNC) ?? true;
 
-  return { basePath, dataDir, host, port, webDir };
+  return { basePath, dataDir, desktopSyncEnabled, host, port, webDir };
 }
 
 export function parseCliInvocation(args: string[]): CliInvocation {
@@ -77,12 +81,20 @@ export function parseCliInvocation(args: string[]): CliInvocation {
   const values = parseFlags(rest);
 
   if (command === "serve") {
-    assertAllowedFlags(values, ["base-path", "data-dir", "host", "port", "web-dir"]);
+    assertAllowedFlags(values, [
+      "base-path",
+      "data-dir",
+      "host",
+      "no-desktop-sync",
+      "port",
+      "web-dir",
+    ]);
     return {
       command,
       config: compactConfig({
         basePath: values.get("base-path"),
         dataDir: values.get("data-dir"),
+        desktopSyncEnabled: values.has("no-desktop-sync") ? false : undefined,
         host: values.get("host"),
         port: parsePort(values.get("port")),
         webDir: values.get("web-dir"),
@@ -147,19 +159,48 @@ function parsePort(value: string | undefined): number | undefined {
   return Number(value);
 }
 
+function parseBooleanSwitch(value: string | undefined): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  switch (value.trim().toLocaleLowerCase("en-US")) {
+    case "1":
+    case "on":
+    case "true":
+    case "yes":
+      return true;
+    case "0":
+    case "false":
+    case "no":
+    case "off":
+      return false;
+    default:
+      throw new Error("Sidecar 桌面端同步开关无效");
+  }
+}
+
 function parseFlags(args: string[]): Map<string, string> {
   const result = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 2) {
+  for (let index = 0; index < args.length; ) {
     const flag = args[index];
-    const value = args[index + 1];
-    if (!flag?.startsWith("--") || value === undefined || value.startsWith("--")) {
+    if (!flag?.startsWith("--")) {
       throw new Error("不支持的参数或缺少参数值");
     }
     const key = flag.slice(2);
     if (result.has(key)) {
       throw new Error("不支持重复参数");
     }
+    if (key === "no-desktop-sync") {
+      result.set(key, "");
+      index += 1;
+      continue;
+    }
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error("不支持的参数或缺少参数值");
+    }
     result.set(key, value);
+    index += 2;
   }
   return result;
 }
@@ -176,6 +217,7 @@ function compactConfig(input: {
   port?: number | undefined;
   basePath?: string | undefined;
   dataDir?: string | undefined;
+  desktopSyncEnabled?: boolean | undefined;
   webDir?: string | undefined;
 }): SidecarConfigOverrides {
   return {
@@ -183,6 +225,9 @@ function compactConfig(input: {
     ...(input.port === undefined ? {} : { port: input.port }),
     ...(input.basePath === undefined ? {} : { basePath: input.basePath }),
     ...(input.dataDir === undefined ? {} : { dataDir: input.dataDir }),
+    ...(input.desktopSyncEnabled === undefined
+      ? {}
+      : { desktopSyncEnabled: input.desktopSyncEnabled }),
     ...(input.webDir === undefined ? {} : { webDir: input.webDir }),
   };
 }

@@ -181,6 +181,47 @@ describe("thread projection", () => {
     expect(JSON.stringify(tools)).not.toContain("\\u0000");
   });
 
+  it("projects persisted context compaction as a Chinese product tool card", () => {
+    expect(
+      projectThreadItem({
+        id: "compaction-1",
+        status: "completed",
+        type: "contextCompaction",
+      }),
+    ).toEqual([
+      {
+        id: "compaction-1",
+        kind: "tool",
+        operation: "context-compaction",
+        status: "complete",
+        title: "压缩对话上下文",
+      },
+    ]);
+
+    const detail = projectThreadDetail(
+      {
+        ...rawThread,
+        turns: [
+          {
+            id: "turn-compaction",
+            items: [{ id: "compaction-from-history", type: "contextCompaction" }],
+            status: "completed",
+          },
+        ],
+      },
+      { managed: true },
+    );
+    expect(detail.items).toEqual([
+      {
+        id: "compaction-from-history",
+        kind: "tool",
+        operation: "context-compaction",
+        status: "complete",
+        title: "压缩对话上下文",
+      },
+    ]);
+  });
+
   it("preserves bounded file-change status, move target, and diff without counting headers", () => {
     const detail = projectThreadDetail(
       {
@@ -399,6 +440,62 @@ describe("thread projection", () => {
 });
 
 describe("notification projection", () => {
+  it("projects the real context-compaction lifecycle without exposing protocol details", () => {
+    const item = {
+      id: "compaction-1",
+      type: "contextCompaction",
+    };
+
+    expect(
+      projectAppServerNotification({
+        method: "item/started",
+        params: { item, threadId: "thread-1", turnId: "turn-compact" },
+      }),
+    ).toEqual([
+      {
+        payload: {
+          item: [
+            {
+              id: "compaction-1",
+              kind: "tool",
+              operation: "context-compaction",
+              status: "running",
+              title: "压缩对话上下文",
+            },
+          ],
+          lifecycle: "started",
+        },
+        threadId: "thread-1",
+        turnId: "turn-compact",
+        type: "thread.item",
+      },
+    ]);
+    expect(
+      projectAppServerNotification({
+        method: "item/completed",
+        params: { item, threadId: "thread-1", turnId: "turn-compact" },
+      }),
+    ).toEqual([
+      {
+        payload: {
+          item: [
+            {
+              id: "compaction-1",
+              kind: "tool",
+              operation: "context-compaction",
+              status: "complete",
+              title: "压缩对话上下文",
+            },
+          ],
+          lifecycle: "completed",
+        },
+        threadId: "thread-1",
+        turnId: "turn-compact",
+        type: "thread.item",
+      },
+    ]);
+  });
+
   it("drops raw reasoning content but preserves reasoning summaries", () => {
     expect(
       projectAppServerNotification({

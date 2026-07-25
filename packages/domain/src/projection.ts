@@ -77,7 +77,7 @@ export function projectThreadDetail(
     const createdAt = secondsToIso(asFiniteNumber(turn.startedAt));
     const turnItems: ConversationItem[] = [];
     for (const item of asRecordArray(turn.items)) {
-      turnItems.push(...projectThreadItem(item, createdAt));
+      turnItems.push(...projectThreadItem(item, createdAt, turn.status));
     }
     items.push(...aggregateToolItems(turnItems));
   }
@@ -97,7 +97,11 @@ export function projectThreadDetail(
   };
 }
 
-export function projectThreadItem(rawItem: unknown, createdAt?: string): ConversationItem[] {
+export function projectThreadItem(
+  rawItem: unknown,
+  createdAt?: string,
+  parentTurnStatus?: unknown,
+): ConversationItem[] {
   if (!isRecord(rawItem)) {
     return [];
   }
@@ -203,6 +207,17 @@ export function projectThreadItem(rawItem: unknown, createdAt?: string): Convers
           ...timestamp,
         },
       ];
+    case "contextCompaction":
+      return [
+        {
+          id,
+          kind: "tool",
+          operation: "context-compaction",
+          status: projectToolStatus(rawItem.status ?? parentTurnStatus),
+          title: "压缩对话上下文",
+          ...timestamp,
+        },
+      ];
     case "webSearch":
       return [{ id, kind: "tool", status: "complete", title: "查询网页", ...timestamp }];
     case "imageView":
@@ -282,7 +297,13 @@ export function projectAppServerNotification(
       ];
     case "item/started":
     case "item/completed": {
-      const item = projectThreadItem(params.item);
+      const item = projectThreadItem(params.item).map((projected) =>
+        notification.method === "item/completed" &&
+        projected.kind === "tool" &&
+        projected.operation === "context-compaction"
+          ? { ...projected, status: "complete" as const }
+          : projected,
+      );
       return item.length === 0
         ? []
         : [

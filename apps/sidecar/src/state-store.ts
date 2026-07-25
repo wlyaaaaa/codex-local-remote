@@ -14,7 +14,7 @@ import {
 
 import type { RegisteredProject } from "@codex-local-remote/domain";
 
-const STATE_SCHEMA_VERSION = 2;
+const STATE_SCHEMA_VERSION = 3;
 const ABSOLUTE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const IDLE_SESSION_TTL_MS = 24 * 60 * 60 * 1_000;
 const SESSION_PERSIST_INTERVAL_MS = 60_000;
@@ -39,6 +39,7 @@ interface PersistedRegisteredProject {
 
 interface PersistedState {
   managedThreadIds: string[];
+  pendingDesktopNotificationThreadIds: string[];
   schemaVersion: typeof STATE_SCHEMA_VERSION;
   passwordHash?: string;
   projects: PersistedRegisteredProject[];
@@ -98,6 +99,10 @@ export class SidecarStateStore {
 
   listManagedThreadIds(): string[] {
     return [...this.#state.managedThreadIds];
+  }
+
+  listPendingDesktopNotificationThreadIds(): string[] {
+    return [...this.#state.pendingDesktopNotificationThreadIds];
   }
 
   async verifyPassword(password: string): Promise<boolean> {
@@ -181,17 +186,41 @@ export class SidecarStateStore {
     }
   }
 
-  async markManagedThread(threadId: string): Promise<void> {
+  async markManagedThread(
+    threadId: string,
+    options: { desktopNotificationPending?: boolean } = {},
+  ): Promise<void> {
     const normalized = threadId.trim();
     if (!normalized || normalized.length > 512) {
       throw new Error("对话标识无效");
     }
-    if (this.#state.managedThreadIds.includes(normalized)) {
+    const managed = this.#state.managedThreadIds.includes(normalized);
+    const pending = this.#state.pendingDesktopNotificationThreadIds.includes(normalized);
+    if (managed && (options.desktopNotificationPending !== true || pending)) {
       return;
     }
     this.#state = {
       ...this.#state,
-      managedThreadIds: [...this.#state.managedThreadIds, normalized],
+      managedThreadIds: managed
+        ? this.#state.managedThreadIds
+        : [...this.#state.managedThreadIds, normalized],
+      pendingDesktopNotificationThreadIds:
+        options.desktopNotificationPending === true && !pending
+          ? [...this.#state.pendingDesktopNotificationThreadIds, normalized]
+          : this.#state.pendingDesktopNotificationThreadIds,
+    };
+    await this.#persist();
+  }
+
+  async clearPendingDesktopNotification(threadId: string): Promise<void> {
+    if (!this.#state.pendingDesktopNotificationThreadIds.includes(threadId)) {
+      return;
+    }
+    this.#state = {
+      ...this.#state,
+      pendingDesktopNotificationThreadIds: this.#state.pendingDesktopNotificationThreadIds.filter(
+        (candidate) => candidate !== threadId,
+      ),
     };
     await this.#persist();
   }
@@ -301,6 +330,7 @@ export class SidecarStateStore {
 function emptyState(): PersistedState {
   return {
     managedThreadIds: [],
+    pendingDesktopNotificationThreadIds: [],
     projects: [],
     schemaVersion: STATE_SCHEMA_VERSION,
     sessions: {},
@@ -311,7 +341,9 @@ function parseState(serialized: string): PersistedState {
   const value: unknown = JSON.parse(serialized);
   if (
     !isRecord(value) ||
-    (value.schemaVersion !== 1 && value.schemaVersion !== STATE_SCHEMA_VERSION)
+    (value.schemaVersion !== 1 &&
+      value.schemaVersion !== 2 &&
+      value.schemaVersion !== STATE_SCHEMA_VERSION)
   ) {
     throw new Error("unsupported state");
   }
@@ -319,12 +351,24 @@ function parseState(serialized: string): PersistedState {
   // currently occupies that path during migration; the user must register it
   // again so V2 can bind authorization to the directory identity.
   const projects =
-    value.schemaVersion === STATE_SCHEMA_VERSION && Array.isArray(value.projects)
+    value.schemaVersion !== 1 && Array.isArray(value.projects)
       ? value.projects.filter(isPersistedRegisteredProject)
       : [];
   const managedThreadIds = Array.isArray(value.managedThreadIds)
     ? [...new Set(value.managedThreadIds.filter(isManagedThreadId))]
     : [];
+  const managedThreadIdSet = new Set(managedThreadIds);
+  const pendingDesktopNotificationThreadIds =
+    value.schemaVersion === STATE_SCHEMA_VERSION &&
+    Array.isArray(value.pendingDesktopNotificationThreadIds)
+      ? [
+          ...new Set(
+            value.pendingDesktopNotificationThreadIds
+              .filter(isManagedThreadId)
+              .filter((threadId) => managedThreadIdSet.has(threadId)),
+          ),
+        ]
+      : [];
   const sessions: Record<string, StoredSession> = {};
   if (isRecord(value.sessions)) {
     for (const [digest, candidate] of Object.entries(value.sessions)) {
@@ -336,6 +380,7 @@ function parseState(serialized: string): PersistedState {
   }
   return {
     managedThreadIds,
+    pendingDesktopNotificationThreadIds,
     projects,
     schemaVersion: STATE_SCHEMA_VERSION,
     sessions,

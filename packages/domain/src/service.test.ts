@@ -23,6 +23,16 @@ const threadFixture = {
 };
 const temporaryDirectories: string[] = [];
 
+function deferred<T>() {
+  let reject!: (reason?: unknown) => void;
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    reject = rejectPromise;
+    resolve = resolvePromise;
+  });
+  return { promise, reject, resolve };
+}
+
 afterEach(async () => {
   for (const directory of temporaryDirectories.splice(0)) {
     await rm(directory, { force: true, recursive: true });
@@ -34,12 +44,14 @@ function createService(
   resolveRegisteredProjectRoot: (projectId: string) => Promise<string | undefined> = async (
     projectId,
   ) => (projectId === "project-1" ? "C:\\workspace\\sample" : undefined),
+  notifyManagedThreadCreated?: (threadId: string) => void | Promise<void>,
 ): CodexDomainService {
   return new CodexDomainService({
     gateway: {
       request: async <T = unknown>(method: string, params?: unknown): Promise<T> =>
         (await request(method, params)) as T,
     },
+    ...(notifyManagedThreadCreated === undefined ? {} : { notifyManagedThreadCreated }),
     projects: new ProjectRegistry([
       { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
     ]),
@@ -180,6 +192,524 @@ describe("CodexDomainService", () => {
     });
   });
 
+  it("waits for the initial turn to become terminal before notifying the host", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000001";
+    const sequence: string[] = [];
+    let persistedTerminal = false;
+    const spawned = deferred<void>();
+    const notifyManagedThreadCreated = vi.fn(async (createdThreadId: string) => {
+      sequence.push(`notify:${createdThreadId}`);
+      await spawned.promise;
+    });
+    const service = new CodexDomainService({
+      gateway: {
+        request: async <T = unknown>(method: string): Promise<T> => {
+          sequence.push(method);
+          if (method === "thread/start") {
+            return {
+              thread: { ...threadFixture, id: threadId },
+            } as T;
+          }
+          if (method === "turn/start") {
+            return {
+              turn: {
+                id: "turn-new",
+                status: "inProgress",
+                startedAt: 1_721_000_001,
+                items: [],
+              },
+            } as T;
+          }
+          if (method === "thread/read") {
+            return {
+              thread: {
+                ...threadFixture,
+                id: threadId,
+                status: { type: persistedTerminal ? "idle" : "active" },
+                turns: [
+                  {
+                    id: "turn-new",
+                    items: [{ id: "user-1", type: "userMessage" }],
+                    status: persistedTerminal ? "completed" : "inProgress",
+                  },
+                ],
+              },
+            } as T;
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+      },
+      notifyManagedThreadCreated,
+      clearPendingDesktopNotification: async (createdThreadId) => {
+        sequence.push(`clear:${createdThreadId}`);
+      },
+      persistManagedThread: async (createdThreadId, options) => {
+        sequence.push(`persist:${createdThreadId}:${String(options.desktopNotificationPending)}`);
+      },
+      projects: new ProjectRegistry([
+        { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
+      ]),
+      resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
+    });
+
+    await expect(
+      service.createThread({ projectId: "project-1", prompt: "同步到桌面端" }),
+    ).resolves.toMatchObject({
+      data: { activeTurnId: "turn-new", id: threadId, state: "running" },
+    });
+    expect(sequence).toEqual(["thread/start", `persist:${threadId}:true`, "turn/start"]);
+    expect(notifyManagedThreadCreated).not.toHaveBeenCalled();
+
+    await service.reconcilePendingDesktopNotifications();
+    expect(sequence).toEqual([
+      "thread/start",
+      `persist:${threadId}:true`,
+      "turn/start",
+      "thread/read",
+    ]);
+    expect(notifyManagedThreadCreated).not.toHaveBeenCalled();
+
+    service.handleNotification({
+      method: "turn/started",
+      params: {
+        threadId,
+        turn: { id: "turn-new", status: "inProgress" },
+      },
+    });
+    service.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId: "01900000-0000-7000-8000-000000000002",
+        turn: { id: "turn-other", status: "completed" },
+      },
+    });
+    expect(notifyManagedThreadCreated).not.toHaveBeenCalled();
+
+    service.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId,
+        turn: {
+          id: "turn-new",
+          items: [{ id: "user-1", type: "userMessage" }],
+          status: "completed",
+        },
+      },
+    });
+    await vi.waitFor(() => {
+      expect(sequence.filter((entry) => entry === "thread/read")).toHaveLength(2);
+    });
+    await service.reconcilePendingDesktopNotifications();
+    expect(notifyManagedThreadCreated).not.toHaveBeenCalled();
+
+    persistedTerminal = true;
+    const terminalReconciliation = service.reconcilePendingDesktopNotifications();
+    await vi.waitFor(() => expect(notifyManagedThreadCreated).toHaveBeenCalledOnce());
+    expect(sequence.at(-2)).toBe("thread/read");
+    expect(sequence.at(-1)).toBe(`notify:${threadId}`);
+
+    const repeatedReconciliation = service.reconcilePendingDesktopNotifications();
+    expect(notifyManagedThreadCreated).toHaveBeenCalledOnce();
+
+    spawned.resolve();
+    await Promise.all([terminalReconciliation, repeatedReconciliation]);
+    expect(notifyManagedThreadCreated).toHaveBeenCalledOnce();
+    expect(sequence.filter((entry) => entry === "thread/read")).toHaveLength(3);
+    expect(sequence.at(-1)).toBe(`clear:${threadId}`);
+  });
+
+  it("does not retain a false active turn when completion arrives before turn/start resolves", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000001";
+    let turnStarts = 0;
+    const service = createService(async (method) => {
+      if (method === "thread/start") {
+        return { thread: { ...threadFixture, id: threadId } };
+      }
+      if (method === "thread/read") {
+        return { thread: { ...threadFixture, id: threadId } };
+      }
+      if (method === "turn/start") {
+        turnStarts += 1;
+        if (turnStarts === 1) {
+          service.handleNotification({
+            method: "turn/completed",
+            params: {
+              threadId,
+              turn: {
+                id: "turn-fast",
+                items: [{ id: "user-fast", type: "userMessage" }],
+                status: "completed",
+              },
+            },
+          });
+          return {
+            turn: {
+              id: "turn-fast",
+              items: [],
+              startedAt: 1_721_000_001,
+              status: "inProgress",
+            },
+          };
+        }
+        return {
+          turn: {
+            id: "turn-second",
+            items: [],
+            startedAt: 1_721_000_002,
+            status: "inProgress",
+          },
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    await service.createThread({ projectId: "project-1", prompt: "极快完成" });
+
+    await expect(service.startTurn(threadId, { prompt: "继续执行" })).resolves.toMatchObject({
+      state: "running",
+      threadId,
+      turnId: "turn-second",
+    });
+    expect(turnStarts).toBe(2);
+  });
+
+  it("does not let an unrelated completion suppress the active turn returned by turn/start", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000001";
+    const service = createService(async (method) => {
+      if (method === "thread/start") {
+        return { thread: { ...threadFixture, id: threadId } };
+      }
+      if (method === "turn/start") {
+        service.handleNotification({
+          method: "turn/completed",
+          params: {
+            threadId,
+            turn: {
+              id: "turn-unrelated",
+              items: [{ id: "user-unrelated", type: "userMessage" }],
+              status: "completed",
+            },
+          },
+        });
+        return {
+          turn: {
+            id: "turn-real",
+            items: [],
+            startedAt: 1_721_000_001,
+            status: "inProgress",
+          },
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    await service.createThread({ projectId: "project-1", prompt: "保持真实活动状态" });
+
+    await expect(service.startTurn(threadId, { prompt: "不能并发" })).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    });
+  });
+
+  it("clears a pending desktop marker when the initial turn fails to start", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000001";
+    const methods: string[] = [];
+    const clearPendingDesktopNotification = vi.fn(async () => undefined);
+    const notifyManagedThreadCreated = vi.fn(async () => undefined);
+    const persistManagedThread = vi.fn(async () => undefined);
+    const service = new CodexDomainService({
+      clearPendingDesktopNotification,
+      gateway: {
+        request: async <T = unknown>(method: string): Promise<T> => {
+          methods.push(method);
+          if (method === "thread/start") {
+            return { thread: { ...threadFixture, id: threadId } } as T;
+          }
+          if (method === "turn/start") {
+            throw new Error("turn start failed");
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+      },
+      notifyManagedThreadCreated,
+      persistManagedThread,
+      projects: new ProjectRegistry([
+        { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
+      ]),
+      resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
+    });
+
+    await expect(
+      service.createThread({ projectId: "project-1", prompt: "启动失败" }),
+    ).rejects.toThrow("turn start failed");
+
+    expect(persistManagedThread).toHaveBeenCalledWith(threadId, {
+      desktopNotificationPending: true,
+    });
+    expect(clearPendingDesktopNotification).toHaveBeenCalledOnce();
+    expect(clearPendingDesktopNotification).toHaveBeenCalledWith(threadId);
+    expect(notifyManagedThreadCreated).not.toHaveBeenCalled();
+
+    await service.reconcilePendingDesktopNotifications();
+    expect(methods).toEqual(["thread/start", "turn/start"]);
+  });
+
+  it("contains host notification failures after the real first turn is terminal", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000001";
+    const methods: string[] = [];
+    const clearPendingDesktopNotification = vi.fn(async () => undefined);
+    let notificationAttempts = 0;
+    const notifyManagedThreadCreated = vi.fn(async () => {
+      notificationAttempts += 1;
+      if (notificationAttempts === 1) {
+        throw new Error("desktop unavailable");
+      }
+    });
+    const service = new CodexDomainService({
+      clearPendingDesktopNotification,
+      gateway: {
+        request: async <T = unknown>(method: string): Promise<T> => {
+          methods.push(method);
+          if (method === "thread/start") {
+            return { thread: { ...threadFixture, id: threadId } } as T;
+          }
+          if (method === "turn/start") {
+            return {
+              turn: {
+                id: "turn-new",
+                status: "inProgress",
+                startedAt: 1_721_000_001,
+                items: [],
+              },
+            } as T;
+          }
+          if (method === "thread/read") {
+            return {
+              thread: {
+                ...threadFixture,
+                id: threadId,
+                status: { type: "idle" },
+                turns: [
+                  {
+                    id: "turn-new",
+                    items: [{ id: "user-1", type: "userMessage" }],
+                    status: "completed",
+                  },
+                ],
+              },
+            } as T;
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+      },
+      notifyManagedThreadCreated,
+      persistManagedThread: async () => undefined,
+      projects: new ProjectRegistry([
+        { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
+      ]),
+      resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
+    });
+
+    await expect(
+      service.createThread({ projectId: "project-1", prompt: "通知失败也要继续" }),
+    ).resolves.toMatchObject({
+      data: { activeTurnId: "turn-new", id: threadId, state: "running" },
+    });
+    expect(methods).toEqual(["thread/start", "turn/start"]);
+    expect(service.isManagedThread(threadId)).toBe(true);
+    expect(notifyManagedThreadCreated).not.toHaveBeenCalled();
+
+    expect(() =>
+      service.handleNotification({
+        method: "turn/completed",
+        params: {
+          threadId,
+          turn: {
+            id: "turn-new",
+            items: [{ id: "user-1", type: "userMessage" }],
+            status: "completed",
+          },
+        },
+      }),
+    ).not.toThrow();
+    await vi.waitFor(() => expect(notifyManagedThreadCreated).toHaveBeenCalledOnce());
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(clearPendingDesktopNotification).not.toHaveBeenCalled();
+
+    await service.reconcilePendingDesktopNotifications();
+
+    expect(notifyManagedThreadCreated).toHaveBeenCalledTimes(2);
+    expect(clearPendingDesktopNotification).toHaveBeenCalledOnce();
+  });
+
+  it("reconciles only durable pending threads after a full Sidecar restart", async () => {
+    const terminalId = "01900000-0000-7000-8000-000000000001";
+    const activeId = "01900000-0000-7000-8000-000000000002";
+    const historicalId = "01900000-0000-7000-8000-000000000003";
+    const reads: string[] = [];
+    let activeReads = 0;
+    const notifyManagedThreadCreated = vi.fn(async () => undefined);
+    const clearPendingDesktopNotification = vi.fn(async () => undefined);
+    const service = new CodexDomainService({
+      clearPendingDesktopNotification,
+      gateway: {
+        request: async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+          if (method !== "thread/read") {
+            throw new Error(`unexpected method ${method}`);
+          }
+          const threadId = (params as { threadId?: string }).threadId ?? "";
+          reads.push(threadId);
+          if (threadId === activeId) {
+            activeReads += 1;
+            return {
+              thread: {
+                ...threadFixture,
+                id: threadId,
+                status: { type: "active" },
+                turns: [
+                  {
+                    id: "turn-active",
+                    items: activeReads === 1 ? [] : [{ id: "user-active", type: "userMessage" }],
+                    status: "inProgress",
+                  },
+                ],
+              },
+            } as T;
+          }
+          return {
+            thread: {
+              ...threadFixture,
+              id: threadId,
+              status: { type: "idle" },
+              turns: [
+                {
+                  id: "turn-complete",
+                  items: [{ id: "user-complete", type: "userMessage" }],
+                  status: "completed",
+                },
+              ],
+            },
+          } as T;
+        },
+      },
+      managedThreadIds: [historicalId, terminalId, activeId],
+      notifyManagedThreadCreated,
+      pendingDesktopNotificationThreadIds: [terminalId, activeId],
+      projects: new ProjectRegistry(),
+      resolveRegisteredProjectRoot: async () => undefined,
+    });
+
+    await service.reconcilePendingDesktopNotifications();
+
+    expect(reads).toEqual([terminalId, activeId]);
+    expect(reads).not.toContain(historicalId);
+    expect(notifyManagedThreadCreated).toHaveBeenCalledTimes(1);
+    expect(notifyManagedThreadCreated).toHaveBeenCalledWith(terminalId);
+    expect(clearPendingDesktopNotification).toHaveBeenCalledWith(terminalId);
+
+    await service.reconcilePendingDesktopNotifications();
+
+    expect(reads).toEqual([terminalId, activeId, activeId]);
+    expect(notifyManagedThreadCreated).toHaveBeenCalledTimes(2);
+    expect(notifyManagedThreadCreated).toHaveBeenLastCalledWith(activeId);
+    expect(clearPendingDesktopNotification).toHaveBeenLastCalledWith(activeId);
+  });
+
+  it("treats current pending desktop notifications as restored after a backend restart", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000001";
+    const notifyManagedThreadCreated = vi.fn(async () => undefined);
+    const clearPendingDesktopNotification = vi.fn(async () => undefined);
+    const service = new CodexDomainService({
+      clearPendingDesktopNotification,
+      gateway: {
+        request: async <T = unknown>(method: string): Promise<T> => {
+          if (method === "thread/start") {
+            return { thread: { ...threadFixture, id: threadId } } as T;
+          }
+          if (method === "turn/start") {
+            return {
+              turn: {
+                id: "turn-before-restart",
+                items: [],
+                startedAt: 1_721_000_001,
+                status: "inProgress",
+              },
+            } as T;
+          }
+          if (method === "thread/read") {
+            return {
+              thread: {
+                ...threadFixture,
+                id: threadId,
+                status: { type: "active" },
+                turns: [
+                  {
+                    id: "turn-before-restart",
+                    items: [{ id: "user-visible", type: "userMessage" }],
+                    status: "inProgress",
+                  },
+                ],
+              },
+            } as T;
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+      },
+      notifyManagedThreadCreated,
+      persistManagedThread: async () => undefined,
+      projects: new ProjectRegistry([
+        { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
+      ]),
+      resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
+    });
+
+    await service.createThread({ projectId: "project-1", prompt: "重启后继续同步" });
+    service.handleBackendRestart();
+    await service.reconcilePendingDesktopNotifications();
+
+    expect(notifyManagedThreadCreated).toHaveBeenCalledOnce();
+    expect(notifyManagedThreadCreated).toHaveBeenCalledWith(threadId);
+    expect(clearPendingDesktopNotification).toHaveBeenCalledWith(threadId);
+  });
+
+  it("clears a restored idle empty shell without opening it in Desktop", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000001";
+    const reads: string[] = [];
+    const notifyManagedThreadCreated = vi.fn(async () => undefined);
+    const clearPendingDesktopNotification = vi.fn(async () => undefined);
+    const service = new CodexDomainService({
+      clearPendingDesktopNotification,
+      gateway: {
+        request: async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+          if (method !== "thread/read") {
+            throw new Error(`unexpected method ${method}`);
+          }
+          reads.push((params as { threadId: string }).threadId);
+          return {
+            thread: {
+              ...threadFixture,
+              id: threadId,
+              status: { type: "idle" },
+              turns: [],
+            },
+          } as T;
+        },
+      },
+      managedThreadIds: [threadId],
+      notifyManagedThreadCreated,
+      pendingDesktopNotificationThreadIds: [threadId],
+      projects: new ProjectRegistry(),
+      resolveRegisteredProjectRoot: async () => undefined,
+    });
+
+    await service.reconcilePendingDesktopNotifications();
+    await service.reconcilePendingDesktopNotifications();
+
+    expect(reads).toEqual([threadId]);
+    expect(notifyManagedThreadCreated).not.toHaveBeenCalled();
+    expect(clearPendingDesktopNotification).toHaveBeenCalledOnce();
+    expect(clearPendingDesktopNotification).toHaveBeenCalledWith(threadId);
+  });
+
   it("continues with a normal turn when experimental collaboration is unavailable", async () => {
     const methods: string[] = [];
     const service = createService(async (method) => {
@@ -285,6 +815,408 @@ describe("CodexDomainService", () => {
     await expect(service.steerTurn("desktop-thread", "turn-1", "补充要求")).rejects.toMatchObject({
       code: "THREAD_READ_ONLY",
     } satisfies Partial<DomainError>);
+  });
+
+  it("reserves an ordinary turn before asynchronous authorization can race another tab", async () => {
+    const authorizationGate = deferred<void>();
+    const authorizationStarted = deferred<void>();
+    let blockAuthorization = false;
+    let nextTurnStarts = 0;
+    let threadReads = 0;
+    const service = createService(async (method) => {
+      if (method === "thread/start") {
+        return { thread: threadFixture };
+      }
+      if (method === "turn/start") {
+        nextTurnStarts += 1;
+        return {
+          turn: {
+            id: nextTurnStarts === 1 ? "turn-initial" : `turn-next-${nextTurnStarts}`,
+            items: [],
+            startedAt: 1_721_000_001 + nextTurnStarts,
+            status: "inProgress",
+          },
+        };
+      }
+      if (method === "thread/read") {
+        threadReads += 1;
+        if (blockAuthorization) {
+          authorizationStarted.resolve();
+          await authorizationGate.promise;
+        }
+        return { thread: threadFixture };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+    await service.createThread({ projectId: "project-1", prompt: "第一轮" });
+    service.handleNotification({
+      method: "turn/completed",
+      params: { threadId: "thread-new", turn: { id: "turn-initial", status: "completed" } },
+    });
+    blockAuthorization = true;
+
+    const first = service.startTurn("thread-new", { prompt: "标签一" });
+    await authorizationStarted.promise;
+    const second = service.startTurn("thread-new", { prompt: "标签二" });
+    await Promise.resolve();
+    authorizationGate.resolve();
+    const outcomes = await Promise.allSettled([first, second]);
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+    expect(outcomes.find((outcome) => outcome.status === "rejected")).toMatchObject({
+      reason: { code: "TURN_MISMATCH" },
+    });
+    expect(threadReads).toBe(1);
+    expect(nextTurnStarts).toBe(2);
+  });
+
+  it("runs real manual compaction once and blocks turns and steer until its terminal event", async () => {
+    const compactAccepted = deferred<void>();
+    const compactRequested = deferred<void>();
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    let laggingCompactionSnapshot = false;
+    let turnStarts = 0;
+    const service = createService(async (method, params) => {
+      calls.push({ method, params });
+      if (method === "thread/start") {
+        return { thread: threadFixture };
+      }
+      if (method === "turn/start") {
+        turnStarts += 1;
+        return {
+          turn: {
+            id: turnStarts === 1 ? "turn-initial" : "turn-after-compaction",
+            items: [],
+            startedAt: 1_721_000_001 + turnStarts,
+            status: "inProgress",
+          },
+        };
+      }
+      if (method === "thread/read") {
+        if (
+          laggingCompactionSnapshot &&
+          (params as { includeTurns?: boolean } | undefined)?.includeTurns === true
+        ) {
+          return {
+            thread: {
+              ...threadFixture,
+              status: { activeFlags: [], type: "active" },
+              turns: [
+                {
+                  id: "turn-compact",
+                  items: [{ id: "compaction-1", type: "contextCompaction" }],
+                  status: "inProgress",
+                },
+              ],
+            },
+          };
+        }
+        return { thread: threadFixture };
+      }
+      if (method === "thread/compact/start") {
+        compactRequested.resolve();
+        await compactAccepted.promise;
+        return {};
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+    await service.createThread({ projectId: "project-1", prompt: "第一轮" });
+    service.handleNotification({
+      method: "turn/completed",
+      params: { threadId: "thread-new", turn: { id: "turn-initial", status: "completed" } },
+    });
+
+    const compaction = service.compactThread("thread-new");
+    await compactRequested.promise;
+    await expect(service.compactThread("thread-new")).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    } satisfies Partial<DomainError>);
+    await expect(service.startTurn("thread-new", { prompt: "不能抢跑" })).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    } satisfies Partial<DomainError>);
+    await expect(
+      service.steerTurn("thread-new", "turn-compact", "不能把压缩当成普通回复"),
+    ).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    } satisfies Partial<DomainError>);
+    await expect(service.getThread("thread-new")).resolves.toMatchObject({
+      availableActions: {
+        changeModelNextTurn: false,
+        interrupt: false,
+        reply: false,
+        steer: false,
+      },
+    });
+    compactAccepted.resolve();
+    await expect(compaction).resolves.toBeUndefined();
+
+    service.handleNotification({
+      method: "turn/started",
+      params: {
+        threadId: "thread-new",
+        turn: { id: "turn-compact", status: "inProgress" },
+      },
+    });
+    service.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-new",
+        turn: { id: "turn-unrelated", status: "completed" },
+      },
+    });
+    await expect(
+      service.startTurn("thread-new", { prompt: "不能被旁路终态解锁" }),
+    ).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    } satisfies Partial<DomainError>);
+    service.handleNotification({
+      method: "item/started",
+      params: {
+        item: { id: "compaction-1", type: "contextCompaction" },
+        threadId: "thread-new",
+        turnId: "turn-compact",
+      },
+    });
+    service.handleNotification({
+      method: "item/completed",
+      params: {
+        item: { id: "compaction-1", type: "contextCompaction" },
+        threadId: "thread-new",
+        turnId: "turn-compact",
+      },
+    });
+    await expect(service.startTurn("thread-new", { prompt: "仍需等终态" })).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    } satisfies Partial<DomainError>);
+    service.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-new",
+        turn: { id: "turn-compact", status: "completed" },
+      },
+    });
+    laggingCompactionSnapshot = true;
+    await expect(service.getThread("thread-new")).resolves.toMatchObject({
+      availableActions: { interrupt: false, reply: false, steer: false },
+    });
+    laggingCompactionSnapshot = false;
+
+    await expect(service.startTurn("thread-new", { prompt: "压缩后继续" })).resolves.toMatchObject({
+      state: "running",
+      threadId: "thread-new",
+      turnId: "turn-after-compaction",
+    });
+    expect(calls.filter((call) => call.method === "thread/compact/start")).toEqual([
+      {
+        method: "thread/compact/start",
+        params: { threadId: "thread-new" },
+      },
+    ]);
+    expect(calls.some((call) => call.method === "turn/steer")).toBe(false);
+  });
+
+  it("tracks automatic context compaction and blocks every competing mutation until its turn ends", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    let turnStarts = 0;
+    const service = createService(async (method, params) => {
+      calls.push({ method, params });
+      if (method === "thread/start") return { thread: threadFixture };
+      if (method === "thread/read") return { thread: threadFixture };
+      if (method === "turn/start") {
+        turnStarts += 1;
+        return {
+          turn: {
+            id: turnStarts === 1 ? "turn-initial" : "turn-after-automatic-compaction",
+            items: [],
+            startedAt: 1_721_000_001 + turnStarts,
+            status: "inProgress",
+          },
+        };
+      }
+      if (method === "thread/compact/start") return {};
+      throw new Error(`unexpected method ${method}`);
+    });
+    await service.createThread({ projectId: "project-1", prompt: "第一轮" });
+    service.handleNotification({
+      method: "turn/completed",
+      params: { threadId: "thread-new", turn: { id: "turn-initial", status: "completed" } },
+    });
+
+    service.handleNotification({
+      method: "turn/started",
+      params: {
+        threadId: "thread-new",
+        turn: { id: "turn-auto-compact", status: "inProgress" },
+      },
+    });
+    service.handleNotification({
+      method: "item/started",
+      params: {
+        item: { id: "automatic-compaction", type: "contextCompaction" },
+        threadId: "thread-new",
+        turnId: "turn-auto-compact",
+      },
+    });
+
+    await expect(service.compactThread("thread-new")).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    });
+    await expect(
+      service.startTurn("thread-new", { prompt: "不能与自动压缩并发" }),
+    ).rejects.toMatchObject({ code: "TURN_MISMATCH" });
+    await expect(
+      service.steerTurn("thread-new", "turn-auto-compact", "仍需等待"),
+    ).rejects.toMatchObject({ code: "TURN_MISMATCH" });
+    await expect(service.interruptTurn("thread-new", "turn-auto-compact")).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    });
+    await expect(service.getThread("thread-new")).resolves.toMatchObject({
+      availableActions: { interrupt: false, reply: false, steer: false },
+    });
+
+    service.handleNotification({
+      method: "turn/completed",
+      params: { threadId: "thread-new", turn: { id: "turn-unrelated", status: "completed" } },
+    });
+    await expect(service.compactThread("thread-new")).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    });
+
+    service.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-new",
+        turn: { id: "turn-auto-compact", status: "completed" },
+      },
+    });
+    await expect(
+      service.startTurn("thread-new", { prompt: "自动压缩后继续" }),
+    ).resolves.toMatchObject({
+      state: "running",
+      turnId: "turn-after-automatic-compaction",
+    });
+    expect(calls.some((call) => call.method === "thread/compact/start")).toBe(false);
+  });
+
+  it("enforces managed direct-input and registered-root gates before compaction", async () => {
+    const snapshot = createService(async () => {
+      throw new Error("gateway must not be called");
+    });
+    await expect(snapshot.compactThread("desktop-thread")).rejects.toMatchObject({
+      code: "THREAD_READ_ONLY",
+    } satisfies Partial<DomainError>);
+
+    const noDirectInput = new CodexDomainService({
+      gateway: {
+        request: async <T = unknown>(method: string): Promise<T> => {
+          if (method === "thread/resume") {
+            return {
+              thread: {
+                ...threadFixture,
+                canAcceptDirectInput: false,
+                id: "thread-restored",
+              },
+            } as T;
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+      },
+      managedThreadIds: ["thread-restored"],
+      projects: new ProjectRegistry([
+        { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
+      ]),
+      resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
+    });
+    await expect(noDirectInput.compactThread("thread-restored")).rejects.toMatchObject({
+      code: "DIRECT_INPUT_UNAVAILABLE",
+    } satisfies Partial<DomainError>);
+
+    let rootAuthorized = true;
+    const changedRoot = createService(
+      async (method) => {
+        if (method === "thread/start") {
+          return { thread: threadFixture };
+        }
+        if (method === "turn/start") {
+          return {
+            turn: { id: "turn-initial", items: [], status: "inProgress" },
+          };
+        }
+        if (method === "thread/read") {
+          return { thread: threadFixture };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      async () => (rootAuthorized ? "C:\\workspace\\sample" : undefined),
+    );
+    await changedRoot.createThread({ projectId: "project-1", prompt: "第一轮" });
+    changedRoot.handleNotification({
+      method: "turn/completed",
+      params: { threadId: "thread-new", turn: { id: "turn-initial", status: "completed" } },
+    });
+    rootAuthorized = false;
+    await expect(changedRoot.compactThread("thread-new")).rejects.toMatchObject({
+      code: "PROJECT_NOT_AUTHORIZED",
+    } satisfies Partial<DomainError>);
+  });
+
+  it("releases compaction state after RPC failure, failed terminal notification, and restart", async () => {
+    let compactRequests = 0;
+    let resumes = 0;
+    const service = new CodexDomainService({
+      gateway: {
+        request: async <T = unknown>(method: string): Promise<T> => {
+          if (method === "thread/resume") {
+            resumes += 1;
+            return {
+              thread: { ...threadFixture, id: "thread-restored" },
+            } as T;
+          }
+          if (method === "thread/read") {
+            return {
+              thread: { ...threadFixture, id: "thread-restored" },
+            } as T;
+          }
+          if (method === "thread/compact/start") {
+            compactRequests += 1;
+            if (compactRequests === 1) {
+              throw new Error("compaction rpc failed");
+            }
+            return {} as T;
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+      },
+      managedThreadIds: ["thread-restored"],
+      projects: new ProjectRegistry([
+        { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
+      ]),
+      resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
+    });
+
+    await expect(service.compactThread("thread-restored")).rejects.toThrow("compaction rpc failed");
+    await expect(service.compactThread("thread-restored")).resolves.toBeUndefined();
+    service.handleNotification({
+      method: "turn/started",
+      params: {
+        threadId: "thread-restored",
+        turn: { id: "turn-failed-compaction", status: "inProgress" },
+      },
+    });
+    service.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-restored",
+        turn: { id: "turn-failed-compaction", status: "failed" },
+      },
+    });
+    await expect(service.compactThread("thread-restored")).resolves.toBeUndefined();
+
+    service.handleBackendRestart();
+    await expect(service.compactThread("thread-restored")).resolves.toBeUndefined();
+    expect(compactRequests).toBe(4);
+    expect(resumes).toBe(2);
   });
 
   it("restores managed ownership and rebuilds the active turn from live thread state", async () => {

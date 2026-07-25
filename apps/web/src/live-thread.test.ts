@@ -231,6 +231,47 @@ describe("实时任务事件投影", () => {
     ]);
   });
 
+  it("保留上下文压缩标识并用完成态替换同一运行项", () => {
+    const running = applyThreadRemoteEvents(detail(), [
+      event(1, "thread.item", {
+        lifecycle: "started",
+        item: [
+          {
+            id: "compaction-1",
+            kind: "tool",
+            operation: "context-compaction",
+            title: "压缩对话上下文",
+            status: "running",
+          },
+        ],
+      }),
+    ]);
+    const completed = applyThreadRemoteEvents(running, [
+      event(2, "thread.item", {
+        lifecycle: "completed",
+        item: [
+          {
+            id: "compaction-1",
+            kind: "tool",
+            operation: "context-compaction",
+            title: "压缩对话上下文",
+            status: "complete",
+          },
+        ],
+      }),
+    ]);
+
+    expect(completed.items).toEqual([
+      {
+        id: "compaction-1",
+        kind: "tool",
+        operation: "context-compaction",
+        title: "压缩对话上下文",
+        status: "complete",
+      },
+    ]);
+  });
+
   it("立即切换 turn 状态和可用操作，完成后恢复下一轮回复", () => {
     const running = applyThreadRemoteEvents(detail(), [
       event(1, "turn.state", {

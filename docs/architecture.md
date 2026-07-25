@@ -103,6 +103,7 @@ Sidecar 为每个宿主维持有界 ring buffer。浏览器携带
 - 会话哈希、创建/到期/最后活动时间；
 - 电脑本机显式登记的项目白名单、显示元数据，以及绑定注册目录所需的
   canonical path 与 device/file identity；
+- 托管任务 id，以及首轮落盘后尚待 Desktop 载入的任务 id；
 - 本地设置；
 - 不含正文的审计事件。
 
@@ -114,7 +115,11 @@ Sidecar 状态文件。
 ### 托管线程
 
 由本 Sidecar 的 app-server 创建。支持实时事件、steer、interrupt、审批、
-模型、思考等级、上下文与子智能体增强。
+模型、思考等级、手动上下文压缩与子智能体增强。
+
+新任务不会在 `turn/start` 刚返回时立刻唤起 Desktop；此时持久化内容可能仍
+为空。Sidecar 等待首轮 terminal 事件后才通过系统协议载入同一任务，并把
+待载入 id 持久化，以便 Sidecar 或电脑重启后继续幂等收口。
 
 ### 桌面快照
 
