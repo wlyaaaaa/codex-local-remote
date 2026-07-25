@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -76,6 +76,11 @@ windowsOnly("Windows script hardening", () => {
   beforeEach(() => {
     sandbox = join(tmpdir(), `codex-local-remote-windows-${process.pid}-${crypto.randomUUID()}`);
     mkdirSync(sandbox, { recursive: true });
+    // GitHub-hosted Windows runners can expose TEMP through an 8.3 path
+    // (RUNNER~1), while PowerShell canonicalizes it to the long path when it
+    // resolves scheduled-task arguments. Keep both sides of the assertion in
+    // the same canonical form.
+    sandbox = realpathSync(sandbox);
     stateFile = join(sandbox, "tailscale-state.json");
     logFile = join(sandbox, "tailscale.log");
     localAppData = join(sandbox, "local-app-data");
