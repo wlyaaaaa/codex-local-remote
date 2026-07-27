@@ -19,23 +19,27 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(start).not.toMatch(/WebSocketUrl\s*=\s*\$webSocketUrl/u);
   });
 
-  it("monitors both children and exits non-zero so Task Scheduler restart is effective", () => {
+  it("keeps the Broker alive and respawns an unexpectedly exited Sidecar in-process", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
     const registration = windowsScript("Register-CodexLocalRemoteStartup.ps1");
-    expect(start).toContain("$sidecarProcess = Start-Process");
-    expect(start).toContain("if ($sidecarProcess.HasExited)");
+    expect(start).toContain("function Start-ManagedSidecarChild");
+    expect(start).toContain("if ($null -eq $sidecarProcess -or $sidecarProcess.HasExited)");
+    expect(start).toContain("$startupStage = 'sidecar-recovery'");
+    expect(start).toContain("$sidecarChild = Start-ManagedSidecarChild");
+    expect(start).toContain("Write-BrokerRuntimeReceipt");
     expect(start).toContain("Test-BrokerInfrastructureReady");
     expect(start).toContain("Get-SharedRuntimeDecision");
     expect(start).toContain("-Phase RuntimeTransition");
     expect(start).toContain("Stop-ProcessIdentityHandle");
-    expect(start).toContain("exit 1");
     expect(registration).toContain("-RestartCount 3");
     expect(registration).toContain("-RestartInterval (New-TimeSpan -Minutes 1)");
   });
 
-  it("leaves the Broker running when an exact Sidecar hot reload ends the bootstrap", () => {
+  it("leaves the Broker running while an exact Sidecar hot reload is recovered", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
-    const sidecarExitStart = start.indexOf("if ($sidecarProcess.HasExited)");
+    const sidecarExitStart = start.indexOf(
+      "if ($null -eq $sidecarProcess -or $sidecarProcess.HasExited)",
+    );
     const brokerRefresh = start.indexOf(
       "$brokerIdentityHandle.Process.Refresh()",
       sidecarExitStart,
@@ -43,7 +47,9 @@ describe("Windows capability and lifecycle safety contract", () => {
     const sidecarExit = start.slice(sidecarExitStart, brokerRefresh);
     expect(sidecarExitStart).toBeGreaterThan(-1);
     expect(brokerRefresh).toBeGreaterThan(sidecarExitStart);
-    expect(sidecarExit).toMatch(/\bexit\b/u);
+    expect(sidecarExit).toContain("Start-ManagedSidecarChild");
+    expect(sidecarExit).toContain("sidecar-recovery");
+    expect(sidecarExit).not.toMatch(/\bexit\b/u);
     expect(sidecarExit).not.toContain("Stop-ExactManagedBrokerAndOrphan");
     expect(sidecarExit).not.toContain("-IdentityHandle $brokerIdentityHandle");
   });
@@ -76,7 +82,7 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(start).toContain("-Phase RuntimeTransition");
   });
 
-  it("bounds true client reconnects but preserves application-only degradation", () => {
+  it("keeps the verified transport alive through true client reconnects", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
     expect(start).toContain("[int]$RuntimeHandshakeTimeoutSeconds");
     expect(start).toContain("[int]$SidecarHandshakeTimeoutSeconds = 60");
@@ -92,8 +98,15 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(start).toContain("$runtimeTransitionDeadline = [DateTime]::UtcNow.AddSeconds(");
     expect(start).toContain("} elseif ([DateTime]::UtcNow -ge $runtimeTransitionDeadline) {");
     expect(start).toContain(
-      '"Runtime client handshake did not recover within $RuntimeHandshakeTimeoutSeconds seconds."',
+      '"Runtime client handshake remains unavailable after $RuntimeHandshakeTimeoutSeconds seconds.',
     );
+    const waitStart = start.indexOf("} elseif ($runtimeDecision -ceq 'Wait') {");
+    const readyStart = start.indexOf("} else {", waitStart);
+    const waitBranch = start.slice(waitStart, readyStart);
+    expect(waitBranch).toContain("$startupStage = 'runtime-recovery-wait'");
+    expect(waitBranch).toContain("-Status 'degraded'");
+    expect(waitBranch).not.toContain("Stop-ProcessIdentityHandle");
+    expect(waitBranch).not.toContain("exit 1");
     expect(start).toMatch(
       /else\s*\{\s*\$runtimeTransitionDeadline\s*=\s*\$null\s+if\s*\(\$runtimeApplicationDegraded\)/u,
     );

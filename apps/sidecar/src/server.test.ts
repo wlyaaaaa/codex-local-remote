@@ -716,6 +716,96 @@ describe("sidecar REST surface", () => {
     await fixture.app.close();
   });
 
+  it("reuses a bounded recent transcript immediately and keeps its replay watermark", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    const recentDetail: ThreadDetail = {
+      id: "thread-recent-cache",
+      title: "超长任务",
+      mode: "managed",
+      state: "running",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+      historyNextCursor: "older-page",
+      items: [
+        {
+          id: "assistant-latest",
+          kind: "assistant-message",
+          text: "最近回复",
+        },
+      ],
+      activeTurnId: "turn-1",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    };
+    fixture.events.append("diagnostic", { message: "快照前事件" });
+    fixture.domain.getThread.mockResolvedValue(recentDetail);
+
+    const first = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-recent-cache",
+      headers: { cookie: authenticated.cookie },
+    });
+    fixture.events.append("diagnostic", { message: "快照后事件" });
+    const refreshed = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-recent-cache",
+      headers: { cookie: authenticated.cookie },
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({
+      historyNextCursor: "older-page",
+      items: [{ id: "assistant-latest", text: "最近回复" }],
+      snapshotEventSeq: 1,
+      state: "running",
+    });
+    expect(refreshed.statusCode).toBe(200);
+    expect(refreshed.json()).toMatchObject({
+      historyNextCursor: "older-page",
+      items: [{ id: "assistant-latest", text: "最近回复" }],
+      snapshotEventSeq: 1,
+      state: "running",
+    });
+    expect(fixture.domain.getThread).toHaveBeenNthCalledWith(1, "thread-recent-cache");
+    expect(fixture.domain.getThread).toHaveBeenCalledTimes(1);
+    await fixture.app.close();
+  });
+
+  it("passes opaque bottom-up history cursors through without decoding them", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    fixture.domain.getThread.mockResolvedValue({
+      id: "thread-history",
+      title: "超长任务",
+      mode: "managed",
+      state: "running",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+      items: [],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    });
+
+    const response = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-history?historyCursor=opaque%2Fpage%2B2",
+      headers: { cookie: authenticated.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.domain.getThread).toHaveBeenCalledWith("thread-history", {
+      historyCursor: "opaque/page+2",
+    });
+    await fixture.app.close();
+  });
+
   it("returns only the approval reviewers advertised by the runtime catalog", async () => {
     const fixture = await createFixture();
     const authenticated = await login(fixture);
@@ -971,7 +1061,7 @@ describe("sidecar REST surface", () => {
     await fixture.app.close();
   });
 
-  it("attaches the event watermark to create, resume, and turn snapshots", async () => {
+  it("attaches a safe event watermark to create, resume, and cached turn snapshots", async () => {
     const fixture = await createFixture();
     const origin = "https://phone.example.test";
     const forwardedHeaders = {
@@ -1035,7 +1125,7 @@ describe("sidecar REST surface", () => {
       headers: { ...mutationHeaders, "idempotency-key": "watermark-turn" },
       payload: { prompt: "继续" },
     });
-    expect(turned.json()).toMatchObject({ id: "thread-watermark", snapshotEventSeq: 3 });
+    expect(turned.json()).toMatchObject({ id: "thread-watermark", snapshotEventSeq: 2 });
     expect(fixture.startTurn).toHaveBeenCalledWith("thread-watermark", { prompt: "继续" });
     await fixture.app.close();
   });

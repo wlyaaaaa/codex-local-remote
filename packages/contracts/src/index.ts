@@ -236,6 +236,7 @@ export type ConversationItem = ConversationItemContext &
 
 export interface ThreadDetail extends ThreadSummary {
   items: ConversationItem[];
+  historyNextCursor?: string;
   activeTurnId?: string;
   snapshotEventSeq?: number;
   availableActions: {

@@ -71,11 +71,15 @@ import { OutboxConflictError } from "./turn-outbox.js";
 const SESSION_COOKIE = "codex_remote_session";
 const PRODUCT_NAME = "Codex Local Remote";
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,128}$/u;
+const RECENT_THREAD_DETAIL_CACHE_CAPACITY = 8;
 
 export interface SidecarDomainApi {
   compactThread(threadId: string): Promise<void>;
   createThread(input: CreateThreadInput): Promise<ServiceResult<ThreadDetail>>;
-  getThread(threadId: string, options?: { includeTurns?: boolean }): Promise<ThreadDetail>;
+  getThread(
+    threadId: string,
+    options?: { historyCursor?: string; includeTurns?: boolean },
+  ): Promise<ThreadDetail>;
   getThreadGoal(threadId: string): Promise<ThreadGoal | undefined>;
   getUsage(threadId?: string): Promise<ServiceResult<UsageSnapshot>>;
   interruptTurn(threadId: string, turnId: string): Promise<TurnCommandResult>;
@@ -131,6 +135,11 @@ interface CachedCommand {
   status: number;
 }
 
+interface CachedThreadDetail {
+  detail: ThreadDetail;
+  snapshotEventSeq: number;
+}
+
 export async function createSidecarServer(
   options: CreateSidecarServerOptions,
 ): Promise<FastifyInstance> {
@@ -151,6 +160,7 @@ export async function createSidecarServer(
   const uploads = await BrowserUploadStore.open(config.dataDir);
   const streamInstanceId = randomUUID();
   const idempotencyCache = new Map<string, Promise<CachedCommand>>();
+  const recentThreadDetails = new Map<string, CachedThreadDetail>();
   const loginLimiter = new LoginRateLimiter({
     baseDelayMs: 500,
     global: { lockoutMs: 15 * 60_000, maxAttempts: 50, windowMs: 10 * 60_000 },
@@ -333,12 +343,16 @@ export async function createSidecarServer(
     await requireAuthentication(request, state);
     const query = asRecord(request.query);
     const includeItems = optionalBoolean(query.includeItems) ?? true;
+    const historyCursor = optionalString(query.historyCursor);
+    const threadId = routeParameter(request, "threadId");
+    if (includeItems && historyCursor === undefined) {
+      return await loadRecentThreadDetail(threadId);
+    }
     const snapshotEventSeq = events.latestSequence;
-    const detail = includeItems
-      ? await domain.getThread(routeParameter(request, "threadId"))
-      : await domain.getThread(routeParameter(request, "threadId"), {
-          includeTurns: false,
-        });
+    const detail =
+      includeItems && historyCursor !== undefined
+        ? await domain.getThread(threadId, { historyCursor })
+        : await domain.getThread(threadId, { includeTurns: false });
     return attachSnapshotEventSequence(detail, snapshotEventSeq);
   });
 
@@ -439,6 +453,7 @@ export async function createSidecarServer(
       const snapshotEventSeq = events.latestSequence;
       const created = await domain.createThread(parseCreateThreadInput(request.body));
       publishDegradations(created.degradations, events);
+      rememberThreadDetail(created.data, snapshotEventSeq);
       return { body: attachSnapshotEventSequence(created.data, snapshotEventSeq), status: 201 };
     });
     return await sendCached(reply, result);
@@ -448,11 +463,11 @@ export async function createSidecarServer(
     const authentication = await requireProtectedMutation(request, state);
     const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
       const snapshotEventSeq = events.latestSequence;
+      const threadId = routeParameter(request, "threadId");
+      const detail = await domain.resumeThread(threadId);
+      rememberThreadDetail(detail, snapshotEventSeq);
       return {
-        body: attachSnapshotEventSequence(
-          await domain.resumeThread(routeParameter(request, "threadId")),
-          snapshotEventSeq,
-        ),
+        body: attachSnapshotEventSequence(detail, snapshotEventSeq),
         status: 200,
       };
     });
@@ -527,7 +542,7 @@ export async function createSidecarServer(
       const threadId = routeParameter(request, "threadId");
       await domain.startTurn(threadId, parseSendTurnInput(request.body));
       return {
-        body: attachSnapshotEventSequence(await domain.getThread(threadId), snapshotEventSeq),
+        body: await loadRecentThreadDetail(threadId, snapshotEventSeq),
         status: 200,
       };
     });
@@ -756,6 +771,45 @@ export async function createSidecarServer(
   }
 
   return app;
+
+  async function loadRecentThreadDetail(
+    threadId: string,
+    fallbackSnapshotEventSeq = events.latestSequence,
+  ): Promise<ThreadDetail> {
+    const cached = recentThreadDetails.get(threadId);
+    if (cached !== undefined) {
+      if (!events.replayAfter(cached.snapshotEventSeq).resetRequired) {
+        return attachSnapshotEventSequence(
+          {
+            ...cached.detail,
+            items: [...cached.detail.items],
+          },
+          cached.snapshotEventSeq,
+        );
+      }
+      recentThreadDetails.delete(threadId);
+    }
+
+    const detail = await domain.getThread(threadId);
+    rememberThreadDetail(detail, fallbackSnapshotEventSeq);
+    return attachSnapshotEventSequence(detail, fallbackSnapshotEventSeq);
+  }
+
+  function rememberThreadDetail(detail: ThreadDetail, snapshotEventSeq: number): void {
+    recentThreadDetails.delete(detail.id);
+    recentThreadDetails.set(detail.id, {
+      detail: {
+        ...detail,
+        items: [...detail.items],
+      },
+      snapshotEventSeq,
+    });
+    while (recentThreadDetails.size > RECENT_THREAD_DETAIL_CACHE_CAPACITY) {
+      const oldestThreadId = recentThreadDetails.keys().next().value;
+      if (oldestThreadId === undefined) break;
+      recentThreadDetails.delete(oldestThreadId);
+    }
+  }
 
   async function requireProtectedMutation(
     request: FastifyRequest,

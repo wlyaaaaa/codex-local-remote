@@ -6,6 +6,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -88,6 +89,7 @@ import {
   applyContextCompactionEvents,
   beginContextCompactionRequest,
   canRequestContextCompaction,
+  contextCompactionItemsForDisplay,
   contextCompactionAttemptFromThread,
   markContextCompactionRecoveryRequired,
   reconcileContextCompactionSnapshot,
@@ -570,34 +572,110 @@ export function shouldShowConversationLoading(
   return !detailProjectionReady;
 }
 
-export function readConversationScrollPosition(
-  storage: Pick<Storage, "getItem">,
-  threadId: string,
-): number | undefined {
-  try {
-    const raw = storage.getItem(`conversation-scroll:${encodeURIComponent(threadId)}`);
-    if (raw === null || !/^\d+(?:\.\d+)?$/u.test(raw)) return undefined;
-    const value = Number(raw);
-    return Number.isFinite(value) && value >= 0 && value <= 1_000_000_000 ? value : undefined;
-  } catch {
-    return undefined;
-  }
+export function initialConversationScrollTop(scrollHeight: number, clientHeight: number): number {
+  if (!Number.isFinite(scrollHeight) || !Number.isFinite(clientHeight)) return 0;
+  return Math.max(0, scrollHeight - clientHeight);
 }
 
-export function writeConversationScrollPosition(
-  storage: Pick<Storage, "setItem">,
-  threadId: string,
-  scrollTop: number,
-): void {
-  if (!Number.isFinite(scrollTop) || scrollTop < 0 || scrollTop > 1_000_000_000) return;
-  try {
-    storage.setItem(
-      `conversation-scroll:${encodeURIComponent(threadId)}`,
-      Math.round(scrollTop).toString(),
-    );
-  } catch {
-    // Scroll restoration is best-effort and must never block task control.
+export function conversationHistoryAnchorTop(
+  previousScrollTop: number,
+  previousScrollHeight: number,
+  nextScrollHeight: number,
+): number {
+  if (
+    !Number.isFinite(previousScrollTop) ||
+    !Number.isFinite(previousScrollHeight) ||
+    !Number.isFinite(nextScrollHeight)
+  ) {
+    return 0;
   }
+  return Math.max(0, previousScrollTop + Math.max(0, nextScrollHeight - previousScrollHeight));
+}
+
+export function conversationAwayFromBottom(
+  scrollHeight: number,
+  clientHeight: number,
+  scrollTop: number,
+  threshold = 24,
+): boolean {
+  return scrollHeight - clientHeight - scrollTop > threshold;
+}
+
+export function conversationAwayAfterScroll(
+  currentAway: boolean,
+  previousScrollTop: number,
+  scrollHeight: number,
+  clientHeight: number,
+  scrollTop: number,
+  threshold = 24,
+): boolean {
+  const awayFromBottom = conversationAwayFromBottom(
+    scrollHeight,
+    clientHeight,
+    scrollTop,
+    threshold,
+  );
+  const movedUp = scrollTop < previousScrollTop - 1;
+  const movedDown = scrollTop > previousScrollTop + 1;
+  if (currentAway) {
+    return !(movedDown && !awayFromBottom);
+  }
+  return movedUp && awayFromBottom;
+}
+
+export function conversationScrollWasUserDriven(
+  lastIntentAt: number,
+  now: number,
+  intentWindowMs = 800,
+): boolean {
+  return (
+    Number.isFinite(lastIntentAt) &&
+    Number.isFinite(now) &&
+    lastIntentAt > 0 &&
+    now >= lastIntentAt &&
+    now - lastIntentAt <= intentWindowMs
+  );
+}
+
+export type ComposerExpansionIntent =
+  | "blur"
+  | "conversation-scroll"
+  | "focus"
+  | "submit"
+  | "thread-change";
+
+export function composerExpandedAfterIntent(intent: ComposerExpansionIntent): boolean {
+  return intent === "focus";
+}
+
+export function prependConversationHistory(
+  current: ThreadDetail,
+  olderPage: ThreadDetail,
+): { added: number; detail: ThreadDetail } {
+  const currentIds = new Set(current.items.map((item) => item.id));
+  const olderItems = olderPage.items.filter((item) => !currentIds.has(item.id));
+  const { historyNextCursor: _previousCursor, ...currentWithoutCursor } = current;
+  return {
+    added: olderItems.length,
+    detail: {
+      ...currentWithoutCursor,
+      ...(olderPage.historyNextCursor === undefined
+        ? {}
+        : { historyNextCursor: olderPage.historyNextCursor }),
+      items: [...olderItems, ...current.items],
+    },
+  };
+}
+
+export function composerActionVisibility(
+  running: boolean,
+  canInterrupt: boolean,
+  hasDraft: boolean,
+): { showInterrupt: boolean; showSubmit: boolean } {
+  return {
+    showInterrupt: running && canInterrupt,
+    showSubmit: !running || hasDraft,
+  };
 }
 
 export function readConversationAttachments(
@@ -684,7 +762,6 @@ function LanguageToggle({ className = "" }: { className?: string }) {
       onClick={() => setLocale(locale === "zh" ? "en" : "zh")}
       type="button"
     >
-      <Icon name="code" size={15} />
       <span>{copy.languageChoice}</span>
     </button>
   );
@@ -1502,24 +1579,24 @@ function ThreadsPage({
     <>
       <MobileHeader
         action={
-          <Button
-            aria-label={copy.newTask}
-            data-testid="new-thread"
-            disabled={!runtime.ready}
-            icon="plus"
-            onClick={() => navigate("/new")}
-            size="compact"
-            variant="primary"
-          >
-            {copy.newShort}
-          </Button>
+          <span className="mobile-header__controls">
+            <LanguageToggle className="language-toggle--header" />
+            <Button
+              aria-label={copy.newTask}
+              data-testid="new-thread"
+              disabled={!runtime.ready}
+              icon="plus"
+              onClick={() => navigate("/new")}
+              size="compact"
+              variant="primary"
+            >
+              {copy.newShort}
+            </Button>
+          </span>
         }
         title={copy.tasks}
       />
       <div className="page list-page">
-        <div className="mobile-language-toolbar">
-          <LanguageToggle />
-        </div>
         <section className="task-overview">
           <span data-testid="current-host-status">
             <StatusPill tone={runtime.tone}>{runtime.label}</StatusPill>
@@ -2183,6 +2260,33 @@ function SubagentActivityGroup({
   );
 }
 
+function ContextCompactionRecord({
+  item,
+}: {
+  item: Extract<ThreadDetail["items"][number], { kind: "tool" }>;
+}) {
+  const running = item.status === "running";
+  return (
+    <div
+      aria-label={running ? "正在压缩上下文" : "上下文压缩记录"}
+      className={`context-compaction-record context-compaction-record--${item.status}`}
+      data-testid="context-compaction-record"
+    >
+      <Icon name={running ? "activity" : item.status === "failed" ? "alert" : "check"} size={15} />
+      <span>
+        <strong>
+          {running
+            ? "正在压缩上下文"
+            : item.status === "failed"
+              ? "上下文压缩失败"
+              : "上下文已压缩"}
+        </strong>
+        {!running && item.status !== "failed" ? <small>后续内容已使用新的上下文继续</small> : null}
+      </span>
+    </div>
+  );
+}
+
 const ConversationItems = memo(function ConversationItems({
   apiClient,
   items,
@@ -2222,6 +2326,8 @@ const ConversationItems = memo(function ConversationItems({
             online={online}
             {...(projectId === undefined ? {} : { projectId })}
           />
+        ) : segment.kind === "compaction" ? (
+          <ContextCompactionRecord item={segment.item} key={`compaction-${segment.item.id}`} />
         ) : (
           <SubagentActivityGroup
             items={segment.items}
@@ -2550,6 +2656,7 @@ function ConversationPage({
   const [goalDraft, setGoalDraft] = useState("");
   const [goalBusy, setGoalBusy] = useState(false);
   const [sending, setSending] = useState(false);
+  const [interrupting, setInterrupting] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
   const [showUsage, setShowUsage] = useState(false);
   const [usageRefreshState, setUsageRefreshState] = useState<"idle" | "refreshing" | "error">(
@@ -2559,6 +2666,10 @@ function ConversationPage({
   const [threadIdCopyState, setThreadIdCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [runtimeNotice, setRuntimeNotice] = useState<RuntimeNotice>();
   const [visibleItemLimit, setVisibleItemLimit] = useState(INITIAL_CONVERSATION_ITEM_LIMIT);
+  const [conversationAway, setConversationAway] = useState(false);
+  const [composerExpanded, setComposerExpanded] = useState(false);
+  const [historyNextCursor, setHistoryNextCursor] = useState<string>();
+  const [historyMoreState, setHistoryMoreState] = useState<MoreState>("idle");
   const [actionError, setActionError] = useState("");
   const [actionStatus, setActionStatus] = useState<
     "steer-accepted" | "turn-interrupted" | "turn-queued" | "settings-applied" | "goal-saved" | ""
@@ -2569,7 +2680,14 @@ function ConversationPage({
   const [compactionError, setCompactionError] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
   const conversationScrollRef = useRef<HTMLDivElement>(null);
-  const restoredScrollThreadRef = useRef("");
+  const conversationStreamRef = useRef<HTMLDivElement>(null);
+  const conversationAwayRef = useRef(false);
+  const lastConversationScrollTopRef = useRef(0);
+  const conversationUserScrollIntentAtRef = useRef(0);
+  const historyExtendedRef = useRef(false);
+  const historyLoadInFlightRef = useRef<Promise<void> | undefined>(undefined);
+  const historyRevealScheduledRef = useRef(false);
+  const initialScrollThreadRef = useRef("");
   const handledLiveDelivery = useRef(0);
   const latestLiveDeliveryRef = useRef(liveEvents.at(-1)?.deliveryId ?? 0);
   const retainedReplayThroughRef = useRef(0);
@@ -2609,14 +2727,19 @@ function ConversationPage({
   const approvalReviewersSupported = approvalReviewersCapability && approvalReviewers.length > 0;
   const runtimeControlAvailable = online && appServerReady(capabilities);
   currentIdRef.current = id;
+  conversationAwayRef.current = conversationAway;
   latestLiveDeliveryRef.current = liveEvents.at(-1)?.deliveryId ?? 0;
   routeSeedRef.current = routeSeed;
   routeInitialPromptRef.current = routeInitialPrompt;
   modelsRef.current = models;
   summaryRef.current = summary;
+  const presentationItems = useMemo(
+    () => (thread ? contextCompactionItemsForDisplay(thread) : []),
+    [thread],
+  );
   const visibleItems = useMemo(
     () =>
-      visibleConversationItems(thread?.items ?? [], visibleItemLimit, (item) => {
+      visibleConversationItems(presentationItems, visibleItemLimit, (item) => {
         if (
           item.kind === "user-message" ||
           item.kind === "assistant-message" ||
@@ -2627,7 +2750,7 @@ function ConversationPage({
         }
         return item.kind === "tool" && item.operation === "context-compaction";
       }),
-    [thread?.items, visibleItemLimit],
+    [presentationItems, visibleItemLimit],
   );
   const composerPlan = useMemo(() => latestPlanProgress(thread?.items ?? []), [thread?.items]);
   const hiddenItemCount = hiddenConversationItemCount(
@@ -2686,66 +2809,40 @@ function ConversationPage({
       }
       const promise = (async () => {
         try {
-          const [
-            detail,
-            agentsResult,
-            usageSnapshot,
-            queuedResult,
-            goalResult,
-            permissionProfileResult,
-            approvalPolicyResult,
-            approvalReviewerResult,
-          ] = await Promise.all([
-            apiClient.thread(id),
-            apiClient
-              .subagents(id)
-              .then((page) => ({ page, error: "" }))
-              .catch((agentsError: unknown) => ({
-                page: { items: [] } as CursorPage<SubagentSummary>,
-                error: errorMessage(agentsError),
-              })),
-            apiClient.usage(id).catch(() => undefined),
-            queueSupported
-              ? apiClient
-                  .queue(id)
-                  .then((snapshot) => ({ snapshot, error: "" }))
-                  .catch((queueLoadError: unknown) => ({
-                    snapshot: undefined,
-                    error: errorMessage(queueLoadError),
-                  }))
-              : Promise.resolve({
-                  snapshot: { threadId: id, revision: 0, items: [] as QueuedTurnItem[] },
-                  error: "",
-                }),
-            goalSupported
-              ? apiClient.threadGoal(id).catch(() => undefined)
-              : Promise.resolve(undefined),
-            permissionProfilesCapability
-              ? apiClient.permissionProfiles({ threadId: id }).catch(() => [])
-              : Promise.resolve([] as PermissionProfileOption[]),
-            approvalPoliciesCapability
-              ? apiClient.approvalPolicies().catch(() => [])
-              : Promise.resolve([] as ApprovalPolicyOption[]),
-            approvalReviewersCapability
-              ? apiClient.approvalReviewers().catch(() => [])
-              : Promise.resolve([] as ApprovalReviewerOption[]),
-          ]);
+          const agentsResultPromise = apiClient
+            .subagents(id)
+            .then((page) => ({ page, error: "" }))
+            .catch((agentsError: unknown) => ({
+              page: { items: [] } as CursorPage<SubagentSummary>,
+              error: errorMessage(agentsError),
+            }));
+          const usageSnapshotPromise = apiClient.usage(id).catch(() => undefined);
+          const queuedResultPromise = queueSupported
+            ? apiClient
+                .queue(id)
+                .then((snapshot) => ({ snapshot, error: "" }))
+                .catch((queueLoadError: unknown) => ({
+                  snapshot: undefined,
+                  error: errorMessage(queueLoadError),
+                }))
+            : Promise.resolve({
+                snapshot: { threadId: id, revision: 0, items: [] as QueuedTurnItem[] },
+                error: "",
+              });
+          const goalResultPromise = goalSupported
+            ? apiClient.threadGoal(id).catch(() => undefined)
+            : Promise.resolve(undefined);
+          const permissionProfileResultPromise = permissionProfilesCapability
+            ? apiClient.permissionProfiles({ threadId: id }).catch(() => [])
+            : Promise.resolve([] as PermissionProfileOption[]);
+          const approvalPolicyResultPromise = approvalPoliciesCapability
+            ? apiClient.approvalPolicies().catch(() => [])
+            : Promise.resolve([] as ApprovalPolicyOption[]);
+          const approvalReviewerResultPromise = approvalReviewersCapability
+            ? apiClient.approvalReviewers().catch(() => [])
+            : Promise.resolve([] as ApprovalReviewerOption[]);
+          const detail = await apiClient.thread(id);
           if (currentIdRef.current !== id) return;
-          const agents = silent
-            ? mergeCursorItems(
-                subagentsRef.current,
-                agentsResult.page.items,
-                (agent) => agent.threadId,
-              )
-            : agentsResult.page.items;
-          const nextCursor = agentsResult.error
-            ? subagentsNextCursorRef.current
-            : nextCursorAfterRefresh(
-                subagentsNextCursorRef.current,
-                agentsResult.page.nextCursor,
-                silent &&
-                  (subagentsExtendedRef.current || subagentsMoreInFlightRef.current?.id === id),
-              );
           const persistedPromptItemId = persistedCreationPromptItemId(
             detail,
             routeInitialPromptRef.current,
@@ -2772,8 +2869,72 @@ function ConversationPage({
               }
             : undefined;
           const mergedDetail = mergeThreadRefresh(threadRef.current, detail, creationContext);
+          if (!historyExtendedRef.current) {
+            setHistoryNextCursor(detail.historyNextCursor);
+          }
           threadRef.current = mergedDetail;
           setThread(mergedDetail);
+          onThreadLoaded(mergedDetail);
+          const compactionAttempt = compactionAttemptRef.current;
+          if (compactionAttempt?.threadId === detail.id) {
+            const progress = reconcileContextCompactionSnapshot(compactionAttempt, detail);
+            compactionAttemptRef.current = progress.attempt;
+            if (progress.resolution !== "pending") {
+              finishContextCompaction(progress.attempt.idempotencyKey, progress.resolution);
+            }
+          }
+          setNextTurnSettings((current) =>
+            reconcileNextTurnSettingsDraft(current, models, mergedDetail),
+          );
+          if (!productSettingsDirtyRef.current) {
+            setServiceTier(mergedDetail.serviceTier ?? null);
+            if (mergedDetail.permissionProfileId) {
+              setPermissionProfileId(mergedDetail.permissionProfileId);
+            }
+            if (mergedDetail.collaborationMode) {
+              setCollaborationMode(mergedDetail.collaborationMode);
+            }
+          }
+          if (projectionGenerationIsCurrent) {
+            retainedReplayThroughRef.current = latestLiveDeliveryRef.current;
+            setDetailProjectionReady(true);
+          }
+          setState("ready");
+          setError("");
+
+          const [
+            agentsResult,
+            usageSnapshot,
+            queuedResult,
+            goalResult,
+            permissionProfileResult,
+            approvalPolicyResult,
+            approvalReviewerResult,
+          ] = await Promise.all([
+            agentsResultPromise,
+            usageSnapshotPromise,
+            queuedResultPromise,
+            goalResultPromise,
+            permissionProfileResultPromise,
+            approvalPolicyResultPromise,
+            approvalReviewerResultPromise,
+          ]);
+          if (currentIdRef.current !== id) return;
+          const agents = silent
+            ? mergeCursorItems(
+                subagentsRef.current,
+                agentsResult.page.items,
+                (agent) => agent.threadId,
+              )
+            : agentsResult.page.items;
+          const nextCursor = agentsResult.error
+            ? subagentsNextCursorRef.current
+            : nextCursorAfterRefresh(
+                subagentsNextCursorRef.current,
+                agentsResult.page.nextCursor,
+                silent &&
+                  (subagentsExtendedRef.current || subagentsMoreInFlightRef.current?.id === id),
+              );
           subagentsRef.current = agents;
           setSubagents(agents);
           subagentsNextCursorRef.current = nextCursor;
@@ -2806,25 +2967,9 @@ function ConversationPage({
             setGoalDraft(goalResult?.goal?.objective ?? "");
             goalLoadedRef.current = true;
           }
-          onThreadLoaded(mergedDetail);
           onSubagentsLoaded(agents);
           onUsageLoaded(usageSnapshot);
-          const compactionAttempt = compactionAttemptRef.current;
-          if (compactionAttempt?.threadId === detail.id) {
-            const progress = reconcileContextCompactionSnapshot(compactionAttempt, detail);
-            compactionAttemptRef.current = progress.attempt;
-            if (progress.resolution !== "pending") {
-              finishContextCompaction(progress.attempt.idempotencyKey, progress.resolution);
-            }
-          }
-          setNextTurnSettings((current) =>
-            reconcileNextTurnSettingsDraft(current, models, mergedDetail),
-          );
           if (!productSettingsDirtyRef.current) {
-            setServiceTier(mergedDetail.serviceTier ?? null);
-            if (mergedDetail.permissionProfileId) {
-              setPermissionProfileId(mergedDetail.permissionProfileId);
-            }
             if (
               mergedDetail.approvalPolicy &&
               approvalPolicyResult.some((policy) => policy.id === mergedDetail.approvalPolicy)
@@ -2839,16 +2984,7 @@ function ConversationPage({
             ) {
               setApprovalReviewer(mergedDetail.approvalsReviewer);
             }
-            if (mergedDetail.collaborationMode) {
-              setCollaborationMode(mergedDetail.collaborationMode);
-            }
           }
-          if (projectionGenerationIsCurrent) {
-            retainedReplayThroughRef.current = latestLiveDeliveryRef.current;
-            setDetailProjectionReady(true);
-          }
-          setState("ready");
-          setError("");
         } catch (loadError) {
           if (currentIdRef.current !== id || silent) return;
           setError(errorMessage(loadError));
@@ -2910,11 +3046,21 @@ function ConversationPage({
     setThreadIdCopyState("idle");
     setRuntimeNotice(undefined);
     setVisibleItemLimit(INITIAL_CONVERSATION_ITEM_LIMIT);
+    setHistoryNextCursor(undefined);
+    setHistoryMoreState("idle");
+    historyExtendedRef.current = false;
+    historyLoadInFlightRef.current = undefined;
+    historyRevealScheduledRef.current = false;
+    conversationAwayRef.current = false;
+    lastConversationScrollTopRef.current = 0;
+    conversationUserScrollIntentAtRef.current = 0;
+    setConversationAway(false);
     setGoalDraft("");
     setActionError("");
     setActionStatus("");
     setResumeBusy(false);
     setSending(false);
+    setInterrupting(false);
     goalLoadedRef.current = false;
     productSettingsDirtyRef.current = false;
     collaborationModeDirtyRef.current = false;
@@ -3303,30 +3449,81 @@ function ConversationPage({
   }, [attachments, id]);
 
   useEffect(() => {
-    restoredScrollThreadRef.current = "";
+    initialScrollThreadRef.current = "";
+    setComposerExpanded(composerExpandedAfterIntent("thread-change"));
     setAttachments(readConversationAttachments(window.localStorage, id));
-    return () => {
-      const element = conversationScrollRef.current;
-      if (element) {
-        writeConversationScrollPosition(window.localStorage, id, element.scrollTop);
-      }
-    };
   }, [id]);
 
-  useEffect(() => {
-    if (state !== "ready" || !detailProjectionReady || restoredScrollThreadRef.current === id) {
+  useLayoutEffect(() => {
+    if (state !== "ready" || !detailProjectionReady || initialScrollThreadRef.current === id) {
       return;
     }
-    const saved = readConversationScrollPosition(window.localStorage, id);
-    restoredScrollThreadRef.current = id;
-    if (saved === undefined) return;
-    const frame = window.requestAnimationFrame(() => {
-      const element = conversationScrollRef.current;
-      if (!element) return;
-      element.scrollTop = Math.min(saved, Math.max(0, element.scrollHeight - element.clientHeight));
-    });
-    return () => window.cancelAnimationFrame(frame);
+    initialScrollThreadRef.current = id;
+    const element = conversationScrollRef.current;
+    if (!element) return;
+    element.scrollTop = initialConversationScrollTop(element.scrollHeight, element.clientHeight);
+    lastConversationScrollTopRef.current = element.scrollTop;
+    conversationAwayRef.current = false;
+    setConversationAway(false);
   }, [detailProjectionReady, id, state]);
+
+  useLayoutEffect(() => {
+    const scroll = conversationScrollRef.current;
+    if (!scroll || state !== "ready" || !detailProjectionReady || conversationAwayRef.current) {
+      return;
+    }
+    scroll.scrollTop = initialConversationScrollTop(scroll.scrollHeight, scroll.clientHeight);
+    lastConversationScrollTopRef.current = scroll.scrollTop;
+  }, [detailProjectionReady, state, visibleItems.length]);
+
+  useEffect(() => {
+    const scroll = conversationScrollRef.current;
+    const stream = conversationStreamRef.current;
+    if (!scroll || !stream || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (conversationAwayRef.current) return;
+      scroll.scrollTop = initialConversationScrollTop(scroll.scrollHeight, scroll.clientHeight);
+      lastConversationScrollTopRef.current = scroll.scrollTop;
+    });
+    observer.observe(stream);
+    observer.observe(scroll);
+    return () => observer.disconnect();
+  }, [id]);
+
+  function updateConversationPosition() {
+    const element = conversationScrollRef.current;
+    if (!element) return;
+    const previousScrollTop = lastConversationScrollTopRef.current;
+    const movedUp = element.scrollTop < previousScrollTop - 1;
+    const userDriven = conversationScrollWasUserDriven(
+      conversationUserScrollIntentAtRef.current,
+      Date.now(),
+    );
+    const nextAway = conversationAwayAfterScroll(
+      conversationAwayRef.current,
+      previousScrollTop,
+      element.scrollHeight,
+      element.clientHeight,
+      element.scrollTop,
+    );
+    lastConversationScrollTopRef.current = element.scrollTop;
+    if (!userDriven) return;
+    if (movedUp && element.scrollTop <= 96) {
+      revealEarlierConversationItems();
+    }
+    if (nextAway === conversationAwayRef.current) return;
+    conversationAwayRef.current = nextAway;
+    setConversationAway(nextAway);
+  }
+
+  function markConversationUserScrollIntent() {
+    conversationUserScrollIntentAtRef.current = Date.now();
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement && activeElement.closest(".composer-shell")) {
+      activeElement.blur();
+    }
+    setComposerExpanded(composerExpandedAfterIntent("conversation-scroll"));
+  }
 
   function refreshUsageDetails() {
     setShowUsage(true);
@@ -3374,17 +3571,81 @@ function ConversationPage({
   }
 
   function revealEarlierConversationItems() {
+    if (hiddenItemCount <= 0) {
+      void loadEarlierConversationHistory();
+      return;
+    }
+    if (historyRevealScheduledRef.current) return;
+    historyRevealScheduledRef.current = true;
     const scroll = conversationScrollRef.current;
     const previousHeight = scroll?.scrollHeight ?? 0;
+    const previousTop = scroll?.scrollTop ?? 0;
+    conversationAwayRef.current = true;
+    setConversationAway(true);
     setVisibleItemLimit((current) =>
       nextConversationItemLimit(current, threadRef.current?.items.length ?? current),
     );
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
+        historyRevealScheduledRef.current = false;
         if (!scroll) return;
-        scroll.scrollTop += Math.max(0, scroll.scrollHeight - previousHeight);
+        scroll.scrollTop = conversationHistoryAnchorTop(
+          previousTop,
+          previousHeight,
+          scroll.scrollHeight,
+        );
+        lastConversationScrollTopRef.current = scroll.scrollTop;
       });
     });
+  }
+
+  function loadEarlierConversationHistory() {
+    if (!historyNextCursor || historyLoadInFlightRef.current) {
+      return historyLoadInFlightRef.current;
+    }
+    const requestedThreadId = id;
+    const cursor = historyNextCursor;
+    const scroll = conversationScrollRef.current;
+    const previousHeight = scroll?.scrollHeight ?? 0;
+    const previousTop = scroll?.scrollTop ?? 0;
+    conversationAwayRef.current = true;
+    setConversationAway(true);
+    setHistoryMoreState("loading");
+    const flight = apiClient
+      .thread(id, cursor)
+      .then((olderPage) => {
+        if (currentIdRef.current !== requestedThreadId || !threadRef.current) return;
+        const merged = prependConversationHistory(threadRef.current, olderPage);
+        historyExtendedRef.current = true;
+        threadRef.current = merged.detail;
+        setThread(merged.detail);
+        setHistoryNextCursor(olderPage.historyNextCursor);
+        if (merged.added > 0) {
+          setVisibleItemLimit((current) => current + merged.added);
+        }
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            if (!scroll) return;
+            scroll.scrollTop = conversationHistoryAnchorTop(
+              previousTop,
+              previousHeight,
+              scroll.scrollHeight,
+            );
+            lastConversationScrollTopRef.current = scroll.scrollTop;
+          });
+        });
+        setHistoryMoreState("idle");
+      })
+      .catch(() => {
+        if (currentIdRef.current === requestedThreadId) setHistoryMoreState("error");
+      });
+    historyLoadInFlightRef.current = flight;
+    void flight.finally(() => {
+      if (historyLoadInFlightRef.current === flight) {
+        historyLoadInFlightRef.current = undefined;
+      }
+    });
+    return flight;
   }
 
   function nextTurnProductSettings(
@@ -3571,6 +3832,7 @@ function ConversationPage({
       }
       setDraft("");
       setAttachments([]);
+      setComposerExpanded(composerExpandedAfterIntent("submit"));
       window.localStorage.removeItem(`draft:${id}`);
       window.localStorage.removeItem(`conversation-attachments:${encodeURIComponent(id)}`);
       window.setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 20);
@@ -3777,8 +4039,8 @@ function ConversationPage({
   }
 
   async function stop() {
-    if (!thread?.activeTurnId || !runtimeControlAvailable) return;
-    setSending(true);
+    if (!thread?.activeTurnId || !runtimeControlAvailable || interrupting) return;
+    setInterrupting(true);
     setActionError("");
     try {
       await apiClient.interrupt(thread.id, thread.activeTurnId);
@@ -3790,7 +4052,7 @@ function ConversationPage({
     } catch (stopError) {
       setActionError(errorMessage(stopError));
     } finally {
-      setSending(false);
+      setInterrupting(false);
     }
   }
 
@@ -3884,6 +4146,11 @@ function ConversationPage({
   const control = conversationControlState(online, capabilities, isSnapshot);
   const canCompose = canShowThreadComposer(thread, control.available);
   const currentApprovals = filterThreadApprovals(approvals, thread.id, thread.activeTurnId);
+  const composerActions = composerActionVisibility(
+    running,
+    thread.availableActions.interrupt,
+    Boolean(draft.trim()),
+  );
   const canCompactNow =
     compactSupported &&
     queue.length === 0 &&
@@ -3958,12 +4225,11 @@ function ConversationPage({
           子智能体对话
         </span>
       ) : null}
-      <MobileHeader back title="对话" />
       <header className="conversation-header">
         <div className="conversation-header__main">
           <Button
             aria-label="返回对话列表"
-            className="desktop-back"
+            className="conversation-back"
             icon="arrow-left"
             onClick={() => navigate("/threads")}
             size="icon"
@@ -4233,12 +4499,26 @@ function ConversationPage({
       <InlineDecisionStack approvals={currentApprovals} onOpen={onOpenApproval} />
       <div
         className="conversation-scroll"
-        onScroll={(event) =>
-          writeConversationScrollPosition(window.localStorage, id, event.currentTarget.scrollTop)
-        }
+        onKeyDown={(event) => {
+          if (
+            event.key === "ArrowDown" ||
+            event.key === "ArrowUp" ||
+            event.key === "End" ||
+            event.key === "Home" ||
+            event.key === "PageDown" ||
+            event.key === "PageUp" ||
+            event.key === " "
+          ) {
+            markConversationUserScrollIntent();
+          }
+        }}
+        onPointerDown={markConversationUserScrollIntent}
+        onScroll={updateConversationPosition}
+        onTouchMove={markConversationUserScrollIntent}
+        onWheel={markConversationUserScrollIntent}
         ref={conversationScrollRef}
       >
-        <div className="conversation-stream">
+        <div className="conversation-stream" ref={conversationStreamRef}>
           {shouldShowConversationLoading(detailProjectionReady, visibleItems.length) ? (
             <div
               aria-live="polite"
@@ -4253,15 +4533,22 @@ function ConversationPage({
               </div>
             </div>
           ) : null}
-          {hiddenItemCount > 0 ? (
+          {hiddenItemCount > 0 || historyNextCursor ? (
             <button
               className="conversation-history-more"
               data-testid="conversation-history-more"
+              disabled={historyMoreState === "loading"}
               onClick={revealEarlierConversationItems}
               type="button"
             >
               <Icon name="clock" size={16} />
-              显示更早内容（还有 {hiddenItemCount} 项）
+              {historyMoreState === "loading"
+                ? "正在向上加载更早记录…"
+                : historyMoreState === "error"
+                  ? "加载失败，点此重试"
+                  : hiddenItemCount > 0
+                    ? `显示更早内容（还有 ${hiddenItemCount} 项）`
+                    : "向上加载更早记录"}
             </button>
           ) : null}
           <ConversationItems
@@ -4294,7 +4581,16 @@ function ConversationPage({
         </div>
       </div>
       {!isSnapshot && canCompose ? (
-        <div className="composer-shell">
+        <div
+          className={`composer-shell${composerExpanded ? "" : " composer-shell--collapsed"}`}
+          onBlurCapture={(event) => {
+            const nextTarget = event.relatedTarget;
+            if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+              setComposerExpanded(composerExpandedAfterIntent("blur"));
+            }
+          }}
+          onFocusCapture={() => setComposerExpanded(composerExpandedAfterIntent("focus"))}
+        >
           <QueueShelf
             busyId={queueBusyId}
             canSteer={Boolean(running && thread.activeTurnId && thread.availableActions.steer)}
@@ -4411,17 +4707,18 @@ function ConversationPage({
                 />
               ) : null}
               <div className="composer__actions">
-                {running && thread.availableActions.interrupt && !draft.trim() ? (
+                {composerActions.showInterrupt ? (
                   <Button
                     aria-label="停止当前工作"
                     data-testid="turn-interrupt"
-                    disabled={!online || sending}
+                    disabled={!online || interrupting}
                     icon="stop"
                     onClick={() => void stop()}
                     size="icon"
                     variant="danger"
                   />
-                ) : (
+                ) : null}
+                {composerActions.showSubmit ? (
                   <Button
                     aria-label={
                       running && deliveryMode === "queue"
@@ -4433,25 +4730,25 @@ function ConversationPage({
                           : "发送"
                     }
                     data-testid={running ? "turn-steer-submit" : "turn-reply-submit"}
-                    disabled={!draft.trim() || !online || sending}
+                    disabled={!draft.trim() || !online || sending || interrupting}
                     icon="send"
                     onClick={() => void submit()}
                     size="icon"
                     variant="primary"
                   />
-                )}
+                ) : null}
               </div>
             </div>
           </div>
-          <small className="next-turn-hint" data-testid="next-turn-model-notice">
-            {running
-              ? deliveryMode === "queue"
-                ? "这条消息会进入网页下一轮队列；Desktop 会在真正发送后显示，模型、思考、速度与权限随消息保存"
-                : thread.activeTurnId
-                  ? "正在引导当前回复；设置按钮中的选择只会在下一轮生效"
-                  : "当前回复仍在运行，控制状态正在同步；文字不会丢失，也可以切换为排队"
-              : "模型、思考、速度与权限只应用于下一轮 · Ctrl + Enter 发送"}
-          </small>
+          {running && deliveryMode !== "queue" && !thread.activeTurnId ? null : (
+            <small className="next-turn-hint" data-testid="next-turn-model-notice">
+              {running
+                ? deliveryMode === "queue"
+                  ? "这条消息会进入网页下一轮队列；Desktop 会在真正发送后显示，模型、思考、速度与权限随消息保存"
+                  : "正在引导当前回复；设置按钮中的选择只会在下一轮生效"
+                : "模型、思考、速度与权限只应用于下一轮 · Ctrl + Enter 发送"}
+            </small>
+          )}
         </div>
       ) : !isSnapshot && !thread.parentThreadId && !control.available ? (
         <div className="read-only-handoff" data-testid="runtime-control-unavailable">
@@ -6408,7 +6705,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   const location = useLocation();
   const eventThreadId = threadIdFromConversationPath(location.pathname);
   const [data, setData] = useState<WorkspaceData>(emptyWorkspace);
-  const [state, setState] = useState<LoadState>("loading");
+  const [state, setState] = useState<LoadState>(eventThreadId ? "ready" : "loading");
   const [error, setError] = useState("");
   const [online, setOnline] = useState(true);
   const [liveEvents, setLiveEvents] = useState<LiveEventEnvelope[]>([]);
@@ -6472,6 +6769,15 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
       if (loadInFlight.current !== undefined) return loadInFlight.current;
       const promise = (async () => {
         try {
+          const modelsPromise = api.models();
+          const collaborationModesPromise = api
+            .collaborationModes()
+            .catch(() => [] as CollaborationModeOption[]);
+          const threadsPagePromise = api.threads({ archived: false });
+          const projectsPromise = api.projects();
+          const usagePromise = api.usage().catch(() => undefined);
+          const diagnosticsPromise = api.diagnostics().catch(() => undefined);
+          const approvalsPromise = api.approvals().catch(() => [] as ApprovalRequest[]);
           const archivedPagePromise: Promise<CursorPage<ThreadSummary> | undefined> =
             archivedLoadedRef.current
               ? api.threads({ archived: true }).catch((loadError: unknown) => {
@@ -6480,29 +6786,8 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
                   return undefined;
                 })
               : Promise.resolve(undefined);
-          const [
-            models,
-            collaborationModes,
-            threadsPage,
-            usage,
-            diagnostics,
-            approvals,
-            archivedPage,
-          ] = await Promise.all([
-            api.models(),
-            api.collaborationModes().catch(() => [] as CollaborationModeOption[]),
-            api.threads({ archived: false }),
-            api.usage().catch(() => undefined),
-            api.diagnostics().catch(() => undefined),
-            api.approvals().catch(() => [] as ApprovalRequest[]),
-            archivedPagePromise,
-          ]);
-          const projects = await api.projects();
-          const approvalReconciliation = reconcileFetchedApprovals(
-            approvals,
-            locallyResolvedApprovalIdsRef.current,
-          );
-          locallyResolvedApprovalIdsRef.current = approvalReconciliation.remainingResolvedIds;
+
+          const threadsPage = await threadsPagePromise;
           let threads = workspaceReadyRef.current
             ? mergeRefreshedFirstPage(
                 threadsRef.current,
@@ -6514,6 +6799,42 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
           if (!workspaceReadyRef.current) {
             threadTailIdsRef.current.clear();
           }
+          const nextCursor = nextCursorAfterRefresh(
+            threadsNextCursorRef.current,
+            threadsPage.nextCursor,
+            threadsExtendedRef.current || threadsMoreInFlightRef.current,
+          );
+          threadsRef.current = threads;
+          threadsNextCursorRef.current = nextCursor;
+          setThreadsNextCursor(nextCursor);
+          setData((current) => ({ ...current, threads }));
+          workspaceReadyRef.current = true;
+          setState("ready");
+          setError("");
+
+          const [
+            models,
+            collaborationModes,
+            projects,
+            usage,
+            diagnostics,
+            approvals,
+            archivedPage,
+          ] = await Promise.all([
+            modelsPromise,
+            collaborationModesPromise,
+            projectsPromise,
+            usagePromise,
+            diagnosticsPromise,
+            approvalsPromise,
+            archivedPagePromise,
+          ]);
+          const approvalReconciliation = reconcileFetchedApprovals(
+            approvals,
+            locallyResolvedApprovalIdsRef.current,
+          );
+          locallyResolvedApprovalIdsRef.current = approvalReconciliation.remainingResolvedIds;
+          threads = threadsRef.current;
           if (archivedPage !== undefined) {
             let archived = mergeRefreshedFirstPage(
               archivedThreadsRef.current,
@@ -6537,14 +6858,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
             setArchivedError("");
             setArchivedState("ready");
           }
-          const nextCursor = nextCursorAfterRefresh(
-            threadsNextCursorRef.current,
-            threadsPage.nextCursor,
-            threadsExtendedRef.current || threadsMoreInFlightRef.current,
-          );
           threadsRef.current = threads;
-          threadsNextCursorRef.current = nextCursor;
-          setThreadsNextCursor(nextCursor);
           setData({
             projects,
             models,

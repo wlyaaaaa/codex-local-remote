@@ -21,10 +21,15 @@ describe("Windows fail-open startup contract", () => {
   it("scopes the capability endpoint to the Sidecar bootstrap process only", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
     const brokerReady = start.indexOf("$startupStage = 'broker-ready'");
-    const processOverride = start.indexOf("$env:CODEX_APP_SERVER_WS_URL = $webSocketUrl");
-    const sidecarStart = start.indexOf("$sidecarProcess = Start-Process");
+    const childFunction = start.indexOf("function Start-ManagedSidecarChild");
+    const processOverride = start.indexOf(
+      "$env:CODEX_APP_SERVER_WS_URL = $webSocketUrl",
+      childFunction,
+    );
+    const sidecarStart = start.indexOf("$process = Start-Process", processOverride);
 
     expect(brokerReady).toBeGreaterThan(-1);
+    expect(childFunction).toBeGreaterThan(brokerReady);
     expect(processOverride).toBeGreaterThan(brokerReady);
     expect(sidecarStart).toBeGreaterThan(processOverride);
     expect(start.slice(Math.max(0, processOverride - 500), sidecarStart)).toContain(

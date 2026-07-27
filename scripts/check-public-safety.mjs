@@ -12,7 +12,11 @@ const root = resolve(
 const maximumFileSize = 2_000_000;
 const reviewedBinaryAssets = new Map([
   ["docs/assets/desktop-tasks-en.jpg", "jpeg"],
+  ["docs/assets/mobile-approval-zh.jpg", "jpeg"],
   ["docs/assets/mobile-conversation-zh.jpg", "jpeg"],
+  ["docs/assets/mobile-diff-zh.jpg", "jpeg"],
+  ["docs/assets/mobile-home-zh.jpg", "jpeg"],
+  ["docs/assets/mobile-model-controls-zh.jpg", "jpeg"],
   ["docs/assets/mobile-tasks-en.jpg", "jpeg"],
 ]);
 

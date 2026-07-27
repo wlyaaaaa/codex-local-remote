@@ -218,6 +218,7 @@ export interface CodexDomainServiceOptions {
   protocolCatalog?: {
     approvalPolicies?: readonly string[];
     approvalReviewers?: readonly string[];
+    clientMethods?: readonly string[];
   };
   readPersistedUsageContext?: (
     threadId: string,
@@ -287,6 +288,7 @@ export class CodexDomainService {
   readonly #pinnedThreadRanks = new Map<string, number>();
   readonly #protocolApprovalPolicies: readonly string[];
   readonly #protocolApprovalReviewers: readonly string[];
+  readonly #protocolClientMethods: ReadonlySet<string>;
   readonly #readPersistedUsageContext:
     | ((
         threadId: string,
@@ -323,6 +325,9 @@ export class CodexDomainService {
     );
     this.#protocolApprovalReviewers = sanitizeProtocolOptions(
       options.protocolCatalog?.approvalReviewers,
+    );
+    this.#protocolClientMethods = new Set(
+      sanitizeProtocolOptions(options.protocolCatalog?.clientMethods),
     );
     this.#readPersistedUsageContext = options.readPersistedUsageContext;
     this.#resolveLocalInputReference = options.resolveLocalInputReference;
@@ -878,7 +883,7 @@ export class CodexDomainService {
 
   async getThread(
     threadId: string,
-    options: { includeTurns?: boolean } = {},
+    options: { historyCursor?: string; includeTurns?: boolean } = {},
   ): Promise<ThreadDetail> {
     requireNonEmpty(threadId, "对话 id");
     await this.#refreshPinnedThreadIds();
@@ -895,11 +900,10 @@ export class CodexDomainService {
         return this.#withControlState(restored);
       }
     }
-    const response = asRecord(
-      await this.#gateway.request("thread/read", {
-        includeTurns: options.includeTurns !== false,
-        threadId,
-      }),
+    const response = await this.#readThreadForDisplay(
+      threadId,
+      options.includeTurns !== false,
+      options.historyCursor,
     );
     const thread = asRecord(response.thread);
     if (!asString(thread.id)) {
@@ -915,6 +919,10 @@ export class CodexDomainService {
       ...this.#runtimeProjectionOptions(threadId),
       ...(projectId === undefined ? {} : { projectId }),
     });
+    const historyNextCursor = asString(response.historyNextCursor);
+    if (historyNextCursor !== undefined) {
+      detail = { ...detail, historyNextCursor };
+    }
     if (isInitialTurnSafelyTerminal(thread)) {
       void this.#notifyManagedThreadAfterInitialTurn(threadId);
     }
@@ -923,6 +931,142 @@ export class CodexDomainService {
       this.#markExistingActiveTurnUncontrollable(detail);
     }
     return this.#withControlState(detail);
+  }
+
+  async #readThreadForDisplay(
+    threadId: string,
+    includeTurns: boolean,
+    historyCursor?: string,
+  ): Promise<Record<string, unknown>> {
+    if (!includeTurns) {
+      return asRecord(
+        await this.#gateway.request("thread/read", {
+          includeTurns: false,
+          threadId,
+        }),
+      );
+    }
+
+    if (
+      this.#protocolClientMethods.has("thread/items/list") &&
+      this.#protocolClientMethods.has("thread/turns/list")
+    ) {
+      try {
+        const [shellResult, itemsResult, turnsResult] = await Promise.all([
+          this.#gateway.request("thread/read", {
+            includeTurns: false,
+            threadId,
+          }),
+          this.#gateway.request("thread/items/list", {
+            ...(historyCursor === undefined ? {} : { cursor: historyCursor }),
+            limit: 160,
+            sortDirection: "desc",
+            threadId,
+          }),
+          this.#gateway.request("thread/turns/list", {
+            itemsView: "summary",
+            limit: 12,
+            sortDirection: "desc",
+            threadId,
+          }),
+        ]);
+        const shell = asRecord(shellResult);
+        const rawThread = asRecord(shell.thread);
+        const itemPage = asRecord(itemsResult);
+        const itemEntries = asRecordArray(itemPage.data).reverse();
+        const turnSummaries = asRecordArray(asRecord(turnsResult).data).reverse();
+        const itemsByTurn = new Map<string, unknown[]>();
+        const orderedTurnIds: string[] = [];
+        for (const entry of itemEntries) {
+          const turnId = asString(entry.turnId);
+          if (!turnId || entry.item === undefined) continue;
+          let items = itemsByTurn.get(turnId);
+          if (!items) {
+            items = [];
+            itemsByTurn.set(turnId, items);
+            orderedTurnIds.push(turnId);
+          }
+          items.push(entry.item);
+        }
+        const summariesByTurn = new Map(
+          turnSummaries.flatMap((turn) => {
+            const turnId = asString(turn.id);
+            return turnId ? [[turnId, turn] as const] : [];
+          }),
+        );
+        for (const turn of turnSummaries) {
+          const turnId = asString(turn.id);
+          if (turnId && !itemsByTurn.has(turnId)) orderedTurnIds.push(turnId);
+        }
+        const recentTurns = [...new Set(orderedTurnIds)].map((turnId) => ({
+          ...(summariesByTurn.get(turnId) ?? { id: turnId, status: "completed" }),
+          id: turnId,
+          items: itemsByTurn.get(turnId) ?? [],
+        }));
+        return {
+          ...shell,
+          ...(asString(itemPage.nextCursor) === undefined
+            ? {}
+            : { historyNextCursor: asString(itemPage.nextCursor) }),
+          thread: {
+            ...rawThread,
+            turns: recentTurns,
+          },
+        };
+      } catch (error) {
+        if (historyCursor !== undefined) throw error;
+        // A newly introduced item page may be temporarily unavailable even
+        // when its schema is present. Fall through to bounded turn pages.
+      }
+    }
+
+    if (historyCursor !== undefined) {
+      throw new DomainError("FEATURE_UNAVAILABLE", "当前 Codex 版本暂时不能继续加载更早对话", 409);
+    }
+
+    if (!this.#protocolClientMethods.has("thread/turns/list")) {
+      return asRecord(
+        await this.#gateway.request("thread/read", {
+          includeTurns: true,
+          threadId,
+        }),
+      );
+    }
+
+    try {
+      const [shellResult, turnsResult] = await Promise.all([
+        this.#gateway.request("thread/read", {
+          includeTurns: false,
+          threadId,
+        }),
+        this.#gateway.request("thread/turns/list", {
+          itemsView: "full",
+          limit: 12,
+          sortDirection: "desc",
+          threadId,
+        }),
+      ]);
+      const shell = asRecord(shellResult);
+      const rawThread = asRecord(shell.thread);
+      const recentTurns = asRecordArray(asRecord(turnsResult).data).reverse();
+      return {
+        ...shell,
+        thread: {
+          ...rawThread,
+          turns: recentTurns,
+        },
+      };
+    } catch {
+      // Older or temporarily incompatible app-server builds keep the stable
+      // full-read path. The protocol catalog is regenerated after upgrades, so
+      // supported builds never pay the unbounded transcript cost on first load.
+      return asRecord(
+        await this.#gateway.request("thread/read", {
+          includeTurns: true,
+          threadId,
+        }),
+      );
+    }
   }
 
   async reconcilePendingDesktopNotifications(): Promise<void> {

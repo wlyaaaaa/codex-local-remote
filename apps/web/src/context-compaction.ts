@@ -39,19 +39,61 @@ export function latestContextCompaction(
     | undefined;
 }
 
+export function activeContextCompaction(
+  thread: ThreadDetail,
+): Extract<ConversationItem, { kind: "tool" }> | undefined {
+  let latestIndex = -1;
+  for (let index = thread.items.length - 1; index >= 0; index -= 1) {
+    const item = thread.items[index];
+    if (item?.kind === "tool" && item.operation === "context-compaction") {
+      latestIndex = index;
+      break;
+    }
+  }
+  if (latestIndex < 0) return undefined;
+
+  const latest = thread.items[latestIndex];
+  if (
+    latest?.kind !== "tool" ||
+    latest.operation !== "context-compaction" ||
+    latest.status !== "running"
+  ) {
+    return undefined;
+  }
+  const threadIsActive =
+    Boolean(thread.activeTurnId) ||
+    thread.state === "running" ||
+    thread.state === "waiting-for-approval";
+  if (!threadIsActive) return undefined;
+  if (latest.turnId && thread.activeTurnId && latest.turnId !== thread.activeTurnId) {
+    return undefined;
+  }
+  if (latestIndex < thread.items.length - 1) return undefined;
+  return latest;
+}
+
+export function contextCompactionItemsForDisplay(thread: ThreadDetail): ConversationItem[] {
+  const latest = latestContextCompaction(thread.items);
+  if (latest?.status !== "running" || activeContextCompaction(thread)?.id === latest.id) {
+    return [...thread.items];
+  }
+  return thread.items.map((item) =>
+    item.id === latest.id && item.kind === "tool" ? { ...item, status: "complete" as const } : item,
+  );
+}
+
 export function canRequestContextCompaction(
   thread: ThreadDetail,
   online: boolean,
   requestState: ContextCompactionRequestState,
 ): boolean {
-  const latest = latestContextCompaction(thread.items);
   return (
     online &&
     requestState === "idle" &&
     thread.mode === "managed" &&
     !thread.parentThreadId &&
     !thread.activeTurnId &&
-    latest?.status !== "running" &&
+    activeContextCompaction(thread) === undefined &&
     thread.availableActions.reply
   );
 }
@@ -60,8 +102,7 @@ export function isContextCompactionBusy(
   thread: ThreadDetail,
   requestState: ContextCompactionRequestState,
 ): boolean {
-  const latest = latestContextCompaction(thread.items);
-  return requestState !== "idle" || latest?.status === "running";
+  return requestState !== "idle" || activeContextCompaction(thread) !== undefined;
 }
 
 export function contextCompactionAttemptFromThread(
@@ -155,13 +196,6 @@ export function reconcileContextCompactionSnapshot(
       terminalSnapshotsWithoutEvidence: 0,
       ...(stableTerminal === undefined ? {} : { terminalState: stableTerminal }),
     };
-    if (
-      candidate.status === "complete" &&
-      stableTerminal === "complete" &&
-      thread.availableActions.reply
-    ) {
-      return { attempt: next, resolution: "succeeded" };
-    }
     if (candidate.status === "failed" || stableTerminal === "failed" || stableTerminal === "idle") {
       return { attempt: next, resolution: "failed" };
     }
@@ -266,18 +300,13 @@ function snapshotCompactionCandidate(
 }
 
 function progress(attempt: ContextCompactionAttempt): ContextCompactionProgress {
-  if (attempt.terminalState === "failed" || attempt.terminalState === "idle") {
+  if (attempt.itemFailed) {
     return { attempt, resolution: "failed" };
   }
-  if (
-    attempt.terminalState === "complete" &&
-    attempt.started &&
-    attempt.completed &&
-    !attempt.itemFailed
-  ) {
+  if (attempt.started && attempt.completed) {
     return { attempt, resolution: "succeeded" };
   }
-  if (attempt.terminalState === "complete" && attempt.itemFailed) {
+  if (attempt.terminalState === "failed" || attempt.terminalState === "idle") {
     return { attempt, resolution: "failed" };
   }
   return { attempt, resolution: "pending" };

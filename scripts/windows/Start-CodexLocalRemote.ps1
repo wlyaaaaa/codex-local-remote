@@ -957,42 +957,95 @@ $sidecarArguments = @(
     '--data-dir'
     (ConvertTo-WindowsCommandLineArgument -Value $resolvedDataDir)
 ) -join ' '
-$sidecarProcess = $null
-try {
-    # The capability endpoint is scoped to this Sidecar child process. Desktop
-    # receives its own process-scoped endpoint only through the fail-open
-    # launcher after the managed Broker has passed infrastructure readiness.
-    $env:CODEX_APP_SERVER_WS_URL = $webSocketUrl
-    $sidecarProcess = Start-Process `
-        -FilePath $resolvedNode `
-        -ArgumentList $sidecarArguments `
-        -WorkingDirectory $resolvedRoot `
-        -WindowStyle Hidden `
-        -PassThru
-} finally {
-    Remove-Item Env:\CODEX_APP_SERVER_WS_URL -ErrorAction SilentlyContinue
+
+function Start-ManagedSidecarChild {
+    $process = $null
+    try {
+        # The capability endpoint is scoped to this Sidecar child process.
+        # Desktop receives its own process-scoped endpoint only through the
+        # fail-open launcher after the managed Broker has passed
+        # infrastructure readiness.
+        try {
+            $env:CODEX_APP_SERVER_WS_URL = $webSocketUrl
+            $process = Start-Process `
+                -FilePath $resolvedNode `
+                -ArgumentList $sidecarArguments `
+                -WorkingDirectory $resolvedRoot `
+                -WindowStyle Hidden `
+                -PassThru
+        } finally {
+            Remove-Item Env:\CODEX_APP_SERVER_WS_URL `
+                -ErrorAction SilentlyContinue
+        }
+        $cimProcess = Get-CimInstance `
+            Win32_Process `
+            -Filter "ProcessId = $($process.Id)" `
+            -ErrorAction Stop
+        $creationIdentity = Get-ProcessCreationIdentity `
+            -CreationDate $cimProcess.CreationDate
+        $startTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks
+        if ([Math]::Abs(
+            [long]$creationIdentity.CreationDateUtcTicks -
+                $startTimeUtcTicks
+        ) -gt [TimeSpan]::FromSeconds(2).Ticks) {
+            throw "Sidecar PID $($process.Id) CreationDate does not match its held process handle."
+        }
+        $identityHandle = [pscustomobject]@{
+            Process = $process
+            ProcessId = $process.Id
+            StartTimeUtcTicks = $startTimeUtcTicks
+        }
+        $receipt = New-RuntimeProcessReceipt `
+            -CimProcess $cimProcess `
+            -StartTimeUtcTicks $startTimeUtcTicks `
+            -RuntimeInvocationId $runtimeInvocationId
+        return [pscustomobject]@{
+            Process = $process
+            IdentityHandle = $identityHandle
+            Receipt = $receipt
+        }
+    } catch {
+        if ($null -ne $process) {
+            try {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                    $process.Kill($true)
+                    $null = $process.WaitForExit(5000)
+                }
+            } catch {
+                # The process object is the exact child created above. A failed
+                # cleanup is reported by the original startup exception and the
+                # next bounded ownership probe.
+            }
+            $process.Dispose()
+        }
+        throw
+    }
 }
-$sidecarCimProcess = Get-CimInstance `
-    Win32_Process `
-    -Filter "ProcessId = $($sidecarProcess.Id)" `
-    -ErrorAction Stop
-$sidecarCreationIdentity = Get-ProcessCreationIdentity `
-    -CreationDate $sidecarCimProcess.CreationDate
-if ([Math]::Abs(
-    [long]$sidecarCreationIdentity.CreationDateUtcTicks -
-        $sidecarProcess.StartTime.ToUniversalTime().Ticks
-) -gt [TimeSpan]::FromSeconds(2).Ticks) {
-    throw "Sidecar PID $($sidecarProcess.Id) CreationDate does not match its held process handle."
+
+function New-VerifiedUpstreamReceipt {
+    param(
+        [Parameter(Mandatory)][object]$UpstreamProcess
+    )
+    $creationIdentity = Get-ProcessCreationIdentity `
+        -CreationDate $UpstreamProcess.CreationDate
+    $identityHandle = Open-ProcessIdentityHandle `
+        -ProcessId ([int]$UpstreamProcess.ProcessId) `
+        -ExpectedCreationDateUtcTicks $creationIdentity.CreationDateUtcTicks
+    try {
+        return New-RuntimeProcessReceipt `
+            -CimProcess $UpstreamProcess `
+            -StartTimeUtcTicks $identityHandle.StartTimeUtcTicks `
+            -RuntimeInvocationId $runtimeInvocationId
+    } finally {
+        $identityHandle.Process.Dispose()
+    }
 }
-$sidecarIdentityHandle = [pscustomobject]@{
-    Process = $sidecarProcess
-    ProcessId = $sidecarProcess.Id
-    StartTimeUtcTicks = $sidecarProcess.StartTime.ToUniversalTime().Ticks
-}
-$sidecarReceipt = New-RuntimeProcessReceipt `
-    -CimProcess $sidecarCimProcess `
-    -StartTimeUtcTicks $sidecarIdentityHandle.StartTimeUtcTicks `
-    -RuntimeInvocationId $runtimeInvocationId
+
+$sidecarChild = Start-ManagedSidecarChild
+$sidecarProcess = $sidecarChild.Process
+$sidecarIdentityHandle = $sidecarChild.IdentityHandle
+$sidecarReceipt = $sidecarChild.Receipt
 
 try {
     $startupStage = 'sidecar-handshake'
@@ -1001,19 +1054,8 @@ try {
         -SidecarProcess $sidecarProcess `
         -BrokerIdentityHandle $brokerIdentityHandle `
         -TimeoutSeconds $SidecarHandshakeTimeoutSeconds
-    $readyUpstreamCreationIdentity = Get-ProcessCreationIdentity `
-        -CreationDate $readyUpstream.CreationDate
-    $readyUpstreamHandle = Open-ProcessIdentityHandle `
-        -ProcessId ([int]$readyUpstream.ProcessId) `
-        -ExpectedCreationDateUtcTicks $readyUpstreamCreationIdentity.CreationDateUtcTicks
-    try {
-        $readyUpstreamReceipt = New-RuntimeProcessReceipt `
-            -CimProcess $readyUpstream `
-            -StartTimeUtcTicks $readyUpstreamHandle.StartTimeUtcTicks `
-            -RuntimeInvocationId $runtimeInvocationId
-    } finally {
-        $readyUpstreamHandle.Process.Dispose()
-    }
+    $readyUpstreamReceipt = New-VerifiedUpstreamReceipt `
+        -UpstreamProcess $readyUpstream
     Write-BrokerRuntimeReceipt `
         -Status 'ready' `
         -BrokerReceipt $brokerReceipt `
@@ -1063,14 +1105,78 @@ try {
         $DesktopRuntimeCheckIntervalSeconds
     )
     $nextDesktopLaunchRecoveryAt = [DateTime]::UtcNow.AddSeconds(10)
+    $sidecarRecoveryAttempt = 0
+    $nextSidecarRecoveryAt = [DateTime]::MinValue
     while ($true) {
-        if ($sidecarProcess.HasExited) {
-            # A long-running scheduled task must return non-zero on every
-            # unexpected child exit so Task Scheduler RestartCount is effective.
+        if ($null -eq $sidecarProcess -or $sidecarProcess.HasExited) {
+            $exitSummary = if ($null -eq $sidecarProcess) {
+                'the previous recovery attempt did not start a child'
+            } else {
+                "the Sidecar exited with code $($sidecarProcess.ExitCode)"
+            }
+            if ($null -ne $sidecarIdentityHandle) {
+                $sidecarIdentityHandle.Process.Dispose()
+            }
+            $sidecarProcess = $null
+            $sidecarIdentityHandle = $null
+            $sidecarReceipt = $null
+
+            if ([DateTime]::UtcNow -lt $nextSidecarRecoveryAt) {
+                Start-Sleep -Seconds 1
+                continue
+            }
+
+            $sidecarRecoveryAttempt++
+            $startupStage = 'sidecar-recovery'
             Write-StartupStatus `
-                -Status 'failed' `
-                -Message "Sidecar exited unexpectedly with code $($sidecarProcess.ExitCode)."
-            exit $(if ($sidecarProcess.ExitCode -eq 0) { 1 } else { $sidecarProcess.ExitCode })
+                -Status 'degraded' `
+                -Message "Remote transport is recovering because $exitSummary. The verified Broker and Codex Desktop remain untouched."
+            try {
+                $sidecarChild = Start-ManagedSidecarChild
+                $sidecarProcess = $sidecarChild.Process
+                $sidecarIdentityHandle = $sidecarChild.IdentityHandle
+                $sidecarReceipt = $sidecarChild.Receipt
+                $recoveredUpstream = Wait-ForSidecarHandshake `
+                    -SidecarProcess $sidecarProcess `
+                    -BrokerIdentityHandle $brokerIdentityHandle `
+                    -TimeoutSeconds $SidecarHandshakeTimeoutSeconds
+                $recoveredUpstreamReceipt = New-VerifiedUpstreamReceipt `
+                    -UpstreamProcess $recoveredUpstream
+                Write-BrokerRuntimeReceipt `
+                    -Status 'ready' `
+                    -BrokerReceipt $brokerReceipt `
+                    -SidecarReceipt $sidecarReceipt `
+                    -UpstreamReceipt $recoveredUpstreamReceipt
+                $sidecarRecoveryAttempt = 0
+                $nextSidecarRecoveryAt = [DateTime]::MinValue
+                $startupStage = 'supervising'
+                Write-StartupStatus -Status 'ready'
+            } catch {
+                if ($null -ne $sidecarIdentityHandle) {
+                    $null = Stop-ProcessIdentityHandle `
+                        -IdentityHandle $sidecarIdentityHandle `
+                        -ErrorAction SilentlyContinue
+                    $sidecarIdentityHandle.Process.Dispose()
+                }
+                $sidecarProcess = $null
+                $sidecarIdentityHandle = $null
+                $sidecarReceipt = $null
+                $retryDelaySeconds = [Math]::Min(
+                    30,
+                    [Math]::Pow(
+                        2,
+                        [Math]::Min($sidecarRecoveryAttempt, 4)
+                    )
+                )
+                $nextSidecarRecoveryAt = [DateTime]::UtcNow.AddSeconds(
+                    $retryDelaySeconds
+                )
+                Write-StartupStatus `
+                    -Status 'degraded' `
+                    -Message "Sidecar recovery attempt $sidecarRecoveryAttempt failed. The verified Broker and Codex Desktop remain untouched; retrying in $retryDelaySeconds seconds."
+            }
+            Start-Sleep -Seconds 1
+            continue
         }
         $brokerIdentityHandle.Process.Refresh()
         $brokerAlive = -not $brokerIdentityHandle.Process.HasExited -and
@@ -1142,13 +1248,14 @@ try {
                     $RuntimeHandshakeTimeoutSeconds
                 )
             } elseif ([DateTime]::UtcNow -ge $runtimeTransitionDeadline) {
+                $runtimeApplicationDegraded = $true
+                $startupStage = 'runtime-recovery-wait'
                 Write-StartupStatus `
-                    -Status 'failed' `
-                    -Message "Runtime client handshake did not recover within $RuntimeHandshakeTimeoutSeconds seconds."
-                $null = Stop-ProcessIdentityHandle `
-                    -IdentityHandle $sidecarIdentityHandle `
-                    -ErrorAction SilentlyContinue
-                exit 1
+                    -Status 'degraded' `
+                    -Message "Runtime client handshake remains unavailable after $RuntimeHandshakeTimeoutSeconds seconds. The verified Broker and Sidecar stay alive and will keep retrying without restarting Codex Desktop."
+                $runtimeTransitionDeadline = [DateTime]::UtcNow.AddSeconds(
+                    $RuntimeHandshakeTimeoutSeconds
+                )
             }
         } else {
             $runtimeTransitionDeadline = $null
@@ -1232,9 +1339,12 @@ try {
         Start-Sleep -Seconds 1
     }
 } finally {
-    $null = Stop-ProcessIdentityHandle `
-        -IdentityHandle $sidecarIdentityHandle `
-        -ErrorAction SilentlyContinue
+    if ($null -ne $sidecarIdentityHandle) {
+        $null = Stop-ProcessIdentityHandle `
+            -IdentityHandle $sidecarIdentityHandle `
+            -ErrorAction SilentlyContinue
+        $sidecarIdentityHandle.Process.Dispose()
+    }
     $brokerIdentityHandle.Process.Dispose()
     $bootstrapIdentityHandle.Process.Dispose()
 }

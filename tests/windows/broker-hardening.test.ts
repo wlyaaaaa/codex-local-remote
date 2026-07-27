@@ -757,6 +757,37 @@ windowsOnly("Windows shared app-server broker hardening", () => {
     expect(JSON.parse(strict.stdout)).toBe("Ready");
   });
 
+  it("keeps a verified runtime alive during a temporary app-server readiness lapse", () => {
+    const readiness = {
+      appServerReady: false,
+      degraded: false,
+      desktopConnected: true,
+      sidecarConnected: true,
+      unknownCount: 0,
+    };
+    const transition = runDriver([
+      "-Operation",
+      "sidecar-readiness-decision",
+      "-Phase",
+      "RuntimeTransition",
+      "-WebSocketUrl",
+      JSON.stringify(readiness),
+    ]);
+    const strict = runDriver([
+      "-Operation",
+      "sidecar-readiness-decision",
+      "-Phase",
+      "StrictRuntime",
+      "-WebSocketUrl",
+      JSON.stringify(readiness),
+    ]);
+
+    expect(transition.status).toBe(0);
+    expect(JSON.parse(transition.stdout)).toBe("Wait");
+    expect(strict.status).toBe(0);
+    expect(JSON.parse(strict.stdout)).toBe("Reject");
+  });
+
   it("keeps degraded application state alive while strict readiness stays fail closed", () => {
     const degraded = {
       appServerReady: true,

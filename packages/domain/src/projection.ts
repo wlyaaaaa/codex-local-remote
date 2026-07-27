@@ -113,9 +113,15 @@ export function projectThreadDetail(
       ...(completedAt === undefined ? {} : { turnCompletedAt: completedAt }),
     };
     const turnItems: ConversationItem[] = [];
-    for (const item of asRecordArray(turn.items)) {
+    const rawTurnItems = asRecordArray(turn.items);
+    for (let index = 0; index < rawTurnItems.length; index += 1) {
+      const item = rawTurnItems[index];
+      const itemParentStatus =
+        item?.type === "contextCompaction" && index < rawTurnItems.length - 1
+          ? "completed"
+          : turn.status;
       turnItems.push(
-        ...projectThreadItem(item, undefined, turn.status).map((projected) => ({
+        ...projectThreadItem(item, undefined, itemParentStatus).map((projected) => ({
           ...projected,
           ...turnContext,
         })),

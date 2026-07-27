@@ -5,6 +5,7 @@ import {
   applyContextCompactionEvents,
   beginContextCompactionRequest,
   canRequestContextCompaction,
+  contextCompactionItemsForDisplay,
   contextCompactionAttemptFromThread,
   isContextCompactionBusy,
   latestContextCompaction,
@@ -56,9 +57,11 @@ describe("上下文压缩界面门禁", () => {
     ).toBe(false);
   });
 
-  it("用最新的显式压缩工具项判断运行状态", () => {
+  it("只把当前活跃轮次最后一个压缩工具项判断为运行中", () => {
     const running: ThreadDetail = {
       ...idleManagedThread,
+      activeTurnId: "turn-compact",
+      state: "running",
       items: [
         {
           id: "compact-old",
@@ -73,18 +76,73 @@ describe("上下文压缩界面门禁", () => {
           operation: "context-compaction",
           status: "running",
           title: "压缩对话上下文",
+          turnId: "turn-compact",
         },
       ],
+      availableActions: { ...idleManagedThread.availableActions, reply: false },
     };
     expect(latestContextCompaction(running.items)?.id).toBe("compact-current");
     expect(isContextCompactionBusy(running, "idle")).toBe(true);
     expect(isContextCompactionBusy(idleManagedThread, "requesting")).toBe(true);
     expect(canRequestContextCompaction(running, true, "idle")).toBe(false);
   });
+
+  it("终态快照里残留的 running 压缩项不再显示为正在压缩", () => {
+    const stale: ThreadDetail = {
+      ...idleManagedThread,
+      items: [
+        {
+          id: "compact-stale",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "running",
+          title: "压缩对话上下文",
+          turnId: "turn-compact",
+        },
+      ],
+    };
+
+    expect(isContextCompactionBusy(stale, "idle")).toBe(false);
+    expect(canRequestContextCompaction(stale, true, "idle")).toBe(true);
+    expect(contextCompactionItemsForDisplay(stale)).toEqual([
+      expect.objectContaining({ id: "compact-stale", status: "complete" }),
+    ]);
+  });
+
+  it("压缩项后已有新轮次内容时清除旧的运行状态", () => {
+    const superseded: ThreadDetail = {
+      ...idleManagedThread,
+      activeTurnId: "turn-new",
+      state: "running",
+      items: [
+        {
+          id: "compact-stale",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "running",
+          title: "压缩对话上下文",
+          turnId: "turn-compact",
+        },
+        {
+          id: "new-user",
+          kind: "user-message",
+          text: "压缩后继续",
+          turnId: "turn-new",
+        },
+      ],
+      availableActions: { ...idleManagedThread.availableActions, reply: false, steer: true },
+    };
+
+    expect(isContextCompactionBusy(superseded, "idle")).toBe(false);
+    expect(contextCompactionItemsForDisplay(superseded)).toEqual([
+      expect.objectContaining({ id: "compact-stale", status: "complete" }),
+      expect.objectContaining({ id: "new-user" }),
+    ]);
+  });
 });
 
 describe("上下文压缩完成判据", () => {
-  it("只接受同一 turnId 和同一 itemId 的 started、completed 与终态", () => {
+  it("只接受同一 turnId 和同一 itemId 的 started 与 completed", () => {
     const attempt = contextCompactionAttemptFromThread(idleManagedThread, "compact-attempt-key");
     const beforeTerminal = applyContextCompactionEvents(attempt, [
       compactionItemEvent("started", "running", "turn-compact", "compaction-current", 1),
@@ -146,7 +204,7 @@ describe("上下文压缩完成判据", () => {
     );
   });
 
-  it("running 快照用 activeTurnId 绑定本次操作，后续仍只接受该 turn 的终态", () => {
+  it("running 快照用 activeTurnId 绑定本次操作，item 完成后立即结束等待", () => {
     const attempt = contextCompactionAttemptFromThread(idleManagedThread, "compact-attempt-key");
     const runningSnapshot: ThreadDetail = {
       ...idleManagedThread,
@@ -183,13 +241,42 @@ describe("上下文压缩完成判据", () => {
       ),
       turnStateEvent("complete", "turn-unrelated", 2),
     ]);
-    expect(unrelatedTerminal.resolution).toBe("pending");
+    expect(unrelatedTerminal.resolution).toBe("succeeded");
+  });
 
-    expect(
-      applyContextCompactionEvents(unrelatedTerminal.attempt, [
-        turnStateEvent("complete", "turn-from-snapshot", 3),
-      ]).resolution,
-    ).toBe("succeeded");
+  it("同一 turn 继续运行时，权威快照里的已完成 item 仍立即结束等待", () => {
+    const attempt = contextCompactionAttemptFromThread(idleManagedThread, "compact-attempt-key");
+    const started = applyContextCompactionEvents(attempt, [
+      compactionItemEvent("started", "running", "turn-compact", "compaction-current", 1),
+    ]);
+    const snapshot: ThreadDetail = {
+      ...idleManagedThread,
+      activeTurnId: "turn-compact",
+      state: "running",
+      items: [
+        {
+          id: "compaction-current",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+        },
+        {
+          id: "later-command",
+          kind: "tool",
+          status: "running",
+          title: "运行命令",
+        },
+      ],
+      availableActions: {
+        ...idleManagedThread.availableActions,
+        reply: false,
+      },
+    };
+
+    expect(reconcileContextCompactionSnapshot(started.attempt, snapshot).resolution).toBe(
+      "succeeded",
+    );
   });
 
   it("reset 后权威快照没有本次压缩证据时明确失败并解锁", () => {

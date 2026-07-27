@@ -1,7 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { UserMessageText, stripInjectedBrowserContext } from "./UserMessageText";
+import {
+  UserMessageText,
+  stripInjectedBrowserContext,
+  stripInjectedMessageScaffolding,
+} from "./UserMessageText";
 
 const ambientBlock = (body: string, newline = "\n") =>
   ['<in-app-browser-context source="ambient-ui-state">', body, "</in-app-browser-context>"].join(
@@ -29,6 +33,49 @@ describe("用户消息纯文本", () => {
 
     expect(stripInjectedBrowserContext(`${before}\n\n真正的用户正文`)).toBe("真正的用户正文");
     expect(stripInjectedBrowserContext(`真正的用户正文\r\n\r\n${after}`)).toBe("真正的用户正文");
+  });
+
+  it("隐藏所有宿主请求标题，不依赖浏览器上下文且支持重复标题", () => {
+    const automatic = ambientBlock("Current URL: https://example.invalid/thread");
+
+    expect(
+      stripInjectedBrowserContext(`${automatic}\n\n## My request for Codex:\n真正的用户正文`),
+    ).toBe("真正的用户正文");
+    expect(
+      stripInjectedBrowserContext(`${automatic}\r\n\r\n## My request for Codex: 同一行正文`),
+    ).toBe("同一行正文");
+    expect(
+      stripInjectedBrowserContext(
+        "## My request for Codex:\n第一段正文\n\n## My request for Codex: 第二段正文\n## My request for Codex第三段正文",
+      ),
+    ).toBe("第一段正文\n\n第二段正文\n第三段正文");
+  });
+
+  it("隐藏文件清单、图片路径标记和请求包装，但保留实际请求", () => {
+    const message = [
+      "# Files mentioned by the user:",
+      "",
+      "## codex-clipboard-example.png: C:/Users/example/AppData/Local/Temp/example.png",
+      "",
+      "## My request for Codex:",
+      "请修复真实问题",
+      '<image name=[Image #1] path="C:\\Users\\example\\example.png">',
+    ].join("\n");
+
+    expect(stripInjectedMessageScaffolding(message)).toBe("请修复真实问题");
+  });
+
+  it("隐藏内部委派包装并保留相邻的真实用户正文", () => {
+    const delegation = [
+      "<codex_delegation>",
+      "  <source_thread_id>internal</source_thread_id>",
+      "  <input>内部协调内容</input>",
+      "</codex_delegation>",
+    ].join("\n");
+
+    expect(
+      stripInjectedMessageScaffolding(`第一段真实正文\n\n${delegation}\n\n第二段真实正文`),
+    ).toBe("第一段真实正文\n\n第二段真实正文");
   });
 
   it("兼容多个自动块和 CRLF，同时保留块之间的真实正文", () => {

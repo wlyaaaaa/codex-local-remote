@@ -1,60 +1,93 @@
 # ChatGPT / Codex Local Remote
 
-> A secure, self-hosted remote control for your local ChatGPT / Codex Desktop tasks —
-> from any modern phone browser, with no mobile app or traditional VPN required.
+> Control the **same live ChatGPT / Codex Desktop task** from your phone — including approvals,
+> model settings, files, context and usage. No mobile app or traditional VPN required.
 >
-> 非官方、自托管的 ChatGPT / Codex Desktop 远程客户端：手机浏览器直接使用，
-> 无需安装手机 App 或传统 VPN。
+> 在手机上控制**桌面版正在运行的同一个任务**：审批、模型、文件、上下文和额度都能看。
+> 无需安装手机 App，也不要求传统 VPN。
 
 [![Windows](https://img.shields.io/badge/Windows-11-0f7a43)](docs/windows-install.md)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-local--first-0f7a43)](docs/architecture.md)
+[![Release](https://img.shields.io/github/v/release/wlyaaaaa/codex-local-remote?color=0f7a43)](https://github.com/wlyaaaaa/codex-local-remote/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-0f7a43)](LICENSE)
+
+**[Five-minute setup](docs/quickstart.md)** ·
+**[Install with AI](docs/ai-install-prompt.md)** ·
+**[中文介绍](#中文介绍)** ·
+**[Latest release](https://github.com/wlyaaaaa/codex-local-remote/releases/latest)**
+
+## Install with AI — one prompt
+
+Open this repository in ChatGPT / Codex Desktop, or paste this directly into a new Desktop task:
+
+```text
+Install or upgrade https://github.com/wlyaaaaa/codex-local-remote on this Windows PC.
+Read AGENTS.md and docs/ai-install-prompt.md first. Inspect the existing Desktop runtime, ports,
+Broker, Sidecar, scheduled task and Tailscale before changing anything. Use only the Codex runtime
+bundled with Desktop, keep native Desktop fail-open, never persist CODEX_APP_SERVER_WS_URL, run the
+targeted checks, and verify that Desktop and the browser see the same task.
+```
+
+The full bilingual prompt tells the AI exactly when it must stop for your password, project,
+Funnel approval or a real Desktop restart:
+**[copy the complete AI install prompt](docs/ai-install-prompt.md)**.
+
+## See the whole task — not a remote desktop stream
+
+### Desktop overview
+
+<p align="center">
+  <img alt="ChatGPT Codex Local Remote desktop task view using synthetic demo data" src="docs/assets/desktop-tasks-en.jpg" width="100%">
+</p>
+
+### Phone: live tasks and Desktop order
+
+<p align="center">
+  <img alt="ChatGPT Codex Local Remote mobile task list with language and new task controls using synthetic demo data" src="docs/assets/mobile-home-zh.jpg" width="460">
+</p>
+
+### Phone: approval and structured questions
+
+<p align="center">
+  <img alt="ChatGPT Codex Local Remote mobile approval sheet using synthetic demo data" src="docs/assets/mobile-approval-zh.jpg" width="460">
+</p>
+
+### Phone: complete file diff
+
+<p align="center">
+  <img alt="ChatGPT Codex Local Remote mobile file diff using synthetic demo data" src="docs/assets/mobile-diff-zh.jpg" width="460">
+</p>
+
+### Phone: models, reasoning and speed for the next turn
+
+<p align="center">
+  <img alt="ChatGPT Codex Local Remote mobile model and reasoning controls using synthetic demo data" src="docs/assets/mobile-model-controls-zh.jpg" width="460">
+</p>
+
+### Phone: steer the current reply or queue the next turn
+
+<p align="center">
+  <img alt="ChatGPT Codex Local Remote mobile conversation using synthetic demo data" src="docs/assets/mobile-conversation-zh.jpg" width="460">
+</p>
+
+> Every screenshot uses synthetic demo data. The public repository contains no real host names,
+> conversations, private paths, passwords or tokens.
 
 ## Your Desktop tasks, in your pocket
 
 - See the same live and historical tasks as ChatGPT / Codex Desktop.
-- Start project or no-project tasks and choose the models your current Desktop exposes.
+- Start project or no-project tasks with the models your current Desktop actually exposes.
 - Steer, queue or stop a running turn; answer approvals and structured questions remotely.
 - Follow tool calls, file diffs, subagents, context usage and account limits in real time.
 - Preview and download files only from explicitly registered projects.
-- Use any modern Android or desktop browser. Installing a mobile app or traditional VPN is
-  optional; bring your own HTTPS reverse proxy, or use Tailscale Funnel.
-- Keep the native Desktop usable: the managed launcher fails open when Remote is unavailable.
+- Use any modern Android or desktop browser through your HTTPS reverse proxy or Tailscale Funnel.
+- Keep native Desktop usable: the managed launcher fails open when Remote is unavailable.
 
-<p align="center">
-  <img alt="ChatGPT Codex Local Remote desktop task view using synthetic demo data" src="docs/assets/desktop-tasks-en.jpg" width="68%">
-  <img alt="ChatGPT Codex Local Remote mobile conversation using synthetic demo data" src="docs/assets/mobile-conversation-zh.jpg" width="27%">
-</p>
+This is not remote desktop software and it does not publish raw app-server JSON-RPC. It is a
+mobile-first client for the same task protocol that Desktop is using on your own Windows PC.
 
-<details>
-<summary>Mobile task list</summary>
-
-![ChatGPT Codex Local Remote mobile task list using synthetic demo data](docs/assets/mobile-tasks-en.jpg)
-
-</details>
-
-> Screenshots use synthetic demo data. No host names, real conversations or private paths are
-> included in the repository.
-
-The interface defaults to Simplified Chinese and includes a persistent `EN / 中` switch for the
-main product navigation. Task content and runtime-provided model or approval values are preserved
-exactly as Desktop reports them.
-
-### Fastest setup: give the repository to Codex
-
-Clone this repository, open it in ChatGPT / Codex Desktop, and send:
-
-> Read `AGENTS.md`, `README.md`, `docs/ai-maintenance.md`, and
-> `docs/windows-install.md`. Install or upgrade ChatGPT / Codex Local Remote while preserving
-> existing changes. Inspect the current Desktop runtime, ports, Broker/Sidecar, Tailscale and
-> project registration before changing anything. Never use an independent CLI session to fake
-> Desktop sync, never persist `CODEX_APP_SERVER_WS_URL`, and never print passwords or tokens.
-> Run the repository checks, keep native Desktop fail-open, and stop only for an interactive
-> password, an explicitly chosen project directory, the first Desktop handoff, public Funnel
-> exposure, or a real Desktop restart.
-
-See the [five-minute guide](docs/quickstart.md) or the full
-[AI installation and maintenance contract](docs/ai-maintenance.md).
+The interface defaults to Simplified Chinese and includes an `EN / 中` switch. Task content and
+runtime-provided model or approval values are preserved exactly as Desktop reports them.
 
 ## 中文介绍
 

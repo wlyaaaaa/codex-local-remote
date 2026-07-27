@@ -572,10 +572,6 @@ a:focus-visible {
   gap: 8px;
 }
 
-.mobile-language-toolbar {
-  display: none;
-}
-
 .language-toggle {
   align-items: center;
   background: var(--surface);
@@ -592,6 +588,18 @@ a:focus-visible {
   min-height: 36px;
   min-width: 54px;
   padding: 0 9px;
+}
+
+.mobile-header__controls {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.language-toggle--header {
+  min-height: 40px;
+  min-width: 42px;
+  padding-inline: 8px;
 }
 
 .language-toggle:hover {
@@ -1285,6 +1293,10 @@ a:focus-visible {
   min-width: 0;
 }
 
+.conversation-back {
+  flex: 0 0 auto;
+}
+
 .conversation-header__main > div:last-child {
   display: flex;
   flex-direction: column;
@@ -1606,6 +1618,42 @@ a:focus-visible {
   grid-row: 3;
 }
 
+.context-compaction-record {
+  align-items: center;
+  border-block: 1px solid var(--line);
+  color: var(--muted);
+  display: flex;
+  gap: 10px;
+  min-height: 46px;
+  padding: 10px 2px;
+}
+
+.context-compaction-record > svg {
+  color: var(--green);
+  flex: 0 0 auto;
+}
+
+.context-compaction-record > span {
+  display: grid;
+  gap: 2px;
+}
+
+.context-compaction-record strong {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.context-compaction-record small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.context-compaction-record--failed > svg,
+.context-compaction-record--failed strong {
+  color: var(--danger);
+}
+
 .context-compaction-button {
   align-items: center;
   background: color-mix(in srgb, var(--green-500) 10%, var(--surface));
@@ -1697,7 +1745,6 @@ a:focus-visible {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scroll-behavior: smooth;
 }
 
 .conversation-stream {
@@ -1764,8 +1811,6 @@ a:focus-visible {
 }
 
 .message {
-  contain-intrinsic-size: auto 90px;
-  content-visibility: auto;
   margin: 0 0 24px;
   min-width: 0;
 }
@@ -1962,8 +2007,6 @@ a:focus-visible {
 
 .activity-record {
   border-top: 1px solid var(--border);
-  contain-intrinsic-size: auto 44px;
-  content-visibility: auto;
   margin: 8px 0 18px;
 }
 
@@ -2515,8 +2558,6 @@ details.activity-row {
   background: var(--surface-subtle);
   border: 1px solid var(--border);
   border-radius: 9px;
-  contain-intrinsic-size: auto 52px;
-  content-visibility: auto;
   display: flex;
   gap: 9px;
   margin: 0 0 8px 43px;
@@ -2685,6 +2726,31 @@ details.file-change {
   box-shadow:
     0 0 0 3px rgb(24 160 94 / 12%),
     0 8px 30px rgb(20 32 25 / 10%);
+}
+
+.composer-shell--collapsed {
+  background: var(--surface);
+  padding-bottom: max(6px, env(safe-area-inset-bottom));
+  padding-top: 4px;
+}
+
+.composer-shell--collapsed .composer__context-bar,
+.composer-shell--collapsed .attachment-chips,
+.composer-shell--collapsed .composer__footer {
+  display: none;
+}
+
+.composer-shell--collapsed .composer {
+  border-radius: 10px;
+  box-shadow: none;
+}
+
+.composer-shell--collapsed .composer textarea {
+  height: 44px;
+  min-height: 44px;
+  overflow: hidden;
+  padding: 10px 12px;
+  white-space: nowrap;
 }
 
 .composer textarea {
@@ -5148,7 +5214,7 @@ button.attachment-picker__entry,
     backdrop-filter: blur(14px);
     border-bottom: 1px solid var(--border);
     display: grid;
-    grid-template-columns: minmax(44px, auto) minmax(0, 1fr) minmax(44px, auto);
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
     min-height: calc(57px + env(safe-area-inset-top));
     padding: env(safe-area-inset-top) 8px 0;
     position: sticky;
@@ -5183,12 +5249,6 @@ button.attachment-picker__entry,
 
   .desktop-page-actions {
     display: none;
-  }
-
-  .mobile-language-toolbar {
-    display: flex;
-    justify-content: flex-end;
-    margin-bottom: 8px;
   }
 
   .mobile-nav {
@@ -5323,18 +5383,9 @@ button.attachment-picker__entry,
     padding-right: 14px;
   }
 
-  .conversation-page > .mobile-header {
-    flex: 0 0 auto;
-    position: relative;
-  }
-
   .conversation-header {
     min-height: 58px;
     padding: 8px 16px;
-  }
-
-  .desktop-back {
-    display: none;
   }
 
   .conversation-header__badges .streaming-label {

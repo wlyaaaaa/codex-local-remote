@@ -11,7 +11,7 @@ beforeAll(async () => {
     localStorage: {
       getItem: () => null,
     },
-    location: { search: "" },
+    location: { hostname: "localhost", search: "" },
   });
   helpers = await import("./App");
 });
@@ -243,28 +243,93 @@ describe("Desktop 运行时健康门禁", () => {
   });
 });
 
-describe("父子对话滚动恢复", () => {
-  it("只保存每个任务的有界滚动位置，不保存任何消息正文", () => {
-    const values = new Map<string, string>();
-    const storage = {
-      getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => values.set(key, value),
-    };
-
-    helpers.writeConversationScrollPosition(storage, "parent/thread", 432.6);
-
-    expect(helpers.readConversationScrollPosition(storage, "parent/thread")).toBe(433);
-    expect(helpers.readConversationScrollPosition(storage, "other-thread")).toBeUndefined();
-    expect([...values.keys()]).toEqual(["conversation-scroll:parent%2Fthread"]);
+describe("任务初始滚动位置", () => {
+  it("首次进入任务默认定位到当前对话最下方", () => {
+    expect(helpers.initialConversationScrollTop(2_400, 915)).toBe(1_485);
+    expect(helpers.initialConversationScrollTop(600, 915)).toBe(0);
   });
 
-  it("忽略损坏或无界的持久化位置", () => {
-    expect(
-      helpers.readConversationScrollPosition({ getItem: () => "1000000001" }, "thread"),
-    ).toBeUndefined();
-    expect(
-      helpers.readConversationScrollPosition({ getItem: () => "not-a-position" }, "thread"),
-    ).toBeUndefined();
+  it("向上插入旧记录时按新增高度保持当前阅读锚点", () => {
+    expect(helpers.conversationHistoryAnchorTop(240, 2_400, 3_100)).toBe(940);
+    expect(helpers.conversationHistoryAnchorTop(0, 2_400, 3_100)).toBe(700);
+    expect(helpers.conversationHistoryAnchorTop(240, 3_100, 2_400)).toBe(240);
+  });
+
+  it("只用底部距离判断是否应继续自动锚定，不再用它展开输入区", () => {
+    expect(helpers.conversationAwayFromBottom(2_400, 915, 1_100)).toBe(true);
+    expect(helpers.conversationAwayFromBottom(2_400, 915, 1_470)).toBe(false);
+    expect(helpers.conversationAwayFromBottom(600, 915, 0)).toBe(false);
+  });
+
+  it("只有用户明确向上滚动才收起，布局高度变化不会让输入区反复闪烁", () => {
+    expect(helpers.conversationAwayAfterScroll(false, 1_485, 2_700, 915, 1_485)).toBe(false);
+    expect(helpers.conversationAwayAfterScroll(false, 1_485, 2_400, 915, 1_100)).toBe(true);
+    expect(helpers.conversationAwayAfterScroll(true, 1_100, 2_050, 915, 1_100)).toBe(true);
+    expect(helpers.conversationAwayAfterScroll(true, 1_100, 2_400, 915, 1_485)).toBe(false);
+    expect(helpers.conversationScrollWasUserDriven(1_000, 1_799)).toBe(true);
+    expect(helpers.conversationScrollWasUserDriven(1_000, 1_801)).toBe(false);
+    expect(helpers.conversationScrollWasUserDriven(0, 1_000)).toBe(false);
+  });
+
+  it("输入框默认一行，只有明确聚焦才展开，滚动到底也必须收回", () => {
+    expect(helpers.composerExpandedAfterIntent("thread-change")).toBe(false);
+    expect(helpers.composerExpandedAfterIntent("focus")).toBe(true);
+    expect(helpers.composerExpandedAfterIntent("conversation-scroll")).toBe(false);
+    expect(helpers.composerExpandedAfterIntent("blur")).toBe(false);
+    expect(helpers.composerExpandedAfterIntent("submit")).toBe(false);
+  });
+
+  it("把旧页插入现有对话顶部并去重，不改变当前运行控制状态", () => {
+    const current = {
+      id: "thread-1",
+      title: "长对话",
+      mode: "managed" as const,
+      state: "running" as const,
+      updatedAt: "2026-07-27T00:00:00.000Z",
+      historyNextCursor: "page-2",
+      items: [
+        { id: "shared", kind: "user-message" as const, text: "当前页起点" },
+        { id: "latest", kind: "assistant-message" as const, text: "最新回答" },
+      ],
+      activeTurnId: "turn-live",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    };
+    const olderPage = {
+      ...current,
+      historyNextCursor: "page-3",
+      items: [{ id: "old", kind: "user-message" as const, text: "更早内容" }, current.items[0]!],
+    };
+
+    expect(helpers.prependConversationHistory(current, olderPage)).toEqual({
+      added: 1,
+      detail: {
+        ...current,
+        historyNextCursor: "page-3",
+        items: [olderPage.items[0], ...current.items],
+      },
+    });
+  });
+});
+
+describe("运行中控制动作", () => {
+  it("输入引导消息时仍同时保留独立停止按钮", () => {
+    expect(helpers.composerActionVisibility(true, true, true)).toEqual({
+      showInterrupt: true,
+      showSubmit: true,
+    });
+    expect(helpers.composerActionVisibility(true, true, false)).toEqual({
+      showInterrupt: true,
+      showSubmit: false,
+    });
+    expect(helpers.composerActionVisibility(false, false, true)).toEqual({
+      showInterrupt: false,
+      showSubmit: true,
+    });
   });
 });
 

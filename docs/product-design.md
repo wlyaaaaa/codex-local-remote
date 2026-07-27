@@ -263,6 +263,12 @@ app-server 不提供 Desktop 原生未发送队列的接口，因此 Sidecar 待
 已登录 Web/手机之间实时同步。队列真正派发并被 app-server 接受后，Desktop
 才显示对应用户消息；产品不声称能在派发前镜像到 Desktop 输入器。
 
+同理，`turn/steer` 的当前公开响应只返回 `turnId`。Sidecar 可以确认消息已被
+当前轮接收，并在 Web/手机之间即时回显及刷新恢复，但不能要求 Desktop 为另一个
+客户端发起的引导创建本地乐观气泡。Desktop 是否即时画出该气泡属于当前 Desktop
+实现细节；本项目不伪造未声明的 Desktop 私有事件。普通下一轮和新任务仍走
+`turn/start`，被 app-server 接受后按同一任务持久化并在 Desktop 中显示。
+
 队列采用每任务 FIFO 和修订号并发控制。崩溃发生在 `turn/start` 边界时，
 先用 `clientUserMessageId` 对账；无法证明已接受或未接受时标记为“状态不明”，
 停止自动重试，由用户显式决定，避免重复发送。

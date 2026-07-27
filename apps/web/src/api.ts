@@ -48,6 +48,7 @@ import {
   demoUnsafeThreadDetail,
   demoUsage,
 } from "./demo";
+import { isDemoModeAllowed } from "./demo-mode";
 import { nextCursorFrom, type CursorPage } from "./pagination";
 
 export class ApiRequestError extends Error {
@@ -79,7 +80,7 @@ export interface ApiClient {
   }): Promise<PermissionProfileOption[]>;
   collaborationModes(): Promise<CollaborationModeOption[]>;
   threads(options?: { archived?: boolean; cursor?: string }): Promise<CursorPage<ThreadSummary>>;
-  thread(id: string): Promise<ThreadDetail>;
+  thread(id: string, historyCursor?: string): Promise<ThreadDetail>;
   threadShell(id: string): Promise<ThreadDetail>;
   createThread(input: CreateThreadInput): Promise<ThreadDetail>;
   resumeThread(threadId: string, idempotencyKey: string): Promise<ThreadDetail>;
@@ -583,8 +584,10 @@ export class HttpApiClient implements ApiClient {
     return this.requestPage<ThreadSummary>(`/threads?${query.toString()}`);
   }
 
-  thread(id: string) {
-    return this.request<ThreadDetail>(`/threads/${encodeURIComponent(id)}`);
+  thread(id: string, historyCursor?: string) {
+    const query =
+      historyCursor === undefined ? "" : `?${new URLSearchParams({ historyCursor }).toString()}`;
+    return this.request<ThreadDetail>(`/threads/${encodeURIComponent(id)}${query}`);
   }
 
   threadShell(id: string) {
@@ -953,7 +956,7 @@ class DemoApiClient implements ApiClient {
     });
   }
 
-  thread(id: string): Promise<ThreadDetail> {
+  thread(id: string, _historyCursor?: string): Promise<ThreadDetail> {
     if (id === this.detail.id) return this.later(this.detail);
     if (id === demoUnsafeThreadDetail.id) return this.later(demoUnsafeThreadDetail);
     const subagent = [...demoSubagents, ...this.createdSubagents].find(
@@ -1485,9 +1488,11 @@ class DemoApiClient implements ApiClient {
 }
 
 export function createApiClient(): ApiClient {
-  const demoRequested =
-    import.meta.env.VITE_DEMO_MODE === "true" ||
-    new URLSearchParams(window.location.search).get("demo") === "1" ||
-    window.localStorage.getItem("local-remote-demo") === "1";
+  const demoRequested = isDemoModeAllowed({
+    buildEnabled: import.meta.env.VITE_DEMO_MODE === "true",
+    hostname: window.location.hostname,
+    search: window.location.search,
+    storedPreference: window.localStorage.getItem("local-remote-demo"),
+  });
   return demoRequested ? new DemoApiClient() : new HttpApiClient();
 }

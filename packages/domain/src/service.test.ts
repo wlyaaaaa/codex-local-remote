@@ -57,6 +57,7 @@ function createService(
     protocolCatalog?: {
       approvalPolicies?: readonly string[];
       approvalReviewers?: readonly string[];
+      clientMethods?: readonly string[];
     };
     readPersistedUsageContext?: (
       threadId: string,
@@ -1941,6 +1942,215 @@ describe("CodexDomainService", () => {
         params: { includeTurns: false, threadId: "thread-shell" },
       },
     ]);
+  });
+
+  it("loads only recent full turns when the paginated protocol is available", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const recentTurn = {
+      id: "turn-recent",
+      items: [
+        {
+          content: [{ text: "最近消息", type: "text" }],
+          id: "message-recent",
+          type: "userMessage",
+        },
+      ],
+      startedAt: 1_721_000_100,
+      status: "completed",
+    };
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, turns: [] } };
+        }
+        if (method === "thread/turns/list") {
+          return {
+            data: [recentTurn],
+            nextCursor: "older",
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { protocolCatalog: { clientMethods: ["thread/turns/list"] } },
+    );
+
+    await expect(service.getThread(threadFixture.id)).resolves.toMatchObject({
+      items: [{ id: "message-recent", kind: "user-message", text: "最近消息" }],
+    });
+    expect(calls).toEqual([
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: threadFixture.id },
+      },
+      {
+        method: "thread/turns/list",
+        params: {
+          itemsView: "full",
+          limit: 12,
+          sortDirection: "desc",
+          threadId: threadFixture.id,
+        },
+      },
+    ]);
+  });
+
+  it("prefers a bounded recent item page for very long conversations", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              status: { type: "active" },
+              turns: [],
+            },
+          };
+        }
+        if (method === "thread/items/list") {
+          return {
+            data: [
+              {
+                item: {
+                  id: "assistant-latest",
+                  text: "最新回答",
+                  type: "agentMessage",
+                },
+                turnId: "turn-live",
+              },
+              {
+                item: {
+                  content: [{ text: "最近问题", type: "text" }],
+                  id: "user-recent",
+                  type: "userMessage",
+                },
+                turnId: "turn-recent",
+              },
+            ],
+            nextCursor: "older-items",
+          };
+        }
+        if (method === "thread/turns/list") {
+          return {
+            data: [
+              {
+                id: "turn-live",
+                items: [],
+                itemsView: "summary",
+                startedAt: 1_721_000_002,
+                status: "inProgress",
+              },
+              {
+                completedAt: 1_721_000_001,
+                id: "turn-recent",
+                items: [],
+                itemsView: "summary",
+                startedAt: 1_721_000_000,
+                status: "completed",
+              },
+            ],
+            nextCursor: "older-turns",
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: {
+          clientMethods: ["thread/items/list", "thread/turns/list"],
+        },
+      },
+    );
+
+    await expect(service.getThread(threadFixture.id)).resolves.toMatchObject({
+      activeTurnId: "turn-live",
+      historyNextCursor: "older-items",
+      items: [
+        { id: "user-recent", kind: "user-message", text: "最近问题" },
+        { id: "assistant-latest", kind: "assistant-message", text: "最新回答" },
+      ],
+      state: "running",
+    });
+    expect(calls).toEqual([
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: threadFixture.id },
+      },
+      {
+        method: "thread/items/list",
+        params: {
+          limit: 160,
+          sortDirection: "desc",
+          threadId: threadFixture.id,
+        },
+      },
+      {
+        method: "thread/turns/list",
+        params: {
+          itemsView: "summary",
+          limit: 12,
+          sortDirection: "desc",
+          threadId: threadFixture.id,
+        },
+      },
+    ]);
+  });
+
+  it("continues loading older item pages with the opaque app-server cursor", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, turns: [] } };
+        }
+        if (method === "thread/items/list") {
+          return {
+            data: [
+              {
+                item: {
+                  content: [{ text: "更早问题", type: "text" }],
+                  id: "user-older",
+                  type: "userMessage",
+                },
+                turnId: "turn-older",
+              },
+            ],
+          };
+        }
+        if (method === "thread/turns/list") {
+          return { data: [] };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: {
+          clientMethods: ["thread/items/list", "thread/turns/list"],
+        },
+      },
+    );
+
+    await expect(
+      service.getThread(threadFixture.id, { historyCursor: "opaque-older-page" }),
+    ).resolves.toMatchObject({
+      items: [{ id: "user-older", kind: "user-message", text: "更早问题" }],
+    });
+    expect(calls).toContainEqual({
+      method: "thread/items/list",
+      params: {
+        cursor: "opaque-older-page",
+        limit: 160,
+        sortDirection: "desc",
+        threadId: threadFixture.id,
+      },
+    });
   });
 
   it("keeps an active Desktop status conservative when the turn-head capability is unavailable", async () => {

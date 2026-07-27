@@ -1634,7 +1634,11 @@ function Get-BrokerReadinessDecision {
             return 'Wait'
         }
         'RuntimeTransition' {
-            if ($appServerReady -ceq $false) { return 'Reject' }
+            # A live managed app-server can briefly report unavailable while
+            # Desktop reconnects, resumes from sleep, or finishes an update.
+            # Runtime identity is verified independently before this decision,
+            # so keep the Sidecar alive and let the recovery loop retry.
+            if ($appServerReady -ceq $false) { return 'Wait' }
             if ($unknownCount -gt 1) { return 'Reject' }
             if ($sidecarConnected -ceq $true -and $unknownCount -eq 0) {
                 if ($degraded) { return 'Degraded' }

@@ -349,6 +349,45 @@ describe("thread projection", () => {
     ]);
   });
 
+  it("marks compaction complete when the same active turn has already continued", () => {
+    const detail = projectThreadDetail(
+      {
+        ...rawThread,
+        status: { type: "active" },
+        turns: [
+          {
+            id: "turn-active",
+            items: [
+              { id: "compaction-complete", type: "contextCompaction" },
+              {
+                command: "pnpm test",
+                commandActions: [],
+                cwd: "C:\\workspace\\sample-project",
+                id: "command-after-compaction",
+                status: "inProgress",
+                type: "commandExecution",
+              },
+            ],
+            status: "inProgress",
+          },
+        ],
+      },
+      { directInputAvailable: true, managed: true },
+    );
+
+    expect(detail.items).toEqual([
+      expect.objectContaining({
+        id: "compaction-complete",
+        operation: "context-compaction",
+        status: "complete",
+      }),
+      expect.objectContaining({
+        id: "command-after-compaction",
+        status: "running",
+      }),
+    ]);
+  });
+
   it("preserves bounded file-change status, move target, and diff without counting headers", () => {
     const detail = projectThreadDetail(
       {

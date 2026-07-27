@@ -3,11 +3,16 @@ import type { ConversationItem } from "@codex-local-remote/contracts";
 export type ConversationSegment =
   | { kind: "content"; item: ConversationItem }
   | { kind: "activity"; items: ConversationItem[] }
+  | { kind: "compaction"; item: Extract<ConversationItem, { kind: "tool" }> }
   | { kind: "subagents"; items: ConversationItem[] };
 
 export function groupConversationItems(items: readonly ConversationItem[]): ConversationSegment[] {
   const segments: ConversationSegment[] = [];
   for (const item of items) {
+    if (item.kind === "tool" && item.operation === "context-compaction") {
+      segments.push({ kind: "compaction", item });
+      continue;
+    }
     const segmentKind =
       item.kind === "tool" || item.kind === "file-change"
         ? "activity"
@@ -68,20 +73,9 @@ export function assistantPhaseForDisplay(
 
 export function conversationContentItems(
   items: readonly ConversationItem[],
-  activeTurnId?: string,
+  _activeTurnId?: string,
 ): ConversationItem[] {
-  const latestActiveCommentaryId =
-    activeTurnId === undefined ? undefined : findLatestActiveCommentaryId(items, activeTurnId);
-  return items.filter(
-    (item) =>
-      item.kind !== "reasoning-summary" &&
-      item.kind !== "plan-progress" &&
-      !(
-        item.kind === "assistant-message" &&
-        assistantPhaseForDisplay(item, items) === "commentary" &&
-        item.id !== latestActiveCommentaryId
-      ),
-  );
+  return items.filter((item) => item.kind !== "reasoning-summary" && item.kind !== "plan-progress");
 }
 
 export function latestPlanProgress(
@@ -91,31 +85,6 @@ export function latestPlanProgress(
     const item = items[index];
     if (item?.kind === "plan-progress") {
       return item.steps.length > 0 ? item : undefined;
-    }
-  }
-  return undefined;
-}
-
-function findLatestActiveCommentaryId(
-  items: readonly ConversationItem[],
-  activeTurnId: string,
-): string | undefined {
-  let latestUserIndex = -1;
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (items[index]?.kind === "user-message") {
-      latestUserIndex = index;
-      break;
-    }
-  }
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    if (
-      item?.kind === "assistant-message" &&
-      assistantPhaseForDisplay(item, items) === "commentary" &&
-      (item.turnId === activeTurnId ||
-        (item.turnId === undefined && latestUserIndex >= 0 && index > latestUserIndex))
-    ) {
-      return item.id;
     }
   }
   return undefined;

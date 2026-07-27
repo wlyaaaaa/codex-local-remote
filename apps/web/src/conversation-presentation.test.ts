@@ -47,6 +47,31 @@ describe("conversation presentation", () => {
     expect(activitySummary(items.slice(1, 3))).toBe("编辑了 1 个文件 · 运行了 1 个命令");
   });
 
+  it("keeps context compaction as a permanent standalone history record", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "compaction",
+        kind: "tool",
+        operation: "context-compaction",
+        status: "complete",
+        title: "压缩对话上下文",
+        turnId: "turn-1",
+      },
+      {
+        id: "command",
+        kind: "tool",
+        status: "complete",
+        title: "运行命令",
+        turnId: "turn-1",
+      },
+    ];
+
+    expect(groupConversationItems(items).map((segment) => segment.kind)).toEqual([
+      "compaction",
+      "activity",
+    ]);
+  });
+
   it("keeps compact subagent chips together and splits different turns", () => {
     const items: ConversationItem[] = [
       {
@@ -202,7 +227,7 @@ describe("conversation presentation", () => {
     ).toBeUndefined();
   });
 
-  it("removes historical commentary after a turn completes while keeping the final answer", () => {
+  it("keeps the complete commentary chain after a turn completes", () => {
     const items: ConversationItem[] = [
       {
         id: "commentary-1",
@@ -227,11 +252,15 @@ describe("conversation presentation", () => {
       },
     ];
 
-    expect(conversationContentItems(items).map((item) => item.id)).toEqual(["final"]);
+    expect(conversationContentItems(items).map((item) => item.id)).toEqual([
+      "commentary-1",
+      "commentary-2",
+      "final",
+    ]);
     expect(currentLivePhase(items, undefined)).toBeUndefined();
   });
 
-  it("keeps the latest active commentary visible while hiding older commentary", () => {
+  it("keeps every active commentary update in order while raw reasoning stays ephemeral", () => {
     const items: ConversationItem[] = [
       { id: "user", kind: "user-message", text: "开始", turnId: "turn-live" },
       {
@@ -258,6 +287,7 @@ describe("conversation presentation", () => {
 
     expect(conversationContentItems(items, "turn-live").map((item) => item.id)).toEqual([
       "user",
+      "commentary-1",
       "commentary-2",
     ]);
     expect(latestPlanProgress(items)?.id).toBe("plan");
