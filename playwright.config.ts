@@ -1,7 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const externalBaseUrl = process.env["CODEX_REMOTE_E2E_URL"];
-const previewPort = Number(process.env["CODEX_REMOTE_E2E_PREVIEW_PORT"] ?? "18792");
+// 18791/18792 are reserved for the shared Broker and its private app-server.
+const previewPort = Number(process.env["CODEX_REMOTE_E2E_PREVIEW_PORT"] ?? "18793");
 if (!Number.isInteger(previewPort) || previewPort < 1 || previewPort > 65_535) {
   throw new Error("CODEX_REMOTE_E2E_PREVIEW_PORT must be a valid TCP port");
 }

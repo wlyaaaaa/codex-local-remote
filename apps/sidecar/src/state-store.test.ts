@@ -56,6 +56,27 @@ describe("SidecarStateStore", () => {
     });
   });
 
+  it("checks a bound session digest synchronously without extending its idle lifetime", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    const session = await store.createSession(1_000, "csrf-digest");
+
+    expect(store.isSessionActive(session.record.tokenDigest, 1_001)).toBe(true);
+    expect(store.findSession(session.token, 1_002)).toMatchObject({
+      record: { idleExpiresAtMs: session.record.idleExpiresAtMs, lastSeenAtMs: 1_000 },
+      valid: true,
+    });
+    expect(store.isSessionActive(session.record.tokenDigest, session.record.idleExpiresAtMs)).toBe(
+      false,
+    );
+
+    await store.deleteSession(session.token);
+    expect(store.isSessionActive(session.record.tokenDigest, 1_003)).toBe(false);
+  });
+
   it("atomically restores managed ownership and a pending Desktop notification", async () => {
     const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
       path.join(os.tmpdir(), "codex-local-remote-state-"),

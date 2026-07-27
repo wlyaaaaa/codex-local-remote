@@ -1,17 +1,36 @@
+import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 
+import {
+  RpcConnectionClosedError,
+  RpcTimeoutError,
+  SharedAppServerConnectionError,
+} from "@codex-local-remote/app-server-client";
 import type {
   ApiError,
+  ApprovalPolicyOption,
+  ApprovalReviewerOption,
   AuthSession,
   CollaborationModeOption,
   CreateThreadInput,
   DiagnosticSnapshot,
+  EditQueuedTurnInput,
+  LocalInputReference,
   ModelOption,
+  PermissionProfileOption,
   ProjectSummary,
   PublicBootstrap,
+  QueueTurnInput,
+  ReorderQueuedTurnsInput,
   RemoteEvent,
+  SendQueuedTurnInput,
+  SetThreadGoalInput,
   SendTurnInput,
+  SteerQueuedTurnInput,
+  SteerTurnInput,
   ThreadDetail,
+  ThreadGoal,
+  ThreadSettingsInput,
   UsageSnapshot,
 } from "@codex-local-remote/contracts";
 import { API_SCHEMA_VERSION } from "@codex-local-remote/contracts";
@@ -36,10 +55,18 @@ import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { setupPassword } from "./auth.js";
+import { BrowserUploadStore, MAX_BROWSER_UPLOAD_BYTES } from "./browser-uploads.js";
 import type { SidecarConfig } from "./config.js";
 import { ProductHttpError } from "./errors.js";
-import { getProjectDownload, getProjectPreview, listProjectFiles } from "./files.js";
+import {
+  getProjectDownload,
+  getProjectPreview,
+  listProjectFiles,
+  resolveProjectFileReference,
+} from "./files.js";
 import type { SessionLookup, SidecarStateStore } from "./state-store.js";
+import type { SidecarTurnQueueApi } from "./turn-queue.js";
+import { OutboxConflictError } from "./turn-outbox.js";
 
 const SESSION_COOKIE = "codex_remote_session";
 const PRODUCT_NAME = "Codex Local Remote";
@@ -48,11 +75,18 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,128}$/u;
 export interface SidecarDomainApi {
   compactThread(threadId: string): Promise<void>;
   createThread(input: CreateThreadInput): Promise<ServiceResult<ThreadDetail>>;
-  getThread(threadId: string): Promise<ThreadDetail>;
+  getThread(threadId: string, options?: { includeTurns?: boolean }): Promise<ThreadDetail>;
+  getThreadGoal(threadId: string): Promise<ThreadGoal | undefined>;
   getUsage(threadId?: string): Promise<ServiceResult<UsageSnapshot>>;
   interruptTurn(threadId: string, turnId: string): Promise<TurnCommandResult>;
+  listApprovalPolicies(): Promise<ServiceResult<ApprovalPolicyOption[]>>;
+  listApprovalReviewers(): Promise<ServiceResult<ApprovalReviewerOption[]>>;
   listCollaborationModes(): Promise<ServiceResult<CollaborationModeOption[]>>;
   listModels(): Promise<ServiceResult<ModelOption[]>>;
+  listPermissionProfiles(options?: {
+    projectId?: string;
+    threadId?: string;
+  }): Promise<ServiceResult<PermissionProfileOption[]>>;
   listProjects(): Promise<ProjectSummary[]> | ProjectSummary[];
   listSubagents(
     threadId: string,
@@ -66,9 +100,12 @@ export interface SidecarDomainApi {
     searchTerm?: string;
   }): Promise<ThreadPage>;
   resumeThread(threadId: string): Promise<ThreadDetail>;
+  clearThreadGoal(threadId: string): Promise<void>;
+  setThreadGoal(threadId: string, input: SetThreadGoalInput): Promise<void>;
   setThreadName(threadId: string, name: string): Promise<void>;
   startTurn(threadId: string, input: SendTurnInput): Promise<TurnCommandResult>;
-  steerTurn(threadId: string, turnId: string, prompt: string): Promise<TurnCommandResult>;
+  steerTurn(threadId: string, turnId: string, input: SteerTurnInput): Promise<TurnCommandResult>;
+  updateThreadSettings(threadId: string, input: ThreadSettingsInput): Promise<void>;
 }
 
 export interface CreateSidecarServerOptions {
@@ -77,6 +114,8 @@ export interface CreateSidecarServerOptions {
   diagnostics: () => DiagnosticSnapshot;
   domain: SidecarDomainApi;
   events: RemoteEventBuffer;
+  queue?: SidecarTurnQueueApi;
+  requestReady?: () => boolean;
   state: SidecarStateStore;
 }
 
@@ -95,13 +134,22 @@ interface CachedCommand {
 export async function createSidecarServer(
   options: CreateSidecarServerOptions,
 ): Promise<FastifyInstance> {
-  const { approvals, config, diagnostics, domain, events, state } = options;
+  const { approvals, config, diagnostics, domain, events, queue, requestReady, state } = options;
   const app = Fastify({
     bodyLimit: 1024 * 1024,
     logger: false,
     trustProxy: (address) => isLoopbackAddress(address),
   });
+  app.addContentTypeParser(
+    "application/octet-stream",
+    { bodyLimit: MAX_BROWSER_UPLOAD_BYTES, parseAs: "buffer" },
+    (_request, body, done) => {
+      done(null, body);
+    },
+  );
   const api = `${config.basePath}/api/v1`;
+  const uploads = await BrowserUploadStore.open(config.dataDir);
+  const streamInstanceId = randomUUID();
   const idempotencyCache = new Map<string, Promise<CachedCommand>>();
   const loginLimiter = new LoginRateLimiter({
     baseDelayMs: 500,
@@ -123,6 +171,9 @@ export async function createSidecarServer(
 
   app.setErrorHandler((error, request, reply) => {
     const projected = projectError(error, request.id);
+    if (projected.status === 503 && projected.body.error.code === "DESKTOP_RUNTIME_NOT_READY") {
+      reply.header("Retry-After", "2");
+    }
     void reply.status(projected.status).send(projected.body);
   });
   app.setNotFoundHandler((request, reply) => {
@@ -144,6 +195,14 @@ export async function createSidecarServer(
       schemaVersion: API_SCHEMA_VERSION,
     };
     return body;
+  });
+
+  app.get(`${api}/ready`, async (_request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    if (requestReady?.() !== true) {
+      return await reply.header("Retry-After", "2").status(503).send({ status: "recovering" });
+    }
+    return { status: "ready" };
   });
 
   app.post(`${api}/setup/password`, async (request, reply) => {
@@ -217,9 +276,36 @@ export async function createSidecarServer(
     return unwrapServiceResult(await domain.listModels(), events);
   });
 
+  app.get(`${api}/approval-reviewers`, async (request) => {
+    await requireAuthentication(request, state);
+    return unwrapServiceResult(await domain.listApprovalReviewers(), events);
+  });
+
+  app.get(`${api}/approval-policies`, async (request) => {
+    await requireAuthentication(request, state);
+    return unwrapServiceResult(await domain.listApprovalPolicies(), events);
+  });
+
   app.get(`${api}/collaboration-modes`, async (request) => {
     await requireAuthentication(request, state);
     return unwrapServiceResult(await domain.listCollaborationModes(), events);
+  });
+
+  app.get(`${api}/permission-profiles`, async (request) => {
+    await requireAuthentication(request, state);
+    const query = asRecord(request.query);
+    const projectId = optionalString(query.projectId);
+    const threadId = optionalString(query.threadId);
+    if (projectId !== undefined && threadId !== undefined) {
+      throw new ProductHttpError("INVALID_INPUT", "项目和对话权限范围不能同时指定", 400);
+    }
+    return unwrapServiceResult(
+      await domain.listPermissionProfiles({
+        ...(projectId === undefined ? {} : { projectId }),
+        ...(threadId === undefined ? {} : { threadId }),
+      }),
+      events,
+    );
   });
 
   app.get(`${api}/threads`, async (request, reply) => {
@@ -245,25 +331,131 @@ export async function createSidecarServer(
 
   app.get(`${api}/threads/:threadId`, async (request) => {
     await requireAuthentication(request, state);
-    return await domain.getThread(routeParameter(request, "threadId"));
+    const query = asRecord(request.query);
+    const includeItems = optionalBoolean(query.includeItems) ?? true;
+    const snapshotEventSeq = events.latestSequence;
+    const detail = includeItems
+      ? await domain.getThread(routeParameter(request, "threadId"))
+      : await domain.getThread(routeParameter(request, "threadId"), {
+          includeTurns: false,
+        });
+    return attachSnapshotEventSequence(detail, snapshotEventSeq);
+  });
+
+  app.post(`${api}/uploads`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const query = asRecord(request.query);
+    const name = requireString(query.name, "请选择要上传的文件");
+    const relativePath = optionalString(query.relativePath);
+    const bytes = request.body;
+    if (!Buffer.isBuffer(bytes)) {
+      throw new ProductHttpError("INVALID_INPUT", "上传内容无效", 400);
+    }
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => ({
+      body: await uploads.save({
+        bytes,
+        name,
+        ...(relativePath === undefined ? {} : { relativePath }),
+      }),
+      status: 201,
+    }));
+    return await sendCached(reply, result);
+  });
+
+  app.get(`${api}/threads/:threadId/queue`, async (request) => {
+    await requireAuthentication(request, state);
+    return await requireQueue(queue).list(routeParameter(request, "threadId"));
+  });
+
+  app.post(`${api}/threads/:threadId/queue`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const snapshot = await requireQueue(queue).enqueue(
+      routeParameter(request, "threadId"),
+      parseQueueTurnInput(request.body),
+      requireIdempotencyScope(request, authentication),
+    );
+    return await reply.status(202).send(snapshot);
+  });
+
+  app.patch(`${api}/threads/:threadId/queue/:queueId`, async (request) => {
+    const authentication = await requireProtectedMutation(request, state);
+    return await requireQueue(queue).edit(
+      routeParameter(request, "threadId"),
+      routeParameter(request, "queueId"),
+      parseEditQueuedTurnInput(request.body),
+      requireIdempotencyScope(request, authentication),
+    );
+  });
+
+  app.delete(`${api}/threads/:threadId/queue/:queueId`, async (request) => {
+    const authentication = await requireProtectedMutation(request, state);
+    return await requireQueue(queue).remove(
+      routeParameter(request, "threadId"),
+      routeParameter(request, "queueId"),
+      requireExpectedRevision(request.body),
+      requireIdempotencyScope(request, authentication),
+    );
+  });
+
+  app.put(`${api}/threads/:threadId/queue/order`, async (request) => {
+    const authentication = await requireProtectedMutation(request, state);
+    return await requireQueue(queue).reorder(
+      routeParameter(request, "threadId"),
+      parseReorderQueuedTurnsInput(request.body),
+      requireIdempotencyScope(request, authentication),
+    );
+  });
+
+  app.post(`${api}/threads/:threadId/queue/:queueId/send`, async (request) => {
+    const authentication = await requireProtectedMutation(request, state);
+    return await requireQueue(queue).send(
+      routeParameter(request, "threadId"),
+      routeParameter(request, "queueId"),
+      parseSendQueuedTurnInput(request.body),
+      requireIdempotencyScope(request, authentication),
+    );
+  });
+
+  app.post(`${api}/threads/:threadId/queue/:queueId/steer`, async (request) => {
+    const authentication = await requireProtectedMutation(request, state);
+    return await requireQueue(queue).steer(
+      routeParameter(request, "threadId"),
+      routeParameter(request, "queueId"),
+      parseSteerQueuedTurnInput(request.body),
+      requireIdempotencyScope(request, authentication),
+    );
   });
 
   app.post(`${api}/threads`, async (request, reply) => {
     const authentication = await requireProtectedMutation(request, state);
+    if (requestReady?.() !== true) {
+      throw new ProductHttpError(
+        "DESKTOP_RUNTIME_NOT_READY",
+        "电脑端连接正在恢复，请稍后重试",
+        503,
+      );
+    }
     const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const snapshotEventSeq = events.latestSequence;
       const created = await domain.createThread(parseCreateThreadInput(request.body));
       publishDegradations(created.degradations, events);
-      return { body: created.data, status: 201 };
+      return { body: attachSnapshotEventSequence(created.data, snapshotEventSeq), status: 201 };
     });
     return await sendCached(reply, result);
   });
 
   app.post(`${api}/threads/:threadId/resume`, async (request, reply) => {
     const authentication = await requireProtectedMutation(request, state);
-    const result = await runIdempotent(request, authentication, idempotencyCache, async () => ({
-      body: await domain.resumeThread(routeParameter(request, "threadId")),
-      status: 200,
-    }));
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const snapshotEventSeq = events.latestSequence;
+      return {
+        body: attachSnapshotEventSequence(
+          await domain.resumeThread(routeParameter(request, "threadId")),
+          snapshotEventSeq,
+        ),
+        status: 200,
+      };
+    });
     return await sendCached(reply, result);
   });
 
@@ -288,12 +480,56 @@ export async function createSidecarServer(
     return await sendCached(reply, result);
   });
 
+  app.get(`${api}/threads/:threadId/goal`, async (request) => {
+    await requireAuthentication(request, state);
+    return {
+      goal: (await domain.getThreadGoal(routeParameter(request, "threadId"))) ?? null,
+    };
+  });
+
+  app.put(`${api}/threads/:threadId/goal`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      await domain.setThreadGoal(
+        routeParameter(request, "threadId"),
+        parseSetThreadGoalInput(request.body),
+      );
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.delete(`${api}/threads/:threadId/goal`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      await domain.clearThreadGoal(routeParameter(request, "threadId"));
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.patch(`${api}/threads/:threadId/settings`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      await domain.updateThreadSettings(
+        routeParameter(request, "threadId"),
+        parseThreadSettingsInput(request.body),
+      );
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
   app.post(`${api}/threads/:threadId/turns`, async (request, reply) => {
     const authentication = await requireProtectedMutation(request, state);
     const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const snapshotEventSeq = events.latestSequence;
       const threadId = routeParameter(request, "threadId");
       await domain.startTurn(threadId, parseSendTurnInput(request.body));
-      return { body: await domain.getThread(threadId), status: 200 };
+      return {
+        body: attachSnapshotEventSequence(await domain.getThread(threadId), snapshotEventSeq),
+        status: 200,
+      };
     });
     return await sendCached(reply, result);
   });
@@ -301,11 +537,45 @@ export async function createSidecarServer(
   app.post(`${api}/threads/:threadId/turns/:turnId/steer`, async (request, reply) => {
     const authentication = await requireProtectedMutation(request, state);
     const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
-      await domain.steerTurn(
-        routeParameter(request, "threadId"),
-        routeParameter(request, "turnId"),
-        requireString(asRecord(request.body).prompt, "请输入补充要求"),
+      const threadId = routeParameter(request, "threadId");
+      const turnId = routeParameter(request, "turnId");
+      const input = parseSteerTurnInput(request.body);
+      const aliasId = `pending-steer-${randomUUID()}`;
+      events.append(
+        "thread.item",
+        {
+          item: [
+            {
+              id: aliasId,
+              kind: "user-message",
+              text: input.prompt,
+            },
+          ],
+          lifecycle: "started",
+          localRemoteAlias: "steer",
+        },
+        { threadId, turnId },
       );
+      try {
+        await domain.steerTurn(threadId, turnId, input);
+      } catch (error) {
+        events.append(
+          "thread.item",
+          {
+            item: [
+              {
+                id: aliasId,
+                kind: "user-message",
+                text: input.prompt,
+              },
+            ],
+            lifecycle: "failed",
+            localRemoteAlias: "steer-cancel",
+          },
+          { threadId, turnId },
+        );
+        throw error;
+      }
       return { status: 204 };
     });
     return await sendCached(reply, result);
@@ -374,6 +644,16 @@ export async function createSidecarServer(
     );
   });
 
+  app.get(`${api}/files/resolve`, async (request) => {
+    await requireAuthentication(request, state);
+    const query = asRecord(request.query);
+    return await resolveProjectFileReference(
+      state,
+      optionalString(query.projectId),
+      requireString(query.path, "请选择文件"),
+    );
+  });
+
   app.get(`${api}/files/preview`, async (request, reply) => {
     await requireAuthentication(request, state);
     const query = asRecord(request.query);
@@ -420,8 +700,20 @@ export async function createSidecarServer(
   });
 
   app.get(`${api}/events`, async (request, reply) => {
-    await requireAuthentication(request, state);
-    openEventStream(request, reply, events);
+    const authentication = await requireAuthentication(request, state);
+    const query = asRecord(request.query);
+    const queryCursor = optionalEventStreamCursor(query.cursor);
+    const threadId = optionalEventStreamThreadId(query.threadId);
+    openEventStream(
+      request,
+      reply,
+      events,
+      streamInstanceId,
+      state,
+      authentication.record.tokenDigest,
+      queryCursor,
+      threadId,
+    );
   });
 
   if (await directoryExists(config.webDir)) {
@@ -438,6 +730,20 @@ export async function createSidecarServer(
       const suffix = routeParameter(request, "*");
       if (suffix === "api" || suffix.startsWith("api/")) {
         throw new ProductHttpError("NOT_FOUND", "找不到这个页面", 404);
+      }
+      if (suffix === "assets" || suffix.startsWith("assets/")) {
+        const segments = suffix.split("/");
+        if (
+          suffix === "assets" ||
+          suffix.includes("\\") ||
+          suffix.includes("\0") ||
+          segments.some((segment) => segment === "" || segment === "." || segment === "..")
+        ) {
+          throw new ProductHttpError("NOT_FOUND", "找不到这个资源", 404);
+        }
+        return await reply
+          .header("Cache-Control", "public, max-age=31536000, immutable")
+          .sendFile(suffix);
       }
       return await reply.header("Cache-Control", "no-cache").sendFile("index.html");
     });
@@ -676,16 +982,7 @@ async function runIdempotent(
   cache: Map<string, Promise<CachedCommand>>,
   command: () => Promise<CachedCommand>,
 ): Promise<CachedCommand> {
-  const key = headerValue(request.headers["idempotency-key"]);
-  if (!key || !IDEMPOTENCY_KEY.test(key)) {
-    throw new ProductHttpError("IDEMPOTENCY_KEY_REQUIRED", "请求标识缺失，请刷新页面后重试", 400);
-  }
-  const cacheKey = [
-    authentication.record.tokenDigest,
-    request.method,
-    request.routeOptions.url,
-    key,
-  ].join(":");
+  const cacheKey = requireIdempotencyScope(request, authentication);
   const cached = cache.get(cacheKey);
   if (cached) {
     return await cached;
@@ -705,6 +1002,32 @@ async function runIdempotent(
     cache.delete(cacheKey);
     throw error;
   }
+}
+
+function requireIdempotencyScope(
+  request: FastifyRequest,
+  authentication: AuthenticatedRequest,
+): string {
+  const key = headerValue(request.headers["idempotency-key"]);
+  if (!key || !IDEMPOTENCY_KEY.test(key)) {
+    throw new ProductHttpError("IDEMPOTENCY_KEY_REQUIRED", "请求标识缺失，请刷新页面后重试", 400);
+  }
+  const routeParameters = isRecord(request.params) ? request.params : {};
+  const targets = Object.entries(routeParameters)
+    .sort(([left], [right]) => left.localeCompare(right, "en-US"))
+    .map(([name, value]) => {
+      if (typeof value !== "string" || !value || value.length > 512) {
+        throw new ProductHttpError("INVALID_ROUTE_TARGET", "请求目标无效", 400);
+      }
+      return `${name}=${encodeURIComponent(value)}`;
+    });
+  return [
+    authentication.record.tokenDigest,
+    request.method,
+    request.routeOptions.url,
+    ...targets,
+    key,
+  ].join(":");
 }
 
 async function sendCached(reply: FastifyReply, result: CachedCommand) {
@@ -729,10 +1052,22 @@ function publishDegradations(degradations: ServiceDegradation[], events: RemoteE
   }
 }
 
+function attachSnapshotEventSequence(detail: ThreadDetail, snapshotEventSeq: number): ThreadDetail {
+  return {
+    ...detail,
+    snapshotEventSeq,
+  };
+}
+
 function openEventStream(
   request: FastifyRequest,
   reply: FastifyReply,
   events: RemoteEventBuffer,
+  streamInstanceId: string,
+  state: SidecarStateStore,
+  sessionTokenDigest: string,
+  queryCursor?: string,
+  threadId?: string,
 ): void {
   const raw = reply.raw;
   reply.hijack();
@@ -742,16 +1077,58 @@ function openEventStream(
     "Content-Type": "text/event-stream; charset=utf-8",
     "X-Accel-Buffering": "no",
   });
-  const lastEventId = optionalInteger(headerValue(request.headers["last-event-id"]));
-  const replay = events.replayAfter(lastEventId);
-  const unsubscribe = events.subscribe((event) => {
-    writeEvent(raw, event);
+  const lastEventId = headerValue(request.headers["last-event-id"]) ?? queryCursor;
+  const cursor = parseEventStreamCursor(lastEventId);
+  const replay =
+    lastEventId === undefined
+      ? events.replayAfter(events.latestSequence)
+      : cursor?.instanceId === streamInstanceId
+        ? events.replayAfter(cursor.sequence)
+        : { events: [], resetRequired: true };
+  let heartbeat: NodeJS.Timeout | undefined;
+  let closed = false;
+  let unsubscribe: () => void = () => undefined;
+  const closeStream = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    if (heartbeat !== undefined) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    unsubscribe();
+    if (!raw.destroyed && !raw.writableEnded) {
+      raw.end();
+    }
+  };
+  const writeAuthenticatedEvent = (event: RemoteEvent): boolean => {
+    if (!eventMatchesSubscription(event, threadId)) {
+      return true;
+    }
+    if (!state.isSessionActive(sessionTokenDigest, Date.now())) {
+      closeStream();
+      return false;
+    }
+    if (!writeEvent(raw, event, streamInstanceId)) {
+      closeStream();
+      return false;
+    }
+    return true;
+  };
+  unsubscribe = events.subscribe((event) => {
+    writeAuthenticatedEvent(event);
   });
+  raw.once("close", closeStream);
   if (replay.resetRequired) {
-    writeEvent(raw, events.createResetEvent());
+    if (!writeAuthenticatedEvent(events.createResetEvent())) {
+      return;
+    }
   } else {
     for (const event of replay.events) {
-      writeEvent(raw, event);
+      if (!writeAuthenticatedEvent(event)) {
+        return;
+      }
     }
   }
   const ready: RemoteEvent = {
@@ -761,22 +1138,70 @@ function openEventStream(
     seq: events.latestSequence,
     type: "connection.ready",
   };
-  writeEvent(raw, ready);
-  const heartbeat = setInterval(() => {
-    if (!raw.destroyed) {
-      raw.write(": keepalive\n\n");
+  if (!writeAuthenticatedEvent(ready)) {
+    return;
+  }
+  heartbeat = setInterval(() => {
+    if (!state.isSessionActive(sessionTokenDigest, Date.now())) {
+      closeStream();
+      return;
+    }
+    if (!raw.destroyed && !raw.writableEnded && !raw.write(": keepalive\n\n")) {
+      closeStream();
     }
   }, 25_000);
   heartbeat.unref();
-  raw.once("close", () => {
-    clearInterval(heartbeat);
-    unsubscribe();
-  });
 }
 
-function writeEvent(stream: FastifyReply["raw"], event: RemoteEvent): void {
-  if (!stream.destroyed) {
-    stream.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+function optionalEventStreamCursor(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
+}
+
+function optionalEventStreamThreadId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
+}
+
+export function eventMatchesSubscription(event: RemoteEvent, threadId?: string): boolean {
+  const detailScoped =
+    event.type === "thread.item" ||
+    event.type === "usage.updated" ||
+    event.type === "queue.updated" ||
+    (event.type === "diagnostic" && event.threadId !== undefined);
+  if (!detailScoped || event.threadId === undefined) {
+    return true;
+  }
+  return threadId !== undefined && event.threadId === threadId;
+}
+
+function parseEventStreamCursor(
+  value: string | undefined,
+): { instanceId: string; sequence: number } | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const match = /^([^:]+):(0|[1-9][0-9]*)$/u.exec(value);
+  if (!match) {
+    return undefined;
+  }
+  const sequence = Number(match[2]);
+  if (!Number.isSafeInteger(sequence)) {
+    return undefined;
+  }
+  return { instanceId: match[1] ?? "", sequence };
+}
+
+export function writeEvent(
+  stream: FastifyReply["raw"],
+  event: RemoteEvent,
+  streamInstanceId: string,
+): boolean {
+  if (stream.destroyed || stream.writableEnded) {
+    return false;
+  }
+  try {
+    return stream.write(`id: ${streamInstanceId}:${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+  } catch {
+    return false;
   }
 }
 
@@ -796,26 +1221,197 @@ function setSecurityHeaders(reply: FastifyReply): void {
 
 function parseCreateThreadInput(value: unknown): CreateThreadInput {
   const body = asRecord(value);
+  const attachments = parseLocalInputReferences(body.attachments);
+  const approvalPolicy = optionalString(body.approvalPolicy);
+  const approvalsReviewer = optionalString(body.approvalsReviewer);
   const collaborationMode = optionalString(body.collaborationMode);
   const model = optionalString(body.model);
+  const permissionProfileId = optionalString(body.permissionProfileId);
+  const projectId = optionalString(body.projectId);
+  const serviceTier = optionalString(body.serviceTier);
   return {
-    projectId: requireString(body.projectId, "请选择项目"),
     prompt: requireString(body.prompt, "请输入消息"),
+    ...(attachments === undefined ? {} : { attachments }),
+    ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+    ...(approvalsReviewer === undefined ? {} : { approvalsReviewer }),
     ...(collaborationMode === undefined ? {} : { collaborationMode }),
     ...(model === undefined ? {} : { model }),
+    ...(permissionProfileId === undefined ? {} : { permissionProfileId }),
+    ...(projectId === undefined ? {} : { projectId }),
     ...(isPermissionMode(body.permissionMode) ? { permissionMode: body.permissionMode } : {}),
     ...(isReasoningEffort(body.reasoningEffort) ? { reasoningEffort: body.reasoningEffort } : {}),
+    ...(serviceTier === undefined ? {} : { serviceTier }),
   };
 }
 
 function parseSendTurnInput(value: unknown): SendTurnInput {
   const body = asRecord(value);
+  const attachments = parseLocalInputReferences(body.attachments);
+  const approvalPolicy = optionalString(body.approvalPolicy);
+  const approvalsReviewer = optionalString(body.approvalsReviewer);
+  const collaborationMode = optionalString(body.collaborationMode);
   const model = optionalString(body.model);
+  const permissionProfileId = optionalString(body.permissionProfileId);
+  const serviceTier = optionalString(body.serviceTier);
   return {
     prompt: requireString(body.prompt, "请输入消息"),
+    ...(attachments === undefined ? {} : { attachments }),
+    ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+    ...(approvalsReviewer === undefined ? {} : { approvalsReviewer }),
+    ...(collaborationMode === undefined ? {} : { collaborationMode }),
     ...(model === undefined ? {} : { model }),
+    ...(permissionProfileId === undefined ? {} : { permissionProfileId }),
     ...(isReasoningEffort(body.reasoningEffort) ? { reasoningEffort: body.reasoningEffort } : {}),
+    ...(serviceTier === undefined ? {} : { serviceTier }),
   };
+}
+
+function parseThreadSettingsInput(value: unknown): ThreadSettingsInput {
+  const body = asRecord(value);
+  const reasoningEffort = optionalNullableSetting(body, "reasoningEffort", "思考等级无效");
+  if (
+    typeof reasoningEffort === "string" &&
+    (reasoningEffort.length > 64 || reasoningEffort.trim() !== reasoningEffort)
+  ) {
+    throw new ProductHttpError("INVALID_INPUT", "思考等级无效", 400);
+  }
+  return {
+    ...nullableSetting(body, "model", "模型无效"),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    ...nullableSetting(body, "serviceTier", "速度设置无效"),
+    ...nullableSetting(body, "permissionProfileId", "权限设置无效"),
+    ...nullableSetting(body, "approvalPolicy", "审批策略无效"),
+    ...nullableSetting(body, "approvalsReviewer", "审批方式无效"),
+    ...nullableSetting(body, "collaborationMode", "协作模式无效"),
+  };
+}
+
+function parseSetThreadGoalInput(value: unknown): SetThreadGoalInput {
+  const body = asRecord(value);
+  const tokenBudget = optionalInteger(body.tokenBudget);
+  if (Object.hasOwn(body, "tokenBudget") && (tokenBudget === undefined || tokenBudget <= 0)) {
+    throw new ProductHttpError("INVALID_INPUT", "目标额度必须是正整数", 400);
+  }
+  return {
+    objective: requireString(body.objective, "请输入目标"),
+    ...(tokenBudget === undefined ? {} : { tokenBudget }),
+  };
+}
+
+function parseQueueTurnInput(value: unknown): QueueTurnInput {
+  const body = asRecord(value);
+  const attachments = parseLocalInputReferences(body.attachments);
+  const approvalPolicy = optionalString(body.approvalPolicy);
+  const approvalsReviewer = optionalString(body.approvalsReviewer);
+  const collaborationMode = optionalString(body.collaborationMode);
+  const model = optionalString(body.model);
+  const permissionProfileId = optionalString(body.permissionProfileId);
+  const serviceTier = optionalString(body.serviceTier);
+  return {
+    prompt: requireString(body.prompt, "请输入消息"),
+    ...(attachments === undefined ? {} : { attachments }),
+    ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+    ...(approvalsReviewer === undefined ? {} : { approvalsReviewer }),
+    ...(collaborationMode === undefined ? {} : { collaborationMode }),
+    ...(model === undefined ? {} : { model }),
+    ...(permissionProfileId === undefined ? {} : { permissionProfileId }),
+    ...(isReasoningEffort(body.reasoningEffort) ? { reasoningEffort: body.reasoningEffort } : {}),
+    ...(serviceTier === undefined ? {} : { serviceTier }),
+  };
+}
+
+function parseSteerTurnInput(value: unknown): SteerTurnInput {
+  const body = asRecord(value);
+  const attachments = parseLocalInputReferences(body.attachments);
+  return {
+    prompt: requireString(body.prompt, "请输入补充要求"),
+    ...(attachments === undefined ? {} : { attachments }),
+  };
+}
+
+function parseLocalInputReferences(value: unknown): LocalInputReference[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 20) {
+    throw new ProductHttpError("INVALID_INPUT", "一次最多添加 20 个文件或文件夹", 400);
+  }
+  return value.map((candidate) => {
+    const reference = asRecord(candidate);
+    const projectId = optionalString(reference.projectId);
+    const uploadId = optionalString(reference.uploadId);
+    const relativePath = requireString(reference.relativePath, "附件路径无效");
+    const projectReference = projectId !== undefined && uploadId === undefined;
+    const uploadReference = uploadId !== undefined && projectId === undefined;
+    if (
+      (!projectReference && !uploadReference) ||
+      (projectId?.length ?? uploadId?.length ?? 0) > 512 ||
+      relativePath.length > 32_768 ||
+      relativePath.includes("\0")
+    ) {
+      throw new ProductHttpError("INVALID_INPUT", "附件路径无效", 400);
+    }
+    if (reference.kind !== "file" && reference.kind !== "directory") {
+      throw new ProductHttpError("INVALID_INPUT", "附件类型无效", 400);
+    }
+    if (uploadReference && reference.kind !== "file") {
+      throw new ProductHttpError("INVALID_INPUT", "浏览器上传仅支持文件", 400);
+    }
+    return {
+      kind: reference.kind,
+      relativePath,
+      ...(projectId === undefined ? {} : { projectId }),
+      ...(uploadId === undefined ? {} : { uploadId }),
+    };
+  });
+}
+
+function parseEditQueuedTurnInput(value: unknown): EditQueuedTurnInput {
+  return {
+    ...parseQueueTurnInput(value),
+    expectedRevision: requireExpectedRevision(value),
+  };
+}
+
+function parseReorderQueuedTurnsInput(value: unknown): ReorderQueuedTurnsInput {
+  const body = asRecord(value);
+  if (
+    !Array.isArray(body.queueIds) ||
+    body.queueIds.length > 500 ||
+    body.queueIds.some(
+      (queueId) =>
+        typeof queueId !== "string" ||
+        !queueId.trim() ||
+        queueId.trim() !== queueId ||
+        queueId.length > 512,
+    )
+  ) {
+    throw new ProductHttpError("INVALID_INPUT", "排队顺序无效", 400);
+  }
+  return {
+    expectedRevision: requireExpectedRevision(value),
+    queueIds: body.queueIds as string[],
+  };
+}
+
+function parseSendQueuedTurnInput(value: unknown): SendQueuedTurnInput {
+  return {
+    expectedRevision: requireExpectedRevision(value),
+    ...(asRecord(value).retryAmbiguous === true ? { retryAmbiguous: true } : {}),
+  };
+}
+
+function parseSteerQueuedTurnInput(value: unknown): SteerQueuedTurnInput {
+  return {
+    expectedRevision: requireExpectedRevision(value),
+    turnId: requireString(asRecord(value).turnId, "当前回复无效"),
+  };
+}
+
+function requireExpectedRevision(value: unknown): number {
+  const revision = optionalInteger(asRecord(value).expectedRevision);
+  if (revision === undefined || revision < 0) {
+    throw new ProductHttpError("INVALID_INPUT", "排队版本无效", 400);
+  }
+  return revision;
 }
 
 function parseApprovalAnswers(value: unknown): Record<string, string[]> | undefined {
@@ -845,6 +1441,13 @@ function routeParameter(request: FastifyRequest, name: string): string {
   return requireString(asRecord(request.params)[name], "请求路径无效");
 }
 
+function requireQueue(queue: SidecarTurnQueueApi | undefined): SidecarTurnQueueApi {
+  if (!queue) {
+    throw new ProductHttpError("QUEUE_UNAVAILABLE", "远程消息队列尚未就绪，请稍后重试", 503);
+  }
+  return queue;
+}
+
 function requireString(value: unknown, message: string): string {
   if (typeof value !== "string" || !value.trim() || value.length > 16_384) {
     throw new ProductHttpError("INVALID_INPUT", message, 400);
@@ -856,6 +1459,38 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 && value.length <= 16_384
     ? value
     : undefined;
+}
+
+function optionalNullableSetting(
+  body: Record<string, unknown>,
+  key: keyof ThreadSettingsInput,
+  message: string,
+): string | null | undefined {
+  if (!Object.hasOwn(body, key)) {
+    return undefined;
+  }
+  const value = body[key];
+  if (value === null) {
+    return null;
+  }
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 512 ||
+    value.trim() !== value
+  ) {
+    throw new ProductHttpError("INVALID_INPUT", message, 400);
+  }
+  return value;
+}
+
+function nullableSetting<K extends keyof ThreadSettingsInput>(
+  body: Record<string, unknown>,
+  key: K,
+  message: string,
+): Partial<Pick<ThreadSettingsInput, K>> {
+  const value = optionalNullableSetting(body, key, message);
+  return value === undefined ? {} : ({ [key]: value } as Partial<Pick<ThreadSettingsInput, K>>);
 }
 
 function optionalInteger(value: unknown): number | undefined {
@@ -939,11 +1574,22 @@ function projectError(error: unknown, requestId: string): { body: ApiError; stat
   if (
     error instanceof ProductHttpError ||
     error instanceof DomainError ||
-    error instanceof ApprovalResolutionError
+    error instanceof ApprovalResolutionError ||
+    error instanceof OutboxConflictError
   ) {
     return {
       body: apiError(error.code, error.message, requestId),
       status: error.httpStatus,
+    };
+  }
+  if (
+    error instanceof RpcConnectionClosedError ||
+    error instanceof RpcTimeoutError ||
+    error instanceof SharedAppServerConnectionError
+  ) {
+    return {
+      body: apiError("DESKTOP_RUNTIME_NOT_READY", "电脑端连接正在恢复，请稍后重试", requestId),
+      status: 503,
     };
   }
   const statusCode = asRecord(error).statusCode;

@@ -12,6 +12,7 @@ const typeChecked = tseslint.configs.recommendedTypeChecked.map((config) => ({
 export default tseslint.config(
   {
     ignores: [
+      "**/.local/**",
       "**/dist/**",
       "**/coverage/**",
       "**/playwright-report/**",

@@ -4,7 +4,13 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { getProjectDownload, getProjectPreview, listProjectFiles } from "./files.js";
+import { ProductHttpError } from "./errors.js";
+import {
+  getProjectDownload,
+  getProjectPreview,
+  listProjectFiles,
+  resolveProjectFileReference,
+} from "./files.js";
 import { SidecarStateStore } from "./state-store.js";
 
 const temporaryDirectories: string[] = [];
@@ -54,17 +60,83 @@ describe("project file boundary", () => {
   });
 
   it("authorizes safe previews and rejects sensitive or traversing downloads", async () => {
-    const { state } = await createFixture();
+    const { root, state } = await createFixture();
 
     await expect(getProjectPreview(state, "project-1", "docs/README.md")).resolves.toMatchObject({
       contentType: "text/markdown; charset=utf-8",
     });
+    await expect(
+      resolveProjectFileReference(state, "project-1", path.join(root, "docs", "README.md")),
+    ).resolves.toMatchObject({
+      downloadable: true,
+      kind: "file",
+      name: "README.md",
+      relativePath: "docs/README.md",
+    });
     await expect(getProjectDownload(state, "project-1", ".env")).rejects.toMatchObject({
       code: "FILE_ACCESS_DENIED",
+    });
+    await expect(
+      resolveProjectFileReference(state, "project-1", path.join(root, ".env")),
+    ).rejects.toMatchObject({
+      code: "FILE_PROTECTED",
     });
     await expect(getProjectDownload(state, "project-1", "../outside.txt")).rejects.toMatchObject({
       code: "FILE_ACCESS_DENIED",
     });
+  });
+
+  it("resolves an absolute file against the deepest registered project even without a thread project", async () => {
+    const { root, state } = await createFixture();
+    const nestedRoot = path.join(root, "nested-project");
+    await mkdir(path.join(nestedRoot, "src"), { recursive: true });
+    const nestedFile = path.join(nestedRoot, "src", "index.ts");
+    await writeFile(nestedFile, "export const ready = true;\n", "utf8");
+    await state.registerProject({
+      id: "project-nested",
+      name: "嵌套项目",
+      root: nestedRoot,
+      source: "registered",
+    });
+
+    await expect(resolveProjectFileReference(state, undefined, nestedFile)).resolves.toMatchObject({
+      downloadable: true,
+      kind: "file",
+      name: "index.ts",
+      projectId: "project-nested",
+      relativePath: "src/index.ts",
+    });
+    await expect(
+      resolveProjectFileReference(state, "project-1", nestedFile),
+    ).resolves.toMatchObject({
+      projectId: "project-nested",
+      relativePath: "src/index.ts",
+    });
+  });
+
+  it("keeps ambiguous relative history paths read-only until a registered project is known", async () => {
+    const { state } = await createFixture();
+
+    await expect(
+      resolveProjectFileReference(state, undefined, "docs/README.md"),
+    ).rejects.toMatchObject({
+      code: "FILE_PROJECT_REQUIRED",
+    });
+  });
+
+  it("explains that Git internals stay protected while the recorded diff remains viewable", async () => {
+    const { root, state } = await createFixture();
+    await writeFile(path.join(root, ".git", "config"), "[core]\n", "utf8");
+
+    try {
+      await resolveProjectFileReference(state, "project-1", path.join(root, ".git", "config"));
+      expect.unreachable("受保护的 Git 文件不应被远程读取");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProductHttpError);
+      if (!(error instanceof ProductHttpError)) return;
+      expect(error.code).toBe("FILE_PROTECTED");
+      expect(error.message).toContain("修改差异仍可查看");
+    }
   });
 
   it("rejects every file sink when a registered root is rebound to a junction", async () => {

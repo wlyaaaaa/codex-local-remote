@@ -1,0 +1,231 @@
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+const windowsOnly = process.platform === "win32" ? describe : describe.skip;
+const repositoryRoot = resolve(import.meta.dirname, "..", "..");
+const scripts = join(repositoryRoot, "scripts", "windows");
+const driver = join(import.meta.dirname, "fixtures", "scheduler-mock-driver.ps1");
+
+interface RegistrationResult {
+  Status: string;
+  LaunchMode: string;
+  LauncherShortcut: string;
+  LegacyPersistentOverride: string;
+  BrokerCapabilityToken: string;
+}
+
+interface ShortcutDefinition {
+  Arguments: string;
+  WindowStyle: number;
+}
+
+function writeRuntimeFile(path: string) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "", "utf8");
+}
+
+windowsOnly("Windows fail-open lifecycle", () => {
+  let sandbox: string;
+  let installRoot: string;
+  let dataDir: string;
+  let nodePath: string;
+  let stateFile: string;
+
+  beforeEach(() => {
+    sandbox = join(
+      tmpdir(),
+      `codex-remote-fail-open-lifecycle-${process.pid}-${crypto.randomUUID()}`,
+    );
+    installRoot = join(sandbox, "install root");
+    dataDir = join(sandbox, "managed data");
+    nodePath = join(sandbox, "Node Runtime", "node.exe");
+    stateFile = join(sandbox, "scheduler.json");
+    for (const path of [
+      nodePath,
+      join(installRoot, "apps", "sidecar", "dist", "cli.js"),
+      join(installRoot, "apps", "broker", "dist", "cli.js"),
+      join(installRoot, "scripts", "windows", "Start-CodexLocalRemote.ps1"),
+      join(installRoot, "scripts", "windows", "Launch-CodexWithRemote.ps1"),
+    ]) {
+      writeRuntimeFile(path);
+    }
+    writeFileSync(stateFile, JSON.stringify({ Task: null, Operations: [] }), "utf8");
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  function register() {
+    return runLifecycle("register");
+  }
+
+  function readShortcut(path: string): ShortcutDefinition {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SHORTCUT_PATH); [pscustomobject]@{Arguments=$s.Arguments;WindowStyle=$s.WindowStyle}|ConvertTo-Json -Compress",
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        env: { ...process.env, SHORTCUT_PATH: path },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    return JSON.parse(result.stdout.trim()) as ShortcutDefinition;
+  }
+
+  function writeShortcutArguments(path: string, argumentsValue: string) {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SHORTCUT_PATH); $s.Arguments=$env:SHORTCUT_ARGUMENTS; $s.Save()",
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SHORTCUT_PATH: path,
+          SHORTCUT_ARGUMENTS: argumentsValue,
+        },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  }
+
+  function runLifecycle(operation: "register" | "unregister") {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        driver,
+        "-TargetScript",
+        join(
+          scripts,
+          operation === "register"
+            ? "Register-CodexLocalRemoteStartup.ps1"
+            : "Unregister-CodexLocalRemoteStartup.ps1",
+        ),
+        "-StateFile",
+        stateFile,
+        "-Operation",
+        operation,
+        "-InstallRoot",
+        installRoot,
+        "-DataDir",
+        dataDir,
+        "-NodePath",
+        nodePath,
+        "-ExerciseFailOpenLifecycle",
+        "-JsonResult",
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        env: { ...process.env, LOCALAPPDATA: sandbox },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    return JSON.parse(result.stdout.trim()) as RegistrationResult;
+  }
+
+  it("installs a capability token and exact safe launcher without a persistent override", () => {
+    const registration = register();
+    expect(registration).toMatchObject({
+      Status: "registered",
+      LaunchMode: "process-scoped-fail-open",
+      LauncherShortcut: "created",
+      LegacyPersistentOverride: "not-found",
+      BrokerCapabilityToken: "created",
+    });
+    expect(existsSync(join(dataDir, "broker-capability.token"))).toBe(true);
+    const shortcutPath = join(dataDir, "Codex Remote safe launch.lnk");
+    expect(existsSync(shortcutPath)).toBe(true);
+    expect(readShortcut(shortcutPath)).toMatchObject({
+      WindowStyle: 7,
+    });
+    expect(readShortcut(shortcutPath).Arguments).toContain("-WindowStyle Hidden");
+  });
+
+  it("retires an exact stale managed environment state when no override remains", () => {
+    register();
+    const legacyStatePath = join(dataDir, "windows-broker-environment.json");
+    writeFileSync(
+      legacyStatePath,
+      JSON.stringify({
+        Signature: "codex-local-remote/user-environment/v2",
+        Version: 2,
+        AppliedValueSha256: "a".repeat(64),
+        PreviousUserValueExists: false,
+        PreviousUserValue: null,
+      }),
+      "utf8",
+    );
+
+    const registration = register();
+    expect(registration).toMatchObject({
+      Status: "already-registered",
+      LaunchMode: "process-scoped-fail-open",
+      LauncherShortcut: "reused",
+      LegacyPersistentOverride: "stale-state-removed",
+      BrokerCapabilityToken: "reused",
+    });
+    expect(existsSync(legacyStatePath)).toBe(false);
+  });
+
+  it("upgrades the exact older visible-window launcher in place", () => {
+    register();
+    const shortcutPath = join(dataDir, "Codex Remote safe launch.lnk");
+    const current = readShortcut(shortcutPath);
+    writeShortcutArguments(shortcutPath, current.Arguments.replace(" -WindowStyle Hidden", ""));
+
+    const registration = register();
+    expect(registration).toMatchObject({
+      Status: "already-registered",
+      LauncherShortcut: "upgraded",
+    });
+    expect(readShortcut(shortcutPath).Arguments).toContain("-WindowStyle Hidden");
+  });
+
+  it("unregisters only the exact launcher, token, and legacy residue", () => {
+    register();
+    const removal = runLifecycle("unregister");
+    expect(removal).toMatchObject({
+      Status: "removed",
+      LaunchMode: "native-only",
+      LauncherShortcut: "removed",
+      LegacyPersistentOverride: "not-found",
+      BrokerCapabilityToken: "removed",
+    });
+    expect(existsSync(join(dataDir, "broker-capability.token"))).toBe(false);
+    expect(existsSync(join(dataDir, "Codex Remote safe launch.lnk"))).toBe(false);
+  });
+
+  it("contains no normal registration path that writes the user override", () => {
+    const registration = readFileSync(
+      join(scripts, "Register-CodexLocalRemoteStartup.ps1"),
+      "utf8",
+    );
+    expect(registration).not.toContain("Install-BrokerUserEnvironment");
+    expect(registration).not.toContain("Set-UserEnvironmentValue");
+    expect(registration).not.toMatch(/EnvironmentVariableTarget\]::User/u);
+    expect(registration).not.toMatch(/setx(?:\.exe)?\b/iu);
+  });
+});

@@ -1,11 +1,17 @@
 import {
+  createContext,
   Fragment,
+  isValidElement,
+  memo,
   useCallback,
+  useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type FormEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import {
   NavLink,
@@ -19,17 +25,22 @@ import {
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import type {
+  ApprovalPolicyOption,
   ApprovalRequest,
+  ApprovalReviewerOption,
   AuthSession,
   CollaborationModeOption,
   DiagnosticSnapshot,
   FileEntry,
   FileListing,
+  ResolvedFileEntry,
+  LocalInputReference,
   ModelOption,
-  PermissionMode,
+  PermissionProfileOption,
   ProductCapabilities,
   ProjectSummary,
   PublicBootstrap,
+  QueuedTurnItem,
   ReasoningEffort,
   RemoteEvent,
   RunState,
@@ -53,6 +64,7 @@ import {
 } from "@codex-local-remote/ui";
 import { ApiRequestError, createApiClient, type ApiClient } from "./api";
 import { authenticatedBootstrap, loggedOutBootstrap } from "./auth-state";
+import { browserAttentionTitle } from "./browser-attention";
 import {
   OTHER_ANSWER,
   approvalInputType,
@@ -61,13 +73,22 @@ import {
   isApprovalQuestionAnswered,
   type ApprovalAnswerDrafts,
 } from "./approval";
+import {
+  approvalPolicyDescription,
+  approvalPolicyLabel,
+  chooseApprovalPolicy,
+} from "./approval-policies";
+import {
+  approvalReviewerDescription,
+  approvalReviewerLabel,
+  chooseApprovalReviewer,
+} from "./approval-reviewers";
 import { canDirectlyCompose } from "./permissions";
 import {
   applyContextCompactionEvents,
   beginContextCompactionRequest,
   canRequestContextCompaction,
   contextCompactionAttemptFromThread,
-  isContextCompactionBusy,
   markContextCompactionRecoveryRequired,
   reconcileContextCompactionSnapshot,
   type ContextCompactionAttempt,
@@ -77,33 +98,148 @@ import {
 } from "./context-compaction";
 import { PaginationFooter } from "./PaginationFooter";
 import { registeredProjects } from "./project-access";
-import { WORKSPACE_REFRESH_MS, canRefreshDocument, threadRefreshDelay } from "./refresh";
-import { mergeCursorItems, nextCursorAfterRefresh, type CursorPage } from "./pagination";
-import { threadRuntimeSummary } from "./thread-runtime";
 import {
-  defaultReasoningEffortForModel,
-  normalizeReasoningEffort,
-  normalizeReasoningEffortForModel,
-} from "./model-effort";
+  WORKSPACE_REFRESH_MS,
+  canRefreshDocument,
+  isTextEntryElement,
+  reconcileFetchedApprovals,
+  reconcileSelectedApproval,
+  resolvedApprovalId,
+  threadRefreshDelay,
+  workspaceEventNeedsRefresh,
+} from "./refresh";
+import {
+  mergeCursorItems,
+  mergeRefreshedFirstPage,
+  nextCursorAfterRefresh,
+  type CursorPage,
+} from "./pagination";
+import { defaultReasoningEffortForModel, normalizeReasoningEffortForModel } from "./model-effort";
+import {
+  choosePermissionProfileId,
+  chooseServiceTier,
+  newThreadRuntimeSettings,
+} from "./new-thread-settings";
+import {
+  clearNewThreadDraft,
+  initialNewThreadProject,
+  readNewThreadDraft,
+  writeNewThreadDraft,
+} from "./new-thread-draft";
+import {
+  activitySummary,
+  assistantPhaseForDisplay,
+  conversationContentItems,
+  currentLivePhase,
+  groupConversationItems,
+  latestPlanProgress,
+} from "./conversation-presentation";
 import { fileChangeStatusLabel, toolFallbackSummary } from "./terminal-display";
+import { DiffView } from "./DiffView";
+import { localFilePathFromHref } from "./file-link";
+import {
+  localeCopy,
+  readUiLocale,
+  writeUiLocale,
+  type UiLocale,
+  type UiLocaleCopy,
+} from "./locale";
+import { homeActivityThreads, isHomeActivityThread } from "./home-activity";
 import {
   applyThreadRemoteEvents,
   applyUsageRemoteEvents,
+  cancelSubmittedTurnUserAlias,
+  consumeNextTurnSettingsDraft,
+  createThreadRemoteEventProjectionState,
   detailFromThreadSummary,
+  nextTurnSettingsInput,
+  nextTurnSettingsDraft,
+  rememberSubmittedTurnUserAlias,
+  reserveSubmittedTurnUserAlias,
+  reconcileThreadSnapshotLists,
+  reconcileNextTurnSettingsDraft,
+  synchronizeThreadRemoteEventProjection,
+  threadSummaryFromSnapshotEvent,
+  updateNextTurnSettingsDraft,
 } from "./live-thread";
 import {
+  compactThreadNavigationState,
+  findCreationPromptLiveAliasItemId,
+  mergeAuthoritativeThreadControl,
   mergeThreadRefresh,
+  persistedCreationPromptItemId,
+  readThreadNavigationCache,
+  reconcileLiveCreationPromptAlias,
+  sortThreadsForDisplay,
+  threadInitialPromptFromNavigationState,
   threadNavigationState,
   threadSeedFromNavigationState,
+  writeThreadNavigationCache,
 } from "./thread-navigation";
+import { threadLocationLabelForDisplay, threadTitleForDisplay } from "./thread-title";
+import { UserMessageText } from "./UserMessageText";
 import {
+  ComposerSettingsButton,
+  ComposerSettingsSheet,
+  ComposerToolsSheet,
+  DeliveryModeSwitch,
+  GoalSheet,
+  InlineDecisionStack,
+  PermissionButton,
+  PlanProgressControl,
+  PlanModeSheet,
+  QueueShelf,
+  type ComposerDestination,
+} from "./ComposerControls";
+import {
+  collaborationModeSetting,
+  CODEX_DEFAULT_SERVICE_TIER,
+  composerDeliveryDecision,
+  composerFeatureSupported,
+  filterThreadApprovals,
+  moveQueueItem,
+  serviceTierDisplayLabel,
+  serviceTierSetting,
+  serviceTierOptions,
+  type ComposerCapabilities,
+} from "./composer-product";
+import {
+  contextPresentation,
+  contextUsageOrbLabel,
   creditBalanceLabel,
+  formatUtc8Time,
+  quotaPresentation,
+  remainingContextPercentLabel,
   remainingFromUsedPercent,
   remainingPercentLabel,
+  usageWindowForDisplay,
   usedPercentLabel,
 } from "./usage-display";
+import {
+  INITIAL_CONVERSATION_ITEM_LIMIT,
+  hiddenConversationItemCount,
+  nextConversationItemLimit,
+  visibleConversationItems,
+} from "./conversation-window";
+import { reduceRuntimeNotice, type RuntimeNotice } from "./runtime-notice";
+import { dismissNotice, noticeDismissalKey, readNoticeDismissal } from "./notice-dismissal";
+import { workspaceLoadFailurePolicy } from "./workspace-recovery";
 
 const api = createApiClient();
+
+const UiLocaleContext = createContext<{
+  copy: UiLocaleCopy;
+  locale: UiLocale;
+  setLocale: (locale: UiLocale) => void;
+}>({
+  copy: localeCopy("zh"),
+  locale: "zh",
+  setLocale: () => undefined,
+});
+
+function useUiLocale() {
+  return useContext(UiLocaleContext);
+}
 
 type LoadState = "loading" | "ready" | "error";
 type MoreState = "idle" | "loading" | "error";
@@ -114,6 +250,87 @@ type LiveEventEnvelope = {
   event: RemoteEvent;
   replayed: boolean;
 };
+
+export function partitionLiveDeliveriesAtReset<T extends { event: { type: string } }>(
+  pending: readonly T[],
+): { beforeReset: T[]; reset?: T; afterReset: T[] } {
+  let resetIndex = -1;
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    if (pending[index]?.event.type === "connection.reset") {
+      resetIndex = index;
+      break;
+    }
+  }
+  if (resetIndex < 0) {
+    return { beforeReset: [...pending], afterReset: [] };
+  }
+  return {
+    beforeReset: pending.slice(0, resetIndex),
+    reset: pending[resetIndex]!,
+    afterReset: pending.slice(resetIndex + 1),
+  };
+}
+
+export function isReplayDelivery(
+  envelope: Pick<LiveEventEnvelope, "deliveryId" | "replayed">,
+  retainedReplayThrough: number,
+): boolean {
+  return envelope.replayed || envelope.deliveryId <= retainedReplayThrough;
+}
+
+export function threadIdFromConversationPath(pathname: string): string | undefined {
+  const match = /^\/threads\/([^/]+)$/u.exec(pathname);
+  if (!match?.[1]) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return undefined;
+  }
+}
+
+type FilePreviewDerivedState = {
+  generation: number;
+  requestKey: string;
+  state: LoadState;
+  text: string;
+  url: string;
+  contentType: string;
+  error: string;
+};
+
+type FilePreviewRequest = Pick<FilePreviewDerivedState, "generation" | "requestKey">;
+
+export function filePreviewRequestKey(projectId: string, relativePath: string): string {
+  return JSON.stringify([projectId, relativePath]);
+}
+
+function loadingFilePreviewState(request: FilePreviewRequest): FilePreviewDerivedState {
+  return {
+    ...request,
+    state: "loading",
+    text: "",
+    url: "",
+    contentType: "",
+    error: "",
+  };
+}
+
+export function visibleFilePreviewState(
+  state: FilePreviewDerivedState,
+  requestKey: string,
+  generation: number,
+): FilePreviewDerivedState {
+  return state.requestKey === requestKey && state.generation === generation
+    ? state
+    : loadingFilePreviewState({ requestKey, generation });
+}
+
+export function isCurrentFilePreviewRequest(
+  current: FilePreviewRequest,
+  candidate: FilePreviewRequest,
+): boolean {
+  return current.generation === candidate.generation && current.requestKey === candidate.requestKey;
+}
 
 const MAX_LIVE_EVENTS = 2_048;
 
@@ -167,16 +384,20 @@ function effortLabel(effort: ReasoningEffort): string {
   return effortLabels[effort] ?? effort;
 }
 
-const permissionOptions: Array<{
-  id: PermissionMode;
-  title: string;
-  description: string;
-  icon: IconName;
-}> = [
-  { id: "ask", title: "按需询问", description: "敏感操作先向你确认", icon: "shield" },
-  { id: "workspace-write", title: "可编辑项目", description: "允许修改当前项目文件", icon: "code" },
-  { id: "read-only", title: "只读", description: "仅检查和回答，不改文件", icon: "file" },
-];
+function runtimeOptionLabel(id: string): string {
+  const compact = id.replace(/[_-]+/gu, " ").trim();
+  if (!compact) return "Codex 动态选项";
+  return compact.replace(/\b\p{L}/gu, (letter) => letter.toUpperCase());
+}
+
+function permissionProfileLabel(id: string): string {
+  const labels: Readonly<Record<string, string>> = {
+    ":danger-full-access": "完全访问",
+    ":read-only": "只读",
+    ":workspace": "工作区",
+  };
+  return labels[id] ?? runtimeOptionLabel(id);
+}
 
 function errorMessage(error: unknown) {
   if (error instanceof ApiRequestError) return error.message;
@@ -223,25 +444,222 @@ function number(value?: number) {
 function capabilityLabel(value: keyof ProductCapabilities) {
   const labels: Record<keyof ProductCapabilities, string> = {
     appServer: "Codex 服务",
-    desktopSnapshots: "桌面快照",
+    approvalPolicies: "审批策略",
+    approvalReviewers: "审批方式",
+    collaborationModes: "协作模式",
+    compact: "上下文压缩",
+    desktopSnapshots: "Desktop 同步",
     fileBrowser: "项目文件",
-    liveEvents: "托管任务实时事件",
+    goals: "任务目标",
+    inlineApprovals: "线程内审批",
+    liveEvents: "共享任务实时事件",
+    permissionProfiles: "动态权限",
+    queue: "下一轮队列",
+    serviceTiers: "速度档位",
+    settingsUpdate: "下一轮设置同步",
     subagents: "子智能体",
     usage: "额度信息",
   };
   return labels[value];
 }
 
-function capabilityTone(value: ProductCapabilities[keyof ProductCapabilities]): StatusTone {
+function capabilityTone(
+  value: ProductCapabilities[keyof ProductCapabilities] | undefined,
+): StatusTone {
   if (value === "available") return "success";
   if (value === "degraded") return "warning";
   return "danger";
 }
 
-function capabilityState(value: ProductCapabilities[keyof ProductCapabilities]) {
+function capabilityState(value: ProductCapabilities[keyof ProductCapabilities] | undefined) {
   if (value === "available") return "正常";
   if (value === "degraded") return "有限可用";
   return "不可用";
+}
+
+export function appServerReady(capabilities: ComposerCapabilities | undefined): boolean {
+  return (capabilities as Record<string, unknown> | undefined)?.appServer === "available";
+}
+
+export function hostStatus(
+  online: boolean,
+  capabilities: ComposerCapabilities | undefined,
+): { label: string; ready: boolean; tone: StatusTone } {
+  const ready = online && appServerReady(capabilities);
+  return {
+    label: ready ? "电脑在线" : online ? "兼容性待确认" : "连接中断",
+    ready,
+    tone: ready ? "success" : online ? "warning" : "danger",
+  };
+}
+
+export function conversationControlState(
+  online: boolean,
+  capabilities: ComposerCapabilities | undefined,
+  snapshot: boolean,
+): { available: boolean; reason: string } {
+  if (!online) {
+    return { available: false, reason: "与电脑的实时连接已中断" };
+  }
+  if (!appServerReady(capabilities)) {
+    return { available: false, reason: "Codex 运行时兼容性待确认" };
+  }
+  if (snapshot) {
+    return { available: false, reason: "先把这项历史任务接入 Desktop，才能继续操作" };
+  }
+  return { available: true, reason: "" };
+}
+
+export function canShowThreadComposer(
+  thread: Pick<
+    ThreadDetail,
+    "activeTurnId" | "availableActions" | "mode" | "parentThreadId" | "state"
+  >,
+  controlAvailable: boolean,
+): boolean {
+  if (!controlAvailable || thread.mode === "desktop-snapshot" || thread.parentThreadId) {
+    return false;
+  }
+  const running =
+    Boolean(thread.activeTurnId) ||
+    thread.state === "running" ||
+    thread.state === "waiting-for-approval";
+  return canDirectlyCompose(thread) || (thread.mode === "managed" && running);
+}
+
+export function desktopSnapshotPresentation(
+  parentThreadId: string | undefined,
+  snapshotDelaySeconds: number | undefined,
+): {
+  description: string;
+  resumable: boolean;
+  statusLabel: string;
+  title: string;
+} {
+  if (parentThreadId) {
+    return {
+      description:
+        "这里会完整显示子智能体的进度与结果。子智能体由父任务控制；需要补充要求时，请返回父对话。",
+      resumable: false,
+      statusLabel: "子智能体",
+      title: "子智能体记录",
+    };
+  }
+  return {
+    description: `当前显示的是电脑上的历史记录，内容可能延迟${
+      snapshotDelaySeconds ? `约 ${snapshotDelaySeconds} 秒` : ""
+    }。接入后会把同一任务同步到 Desktop、Web 和手机；不需要先在电脑里手动打开。`,
+    resumable: true,
+    statusLabel: "历史记录",
+    title: "这是一项历史任务",
+  };
+}
+
+export function shouldSeedThreadFromLateSummary(
+  currentThreadId: string | undefined,
+  routeSeedId: string | undefined,
+  summaryId: string | undefined,
+): boolean {
+  return currentThreadId === undefined && routeSeedId === undefined && summaryId !== undefined;
+}
+
+export function shouldShowConversationLoading(
+  detailProjectionReady: boolean,
+  _visibleItemCount: number,
+): boolean {
+  return !detailProjectionReady;
+}
+
+export function readConversationScrollPosition(
+  storage: Pick<Storage, "getItem">,
+  threadId: string,
+): number | undefined {
+  try {
+    const raw = storage.getItem(`conversation-scroll:${encodeURIComponent(threadId)}`);
+    if (raw === null || !/^\d+(?:\.\d+)?$/u.test(raw)) return undefined;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 && value <= 1_000_000_000 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeConversationScrollPosition(
+  storage: Pick<Storage, "setItem">,
+  threadId: string,
+  scrollTop: number,
+): void {
+  if (!Number.isFinite(scrollTop) || scrollTop < 0 || scrollTop > 1_000_000_000) return;
+  try {
+    storage.setItem(
+      `conversation-scroll:${encodeURIComponent(threadId)}`,
+      Math.round(scrollTop).toString(),
+    );
+  } catch {
+    // Scroll restoration is best-effort and must never block task control.
+  }
+}
+
+export function readConversationAttachments(
+  storage: Pick<Storage, "getItem">,
+  threadId: string,
+): LocalInputReference[] {
+  try {
+    const raw = storage.getItem(`conversation-attachments:${encodeURIComponent(threadId)}`);
+    if (raw === null) return [];
+    const value: unknown = JSON.parse(raw);
+    if (!Array.isArray(value) || value.length > 20) return [];
+    const attachments: LocalInputReference[] = [];
+    for (const candidate of value) {
+      if (typeof candidate !== "object" || candidate === null) return [];
+      const reference = candidate as Record<string, unknown>;
+      const projectId =
+        typeof reference.projectId === "string" && reference.projectId.length <= 512
+          ? reference.projectId
+          : undefined;
+      const uploadId =
+        typeof reference.uploadId === "string" && reference.uploadId.length <= 512
+          ? reference.uploadId
+          : undefined;
+      if (
+        (projectId === undefined) === (uploadId === undefined) ||
+        (reference.kind !== "file" && reference.kind !== "directory") ||
+        (uploadId !== undefined && reference.kind !== "file") ||
+        typeof reference.relativePath !== "string" ||
+        !reference.relativePath ||
+        reference.relativePath.length > 32_768 ||
+        reference.relativePath.includes("\0")
+      ) {
+        return [];
+      }
+      attachments.push({
+        kind: reference.kind,
+        relativePath: reference.relativePath,
+        ...(projectId === undefined ? {} : { projectId }),
+        ...(uploadId === undefined ? {} : { uploadId }),
+      });
+    }
+    return attachments;
+  } catch {
+    return [];
+  }
+}
+
+export function writeConversationAttachments(
+  storage: Pick<Storage, "removeItem" | "setItem">,
+  threadId: string,
+  attachments: readonly LocalInputReference[],
+): void {
+  const key = `conversation-attachments:${encodeURIComponent(threadId)}`;
+  try {
+    if (attachments.length === 0) {
+      storage.removeItem(key);
+      return;
+    }
+    storage.setItem(key, JSON.stringify(attachments.slice(0, 20)));
+  } catch {
+    // Attachment references are best-effort drafts and must never block task control.
+  }
 }
 
 function useMediaQuery(query: string) {
@@ -256,40 +674,139 @@ function useMediaQuery(query: string) {
   return matches;
 }
 
-function Wordmark({ compact = false }: { compact?: boolean }) {
+function LanguageToggle({ className = "" }: { className?: string }) {
+  const { copy, locale, setLocale } = useUiLocale();
+  return (
+    <button
+      aria-label={copy.languageLabel}
+      className={`language-toggle ${className}`.trim()}
+      data-testid="language-toggle"
+      onClick={() => setLocale(locale === "zh" ? "en" : "zh")}
+      type="button"
+    >
+      <Icon name="code" size={15} />
+      <span>{copy.languageChoice}</span>
+    </button>
+  );
+}
+
+function localizedThreadLocation(thread: ThreadSummary, copy: UiLocaleCopy): string {
+  const location = threadLocationLabelForDisplay(thread);
+  return location === "无项目" ? copy.unprojected : location;
+}
+
+function Wordmark() {
+  const { copy } = useUiLocale();
   return (
     <div className="wordmark">
       <span className="wordmark__mark">
-        <Icon name="terminal" size={compact ? 18 : 20} />
+        <Icon name="terminal" size={20} />
       </span>
-      {compact ? null : (
-        <span>
-          <strong>Local Remote</strong>
-          <small>桌面 AI 控制台</small>
-        </span>
-      )}
+      <span>
+        <strong>Local Remote</strong>
+        <small>{copy.brandSubtitle}</small>
+      </span>
     </div>
   );
 }
 
-function Markdown({ children, compact = false }: { children: string; compact?: boolean }) {
+function Markdown({
+  apiClient,
+  children,
+  compact = false,
+  online = false,
+  projectId,
+}: {
+  apiClient?: ApiClient;
+  children: string;
+  compact?: boolean;
+  online?: boolean;
+  projectId?: string;
+}) {
+  const [linkedFile, setLinkedFile] = useState<FileEntry>();
+  const [linkedFileError, setLinkedFileError] = useState("");
+  const [linkedFileLoading, setLinkedFileLoading] = useState(false);
+
+  function closeLinkedFile() {
+    setLinkedFile(undefined);
+    setLinkedFileError("");
+    setLinkedFileLoading(false);
+  }
+
   return (
-    <div className={compact ? "markdown markdown--compact" : "markdown"}>
-      <ReactMarkdown
-        rehypePlugins={[rehypeSanitize]}
-        skipHtml
-        components={{
-          a: ({ children: linkChildren, ...props }) => (
-            <a {...props} rel="noreferrer" target="_blank">
-              {linkChildren}
-            </a>
-          ),
-          img: () => <span className="unsafe-content-note">图片链接已隐藏</span>,
-        }}
+    <>
+      <div className={compact ? "markdown markdown--compact" : "markdown"}>
+        <ReactMarkdown
+          rehypePlugins={[rehypeSanitize]}
+          skipHtml
+          components={{
+            a: ({ children: linkChildren, href, ...props }) => {
+              const localPath = apiClient && projectId ? localFilePathFromHref(href) : undefined;
+              return localPath ? (
+                <a
+                  {...props}
+                  href={href}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    if (!online || !apiClient || !projectId) {
+                      setLinkedFileError("电脑当前离线，恢复连接后才能打开这个文件。");
+                      return;
+                    }
+                    setLinkedFile(undefined);
+                    setLinkedFileError("");
+                    setLinkedFileLoading(true);
+                    void apiClient
+                      .resolveFile(projectId, localPath)
+                      .then((entry) => setLinkedFile(entry))
+                      .catch((error: unknown) => setLinkedFileError(errorMessage(error)))
+                      .finally(() => setLinkedFileLoading(false));
+                  }}
+                >
+                  {linkChildren}
+                </a>
+              ) : (
+                <a {...props} href={href} rel="noreferrer" target="_blank">
+                  {linkChildren}
+                </a>
+              );
+            },
+            img: () => <span className="unsafe-content-note">图片链接已隐藏</span>,
+          }}
+        >
+          {children}
+        </ReactMarkdown>
+      </div>
+      <Sheet
+        onClose={closeLinkedFile}
+        open={linkedFileLoading || linkedFile !== undefined || Boolean(linkedFileError)}
+        title={linkedFile?.name ?? (linkedFileLoading ? "正在打开文件" : "无法打开文件")}
       >
-        {children}
-      </ReactMarkdown>
-    </div>
+        {linkedFileLoading ? (
+          <div className="activity-detail__loading">
+            <Skeleton />
+            <Skeleton width="72%" />
+          </div>
+        ) : linkedFileError ? (
+          <EmptyState description={linkedFileError} icon="alert" title="文件不可用" />
+        ) : linkedFile && apiClient && projectId ? (
+          linkedFile.kind === "file" ? (
+            <FilePreview
+              apiClient={apiClient}
+              embedded
+              entry={linkedFile}
+              online={online}
+              projectId={projectId}
+            />
+          ) : (
+            <EmptyState
+              description="这是一个文件夹。请从输入框的“文件和文件夹”入口添加，或前往文件页浏览。"
+              icon="folder"
+              title="已定位文件夹"
+            />
+          )
+        ) : null}
+      </Sheet>
+    </>
   );
 }
 
@@ -318,19 +835,48 @@ function LoadingPage() {
   );
 }
 
-function Notice({
+function noticeText(node: ReactNode): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(noticeText).join(" ");
+  if (isValidElement<{ children?: ReactNode }>(node)) return noticeText(node.props.children);
+  return "";
+}
+
+export function Notice({
   tone = "info",
   icon,
   title,
   children,
   action,
+  dismissKey,
+  dismissible = true,
 }: {
   tone?: StatusTone;
   icon: IconName;
   title: string;
   children: ReactNode;
   action?: ReactNode;
+  dismissKey?: string;
+  dismissible?: boolean;
 }) {
+  const key =
+    dismissKey ??
+    noticeDismissalKey(
+      window.location.hash || window.location.pathname,
+      title,
+      noticeText(children),
+    );
+  const [dismissed, setDismissed] = useState(
+    () => dismissible && readNoticeDismissal(window.localStorage, key),
+  );
+
+  useEffect(() => {
+    setDismissed(dismissible && readNoticeDismissal(window.localStorage, key));
+  }, [dismissible, key]);
+
+  if (dismissed) return null;
+
   return (
     <div className={`notice notice--${tone}`}>
       <Icon name={icon} size={20} />
@@ -339,6 +885,20 @@ function Notice({
         <div>{children}</div>
       </div>
       {action ? <span className="notice__action">{action}</span> : null}
+      {dismissible ? (
+        <button
+          aria-label={`关闭提示：${title}`}
+          className="notice__dismiss"
+          onClick={() => {
+            dismissNotice(window.localStorage, key);
+            setDismissed(true);
+          }}
+          title="关闭，刷新后不再显示"
+          type="button"
+        >
+          <Icon name="close" size={15} />
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -475,6 +1035,7 @@ function ConnectionError({ onRetry }: { onRetry: () => void }) {
 }
 
 function ThreadRow({ thread, compact = false }: { thread: ThreadSummary; compact?: boolean }) {
+  const { copy } = useUiLocale();
   return (
     <NavLink
       className={({ isActive }) => `thread-row ${isActive ? "is-active" : ""}`}
@@ -483,41 +1044,61 @@ function ThreadRow({ thread, compact = false }: { thread: ThreadSummary; compact
     >
       <span className={`thread-row__state thread-row__state--${thread.state}`} />
       <span className="thread-row__body">
-        <strong>{thread.title}</strong>
+        <strong>{threadTitleForDisplay(thread.title)}</strong>
         <span>
-          {thread.mode === "desktop-snapshot" ? "桌面快照" : (thread.cwdLabel ?? "未关联项目")}
+          {thread.pinnedRank === undefined ? "" : `${copy.pinned} · `}
+          {thread.mode === "desktop-snapshot"
+            ? copy.history
+            : localizedThreadLocation(thread, copy)}
           {!compact ? ` · ${timeAgo(thread.updatedAt)}` : ""}
         </span>
       </span>
+      {thread.pinnedRank === undefined ? null : (
+        <span aria-label="已置顶" className="thread-row__pin">
+          <Icon name="pin" size={15} />
+        </span>
+      )}
       {thread.state === "waiting-for-approval" ? <Icon name="alert" size={17} /> : null}
     </NavLink>
   );
 }
 
-const navItems: Array<{ to: string; label: string; icon: IconName; end?: boolean }> = [
-  { to: "/", label: "首页", icon: "home", end: true },
-  { to: "/threads", label: "对话", icon: "message" },
-  { to: "/files", label: "文件", icon: "folder" },
-  { to: "/settings", label: "设置", icon: "settings" },
-];
+function navItems(copy: UiLocaleCopy): Array<{
+  to: string;
+  label: string;
+  icon: IconName;
+  end?: boolean;
+}> {
+  return [
+    { to: "/", label: copy.nav[0], icon: "message", end: true },
+    { to: "/files", label: copy.nav[1], icon: "folder" },
+    { to: "/settings", label: copy.nav[2], icon: "settings" },
+  ];
+}
 
 function DesktopRail({ threads }: { threads: ThreadSummary[] }) {
+  const { copy } = useUiLocale();
+  const sorted = sortThreadsForDisplay(threads);
+  const pinned = sorted.filter((thread) => thread.pinnedRank !== undefined).slice(0, 3);
+  const recent = sorted.filter((thread) => thread.pinnedRank === undefined).slice(0, 3);
   return (
     <aside className="desktop-rail">
       <div className="desktop-rail__brand">
         <Wordmark />
         <Button
-          aria-label="新建对话"
+          aria-label={copy.newTask}
           icon="plus"
-          size="icon"
           variant="primary"
           onClick={() => {
             window.location.hash = "#/new";
           }}
-        />
+          size="compact"
+        >
+          {copy.newShort}
+        </Button>
       </div>
       <nav aria-label="主导航" className="rail-nav" data-testid="primary-navigation">
-        {navItems.map((item) => (
+        {navItems(copy).map((item) => (
           <NavLink
             className={({ isActive }) => (isActive ? "is-active" : "")}
             data-testid={item.to === "/files" ? "files-open" : undefined}
@@ -531,18 +1112,31 @@ function DesktopRail({ threads }: { threads: ThreadSummary[] }) {
           </NavLink>
         ))}
       </nav>
+      {pinned.length > 0 ? (
+        <>
+          <div className="rail-section-heading">
+            <span>{copy.pinned}</span>
+            <NavLink to="/">{copy.viewAll}</NavLink>
+          </div>
+          <div className="rail-threads">
+            {pinned.map((thread) => (
+              <ThreadRow compact key={thread.id} thread={thread} />
+            ))}
+          </div>
+        </>
+      ) : null}
       <div className="rail-section-heading">
-        <span>最近对话</span>
-        <NavLink to="/threads">查看全部</NavLink>
+        <span>{copy.recent}</span>
+        {pinned.length === 0 ? <NavLink to="/">{copy.viewAll}</NavLink> : null}
       </div>
       <div className="rail-threads">
-        {threads.slice(0, 6).map((thread) => (
+        {recent.map((thread) => (
           <ThreadRow compact key={thread.id} thread={thread} />
         ))}
       </div>
       <div className="rail-footer">
         <span className="connection-dot" />
-        <span>已连接到电脑</span>
+        <span>{copy.connected}</span>
       </div>
     </aside>
   );
@@ -558,18 +1152,19 @@ function MobileHeader({
   action?: ReactNode;
 }) {
   const navigate = useNavigate();
+  const { copy } = useUiLocale();
   return (
     <header className="mobile-header">
       {back ? (
         <Button
-          aria-label="返回"
+          aria-label={copy.back}
           icon="arrow-left"
           onClick={() => navigate(-1)}
           size="icon"
           variant="ghost"
         />
       ) : (
-        <Wordmark compact />
+        <span aria-hidden="true" className="mobile-header__spacer" />
       )}
       <strong>{title}</strong>
       <span className="mobile-header__action">{action ?? <span />}</span>
@@ -578,9 +1173,10 @@ function MobileHeader({
 }
 
 function MobileNav({ approvalCount }: { approvalCount: number }) {
+  const { copy } = useUiLocale();
   return (
     <nav aria-label="主导航" className="mobile-nav" data-testid="primary-navigation">
-      {navItems.map((item) => (
+      {navItems(copy).map((item) => (
         <NavLink
           className={({ isActive }) => (isActive ? "is-active" : "")}
           data-testid={item.to === "/files" ? "files-open" : undefined}
@@ -591,7 +1187,7 @@ function MobileNav({ approvalCount }: { approvalCount: number }) {
         >
           <span className="mobile-nav__icon">
             <Icon name={item.icon} size={21} />
-            {item.to === "/threads" && approvalCount > 0 ? <b>{approvalCount}</b> : null}
+            {item.to === "/" && approvalCount > 0 ? <b>{approvalCount}</b> : null}
           </span>
           <span>{item.label}</span>
         </NavLink>
@@ -626,8 +1222,63 @@ function ConnectionBanner({ online, demo }: { online: boolean; demo: boolean }) 
   );
 }
 
-function UsageMini({ usage }: { usage: UsageSnapshot | undefined }) {
-  const window = usage?.windows[0];
+function UsageOrb({
+  usage,
+  refreshing,
+  open,
+  buttonRef,
+  onClick,
+}: {
+  usage: UsageSnapshot | undefined;
+  refreshing: boolean;
+  open: boolean;
+  buttonRef: RefObject<HTMLButtonElement | null>;
+  onClick: () => void;
+}) {
+  const presentation = contextPresentation(usage);
+  const usedPercent = presentation.usedPercent;
+  const ringPercent = Math.max(0, Math.min(100, usedPercent ?? 0));
+  return (
+    <button
+      aria-label={contextUsageOrbLabel(presentation, refreshing)}
+      aria-controls="conversation-usage-panel"
+      aria-expanded={open}
+      className={`usage-orb usage-orb--${presentation.state}`}
+      data-testid="usage-open"
+      onClick={onClick}
+      ref={buttonRef}
+      title={contextUsageOrbLabel(presentation, false)}
+      type="button"
+    >
+      <span
+        aria-hidden="true"
+        className="usage-orb__ring"
+        style={{
+          background: `conic-gradient(var(--usage-orb-color) ${ringPercent}%, var(--usage-orb-track) 0)`,
+        }}
+      >
+        <span>
+          {refreshing ? (
+            <Icon name="activity" size={14} />
+          ) : usedPercent === undefined ? (
+            "—"
+          ) : (
+            Math.round(usedPercent)
+          )}
+        </span>
+      </span>
+    </button>
+  );
+}
+
+function UsageMini({
+  usage,
+  preferredModel,
+}: {
+  usage: UsageSnapshot | undefined;
+  preferredModel?: string;
+}) {
+  const window = usageWindowForDisplay(usage?.windows, preferredModel);
   if (!window) {
     return (
       <div className="usage-mini">
@@ -651,8 +1302,11 @@ function UsageMini({ usage }: { usage: UsageSnapshot | undefined }) {
       <small>
         {remainingPercentLabel(window.remainingPercent)}
         {" · "}
-        {window.resetsAt ? `${absoluteTime(window.resetsAt)} 重置` : "重置时间暂时无法读取"}
+        {window.resetsAt ? `${formatUtc8Time(window.resetsAt)} 重置` : "重置时间暂时无法读取"}
       </small>
+      {(usage?.windows.length ?? 0) > 1 ? (
+        <small>另有 {(usage?.windows.length ?? 1) - 1} 个额度窗口，可在详情查看</small>
+      ) : null}
       <CreditsList compact credits={usage?.credits} />
     </div>
   );
@@ -720,7 +1374,10 @@ function RightInspector({
           <span>额度</span>
           <NavLink to="/settings">详情</NavLink>
         </div>
-        <UsageMini usage={usage} />
+        <UsageMini
+          {...(currentThread?.model ? { preferredModel: currentThread.model } : {})}
+          usage={usage}
+        />
       </section>
       {currentThread ? (
         <>
@@ -748,7 +1405,9 @@ function RightInspector({
               <small>
                 {usedPercentLabel(threadUsage?.context?.usedPercent)}
                 {" · "}
-                {remainingPercentLabel(remainingFromUsedPercent(threadUsage?.context?.usedPercent))}
+                {remainingContextPercentLabel(
+                  remainingFromUsedPercent(threadUsage?.context?.usedPercent),
+                )}
               </small>
             </div>
           </section>
@@ -773,201 +1432,10 @@ function RightInspector({
   );
 }
 
-function HomePage({
+function ThreadsPage({
   data,
   online,
   onOpenApproval,
-}: {
-  data: WorkspaceData;
-  online: boolean;
-  onOpenApproval: (approval: ApprovalRequest) => void;
-}) {
-  const navigate = useNavigate();
-  const active = data.threads.filter(
-    (thread) =>
-      thread.mode === "managed" && ["running", "waiting-for-approval"].includes(thread.state),
-  );
-  const recentProjects = [...data.projects].sort(
-    (a, b) => new Date(b.lastUsedAt ?? 0).getTime() - new Date(a.lastUsedAt ?? 0).getTime(),
-  );
-  const caps = data.diagnostics?.capabilities;
-
-  return (
-    <>
-      <MobileHeader
-        action={
-          <Button
-            aria-label="新建对话"
-            icon="plus"
-            onClick={() => navigate("/new")}
-            size="icon"
-            variant="primary"
-          />
-        }
-        title="首页"
-      />
-      <div className="page home-page">
-        <section className="hero">
-          <div>
-            <span data-testid="current-host-status">
-              <StatusPill tone={online ? "success" : "danger"}>
-                {online ? "电脑在线" : "连接中断"}
-              </StatusPill>
-            </span>
-            <h1>继续推进你的项目</h1>
-            <p>
-              {active.length
-                ? `${active.length} 个任务正在工作，${data.approvals.length} 项需要你处理。`
-                : "目前没有运行中的任务，可以开始一段新对话。"}
-            </p>
-          </div>
-          <Button
-            data-testid="new-thread"
-            icon="plus"
-            onClick={() => navigate("/new")}
-            variant="primary"
-          >
-            新建对话
-          </Button>
-        </section>
-
-        {data.approvals.length > 0 ? (
-          <button className="approval-callout" onClick={() => onOpenApproval(data.approvals[0]!)}>
-            <span className="approval-callout__icon">
-              <Icon name="shield" size={21} />
-            </span>
-            <span>
-              <strong>{data.approvals.length} 项操作等待你的决定</strong>
-              <small>查看影响范围后允许或拒绝</small>
-            </span>
-            <Icon name="chevron-right" size={20} />
-          </button>
-        ) : null}
-
-        <div className="section-heading">
-          <div>
-            <h2>正在进行</h2>
-            <span>托管对话可在手机上继续控制</span>
-          </div>
-          <NavLink to="/threads">全部对话</NavLink>
-        </div>
-        {active.length ? (
-          <div className="active-grid">
-            {active.slice(0, 3).map((thread) => (
-              <NavLink className="active-card" key={thread.id} to={`/threads/${thread.id}`}>
-                <div className="active-card__top">
-                  <StatusPill tone={runTones[thread.state]}>{runLabels[thread.state]}</StatusPill>
-                  <span>{timeAgo(thread.updatedAt)}</span>
-                </div>
-                <h3>{thread.title}</h3>
-                <p>
-                  <Icon name="folder" size={15} />
-                  {thread.cwdLabel ?? "未关联项目"}
-                </p>
-                <div className="active-card__footer">
-                  <span>{threadRuntimeSummary(thread)}</span>
-                  {thread.childCount ? (
-                    <span>
-                      <Icon name="layers" size={15} />
-                      {thread.childCount} 个子智能体
-                    </span>
-                  ) : null}
-                </div>
-              </NavLink>
-            ))}
-          </div>
-        ) : (
-          <Card>
-            <EmptyState
-              action={
-                <Button onClick={() => navigate("/new")} variant="primary">
-                  开始新任务
-                </Button>
-              }
-              description="选择一个项目并说明要完成的工作。"
-              title="等待你的新任务"
-            />
-          </Card>
-        )}
-
-        <div className="home-columns">
-          <section>
-            <div className="section-heading section-heading--tight">
-              <div>
-                <h2>最近项目</h2>
-                <span>快速从上次的位置继续</span>
-              </div>
-            </div>
-            <Card className="project-list">
-              {recentProjects.slice(0, 4).map((project) => (
-                <button
-                  key={project.id}
-                  onClick={() => navigate(`/new?project=${encodeURIComponent(project.id)}`)}
-                >
-                  <span className="project-icon">
-                    <Icon name="folder" size={20} />
-                  </span>
-                  <span className="project-copy">
-                    <strong>{project.name}</strong>
-                    <small>{project.rootLabel}</small>
-                  </span>
-                  <span className="project-time">{timeAgo(project.lastUsedAt)}</span>
-                  <Icon name="chevron-right" size={18} />
-                </button>
-              ))}
-            </Card>
-          </section>
-          <section>
-            <div className="section-heading section-heading--tight">
-              <div>
-                <h2>连接状态</h2>
-                <span>从公网入口到本机服务</span>
-              </div>
-            </div>
-            <Card className="health-card">
-              <div className="health-row">
-                <span>
-                  <Icon name="wifi-off" size={18} />
-                  <strong>公网入口</strong>
-                </span>
-                <StatusPill tone={online ? "success" : "danger"}>
-                  {online ? "已连接" : "断线"}
-                </StatusPill>
-              </div>
-              {caps ? (
-                (Object.keys(caps) as Array<keyof ProductCapabilities>).slice(0, 3).map((key) => (
-                  <div className="health-row" key={key}>
-                    <span>
-                      <Icon
-                        name={
-                          key === "fileBrowser"
-                            ? "folder"
-                            : key === "appServer"
-                              ? "spark"
-                              : "activity"
-                        }
-                        size={18}
-                      />
-                      <strong>{capabilityLabel(key)}</strong>
-                    </span>
-                    <StatusPill tone={capabilityTone(caps[key])}>
-                      {capabilityState(caps[key])}
-                    </StatusPill>
-                  </div>
-                ))
-              ) : (
-                <div className="mini-empty">诊断信息暂时无法读取</div>
-              )}
-            </Card>
-          </section>
-        </div>
-      </div>
-    </>
-  );
-}
-
-function ThreadsPage({
-  threads,
   nextCursor,
   moreState,
   moreError,
@@ -979,7 +1447,9 @@ function ThreadsPage({
   onLoadArchived,
   onLoadMoreArchived,
 }: {
-  threads: ThreadSummary[];
+  data: WorkspaceData;
+  online: boolean;
+  onOpenApproval: (approval: ApprovalRequest) => void;
   nextCursor: string | undefined;
   moreState: MoreState;
   moreError: string;
@@ -991,6 +1461,11 @@ function ThreadsPage({
   onLoadArchived: () => void;
   onLoadMoreArchived: () => void;
 }) {
+  const navigate = useNavigate();
+  const { copy, locale } = useUiLocale();
+  const threads = data.threads;
+  const active = homeActivityThreads(threads);
+  const runtime = hostStatus(online, data.diagnostics?.capabilities);
   const [query, setQuery] = useState("");
   const [archiveScope, setArchiveScope] = useState<"current" | "archived">("current");
   const [filter, setFilter] = useState<"all" | "active" | "snapshot">("all");
@@ -999,13 +1474,20 @@ function ThreadsPage({
   const visibleMoreState = archiveScope === "archived" ? archivedState : moreState;
   const visibleError = archiveScope === "archived" ? archivedError : moreError;
   const visibleLoadMore = archiveScope === "archived" ? onLoadMoreArchived : onLoadMore;
-  const filtered = visibleThreads.filter((thread) => {
-    const matchesQuery = `${thread.title} ${thread.cwdLabel ?? ""}`
+  const filterOptions: ReadonlyArray<readonly ["all" | "active" | "snapshot", string]> = [
+    ["all", copy.allTypes],
+    ...(archiveScope === "current" ? ([["active", copy.running]] as const) : []),
+    ...(visibleThreads.some((thread) => thread.mode === "desktop-snapshot")
+      ? ([["snapshot", copy.archivedHistory]] as const)
+      : []),
+  ];
+  const filtered = sortThreadsForDisplay(visibleThreads).filter((thread) => {
+    const matchesQuery = `${threadTitleForDisplay(thread.title)} ${thread.cwdLabel ?? ""}`
       .toLowerCase()
       .includes(query.toLowerCase());
     const matchesFilter =
       filter === "all" ||
-      (filter === "active" && thread.mode === "managed" && thread.state !== "complete") ||
+      (filter === "active" && isHomeActivityThread(thread)) ||
       (filter === "snapshot" && thread.mode === "desktop-snapshot");
     return matchesQuery && matchesFilter;
   });
@@ -1018,63 +1500,113 @@ function ThreadsPage({
 
   return (
     <>
-      <MobileHeader title="对话" />
+      <MobileHeader
+        action={
+          <Button
+            aria-label={copy.newTask}
+            data-testid="new-thread"
+            disabled={!runtime.ready}
+            icon="plus"
+            onClick={() => navigate("/new")}
+            size="compact"
+            variant="primary"
+          >
+            {copy.newShort}
+          </Button>
+        }
+        title={copy.tasks}
+      />
       <div className="page list-page">
+        <div className="mobile-language-toolbar">
+          <LanguageToggle />
+        </div>
+        <section className="task-overview">
+          <span data-testid="current-host-status">
+            <StatusPill tone={runtime.tone}>{runtime.label}</StatusPill>
+          </span>
+          <div>
+            <strong>{active.length ? copy.tasksWorking(active.length) : copy.computerReady}</strong>
+            <small>
+              {data.approvals.length
+                ? copy.approvalsWaiting(data.approvals.length)
+                : copy.sharedTaskList}
+            </small>
+          </div>
+        </section>
+        {online && !runtime.ready ? (
+          <Notice icon="alert" title={copy.runtimeDegraded}>
+            {copy.runtimeDegradedBody}
+          </Notice>
+        ) : null}
+        {data.approvals.length > 0 ? (
+          <button
+            className="approval-callout"
+            data-testid="approval-open"
+            onClick={() => onOpenApproval(data.approvals[0]!)}
+          >
+            <span className="approval-callout__icon">
+              <Icon name="shield" size={21} />
+            </span>
+            <span>
+              <strong>{copy.approvalsWaiting(data.approvals.length)}</strong>
+              <small>
+                {locale === "zh"
+                  ? "查看影响范围后允许或拒绝"
+                  : "Review the impact, then allow or deny"}
+              </small>
+            </span>
+            <Icon name="chevron-right" size={20} />
+          </button>
+        ) : null}
         <div className="page-heading page-heading--action">
           <div>
-            <h1>对话</h1>
-            <p>托管对话可控制，桌面快照仅供查看。</p>
+            <h1>{copy.tasks}</h1>
+            <p>{copy.taskPageDescription}</p>
           </div>
-          <NavLink
-            className="desktop-only-button ui-button ui-button--primary ui-button--regular"
-            to="/new"
-          >
-            <Icon name="plus" size={18} />
-            新建对话
-          </NavLink>
+          <div className="desktop-page-actions">
+            <LanguageToggle />
+            <NavLink
+              className="desktop-only-button ui-button ui-button--primary ui-button--regular"
+              data-testid="new-thread"
+              to="/new"
+            >
+              <Icon name="plus" size={18} />
+              {copy.newTask}
+            </NavLink>
+          </div>
         </div>
-        <div aria-label="对话归档范围" className="archive-tabs" role="tablist">
+        <div aria-label={copy.archiveScopeLabel} className="archive-tabs" role="tablist">
           <button
             aria-selected={archiveScope === "current"}
             onClick={() => selectArchiveScope("current")}
             role="tab"
           >
-            当前
+            {copy.current}
           </button>
           <button
             aria-selected={archiveScope === "archived"}
             onClick={() => selectArchiveScope("archived")}
             role="tab"
           >
-            已归档
+            {copy.archived}
           </button>
         </div>
         <div className="search-field">
           <Icon name="search" size={19} />
           <input
-            aria-label="搜索对话"
+            aria-label={copy.searchTasks}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder={archiveScope === "archived" ? "搜索已归档对话" : "搜索当前对话"}
+            placeholder={archiveScope === "archived" ? copy.searchArchivedTasks : copy.searchTasks}
             value={query}
           />
           {query ? (
-            <button aria-label="清空搜索" onClick={() => setQuery("")}>
+            <button aria-label={copy.clearSearch} onClick={() => setQuery("")}>
               <Icon name="close" size={17} />
             </button>
           ) : null}
         </div>
         <div className="filter-tabs" role="tablist">
-          {(archiveScope === "archived"
-            ? ([
-                ["all", "全部类型"],
-                ["snapshot", "桌面快照"],
-              ] as const)
-            : ([
-                ["all", "全部类型"],
-                ["active", "进行中"],
-                ["snapshot", "桌面快照"],
-              ] as const)
-          ).map(([id, label]) => (
+          {filterOptions.map(([id, label]) => (
             <button aria-selected={filter === id} key={id} onClick={() => setFilter(id)} role="tab">
               {label}
             </button>
@@ -1106,41 +1638,72 @@ function ThreadsPage({
         ) : filtered.length ? (
           <>
             <Card className="thread-list-card">
-              {filtered.map((thread) => (
-                <NavLink className="thread-list-item" key={thread.id} to={`/threads/${thread.id}`}>
-                  <span
-                    className={`thread-list-item__icon thread-list-item__icon--${thread.state}`}
-                  >
-                    <Icon
-                      name={
-                        thread.mode === "desktop-snapshot"
-                          ? "clock"
-                          : thread.state === "running"
-                            ? "activity"
-                            : "message"
-                      }
-                      size={20}
-                    />
-                  </span>
-                  <span className="thread-list-item__copy">
-                    <span>
-                      <strong>{thread.title}</strong>
-                      <time>{timeAgo(thread.updatedAt)}</time>
-                    </span>
-                    <small>{thread.cwdLabel ?? "未关联项目"}</small>
-                    <span className="thread-list-item__meta">
-                      <StatusPill
-                        tone={thread.mode === "desktop-snapshot" ? "info" : runTones[thread.state]}
+              {filtered.map((thread, index) => {
+                const previous = filtered[index - 1];
+                const startsPinnedGroup =
+                  thread.pinnedRank !== undefined && previous?.pinnedRank === undefined;
+                const startsRecentGroup =
+                  thread.pinnedRank === undefined &&
+                  (index === 0 || previous?.pinnedRank !== undefined);
+                return (
+                  <Fragment key={thread.id}>
+                    {startsPinnedGroup ? (
+                      <div className="thread-list-section-label" data-testid="pinned-threads-group">
+                        <Icon name="pin" size={15} />
+                        {copy.pinned}
+                      </div>
+                    ) : null}
+                    {startsRecentGroup ? (
+                      <div className="thread-list-section-label" data-testid="recent-threads-group">
+                        {copy.recent}
+                      </div>
+                    ) : null}
+                    <NavLink className="thread-list-item" to={`/threads/${thread.id}`}>
+                      <span
+                        className={`thread-list-item__icon thread-list-item__icon--${thread.state}`}
                       >
-                        {thread.mode === "desktop-snapshot" ? "只读快照" : runLabels[thread.state]}
-                      </StatusPill>
-                      {thread.model ? <span>{thread.model}</span> : null}
-                      {thread.childCount ? <span>{thread.childCount} 个子智能体</span> : null}
-                    </span>
-                  </span>
-                  <Icon name="chevron-right" size={19} />
-                </NavLink>
-              ))}
+                        <Icon
+                          name={
+                            thread.mode === "desktop-snapshot"
+                              ? "clock"
+                              : thread.state === "running"
+                                ? "activity"
+                                : "message"
+                          }
+                          size={20}
+                        />
+                      </span>
+                      <span className="thread-list-item__copy">
+                        <span>
+                          <strong>{threadTitleForDisplay(thread.title)}</strong>
+                          <time>{timeAgo(thread.updatedAt)}</time>
+                        </span>
+                        <small>{localizedThreadLocation(thread, copy)}</small>
+                        <span className="thread-list-item__meta">
+                          <StatusPill
+                            tone={
+                              thread.mode === "desktop-snapshot" ? "info" : runTones[thread.state]
+                            }
+                          >
+                            {thread.mode === "desktop-snapshot"
+                              ? copy.history
+                              : runLabels[thread.state]}
+                          </StatusPill>
+                          {thread.pinnedRank === undefined ? null : (
+                            <span className="thread-list-item__pin">
+                              <Icon name="pin" size={14} />
+                              {copy.pinned}
+                            </span>
+                          )}
+                          {thread.model ? <span>{thread.model}</span> : null}
+                          {thread.childCount ? <span>{thread.childCount} 个子智能体</span> : null}
+                        </span>
+                      </span>
+                      <Icon name="chevron-right" size={19} />
+                    </NavLink>
+                  </Fragment>
+                );
+              })}
             </Card>
             <PaginationFooter
               completeLabel={
@@ -1159,18 +1722,18 @@ function ThreadsPage({
               <EmptyState
                 description={
                   query || filter !== "all"
-                    ? "换一个关键词或筛选条件试试。"
+                    ? copy.noMatchingDescription
                     : archiveScope === "archived"
-                      ? "归档后的对话会保留在这里，随时可以回来查看。"
-                      : "开始新任务后，对话会显示在这里。"
+                      ? copy.noArchivedDescription
+                      : copy.noTasksDescription
                 }
                 icon={query || filter !== "all" ? "search" : "message"}
                 title={
                   query || filter !== "all"
-                    ? "没有找到对话"
+                    ? copy.noMatchingTasks
                     : archiveScope === "archived"
-                      ? "还没有归档对话"
-                      : "当前没有对话"
+                      ? copy.noArchivedTasks
+                      : copy.noTasks
                 }
               />
             </Card>
@@ -1191,7 +1754,21 @@ function ThreadsPage({
   );
 }
 
-function MessageItem({ item }: { item: ThreadDetail["items"][number] }) {
+const MessageItem = memo(function MessageItem({
+  apiClient,
+  item,
+  items,
+  online,
+  projectId,
+}: {
+  apiClient: ApiClient;
+  item: ThreadDetail["items"][number];
+  items: ReadonlyArray<ThreadDetail["items"][number]>;
+  online: boolean;
+  projectId?: string;
+}) {
+  const phase = assistantPhaseForDisplay(item, items);
+
   if (item.kind === "user-message") {
     return (
       <article className="message message--user">
@@ -1200,120 +1777,481 @@ function MessageItem({ item }: { item: ThreadDetail["items"][number] }) {
           {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
         </div>
         <div className="message__bubble">
-          <Markdown>{item.text}</Markdown>
+          <UserMessageText>{item.text}</UserMessageText>
         </div>
       </article>
     );
   }
   if (item.kind === "assistant-message") {
     return (
-      <article className="message message--assistant">
-        <div className="message__avatar">
-          <Icon name="spark" size={18} />
-        </div>
+      <article className={`message message--assistant message--${phase ?? "answer"}`}>
         <div
           className="message__content"
           data-testid={item.id === "unsafe-content-message" ? "unsafe-content-message" : undefined}
         >
-          <div className="message__meta">
-            <span>智能体</span>
+          <div className="message__stage">
+            <span>{phase === "commentary" ? "思考" : "回答"}</span>
             {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
           </div>
-          <Markdown>{item.text}</Markdown>
+          <Markdown
+            apiClient={apiClient}
+            online={online}
+            {...(projectId === undefined ? {} : { projectId })}
+          >
+            {item.text}
+          </Markdown>
         </div>
       </article>
     );
   }
-  if (item.kind === "reasoning-summary") {
-    return (
-      <details className="reasoning-item" open>
-        <summary>
-          <span>
-            <Icon name="spark" size={17} />
-            工作思路
-          </span>
-          <Icon name="chevron-down" size={17} />
-        </summary>
-        <Markdown compact>{item.text}</Markdown>
-      </details>
-    );
-  }
+  return null;
+});
+
+type ActivityItem = Extract<ThreadDetail["items"][number], { kind: "tool" | "file-change" }>;
+
+function ActivityRow({ item, onOpen }: { item: ActivityItem; onOpen: () => void }) {
   if (item.kind === "tool") {
-    return (
-      <details className={`tool-item tool-item--${item.status}`}>
-        <summary>
-          <span className="tool-item__icon">
-            <Icon
-              name={
-                item.status === "running"
-                  ? "activity"
-                  : item.status === "failed"
-                    ? "alert"
-                    : "check"
-              }
-              size={17}
-            />
-          </span>
-          <span className="tool-item__copy">
-            <strong>{item.title}</strong>
-            <small>{item.summary ?? toolFallbackSummary(item.status)}</small>
-          </span>
-          {item.occurrences && item.occurrences > 1 ? (
-            <span className="occurrence-badge">{item.occurrences} 次</span>
-          ) : null}
-          {item.detail ? <Icon name="chevron-down" size={17} /> : null}
-        </summary>
-        {item.detail ? <pre>{item.detail}</pre> : null}
-      </details>
+    const canOpen =
+      Boolean(item.detail) ||
+      (item.occurrences ?? 0) > 1 ||
+      Boolean(item.occurrenceDetails?.length);
+    const content = (
+      <>
+        <span className={`activity-row__state activity-row__state--${item.status}`}>
+          <Icon
+            name={
+              item.status === "running" ? "activity" : item.status === "failed" ? "alert" : "check"
+            }
+            size={14}
+          />
+        </span>
+        <span className="activity-row__copy">
+          <strong>{item.title}</strong>
+          <small>{item.summary ?? toolFallbackSummary(item.status)}</small>
+        </span>
+        {item.occurrences && item.occurrences > 1 ? (
+          <span className="occurrence-badge">{item.occurrences} 次</span>
+        ) : null}
+        {canOpen ? <Icon name="chevron-right" size={15} /> : null}
+      </>
+    );
+    return canOpen ? (
+      <button className="activity-row activity-row--button" onClick={onOpen} type="button">
+        {content}
+      </button>
+    ) : (
+      <div className="activity-row">{content}</div>
     );
   }
   if (item.kind !== "file-change") return null;
   const status = item.status ?? "completed";
-  const summary = (
+  const content = (
     <>
-      <span className="file-change__status">{fileChangeStatusLabel(item.change, status)}</span>
-      <span className="file-change__paths">
+      <span className={`activity-row__state activity-row__state--${status}`}>
+        <Icon
+          name={status === "failed" ? "alert" : status === "inProgress" ? "activity" : "file"}
+          size={14}
+        />
+      </span>
+      <span className="activity-row__copy">
+        <strong>{fileChangeStatusLabel(item.change, status)}</strong>
         <code>{item.path}</code>
         {item.targetPath ? (
-          <>
-            <Icon name="chevron-right" size={14} />
-            <code>{item.targetPath}</code>
-          </>
+          <small>
+            移至 <code>{item.targetPath}</code>
+          </small>
         ) : null}
       </span>
-      <span className="file-change__stats">
+      <span className="activity-row__stats">
         {item.additions !== undefined ? <b>+{item.additions}</b> : null}
         {item.deletions !== undefined ? <i>-{item.deletions}</i> : null}
       </span>
-      {item.diff ? <Icon name="chevron-down" size={16} /> : null}
+      <Icon name="chevron-right" size={15} />
     </>
   );
-  if (item.diff) {
-    return (
-      <details className={`file-change file-change--${item.change} file-change--${status}`}>
-        <summary>{summary}</summary>
-        <pre aria-label="文件差异">{item.diff}</pre>
-      </details>
-    );
-  }
   return (
-    <div className={`file-change file-change--${item.change} file-change--${status}`}>
-      {summary}
+    <button
+      className="activity-row activity-row--button activity-row--file"
+      onClick={onOpen}
+      type="button"
+    >
+      {content}
+    </button>
+  );
+}
+
+function ActivityDetailSheet({
+  apiClient,
+  item,
+  online,
+  projectId,
+  onClose,
+}: {
+  apiClient: ApiClient;
+  item: ActivityItem | undefined;
+  online: boolean;
+  projectId?: string;
+  onClose: () => void;
+}) {
+  const isFile = item?.kind === "file-change";
+  const [view, setView] = useState<"diff" | "file">("diff");
+  const [resolvedEntry, setResolvedEntry] = useState<ResolvedFileEntry>();
+  const [resolveError, setResolveError] = useState("");
+  const [resolving, setResolving] = useState(false);
+
+  useEffect(() => {
+    setView(item?.kind === "file-change" && !item.diff ? "file" : "diff");
+    setResolvedEntry(undefined);
+    setResolveError("");
+  }, [item]);
+
+  useEffect(() => {
+    if (!isFile || !item || !online || view !== "file") return;
+    let active = true;
+    setResolving(true);
+    setResolveError("");
+    void apiClient
+      .resolveFile(projectId, item.path)
+      .then((entry) => {
+        if (!active) return;
+        setResolvedEntry(entry);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setResolveError(errorMessage(error));
+      })
+      .finally(() => {
+        if (active) setResolving(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiClient, isFile, item, online, projectId, view]);
+
+  const description =
+    item?.kind === "file-change"
+      ? item.path
+      : item?.kind === "tool"
+        ? (item.summary ?? toolFallbackSummary(item.status))
+        : undefined;
+
+  return (
+    <Sheet
+      description={description}
+      onClose={onClose}
+      open={item !== undefined}
+      title={
+        item?.kind === "file-change"
+          ? fileChangeStatusLabel(item.change, item.status ?? "completed")
+          : (item?.title ?? "运行详情")
+      }
+    >
+      {item?.kind === "tool" ? (
+        <div className="activity-detail">
+          <div className="activity-detail__status">
+            <StatusPill
+              tone={
+                item.status === "failed" ? "danger" : item.status === "running" ? "info" : "success"
+              }
+            >
+              {item.status === "failed" ? "失败" : item.status === "running" ? "运行中" : "已完成"}
+            </StatusPill>
+            {item.occurrences && item.occurrences > 1 ? (
+              <span>{item.occurrences} 次调用</span>
+            ) : null}
+          </div>
+          {item.occurrences && item.occurrences > 1 ? (
+            <ol className="activity-detail__occurrences">
+              {(item.occurrenceDetails ?? []).map((occurrence, index) => (
+                <li key={occurrence.id}>
+                  <details>
+                    <summary>
+                      <span
+                        className={`activity-row__state activity-row__state--${occurrence.status}`}
+                      >
+                        <Icon
+                          name={
+                            occurrence.status === "running"
+                              ? "activity"
+                              : occurrence.status === "failed"
+                                ? "alert"
+                                : "check"
+                          }
+                          size={13}
+                        />
+                      </span>
+                      <span>
+                        <strong>第 {index + 1} 次</strong>
+                        <small>
+                          {occurrence.summary ?? toolFallbackSummary(occurrence.status)}
+                        </small>
+                      </span>
+                      {occurrence.detail ? <Icon name="chevron-down" size={14} /> : null}
+                    </summary>
+                    {occurrence.detail ? (
+                      <pre className="activity-detail__code">{occurrence.detail}</pre>
+                    ) : null}
+                  </details>
+                </li>
+              ))}
+            </ol>
+          ) : item.detail ? (
+            <pre className="activity-detail__code">{item.detail}</pre>
+          ) : null}
+          {(item.occurrences ?? 0) > (item.occurrenceDetails?.length ?? 0) &&
+          (item.occurrenceDetails?.length ?? 0) > 0 ? (
+            <p className="activity-detail__note">
+              已显示 {item.occurrenceDetails?.length} 项；更早的逐项明细未保留在当前快照中。
+            </p>
+          ) : null}
+          {(item.occurrences ?? 0) > 1 && !item.occurrenceDetails?.length ? (
+            <p className="activity-detail__note">当前历史快照只有合并计数，没有逐项明细。</p>
+          ) : null}
+        </div>
+      ) : null}
+      {item?.kind === "file-change" ? (
+        <div className="activity-detail activity-detail--file">
+          <div className="activity-detail__file-head">
+            <span>
+              <Icon name="file" size={18} />
+            </span>
+            <div>
+              <strong>{item.path.split(/[\\/]/).pop() || item.path}</strong>
+              <small>{item.path}</small>
+            </div>
+            <span className="activity-row__stats">
+              {item.additions !== undefined ? <b>+{item.additions}</b> : null}
+              {item.deletions !== undefined ? <i>-{item.deletions}</i> : null}
+            </span>
+          </div>
+          {item.diff ? (
+            <div aria-label="文件详情视图" className="activity-detail__tabs" role="tablist">
+              <button
+                aria-selected={view === "diff"}
+                onClick={() => setView("diff")}
+                role="tab"
+                type="button"
+              >
+                修改内容
+              </button>
+              <button
+                aria-selected={view === "file"}
+                onClick={() => setView("file")}
+                role="tab"
+                type="button"
+              >
+                最新文件
+              </button>
+            </div>
+          ) : null}
+          {view === "diff" && item.diff ? <DiffView diff={item.diff} /> : null}
+          {view === "file" ? (
+            resolving ? (
+              <div className="activity-detail__loading">
+                <Skeleton />
+                <Skeleton width="76%" />
+              </div>
+            ) : resolveError ? (
+              <EmptyState description={resolveError} icon="alert" title="无法读取最新文件" />
+            ) : resolvedEntry ? (
+              <FilePreview
+                apiClient={apiClient}
+                embedded
+                entry={resolvedEntry}
+                online={online}
+                projectId={resolvedEntry.projectId}
+              />
+            ) : null
+          ) : null}
+        </div>
+      ) : null}
+    </Sheet>
+  );
+}
+
+function ActivityGroup({
+  apiClient,
+  items,
+  online,
+  projectId,
+}: {
+  apiClient: ApiClient;
+  items: ReadonlyArray<ThreadDetail["items"][number]>;
+  online: boolean;
+  projectId?: string;
+}) {
+  const running = items.some(
+    (item) =>
+      (item.kind === "tool" && item.status === "running") ||
+      (item.kind === "file-change" && item.status === "inProgress"),
+  );
+  const [open, setOpen] = useState(running);
+  const [selected, setSelected] = useState<ActivityItem>();
+
+  useEffect(() => {
+    if (running) setOpen(true);
+  }, [running]);
+
+  return (
+    <>
+      <details
+        className="activity-record"
+        onToggle={(event) => setOpen(event.currentTarget.open)}
+        open={open}
+      >
+        <summary>
+          <span>
+            <Icon name={running ? "activity" : "check"} size={15} />
+            {activitySummary(items)}
+          </span>
+          <Icon name="chevron-down" size={15} />
+        </summary>
+        {open ? (
+          <div className="activity-record__items">
+            {items.map((item) =>
+              item.kind === "tool" || item.kind === "file-change" ? (
+                <ActivityRow item={item} key={item.id} onOpen={() => setSelected(item)} />
+              ) : null,
+            )}
+          </div>
+        ) : null}
+      </details>
+      <ActivityDetailSheet
+        apiClient={apiClient}
+        item={selected}
+        online={online}
+        {...(projectId === undefined ? {} : { projectId })}
+        onClose={() => setSelected(undefined)}
+      />
+    </>
+  );
+}
+
+function SubagentActivityGroup({
+  items,
+  subagents,
+}: {
+  items: ReadonlyArray<ThreadDetail["items"][number]>;
+  subagents: readonly SubagentSummary[];
+}) {
+  const navigate = useNavigate();
+  const agentById = new Map(subagents.map((agent) => [agent.threadId, agent]));
+  const latestById = new Map<
+    string,
+    { label: string; status: "running" | "complete" | "failed" }
+  >();
+  for (const item of items) {
+    if (item.kind !== "subagent-activity") continue;
+    for (const agent of item.agents) {
+      latestById.set(agent.threadId, {
+        label: agent.label ?? agentById.get(agent.threadId)?.title ?? "子智能体",
+        status: item.status,
+      });
+    }
+  }
+  const latestActivity = [...items].reverse().find((item) => item.kind === "subagent-activity");
+  const activityLabel =
+    latestActivity?.kind === "subagent-activity"
+      ? {
+          spawn: "已开始工作",
+          update: "已更新",
+          resume: "已继续工作",
+          wait: "正在等待",
+          close: "已完成",
+          activity: latestActivity.status === "running" ? "正在工作" : "已更新",
+        }[latestActivity.action]
+      : "";
+  return (
+    <div className="subagent-activity" aria-label="子智能体活动">
+      <div className="subagent-activity__chips">
+        {[...latestById].map(([threadId, agent]) => (
+          <button
+            className={`subagent-chip subagent-chip--${agent.status}`}
+            key={threadId}
+            onClick={() => navigate(`/threads/${threadId}`)}
+            type="button"
+          >
+            <span aria-hidden="true">
+              <Icon name="layers" size={13} />
+            </span>
+            <strong>{agent.label}</strong>
+          </button>
+        ))}
+      </div>
+      {activityLabel ? <span>{activityLabel}</span> : null}
     </div>
   );
 }
 
-function SubagentRow({ agent, onNavigate }: { agent: SubagentSummary; onNavigate?: () => void }) {
-  const navigate = useNavigate();
+const ConversationItems = memo(function ConversationItems({
+  apiClient,
+  items,
+  activeTurnId,
+  online,
+  projectId,
+  showLivePhase,
+  subagents,
+}: {
+  apiClient: ApiClient;
+  items: ReadonlyArray<ThreadDetail["items"][number]>;
+  activeTurnId?: string;
+  online: boolean;
+  projectId?: string;
+  showLivePhase: boolean;
+  subagents: readonly SubagentSummary[];
+}) {
+  const segments = groupConversationItems(conversationContentItems(items, activeTurnId));
+  const livePhase = showLivePhase ? currentLivePhase(items, activeTurnId) : undefined;
   return (
-    <button
+    <>
+      {segments.map((segment, index) =>
+        segment.kind === "content" ? (
+          <MessageItem
+            apiClient={apiClient}
+            item={segment.item}
+            items={items}
+            key={segment.item.id}
+            online={online}
+            {...(projectId === undefined ? {} : { projectId })}
+          />
+        ) : segment.kind === "activity" ? (
+          <ActivityGroup
+            apiClient={apiClient}
+            items={segment.items}
+            key={`activity-${segment.items[0]?.id ?? index}`}
+            online={online}
+            {...(projectId === undefined ? {} : { projectId })}
+          />
+        ) : (
+          <SubagentActivityGroup
+            items={segment.items}
+            key={`subagents-${segment.items[0]?.id ?? index}`}
+            subagents={subagents}
+          />
+        ),
+      )}
+      {livePhase ? (
+        <p
+          aria-label={livePhase.kind === "reasoning" ? "当前思考" : "当前操作"}
+          aria-live="polite"
+          className={`live-phase live-phase--${livePhase.kind}`}
+          data-testid="turn-running"
+        >
+          {livePhase.text}
+        </p>
+      ) : null}
+    </>
+  );
+});
+
+function SubagentRow({ agent, onNavigate }: { agent: SubagentSummary; onNavigate?: () => void }) {
+  return (
+    <NavLink
       className="subagent-row"
       data-testid="subagent-node"
-      onClick={() => {
-        onNavigate?.();
-        void navigate(`/threads/${agent.threadId}`);
-      }}
+      onClick={onNavigate}
       style={{ paddingLeft: `${12 + Math.min(agent.depth, 3) * 14}px` }}
+      to={`/threads/${agent.threadId}`}
     >
       <span className={`subagent-row__line subagent-row__line--${agent.state}`} />
       <span>
@@ -1323,7 +2261,7 @@ function SubagentRow({ agent, onNavigate }: { agent: SubagentSummary; onNavigate
         </small>
       </span>
       <Icon name="chevron-right" size={17} />
-    </button>
+    </NavLink>
   );
 }
 
@@ -1340,16 +2278,17 @@ function ModelControls({
 }: {
   models: ModelOption[];
   model: string;
-  effort: ReasoningEffort;
+  effort: ReasoningEffort | undefined;
   disabled?: boolean;
   modelTestId?: string;
   effortTestId?: string;
   ariaContext: "新建对话" | "下一轮";
   onModel: (value: string) => void;
-  onEffort: (value: ReasoningEffort) => void;
+  onEffort: (value: ReasoningEffort | undefined) => void;
 }) {
   const selected = models.find((option) => option.id === model) ?? models[0];
   const selectedEffort = normalizeReasoningEffortForModel(selected, effort);
+  const efforts = selected?.supportedReasoningEfforts ?? [];
   return (
     <div className="model-controls">
       <label>
@@ -1372,40 +2311,177 @@ function ModelControls({
           ))}
         </select>
       </label>
-      <label>
-        <span>思考</span>
-        <select
-          aria-label={`${ariaContext}思考等级`}
-          data-testid={effortTestId}
-          disabled={disabled}
-          onChange={(event) => onEffort(event.target.value)}
-          value={selectedEffort}
-        >
-          {(selected?.supportedReasoningEfforts ?? ["medium"]).map((option) => (
-            <option key={option} value={option}>
-              {effortLabel(option)}
-            </option>
-          ))}
-        </select>
-      </label>
+      {efforts.length > 0 && selectedEffort ? (
+        <label>
+          <span>思考</span>
+          <select
+            aria-label={`${ariaContext}思考等级`}
+            data-testid={effortTestId}
+            disabled={disabled}
+            onChange={(event) => onEffort(event.target.value)}
+            value={selectedEffort}
+          >
+            {efforts.map((option) => (
+              <option key={option} value={option}>
+                {effortLabel(option)}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : (
+        <div className="model-controls__unavailable" data-testid="reasoning-effort-unavailable">
+          <span>思考</span>
+          <small>此模型未公开可选等级</small>
+        </div>
+      )}
     </div>
+  );
+}
+
+function AccessAndReviewerSheet({
+  approvalPolicy,
+  approvalPolicies,
+  approvalReviewer,
+  approvalReviewers,
+  busy,
+  onApply,
+  onApprovalPolicy,
+  onApprovalReviewer,
+  onClose,
+  onPermission,
+  open,
+  permissionProfileId,
+  permissionProfiles,
+}: {
+  approvalPolicy: string;
+  approvalPolicies: ApprovalPolicyOption[];
+  approvalReviewer: string;
+  approvalReviewers: ApprovalReviewerOption[];
+  busy: boolean;
+  onApply: () => void;
+  onApprovalPolicy: (id: string) => void;
+  onApprovalReviewer: (id: string) => void;
+  onClose: () => void;
+  onPermission: (id: string) => void;
+  open: boolean;
+  permissionProfileId: string;
+  permissionProfiles: PermissionProfileOption[];
+}) {
+  return (
+    <Sheet
+      description="这里只显示当前 Codex 运行时声明的选项，并在下一轮生效。"
+      footer={
+        <Button disabled={busy} onClick={onApply} variant="primary">
+          {busy ? "正在应用…" : "应用到下一轮"}
+        </Button>
+      }
+      onClose={onClose}
+      open={open}
+      title="权限与审批"
+    >
+      {permissionProfiles.length > 0 ? (
+        <section className="composer-sheet-section">
+          <h3>文件与命令权限</h3>
+          <div className="composer-option-list">
+            {permissionProfiles.map((profile) => (
+              <button
+                className={`composer-option ${
+                  profile.id === permissionProfileId ? "is-selected" : ""
+                }`}
+                data-testid={`permission-profile-${profile.id}`}
+                disabled={!profile.allowed || busy}
+                key={profile.id}
+                onClick={() => onPermission(profile.id)}
+                type="button"
+              >
+                <span>
+                  <strong>{permissionProfileLabel(profile.id)}</strong>
+                  <small>
+                    {profile.description ??
+                      `${profile.id} · ` +
+                        (profile.allowed ? "Codex 当前允许使用" : "Codex 当前不允许使用")}
+                  </small>
+                </span>
+                {profile.id === permissionProfileId ? <Icon name="check" size={17} /> : null}
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {approvalPolicies.length > 0 ? (
+        <section className="composer-sheet-section">
+          <h3>何时请求你确认</h3>
+          <div className="composer-option-list">
+            {approvalPolicies.map((policy) => (
+              <button
+                className={`composer-option ${policy.id === approvalPolicy ? "is-selected" : ""}`}
+                data-testid={`approval-policy-${policy.id}`}
+                disabled={busy}
+                key={policy.id}
+                onClick={() => onApprovalPolicy(policy.id)}
+                type="button"
+              >
+                <span>
+                  <strong>{approvalPolicyLabel(policy.id)}</strong>
+                  <small>{approvalPolicyDescription(policy.id)}</small>
+                </span>
+                {policy.id === approvalPolicy ? <Icon name="check" size={17} /> : null}
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {approvalReviewers.length > 0 ? (
+        <section className="composer-sheet-section">
+          <h3>审批方式</h3>
+          <div className="composer-option-list">
+            {approvalReviewers.map((reviewer) => (
+              <button
+                className={`composer-option ${
+                  reviewer.id === approvalReviewer ? "is-selected" : ""
+                }`}
+                data-testid={`approval-reviewer-${reviewer.id}`}
+                disabled={busy}
+                key={reviewer.id}
+                onClick={() => onApprovalReviewer(reviewer.id)}
+                type="button"
+              >
+                <span>
+                  <strong>{approvalReviewerLabel(reviewer.id)}</strong>
+                  <small>{approvalReviewerDescription(reviewer.id)}</small>
+                </span>
+                {reviewer.id === approvalReviewer ? <Icon name="check" size={17} /> : null}
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+    </Sheet>
   );
 }
 
 function ConversationPage({
   apiClient,
+  approvals,
+  capabilities,
+  collaborationModes,
   liveEvents,
   models,
   online,
+  onOpenApproval,
   onThreadLoaded,
   onSubagentsLoaded,
   onUsageLoaded,
   threadSummaries,
 }: {
   apiClient: ApiClient;
+  approvals: ApprovalRequest[];
+  capabilities: ProductCapabilities | undefined;
+  collaborationModes: CollaborationModeOption[];
   liveEvents: LiveEventEnvelope[];
   models: ModelOption[];
   online: boolean;
+  onOpenApproval: (approval: ApprovalRequest) => void;
   onThreadLoaded: (thread?: ThreadDetail) => void;
   onSubagentsLoaded: (agents: SubagentSummary[]) => void;
   onUsageLoaded: (usage?: UsageSnapshot) => void;
@@ -1415,7 +2491,15 @@ function ConversationPage({
   const navigate = useNavigate();
   const location = useLocation();
   const summary = threadSummaries.find((candidate) => candidate.id === id);
-  const routeSeed = threadSeedFromNavigationState(location.state, id);
+  const cachedNavigationState = useMemo(
+    () => readThreadNavigationCache(window.sessionStorage, id),
+    [id],
+  );
+  const routeSeed =
+    threadSeedFromNavigationState(location.state, id) ?? cachedNavigationState?.threadSeed;
+  const routeInitialPrompt =
+    threadInitialPromptFromNavigationState(location.state, id) ??
+    cachedNavigationState?.initialPrompt;
   const initialThread = routeSeed ?? (summary ? detailFromThreadSummary(summary) : undefined);
   const [thread, setThread] = useState<ThreadDetail | undefined>(initialThread);
   const [subagents, setSubagents] = useState<SubagentSummary[]>([]);
@@ -1424,26 +2508,78 @@ function ConversationPage({
   const [subagentsError, setSubagentsError] = useState("");
   const [threadUsage, setThreadUsage] = useState<UsageSnapshot>();
   const [state, setState] = useState<LoadState>(summary ? "ready" : "loading");
+  const [detailProjectionReady, setDetailProjectionReady] = useState(Boolean(routeSeed));
   const [error, setError] = useState("");
   const [draft, setDraft] = useState(() => window.localStorage.getItem(`draft:${id}`) ?? "");
-  const [model, setModel] = useState(
-    models.find((item) => item.isDefault)?.id ?? models[0]?.id ?? "",
+  const [attachments, setAttachments] = useState<LocalInputReference[]>(() =>
+    readConversationAttachments(window.localStorage, id),
   );
-  const [effort, setEffort] = useState<ReasoningEffort>("medium");
+  const [nextTurnSettings, setNextTurnSettings] = useState(() =>
+    nextTurnSettingsDraft(models, initialThread),
+  );
+  const [serviceTier, setServiceTier] = useState<string | null>(
+    initialThread?.serviceTier ??
+      models.find((model) => model.id === initialThread?.model)?.defaultServiceTier ??
+      models.find((model) => model.isDefault)?.defaultServiceTier ??
+      null,
+  );
+  const [permissionProfileId, setPermissionProfileId] = useState(
+    initialThread?.permissionProfileId ?? "",
+  );
+  const [approvalPolicy, setApprovalPolicy] = useState(initialThread?.approvalPolicy ?? "");
+  const [approvalReviewer, setApprovalReviewer] = useState(initialThread?.approvalsReviewer ?? "");
+  const [collaborationMode, setCollaborationMode] = useState(
+    initialThread?.collaborationMode ??
+      collaborationModes.find((mode) => mode.id === "auto" && mode.available)?.id ??
+      collaborationModes.find((mode) => mode.available)?.id ??
+      "",
+  );
+  const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([]);
+  const [approvalPolicies, setApprovalPolicies] = useState<ApprovalPolicyOption[]>([]);
+  const [approvalReviewers, setApprovalReviewers] = useState<ApprovalReviewerOption[]>([]);
+  const [deliveryMode, setDeliveryMode] = useState<ComposerDestination>("steer");
+  const [queue, setQueue] = useState<QueuedTurnItem[]>([]);
+  const [queueRevision, setQueueRevision] = useState(0);
+  const [queueBusyId, setQueueBusyId] = useState("");
+  const [queueError, setQueueError] = useState("");
+  const [composerSheet, setComposerSheet] = useState<
+    "" | "settings" | "permission" | "tools" | "goal" | "plan" | "attachments"
+  >("");
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [goalDraft, setGoalDraft] = useState("");
+  const [goalBusy, setGoalBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
   const [showUsage, setShowUsage] = useState(false);
+  const [usageRefreshState, setUsageRefreshState] = useState<"idle" | "refreshing" | "error">(
+    "idle",
+  );
+  const [usageRefreshError, setUsageRefreshError] = useState("");
+  const [threadIdCopyState, setThreadIdCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const [runtimeNotice, setRuntimeNotice] = useState<RuntimeNotice>();
+  const [visibleItemLimit, setVisibleItemLimit] = useState(INITIAL_CONVERSATION_ITEM_LIMIT);
   const [actionError, setActionError] = useState("");
-  const [actionStatus, setActionStatus] = useState<"steer-accepted" | "turn-interrupted" | "">("");
+  const [actionStatus, setActionStatus] = useState<
+    "steer-accepted" | "turn-interrupted" | "turn-queued" | "settings-applied" | "goal-saved" | ""
+  >("");
   const [compactionRequestState, setCompactionRequestState] =
     useState<ContextCompactionRequestState>("idle");
   const [compactionNotice, setCompactionNotice] = useState("");
   const [compactionError, setCompactionError] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
+  const conversationScrollRef = useRef<HTMLDivElement>(null);
+  const restoredScrollThreadRef = useRef("");
   const handledLiveDelivery = useRef(0);
+  const latestLiveDeliveryRef = useRef(liveEvents.at(-1)?.deliveryId ?? 0);
+  const retainedReplayThroughRef = useRef(0);
   const currentIdRef = useRef(id);
   const threadRef = useRef(initialThread);
   const routeSeedRef = useRef(routeSeed);
+  const routeInitialPromptRef = useRef(routeInitialPrompt);
+  const modelsRef = useRef(models);
+  const creationPromptLiveAliasItemIdRef = useRef<string | undefined>(undefined);
+  const creationPromptPersistedItemIdRef = useRef<string | undefined>(undefined);
   const summaryRef = useRef(summary);
   const loadInFlight = useRef<{ id: string; promise: Promise<void> } | undefined>(undefined);
   const subagentsRef = useRef<SubagentSummary[]>([]);
@@ -1452,9 +2588,52 @@ function ConversationPage({
   const subagentsMoreInFlightRef = useRef<{ id: string } | undefined>(undefined);
   const compactionAttemptRef = useRef<ContextCompactionAttempt | undefined>(undefined);
   const compactionRequestFlightRef = useRef<ContextCompactionRequestFlight | undefined>(undefined);
+  const navigationSeedSignatureRef = useRef("");
+  const usageRefreshInFlightRef = useRef<Promise<void> | undefined>(undefined);
+  const usageButtonRef = useRef<HTMLButtonElement>(null);
+  const usagePanelRef = useRef<HTMLElement>(null);
+  const goalLoadedRef = useRef(false);
+  const productSettingsDirtyRef = useRef(false);
+  const collaborationModeDirtyRef = useRef(false);
+  const remoteProjectionRef = useRef(createThreadRemoteEventProjectionState());
+  const queueSupported = composerFeatureSupported(capabilities, "queue");
+  const goalSupported = composerFeatureSupported(capabilities, "goal");
+  const settingsUpdateSupported = composerFeatureSupported(capabilities, "settings");
+  const serviceTiersSupported = composerFeatureSupported(capabilities, "serviceTiers");
+  const compactSupported = composerFeatureSupported(capabilities, "compact");
+  const permissionProfilesCapability = composerFeatureSupported(capabilities, "permissionProfiles");
+  const permissionProfilesSupported = permissionProfiles.length > 0 && permissionProfilesCapability;
+  const approvalPoliciesCapability = capabilities?.approvalPolicies === "available";
+  const approvalPoliciesSupported = approvalPoliciesCapability && approvalPolicies.length > 0;
+  const approvalReviewersCapability = capabilities?.approvalReviewers === "available";
+  const approvalReviewersSupported = approvalReviewersCapability && approvalReviewers.length > 0;
+  const runtimeControlAvailable = online && appServerReady(capabilities);
   currentIdRef.current = id;
+  latestLiveDeliveryRef.current = liveEvents.at(-1)?.deliveryId ?? 0;
   routeSeedRef.current = routeSeed;
+  routeInitialPromptRef.current = routeInitialPrompt;
+  modelsRef.current = models;
   summaryRef.current = summary;
+  const visibleItems = useMemo(
+    () =>
+      visibleConversationItems(thread?.items ?? [], visibleItemLimit, (item) => {
+        if (
+          item.kind === "user-message" ||
+          item.kind === "assistant-message" ||
+          item.kind === "plan-progress" ||
+          item.kind === "subagent-activity"
+        ) {
+          return true;
+        }
+        return item.kind === "tool" && item.operation === "context-compaction";
+      }),
+    [thread?.items, visibleItemLimit],
+  );
+  const composerPlan = useMemo(() => latestPlanProgress(thread?.items ?? []), [thread?.items]);
+  const hiddenItemCount = hiddenConversationItemCount(
+    thread?.items.length ?? 0,
+    visibleItems.length,
+  );
 
   const finishContextCompaction = useCallback(
     (attemptKey: string, resolution: Exclude<ContextCompactionResolution, "pending">) => {
@@ -1476,9 +2655,47 @@ function ConversationPage({
     (silent = false) => {
       if (loadInFlight.current?.id === id) return loadInFlight.current.promise;
       if (!silent) setState("loading");
+      const projectionGeneration = remoteProjectionRef.current.generation;
+      if (!silent && !threadRef.current) {
+        void apiClient
+          .threadShell(id)
+          .then((shell) => {
+            if (currentIdRef.current !== id || threadRef.current) return;
+            threadRef.current = shell;
+            setThread(shell);
+            setState("ready");
+            onThreadLoaded(shell);
+            setNextTurnSettings((current) =>
+              reconcileNextTurnSettingsDraft(current, models, shell),
+            );
+            if (!productSettingsDirtyRef.current) {
+              setServiceTier(shell.serviceTier ?? null);
+              if (shell.permissionProfileId) {
+                setPermissionProfileId(shell.permissionProfileId);
+              }
+              if (shell.collaborationMode) {
+                setCollaborationMode(shell.collaborationMode);
+              }
+            }
+          })
+          .catch(() => {
+            // The full detail request remains authoritative and owns the visible
+            // error state. A shell failure must not turn one recoverable load
+            // into two competing error messages.
+          });
+      }
       const promise = (async () => {
         try {
-          const [detail, agentsResult, usageSnapshot] = await Promise.all([
+          const [
+            detail,
+            agentsResult,
+            usageSnapshot,
+            queuedResult,
+            goalResult,
+            permissionProfileResult,
+            approvalPolicyResult,
+            approvalReviewerResult,
+          ] = await Promise.all([
             apiClient.thread(id),
             apiClient
               .subagents(id)
@@ -1488,6 +2705,30 @@ function ConversationPage({
                 error: errorMessage(agentsError),
               })),
             apiClient.usage(id).catch(() => undefined),
+            queueSupported
+              ? apiClient
+                  .queue(id)
+                  .then((snapshot) => ({ snapshot, error: "" }))
+                  .catch((queueLoadError: unknown) => ({
+                    snapshot: undefined,
+                    error: errorMessage(queueLoadError),
+                  }))
+              : Promise.resolve({
+                  snapshot: { threadId: id, revision: 0, items: [] as QueuedTurnItem[] },
+                  error: "",
+                }),
+            goalSupported
+              ? apiClient.threadGoal(id).catch(() => undefined)
+              : Promise.resolve(undefined),
+            permissionProfilesCapability
+              ? apiClient.permissionProfiles({ threadId: id }).catch(() => [])
+              : Promise.resolve([] as PermissionProfileOption[]),
+            approvalPoliciesCapability
+              ? apiClient.approvalPolicies().catch(() => [])
+              : Promise.resolve([] as ApprovalPolicyOption[]),
+            approvalReviewersCapability
+              ? apiClient.approvalReviewers().catch(() => [])
+              : Promise.resolve([] as ApprovalReviewerOption[]),
           ]);
           if (currentIdRef.current !== id) return;
           const agents = silent
@@ -1505,7 +2746,32 @@ function ConversationPage({
                 silent &&
                   (subagentsExtendedRef.current || subagentsMoreInFlightRef.current?.id === id),
               );
-          const mergedDetail = mergeThreadRefresh(threadRef.current, detail, routeSeedRef.current);
+          const persistedPromptItemId = persistedCreationPromptItemId(
+            detail,
+            routeInitialPromptRef.current,
+          );
+          synchronizeThreadRemoteEventProjection(
+            remoteProjectionRef.current,
+            detail,
+            projectionGeneration,
+          );
+          const projectionGenerationIsCurrent =
+            remoteProjectionRef.current.generation === projectionGeneration;
+          if (persistedPromptItemId) {
+            creationPromptPersistedItemIdRef.current = persistedPromptItemId;
+          }
+          const creationContext = routeSeedRef.current
+            ? {
+                creationSeed: routeSeedRef.current,
+                ...(routeInitialPromptRef.current === undefined
+                  ? {}
+                  : { initialPrompt: routeInitialPromptRef.current }),
+                ...(creationPromptLiveAliasItemIdRef.current === undefined
+                  ? {}
+                  : { liveAliasItemId: creationPromptLiveAliasItemIdRef.current }),
+              }
+            : undefined;
+          const mergedDetail = mergeThreadRefresh(threadRef.current, detail, creationContext);
           threadRef.current = mergedDetail;
           setThread(mergedDetail);
           subagentsRef.current = agents;
@@ -1514,6 +2780,32 @@ function ConversationPage({
           setSubagentsNextCursor(nextCursor);
           setSubagentsError(agentsResult.error);
           setThreadUsage(usageSnapshot);
+          if (queuedResult.snapshot) {
+            setQueue(queuedResult.snapshot.items);
+            setQueueRevision(queuedResult.snapshot.revision);
+          }
+          setQueueError(queuedResult.error);
+          setPermissionProfiles(permissionProfileResult);
+          if (!permissionProfileId && permissionProfileResult.some((profile) => profile.allowed)) {
+            setPermissionProfileId(
+              permissionProfileResult.find((profile) => profile.allowed)?.id ?? "",
+            );
+          }
+          setApprovalPolicies(approvalPolicyResult);
+          setApprovalPolicy((current) =>
+            chooseApprovalPolicy(approvalPolicyResult, mergedDetail.approvalPolicy ?? current),
+          );
+          setApprovalReviewers(approvalReviewerResult);
+          setApprovalReviewer((current) =>
+            chooseApprovalReviewer(
+              approvalReviewerResult,
+              mergedDetail.approvalsReviewer ?? current,
+            ),
+          );
+          if (!goalLoadedRef.current) {
+            setGoalDraft(goalResult?.goal?.objective ?? "");
+            goalLoadedRef.current = true;
+          }
           onThreadLoaded(mergedDetail);
           onSubagentsLoaded(agents);
           onUsageLoaded(usageSnapshot);
@@ -1525,9 +2817,36 @@ function ConversationPage({
               finishContextCompaction(progress.attempt.idempotencyKey, progress.resolution);
             }
           }
-          if (mergedDetail.model && models.some((option) => option.id === mergedDetail.model))
-            setModel(mergedDetail.model);
-          if (mergedDetail.reasoningEffort) setEffort(mergedDetail.reasoningEffort);
+          setNextTurnSettings((current) =>
+            reconcileNextTurnSettingsDraft(current, models, mergedDetail),
+          );
+          if (!productSettingsDirtyRef.current) {
+            setServiceTier(mergedDetail.serviceTier ?? null);
+            if (mergedDetail.permissionProfileId) {
+              setPermissionProfileId(mergedDetail.permissionProfileId);
+            }
+            if (
+              mergedDetail.approvalPolicy &&
+              approvalPolicyResult.some((policy) => policy.id === mergedDetail.approvalPolicy)
+            ) {
+              setApprovalPolicy(mergedDetail.approvalPolicy);
+            }
+            if (
+              mergedDetail.approvalsReviewer &&
+              approvalReviewerResult.some(
+                (reviewer) => reviewer.id === mergedDetail.approvalsReviewer,
+              )
+            ) {
+              setApprovalReviewer(mergedDetail.approvalsReviewer);
+            }
+            if (mergedDetail.collaborationMode) {
+              setCollaborationMode(mergedDetail.collaborationMode);
+            }
+          }
+          if (projectionGenerationIsCurrent) {
+            retainedReplayThroughRef.current = latestLiveDeliveryRef.current;
+            setDetailProjectionReady(true);
+          }
           setState("ready");
           setError("");
         } catch (loadError) {
@@ -1548,11 +2867,17 @@ function ConversationPage({
     [
       apiClient,
       finishContextCompaction,
+      goalSupported,
       id,
       models,
       onSubagentsLoaded,
       onThreadLoaded,
       onUsageLoaded,
+      approvalReviewersCapability,
+      approvalPoliciesCapability,
+      permissionProfilesCapability,
+      permissionProfileId,
+      queueSupported,
     ],
   );
 
@@ -1568,22 +2893,133 @@ function ConversationPage({
     setCompactionRequestState("idle");
     setCompactionNotice("");
     setCompactionError("");
+    setQueue([]);
+    setQueueRevision(0);
+    setQueueBusyId("");
+    setQueueError("");
+    setPermissionProfiles([]);
+    setApprovalPolicies([]);
+    setApprovalPolicy("");
+    setApprovalReviewers([]);
+    setApprovalReviewer("");
+    setDeliveryMode("steer");
+    setComposerSheet("");
+    setShowUsage(false);
+    setUsageRefreshState("idle");
+    setUsageRefreshError("");
+    setThreadIdCopyState("idle");
+    setRuntimeNotice(undefined);
+    setVisibleItemLimit(INITIAL_CONVERSATION_ITEM_LIMIT);
+    setGoalDraft("");
+    setActionError("");
+    setActionStatus("");
+    setResumeBusy(false);
+    setSending(false);
+    goalLoadedRef.current = false;
+    productSettingsDirtyRef.current = false;
+    collaborationModeDirtyRef.current = false;
     compactionAttemptRef.current = undefined;
     compactionRequestFlightRef.current = undefined;
+    creationPromptLiveAliasItemIdRef.current = undefined;
+    creationPromptPersistedItemIdRef.current = undefined;
+    retainedReplayThroughRef.current = 0;
+    setDetailProjectionReady(Boolean(routeSeedRef.current));
     const fallback =
       routeSeedRef.current ??
       (summaryRef.current ? detailFromThreadSummary(summaryRef.current) : undefined);
     if (fallback) {
       threadRef.current = fallback;
       setThread(fallback);
+      setNextTurnSettings(nextTurnSettingsDraft(modelsRef.current, fallback));
+      setServiceTier(
+        fallback.serviceTier ??
+          modelsRef.current.find((model) => model.id === fallback.model)?.defaultServiceTier ??
+          null,
+      );
+      setPermissionProfileId(fallback.permissionProfileId ?? "");
+      setApprovalPolicy(fallback.approvalPolicy ?? "");
+      setApprovalReviewer(fallback.approvalsReviewer ?? "");
+      setCollaborationMode(
+        fallback.collaborationMode ??
+          collaborationModes.find((mode) => mode.id === "auto" && mode.available)?.id ??
+          collaborationModes.find((mode) => mode.available)?.id ??
+          "",
+      );
       setState("ready");
       setError("");
     } else {
       threadRef.current = undefined;
       setThread(undefined);
       setThreadUsage(undefined);
+      setNextTurnSettings(nextTurnSettingsDraft(modelsRef.current, undefined));
+      setServiceTier(
+        modelsRef.current.find((model) => model.isDefault)?.defaultServiceTier ?? null,
+      );
     }
   }, [id]);
+
+  useEffect(() => {
+    if (
+      !shouldSeedThreadFromLateSummary(
+        threadRef.current?.id,
+        routeSeedRef.current?.id,
+        summary?.id,
+      ) ||
+      !summary
+    ) {
+      return;
+    }
+    const fallback = detailFromThreadSummary(summary);
+    threadRef.current = fallback;
+    setThread(fallback);
+    setNextTurnSettings(nextTurnSettingsDraft(models, fallback));
+    setServiceTier(
+      fallback.serviceTier ??
+        models.find((model) => model.id === fallback.model)?.defaultServiceTier ??
+        null,
+    );
+    setPermissionProfileId(fallback.permissionProfileId ?? "");
+    setApprovalPolicy(fallback.approvalPolicy ?? "");
+    setApprovalReviewer(fallback.approvalsReviewer ?? "");
+    setState("ready");
+    setError("");
+  }, [models, summary]);
+
+  useEffect(() => {
+    if (!thread || thread.id !== id || !detailProjectionReady) return;
+    const nextState = compactThreadNavigationState(thread, routeInitialPromptRef.current);
+    const signature = JSON.stringify(nextState);
+    if (navigationSeedSignatureRef.current === signature) return;
+    navigationSeedSignatureRef.current = signature;
+    writeThreadNavigationCache(window.sessionStorage, nextState);
+    void navigate(`/threads/${id}`, {
+      replace: true,
+      state: nextState,
+    });
+  }, [detailProjectionReady, id, navigate, thread]);
+
+  useEffect(() => {
+    if (!showUsage) return;
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setShowUsage(false);
+    }
+
+    function closeOutsideUsage(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (usageButtonRef.current?.contains(target) || usagePanelRef.current?.contains(target))
+        return;
+      setShowUsage(false);
+    }
+
+    document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("pointerdown", closeOutsideUsage);
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("pointerdown", closeOutsideUsage);
+    };
+  }, [showUsage]);
 
   useEffect(() => {
     void load(Boolean(routeSeedRef.current ?? summaryRef.current));
@@ -1654,6 +3090,34 @@ function ConversationPage({
     if (pending.length === 0) {
       return;
     }
+    const resetPartition = partitionLiveDeliveriesAtReset(pending);
+    if (resetPartition.reset) {
+      handledLiveDelivery.current = resetPartition.reset.deliveryId;
+      const current = threadRef.current;
+      if (current) {
+        applyThreadRemoteEvents(current, [resetPartition.reset.event], {
+          projection: remoteProjectionRef.current,
+        });
+      }
+      retainedReplayThroughRef.current = 0;
+      setDetailProjectionReady(false);
+      const pendingCompactionAttempt = compactionAttemptRef.current;
+      if (pendingCompactionAttempt) {
+        compactionAttemptRef.current =
+          markContextCompactionRecoveryRequired(pendingCompactionAttempt);
+      }
+      const collidedWithExistingLoad = loadInFlight.current?.id === id;
+      const recovery = load(true);
+      if (collidedWithExistingLoad) {
+        void recovery.finally(() => {
+          if (currentIdRef.current === id) void load(true);
+        });
+      }
+      return;
+    }
+    if (!detailProjectionReady) {
+      return;
+    }
     const firstDelivery = pending[0]?.deliveryId;
     const missedBufferedEvents =
       handledLiveDelivery.current > 0 &&
@@ -1666,26 +3130,89 @@ function ConversationPage({
     if (relevant.length > 0) {
       const current = threadRef.current;
       if (current) {
+        const creationContext = routeSeedRef.current
+          ? {
+              creationSeed: routeSeedRef.current,
+              ...(routeInitialPromptRef.current === undefined
+                ? {}
+                : { initialPrompt: routeInitialPromptRef.current }),
+              ...(creationPromptLiveAliasItemIdRef.current === undefined
+                ? {}
+                : { liveAliasItemId: creationPromptLiveAliasItemIdRef.current }),
+            }
+          : undefined;
+        const liveAliasItemId = findCreationPromptLiveAliasItemId(relevantEvents, creationContext);
+        if (liveAliasItemId) {
+          creationPromptLiveAliasItemIdRef.current = liveAliasItemId;
+        }
+        const liveCreationContext =
+          creationContext && liveAliasItemId
+            ? { ...creationContext, liveAliasItemId }
+            : creationContext;
         let projected = current;
         let group: RemoteEvent[] = [];
-        let replayed = relevant[0]?.replayed ?? false;
+        let replayed = relevant[0]
+          ? isReplayDelivery(relevant[0], retainedReplayThroughRef.current)
+          : false;
         const flush = () => {
           if (group.length === 0) return;
-          projected = applyThreadRemoteEvents(projected, group, { replayed });
+          projected = applyThreadRemoteEvents(projected, group, {
+            projection: remoteProjectionRef.current,
+            replayed,
+          });
           group = [];
         };
         for (const envelope of relevant) {
-          if (envelope.replayed !== replayed) {
+          const envelopeReplayed = isReplayDelivery(envelope, retainedReplayThroughRef.current);
+          if (envelopeReplayed !== replayed) {
             flush();
-            replayed = envelope.replayed;
+            replayed = envelopeReplayed;
           }
           group.push(envelope.event);
         }
         flush();
+        projected = reconcileLiveCreationPromptAlias(
+          projected,
+          liveCreationContext,
+          creationPromptPersistedItemIdRef.current,
+        );
         threadRef.current = projected;
         setThread(projected);
+        if (!productSettingsDirtyRef.current) {
+          setServiceTier(projected.serviceTier ?? null);
+          if (projected.permissionProfileId) {
+            setPermissionProfileId(projected.permissionProfileId);
+          }
+          if (
+            projected.approvalPolicy &&
+            approvalPolicies.some((policy) => policy.id === projected.approvalPolicy)
+          ) {
+            setApprovalPolicy(projected.approvalPolicy);
+          }
+          if (
+            projected.approvalsReviewer &&
+            approvalReviewers.some((reviewer) => reviewer.id === projected.approvalsReviewer)
+          ) {
+            setApprovalReviewer(projected.approvalsReviewer);
+          }
+          if (projected.collaborationMode) {
+            setCollaborationMode(projected.collaborationMode);
+          }
+        }
       }
       setThreadUsage((current) => applyUsageRemoteEvents(current, id, relevantEvents));
+      setRuntimeNotice((current) => reduceRuntimeNotice(current, relevantEvents));
+      if (queueSupported && relevantEvents.some((event) => event.type === "queue.updated")) {
+        void apiClient
+          .queue(id)
+          .then((snapshot) => {
+            if (currentIdRef.current !== id) return;
+            setQueue(snapshot.items);
+            setQueueRevision(snapshot.revision);
+            setQueueError("");
+          })
+          .catch((queueRefreshError: unknown) => setQueueError(errorMessage(queueRefreshError)));
+      }
     }
 
     const compactionAttempt = compactionAttemptRef.current;
@@ -1697,7 +3224,6 @@ function ConversationPage({
       }
     }
 
-    const resetRequested = relevantEvents.some((event) => event.type === "connection.reset");
     const turnFinished = relevantEvents.some((event) => {
       if (event.type !== "turn.state") return false;
       const payload =
@@ -1707,19 +3233,31 @@ function ConversationPage({
       return payload.state === "idle" || payload.state === "complete" || payload.state === "failed";
     });
     const pendingCompactionAttempt = compactionAttemptRef.current;
-    if (pendingCompactionAttempt && (missedBufferedEvents || resetRequested)) {
+    if (pendingCompactionAttempt && missedBufferedEvents) {
       compactionAttemptRef.current =
         markContextCompactionRecoveryRequired(pendingCompactionAttempt);
     }
-    if (missedBufferedEvents || resetRequested || turnFinished) {
+    if (missedBufferedEvents || turnFinished) {
       void load(true);
     }
-  }, [finishContextCompaction, id, liveEvents, load, state, thread]);
+  }, [
+    apiClient,
+    approvalPolicies,
+    approvalReviewers,
+    detailProjectionReady,
+    finishContextCompaction,
+    id,
+    liveEvents,
+    load,
+    queueSupported,
+    state,
+    thread,
+  ]);
 
   useEffect(() => {
     let timer: number | undefined;
     let disposed = false;
-    const delay = threadRefreshDelay(thread?.state);
+    const delay = threadRefreshDelay(thread?.state, compactionRequestState === "accepted");
     const clear = () => {
       if (timer !== undefined) window.clearTimeout(timer);
       timer = undefined;
@@ -1728,6 +3266,10 @@ function ConversationPage({
       clear();
       if (disposed || !canRefreshDocument(document.visibilityState)) return;
       timer = window.setTimeout(() => {
+        if (isTextEntryElement(document.activeElement)) {
+          schedule();
+          return;
+        }
         void load(true).finally(schedule);
       }, delay);
     };
@@ -1744,74 +3286,507 @@ function ConversationPage({
       clear();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [load, thread?.state]);
+  }, [compactionRequestState, load, thread?.state]);
 
   useEffect(() => {
     window.localStorage.setItem(`draft:${id}`, draft);
   }, [draft, id]);
 
+  useEffect(() => {
+    if (!actionStatus) return;
+    const timer = window.setTimeout(() => setActionStatus(""), 4_000);
+    return () => window.clearTimeout(timer);
+  }, [actionStatus]);
+
+  useEffect(() => {
+    writeConversationAttachments(window.localStorage, id, attachments);
+  }, [attachments, id]);
+
+  useEffect(() => {
+    restoredScrollThreadRef.current = "";
+    setAttachments(readConversationAttachments(window.localStorage, id));
+    return () => {
+      const element = conversationScrollRef.current;
+      if (element) {
+        writeConversationScrollPosition(window.localStorage, id, element.scrollTop);
+      }
+    };
+  }, [id]);
+
+  useEffect(() => {
+    if (state !== "ready" || !detailProjectionReady || restoredScrollThreadRef.current === id) {
+      return;
+    }
+    const saved = readConversationScrollPosition(window.localStorage, id);
+    restoredScrollThreadRef.current = id;
+    if (saved === undefined) return;
+    const frame = window.requestAnimationFrame(() => {
+      const element = conversationScrollRef.current;
+      if (!element) return;
+      element.scrollTop = Math.min(saved, Math.max(0, element.scrollHeight - element.clientHeight));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [detailProjectionReady, id, state]);
+
+  function refreshUsageDetails() {
+    setShowUsage(true);
+    if (usageRefreshInFlightRef.current) return usageRefreshInFlightRef.current;
+    setUsageRefreshState("refreshing");
+    setUsageRefreshError("");
+    const requestedThreadId = id;
+    const flight = apiClient
+      .usage(requestedThreadId)
+      .then((snapshot) => {
+        if (currentIdRef.current !== requestedThreadId) return;
+        setThreadUsage(snapshot);
+        onUsageLoaded(snapshot);
+        setUsageRefreshState("idle");
+      })
+      .catch((usageError: unknown) => {
+        if (currentIdRef.current !== requestedThreadId) return;
+        setUsageRefreshState("error");
+        setUsageRefreshError(errorMessage(usageError));
+      });
+    usageRefreshInFlightRef.current = flight;
+    void flight.finally(() => {
+      if (usageRefreshInFlightRef.current === flight) {
+        usageRefreshInFlightRef.current = undefined;
+      }
+    });
+    return flight;
+  }
+
+  function toggleUsageDetails() {
+    if (showUsage) {
+      setShowUsage(false);
+      return;
+    }
+    void refreshUsageDetails();
+  }
+
+  async function copyThreadId() {
+    try {
+      await navigator.clipboard.writeText(id);
+      if (currentIdRef.current === id) setThreadIdCopyState("copied");
+    } catch {
+      if (currentIdRef.current === id) setThreadIdCopyState("error");
+    }
+  }
+
+  function revealEarlierConversationItems() {
+    const scroll = conversationScrollRef.current;
+    const previousHeight = scroll?.scrollHeight ?? 0;
+    setVisibleItemLimit((current) =>
+      nextConversationItemLimit(current, threadRef.current?.items.length ?? current),
+    );
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (!scroll) return;
+        scroll.scrollTop += Math.max(0, scroll.scrollHeight - previousHeight);
+      });
+    });
+  }
+
+  function nextTurnProductSettings(
+    overrides: {
+      serviceTier?: string | null;
+      permissionProfileId?: string;
+      approvalPolicy?: string;
+      approvalsReviewer?: string;
+      collaborationMode?: string;
+    } = {},
+  ) {
+    const base = nextTurnSettingsInput(nextTurnSettings, models);
+    const selectedServiceTier =
+      overrides.serviceTier === undefined ? serviceTier : overrides.serviceTier;
+    const selectedPermission =
+      overrides.permissionProfileId === undefined
+        ? permissionProfileId
+        : overrides.permissionProfileId;
+    const selectedApprovalReviewer =
+      overrides.approvalsReviewer === undefined ? approvalReviewer : overrides.approvalsReviewer;
+    const selectedApprovalPolicy =
+      overrides.approvalPolicy === undefined ? approvalPolicy : overrides.approvalPolicy;
+    const selectedCollaboration =
+      overrides.collaborationMode === undefined ? collaborationMode : overrides.collaborationMode;
+    return {
+      ...base,
+      ...serviceTierSetting(
+        capabilities,
+        selectedServiceTier === null ? undefined : selectedServiceTier,
+      ),
+      ...(permissionProfilesSupported && selectedPermission
+        ? { permissionProfileId: selectedPermission }
+        : {}),
+      ...(approvalPoliciesSupported && selectedApprovalPolicy
+        ? { approvalPolicy: selectedApprovalPolicy }
+        : {}),
+      ...(approvalReviewersSupported && selectedApprovalReviewer
+        ? { approvalsReviewer: selectedApprovalReviewer }
+        : {}),
+      ...collaborationModeSetting(capabilities, collaborationModes, selectedCollaboration, {
+        includeDefault:
+          overrides.collaborationMode !== undefined || collaborationModeDirtyRef.current,
+      }),
+    };
+  }
+
   async function submit() {
-    if (!thread || !draft.trim() || !online) return;
+    if (
+      !thread ||
+      thread.mode === "desktop-snapshot" ||
+      !draft.trim() ||
+      !runtimeControlAvailable
+    ) {
+      return;
+    }
     setSending(true);
     setActionError("");
     try {
-      if (thread.activeTurnId && thread.availableActions.steer) {
-        await apiClient.steer(thread.id, thread.activeTurnId, { prompt: draft.trim() });
-        const updated: ThreadDetail = {
-          ...thread,
+      const prompt = draft.trim();
+      let currentThread = threadRef.current ?? thread;
+      let decision = composerDeliveryDecision(currentThread, deliveryMode, queueSupported);
+      const decisionBeforeRefresh = decision;
+      if (decision === "start" || decision === "synchronize") {
+        const authoritative = await apiClient.thread(currentThread.id);
+        if (currentIdRef.current !== id) return;
+        const creationContext = routeSeedRef.current
+          ? {
+              creationSeed: routeSeedRef.current,
+              ...(routeInitialPromptRef.current === undefined
+                ? {}
+                : { initialPrompt: routeInitialPromptRef.current }),
+              ...(creationPromptLiveAliasItemIdRef.current === undefined
+                ? {}
+                : { liveAliasItemId: creationPromptLiveAliasItemIdRef.current }),
+            }
+          : undefined;
+        const synchronized = mergeAuthoritativeThreadControl(
+          threadRef.current,
+          authoritative,
+          creationContext,
+        );
+        threadRef.current = synchronized;
+        setThread(synchronized);
+        onThreadLoaded(synchronized);
+        currentThread = authoritative;
+        decision = composerDeliveryDecision(authoritative, deliveryMode, queueSupported);
+        if (decisionBeforeRefresh === "start" && decision !== "start") {
+          setActionError(
+            "电脑端刚开始或仍在执行回复，状态已同步；请选择“引导”或“排队”后再次发送，文字已保留。",
+          );
+          return;
+        }
+        if (decisionBeforeRefresh === "synchronize" && decision === "start") {
+          setActionError("刚才的回复已经结束，状态已同步；再次发送会开始下一轮，文字已保留。");
+          return;
+        }
+      }
+      if (decision === "synchronize") {
+        setActionError("正在同步当前回复的控制状态；也可以切换为“排队”，文字已保留。");
+        return;
+      }
+      if (decision === "queue") {
+        const snapshot = await apiClient.enqueue(currentThread.id, {
+          prompt,
+          ...(attachments.length ? { attachments } : {}),
+          ...nextTurnProductSettings(),
+        });
+        setQueue(snapshot.items);
+        setQueueRevision(snapshot.revision);
+        collaborationModeDirtyRef.current = false;
+        setActionStatus("turn-queued");
+      } else if (decision === "steer" && currentThread.activeTurnId) {
+        reserveSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
+        const optimisticId = `pending-steer-${Date.now()}`;
+        const latestThread = threadRef.current ?? currentThread;
+        const optimistic: ThreadDetail = {
+          ...latestThread,
           items: [
-            ...thread.items,
+            ...latestThread.items,
             {
-              id: `pending-${Date.now()}`,
+              id: optimisticId,
               kind: "user-message",
-              text: `补充要求：${draft.trim()}`,
+              text: prompt,
+              turnId: currentThread.activeTurnId,
             },
           ],
         };
-        threadRef.current = updated;
-        setThread(updated);
+        threadRef.current = optimistic;
+        setThread(optimistic);
+        try {
+          await apiClient.steer(currentThread.id, currentThread.activeTurnId, {
+            prompt,
+            ...(attachments.length ? { attachments } : {}),
+          });
+        } catch (steerError) {
+          cancelSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
+          const latestAfterFailure = threadRef.current ?? optimistic;
+          const rolledBack: ThreadDetail = {
+            ...latestAfterFailure,
+            items: latestAfterFailure.items.filter((item) => item.id !== optimisticId),
+          };
+          threadRef.current = rolledBack;
+          setThread(rolledBack);
+          throw steerError;
+        }
+        const accepted = threadRef.current ?? optimistic;
+        rememberSubmittedTurnUserAlias(remoteProjectionRef.current, accepted, prompt);
         setActionStatus("steer-accepted");
       } else {
-        const updated = await apiClient.sendTurn(thread.id, {
-          prompt: draft.trim(),
-          model,
-          reasoningEffort: normalizeReasoningEffort(models, model, effort),
-        });
+        reserveSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
+        let updated: ThreadDetail;
+        try {
+          updated = await apiClient.sendTurn(currentThread.id, {
+            prompt,
+            ...(attachments.length ? { attachments } : {}),
+            ...nextTurnProductSettings(),
+          });
+        } catch (sendError) {
+          cancelSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
+          throw sendError;
+        }
+        rememberSubmittedTurnUserAlias(remoteProjectionRef.current, updated, prompt);
         threadRef.current = updated;
         setThread(updated);
+        setNextTurnSettings((current) => consumeNextTurnSettingsDraft(current, models, updated));
+        productSettingsDirtyRef.current = false;
+        collaborationModeDirtyRef.current = false;
+        setServiceTier(updated.serviceTier ?? serviceTier);
+        if (updated.permissionProfileId) setPermissionProfileId(updated.permissionProfileId);
+        if (
+          updated.approvalPolicy &&
+          approvalPolicies.some((policy) => policy.id === updated.approvalPolicy)
+        ) {
+          setApprovalPolicy(updated.approvalPolicy);
+        }
+        if (
+          updated.approvalsReviewer &&
+          approvalReviewers.some((reviewer) => reviewer.id === updated.approvalsReviewer)
+        ) {
+          setApprovalReviewer(updated.approvalsReviewer);
+        }
+        if (updated.collaborationMode) setCollaborationMode(updated.collaborationMode);
         onThreadLoaded(updated);
       }
       setDraft("");
+      setAttachments([]);
       window.localStorage.removeItem(`draft:${id}`);
+      window.localStorage.removeItem(`conversation-attachments:${encodeURIComponent(id)}`);
       window.setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 20);
     } catch (submitError) {
-      setActionError(errorMessage(submitError));
+      if (submitError instanceof ApiRequestError && submitError.code === "TURN_MISMATCH") {
+        setActionError(`${submitError.message}；状态正在刷新，文字已保留。`);
+        void load(true);
+      } else {
+        setActionError(errorMessage(submitError));
+      }
     } finally {
       setSending(false);
     }
   }
 
+  async function persistNextTurnSettings(
+    overrides: {
+      serviceTier?: string | null;
+      permissionProfileId?: string;
+      approvalPolicy?: string;
+      approvalsReviewer?: string;
+      collaborationMode?: string;
+    } = {},
+  ) {
+    if (!thread || settingsBusy || !runtimeControlAvailable) return;
+    setSettingsBusy(true);
+    setActionError("");
+    try {
+      if (settingsUpdateSupported && thread.availableActions.updateSettings !== false) {
+        await apiClient.updateThreadSettings(thread.id, {
+          ...nextTurnProductSettings(overrides),
+          ...(overrides.serviceTier === null ? serviceTierSetting(capabilities, null) : {}),
+        });
+        if (overrides.collaborationMode === undefined) {
+          productSettingsDirtyRef.current = false;
+        }
+      }
+      setActionStatus("settings-applied");
+      setComposerSheet("");
+    } catch (settingsError) {
+      setActionError(errorMessage(settingsError));
+    } finally {
+      setSettingsBusy(false);
+    }
+  }
+
+  async function updateQueuedPrompt(item: QueuedTurnItem, prompt: string) {
+    if (!thread) return;
+    setQueueBusyId(item.id);
+    setQueueError("");
+    try {
+      const snapshot = await apiClient.updateQueued(thread.id, item.id, {
+        expectedRevision: queueRevision,
+        prompt,
+        ...(item.attachments ? { attachments: item.attachments } : {}),
+        ...(item.approvalPolicy ? { approvalPolicy: item.approvalPolicy } : {}),
+        ...(item.approvalsReviewer ? { approvalsReviewer: item.approvalsReviewer } : {}),
+        ...(item.collaborationMode ? { collaborationMode: item.collaborationMode } : {}),
+        ...(item.model ? { model: item.model } : {}),
+        ...(item.permissionProfileId ? { permissionProfileId: item.permissionProfileId } : {}),
+        ...(item.reasoningEffort ? { reasoningEffort: item.reasoningEffort } : {}),
+        ...(item.serviceTier ? { serviceTier: item.serviceTier } : {}),
+      });
+      setQueue(snapshot.items);
+      setQueueRevision(snapshot.revision);
+    } catch (queueActionError) {
+      setQueueError(errorMessage(queueActionError));
+    } finally {
+      setQueueBusyId("");
+    }
+  }
+
+  async function deleteQueued(item: QueuedTurnItem) {
+    if (!thread) return;
+    setQueueBusyId(item.id);
+    setQueueError("");
+    try {
+      const snapshot = await apiClient.deleteQueued(thread.id, item.id, queueRevision);
+      setQueue(snapshot.items);
+      setQueueRevision(snapshot.revision);
+    } catch (queueActionError) {
+      setQueueError(errorMessage(queueActionError));
+    } finally {
+      setQueueBusyId("");
+    }
+  }
+
+  async function moveQueued(item: QueuedTurnItem, offset: -1 | 1) {
+    if (!thread) return;
+    const previous = queue;
+    const moved = moveQueueItem(queue, item.id, offset);
+    setQueue(moved);
+    setQueueBusyId(item.id);
+    setQueueError("");
+    try {
+      const authoritative = await apiClient.reorderQueue(thread.id, {
+        expectedRevision: queueRevision,
+        queueIds: moved.map((candidate) => candidate.id),
+      });
+      setQueue(authoritative.items);
+      setQueueRevision(authoritative.revision);
+    } catch (queueActionError) {
+      setQueue(previous);
+      setQueueError(errorMessage(queueActionError));
+    } finally {
+      setQueueBusyId("");
+    }
+  }
+
+  async function dispatchQueued(item: QueuedTurnItem) {
+    if (!thread || thread.activeTurnId) return;
+    setQueueBusyId(item.id);
+    setQueueError("");
+    try {
+      const snapshot = await apiClient.dispatchQueued(thread.id, item.id, {
+        expectedRevision: queueRevision,
+        ...(item.state === "ambiguous" ? { retryAmbiguous: true } : {}),
+      });
+      setQueue(snapshot.items);
+      setQueueRevision(snapshot.revision);
+      const updated = await apiClient.thread(thread.id);
+      threadRef.current = updated;
+      setThread(updated);
+      onThreadLoaded(updated);
+    } catch (queueActionError) {
+      setQueueError(errorMessage(queueActionError));
+    } finally {
+      setQueueBusyId("");
+    }
+  }
+
+  async function steerQueued(item: QueuedTurnItem) {
+    if (!thread?.activeTurnId || !thread.availableActions.steer) return;
+    setQueueBusyId(item.id);
+    setQueueError("");
+    try {
+      const snapshot = await apiClient.steerQueued(thread.id, item.id, {
+        expectedRevision: queueRevision,
+        turnId: thread.activeTurnId,
+      });
+      setQueue(snapshot.items);
+      setQueueRevision(snapshot.revision);
+      setActionStatus("steer-accepted");
+      const updated = await apiClient.thread(thread.id);
+      threadRef.current = updated;
+      setThread(updated);
+      onThreadLoaded(updated);
+    } catch (queueActionError) {
+      setQueueError(errorMessage(queueActionError));
+    } finally {
+      setQueueBusyId("");
+    }
+  }
+
+  async function saveGoal() {
+    if (!thread || !goalDraft.trim() || goalBusy) return;
+    setGoalBusy(true);
+    setActionError("");
+    try {
+      await apiClient.setThreadGoal(thread.id, { objective: goalDraft.trim() });
+      setActionStatus("goal-saved");
+      setComposerSheet("");
+    } catch (goalError) {
+      setActionError(errorMessage(goalError));
+    } finally {
+      setGoalBusy(false);
+    }
+  }
+
+  async function clearGoal() {
+    if (!thread || goalBusy) return;
+    setGoalBusy(true);
+    setActionError("");
+    try {
+      await apiClient.clearThreadGoal(thread.id);
+      setGoalDraft("");
+      setActionStatus("goal-saved");
+      setComposerSheet("");
+    } catch (goalError) {
+      setActionError(errorMessage(goalError));
+    } finally {
+      setGoalBusy(false);
+    }
+  }
+
+  async function resumeHistoryThread() {
+    if (!thread || thread.mode !== "desktop-snapshot" || !runtimeControlAvailable || resumeBusy) {
+      return;
+    }
+    setResumeBusy(true);
+    setActionError("");
+    try {
+      const restored = await apiClient.resumeThread(thread.id, crypto.randomUUID());
+      threadRef.current = restored;
+      setThread(restored);
+      setDetailProjectionReady(true);
+      onThreadLoaded(restored);
+      await load(true);
+    } catch (resumeError) {
+      setActionError(errorMessage(resumeError));
+    } finally {
+      setResumeBusy(false);
+    }
+  }
+
   async function stop() {
-    if (!thread?.activeTurnId || !online) return;
+    if (!thread?.activeTurnId || !runtimeControlAvailable) return;
     setSending(true);
     setActionError("");
     try {
       await apiClient.interrupt(thread.id, thread.activeTurnId);
-      const { activeTurnId: _activeTurnId, ...threadWithoutActiveTurn } = thread;
-      const updated: ThreadDetail = {
-        ...threadWithoutActiveTurn,
-        state: "idle",
-        availableActions: {
-          ...thread.availableActions,
-          interrupt: false,
-          reply: true,
-          steer: false,
-        },
-      };
-      threadRef.current = updated;
-      setThread(updated);
-      onThreadLoaded(updated);
       setActionStatus("turn-interrupted");
+      const confirmed = await apiClient.thread(thread.id);
+      threadRef.current = confirmed;
+      setThread(confirmed);
+      onThreadLoaded(confirmed);
     } catch (stopError) {
       setActionError(errorMessage(stopError));
     } finally {
@@ -1827,6 +3802,7 @@ function ConversationPage({
     const currentThread = threadRef.current;
     if (
       !currentThread ||
+      !compactSupported ||
       !canRequestContextCompaction(currentThread, online, compactionRequestState)
     ) {
       return;
@@ -1900,11 +3876,83 @@ function ConversationPage({
   }
 
   const isSnapshot = thread.mode === "desktop-snapshot";
-  const running = !isSnapshot && Boolean(thread.activeTurnId);
-  const compactionBusy = isContextCompactionBusy(thread, compactionRequestState);
-  const canCompose = canDirectlyCompose(thread) && !compactionBusy;
+  const running =
+    !isSnapshot &&
+    (Boolean(thread.activeTurnId) ||
+      thread.state === "running" ||
+      thread.state === "waiting-for-approval");
+  const control = conversationControlState(online, capabilities, isSnapshot);
+  const canCompose = canShowThreadComposer(thread, control.available);
+  const currentApprovals = filterThreadApprovals(approvals, thread.id, thread.activeTurnId);
+  const canCompactNow =
+    compactSupported &&
+    queue.length === 0 &&
+    thread.availableActions.compact !== false &&
+    canRequestContextCompaction(thread, online, compactionRequestState);
+  const hasComposerTools =
+    Boolean(thread.projectId) ||
+    composerFeatureSupported(capabilities, "goal") ||
+    composerFeatureSupported(capabilities, "plan") ||
+    compactSupported;
+  const selectedPermission =
+    permissionProfiles.find((profile) => profile.id === permissionProfileId) ??
+    permissionProfiles[0];
+  const selectedPermissionLabel = selectedPermission
+    ? permissionProfileLabel(selectedPermission.id)
+    : "权限";
+  const selectedApprovalPolicyLabel = approvalPolicy
+    ? approvalPolicyLabel(approvalPolicy)
+    : "沿用设置";
+  const selectedReviewerLabel = approvalReviewer ? approvalReviewerLabel(approvalReviewer) : "";
+  const quota = quotaPresentation(threadUsage, thread.model);
+  const currentRuntimeDetails = [
+    thread.model ?? "模型由 Codex 决定",
+    thread.reasoningEffort ? effortLabel(thread.reasoningEffort) : undefined,
+    thread.serviceTier ? serviceTierDisplayLabel(thread.serviceTier) : undefined,
+  ].filter(Boolean);
+  const currentControlDetails = [
+    thread.permissionProfileId ? permissionProfileLabel(thread.permissionProfileId) : undefined,
+    thread.approvalPolicy ? approvalPolicyLabel(thread.approvalPolicy) : undefined,
+    thread.approvalsReviewer ? approvalReviewerLabel(thread.approvalsReviewer) : undefined,
+    thread.collaborationMode
+      ? (collaborationModes.find((mode) => mode.id === thread.collaborationMode)?.displayName ??
+        runtimeOptionLabel(thread.collaborationMode))
+      : undefined,
+  ].filter(Boolean);
+  const actionStatusCopy = {
+    "steer-accepted": "引导已发送到当前回复",
+    "turn-interrupted": "停止请求已发送",
+    "turn-queued": "已加入下一轮队列",
+    "settings-applied":
+      settingsUpdateSupported && thread.availableActions.updateSettings !== false
+        ? "下一轮设置已同步"
+        : "下一轮设置已保存，将在发送时应用",
+    "goal-saved": goalDraft.trim() ? "任务目标已保存" : "任务目标已清除",
+  } as const;
+  const snapshotPresentation = desktopSnapshotPresentation(
+    thread.parentThreadId,
+    thread.snapshotDelaySeconds,
+  );
+
+  function selectNextModel(modelId: string) {
+    const selectedModel = models.find((model) => model.id === modelId);
+    setNextTurnSettings((current) =>
+      updateNextTurnSettingsDraft(current, {
+        model: modelId,
+        effort: normalizeReasoningEffortForModel(selectedModel, current.effort),
+      }),
+    );
+    productSettingsDirtyRef.current = true;
+    setServiceTier(null);
+  }
+
   return (
     <div className="conversation-page" data-testid="thread-view">
+      {!appServerReady(capabilities) ? (
+        <Notice icon="alert" title="Codex 运行时兼容性待确认">
+          对话仍可查看；当前连接不再标记为完全可用。请留意操作报错，系统不会回退到另一套 CLI 后台。
+        </Notice>
+      ) : null}
       {thread.parentThreadId ? (
         <span className="sr-only" data-testid="subagent-thread">
           子智能体对话
@@ -1922,9 +3970,9 @@ function ConversationPage({
             variant="ghost"
           />
           <div>
-            <h1>{thread.title}</h1>
+            <h1>{threadTitleForDisplay(thread.title)}</h1>
             <span>
-              {thread.cwdLabel ?? "未关联项目"} · {timeAgo(thread.updatedAt)}
+              {threadLocationLabelForDisplay(thread)} · {timeAgo(thread.updatedAt)}
             </span>
           </div>
         </div>
@@ -1939,16 +3987,15 @@ function ConversationPage({
               <span>{subagents.length}</span>
             </button>
           ) : null}
-          <button
-            className="usage-trigger"
-            data-testid="usage-open"
-            onClick={() => setShowUsage((value) => !value)}
-          >
-            <Icon name="activity" size={15} />
-            额度
-          </button>
+          <UsageOrb
+            buttonRef={usageButtonRef}
+            onClick={toggleUsageDetails}
+            open={showUsage}
+            refreshing={usageRefreshState === "refreshing"}
+            usage={threadUsage}
+          />
           <StatusPill tone={isSnapshot ? "info" : runTones[thread.state]}>
-            {isSnapshot ? "只读快照" : runLabels[thread.state]}
+            {isSnapshot ? snapshotPresentation.statusLabel : runLabels[thread.state]}
           </StatusPill>
           {running ? (
             <span className="streaming-label">
@@ -1959,13 +4006,82 @@ function ConversationPage({
         </div>
       </header>
       {showUsage ? (
-        <section className="conversation-usage-panel" data-testid="usage-panel">
-          <div>
-            <strong>额度与上下文</strong>
-            <button aria-label="关闭额度面板" onClick={() => setShowUsage(false)}>
-              <Icon name="close" size={16} />
-            </button>
+        <section
+          aria-label="额度、上下文与当前运行参数"
+          className="conversation-usage-panel"
+          data-testid="usage-panel"
+          id="conversation-usage-panel"
+          ref={usagePanelRef}
+        >
+          <div className="conversation-usage-panel__header">
+            <div>
+              <strong>额度与上下文</strong>
+              <small>数据来自当前 Codex 运行时</small>
+            </div>
+            <div className="conversation-usage-panel__actions">
+              <button
+                aria-label="立即刷新额度"
+                disabled={usageRefreshState === "refreshing"}
+                onClick={() => void refreshUsageDetails()}
+                type="button"
+              >
+                <Icon
+                  name={usageRefreshState === "refreshing" ? "activity" : "refresh"}
+                  size={16}
+                />
+              </button>
+              <button aria-label="关闭额度面板" onClick={() => setShowUsage(false)} type="button">
+                <Icon name="close" size={16} />
+              </button>
+            </div>
           </div>
+          {usageRefreshError ? (
+            <div className="conversation-usage-error" role="alert">
+              <Icon name="alert" size={15} />
+              刷新失败：{usageRefreshError}
+            </div>
+          ) : null}
+          {quota.message && quota.state !== "unknown" ? (
+            <div
+              className={`conversation-quota-state conversation-quota-state--${quota.state}`}
+              role={quota.state === "exhausted" ? "alert" : "status"}
+            >
+              <Icon name={quota.state === "exhausted" ? "alert" : "activity"} size={15} />
+              {quota.message}
+            </div>
+          ) : null}
+          <dl className="conversation-usage-meta">
+            <div>
+              <dt>实时刷新</dt>
+              <dd>
+                {threadUsage?.updatedAt
+                  ? formatUtc8Time(threadUsage.updatedAt)
+                  : "尚未取得额度快照"}
+              </dd>
+            </div>
+            <div>
+              <dt>对话 ID</dt>
+              <dd>
+                <code data-testid="thread-id">{thread.id}</code>
+                <button aria-label="复制对话 ID" onClick={() => void copyThreadId()} type="button">
+                  <Icon name={threadIdCopyState === "copied" ? "check" : "copy"} size={14} />
+                  {threadIdCopyState === "copied"
+                    ? "已复制"
+                    : threadIdCopyState === "error"
+                      ? "复制失败"
+                      : "复制"}
+                </button>
+              </dd>
+            </div>
+            <div>
+              <dt>当前模型</dt>
+              <dd>{currentRuntimeDetails.join(" · ")}</dd>
+            </div>
+            <div>
+              <dt>权限与模式</dt>
+              <dd>{currentControlDetails.join(" · ") || "沿用 Codex 当前设置"}</dd>
+            </div>
+          </dl>
           <div className="conversation-usage-windows" data-testid="usage-window">
             {threadUsage ? (
               threadUsage.windows.map((window) => (
@@ -1988,7 +4104,7 @@ function ConversationPage({
                     {remainingPercentLabel(window.remainingPercent)}
                     {" · "}
                     {window.resetsAt
-                      ? `${absoluteTime(window.resetsAt)} 重置`
+                      ? `${formatUtc8Time(window.resetsAt)} 重置`
                       : "重置时间暂时无法读取"}
                   </small>
                 </div>
@@ -2013,9 +4129,11 @@ function ConversationPage({
                 {" · "}
                 {usedPercentLabel(threadUsage?.context?.usedPercent)}
                 {" · "}
-                {remainingPercentLabel(remainingFromUsedPercent(threadUsage?.context?.usedPercent))}
+                {remainingContextPercentLabel(
+                  remainingFromUsedPercent(threadUsage?.context?.usedPercent),
+                )}
               </small>
-              {thread.mode === "managed" && !thread.parentThreadId ? (
+              {compactSupported && thread.mode === "managed" && !thread.parentThreadId ? (
                 <div className="context-compaction-actions">
                   <button
                     className="context-compaction-button"
@@ -2051,13 +4169,41 @@ function ConversationPage({
                 </div>
               ) : null}
             </div>
+            <div className="conversation-usage-window conversation-usage-window--credits">
+              <span>{threadUsage?.plan ? `套餐 · ${threadUsage.plan}` : "账户额度"}</span>
+              <CreditsList compact credits={threadUsage?.credits} />
+            </div>
           </div>
         </section>
       ) : null}
       {isSnapshot ? (
-        <Notice icon="clock" title="这是桌面快照" tone="info">
-          内容可能延迟{thread.snapshotDelaySeconds ? `约 ${thread.snapshotDelaySeconds} 秒` : ""}
-          ，无法实时跟随、追加要求或停止 Desktop 当前回复。只有托管任务支持实时控制。
+        <Notice
+          action={
+            snapshotPresentation.resumable ? (
+              <Button
+                data-testid="resume-desktop-thread"
+                disabled={!runtimeControlAvailable || resumeBusy}
+                onClick={() => void resumeHistoryThread()}
+                size="compact"
+                variant="primary"
+              >
+                {resumeBusy ? "正在接入…" : "接入 Desktop 并继续"}
+              </Button>
+            ) : undefined
+          }
+          icon={thread.parentThreadId ? "layers" : "clock"}
+          title={snapshotPresentation.title}
+          tone="info"
+        >
+          {snapshotPresentation.description}
+          {snapshotPresentation.resumable && !runtimeControlAvailable
+            ? ` ${conversationControlState(online, capabilities, false).reason}。`
+            : ""}
+        </Notice>
+      ) : null}
+      {isSnapshot && actionError ? (
+        <Notice icon="alert" title="未能接入 Desktop" tone="danger">
+          {actionError}
         </Notice>
       ) : null}
       {thread.parentThreadId ? (
@@ -2075,23 +4221,58 @@ function ConversationPage({
           你仍可查看已加载内容；恢复连接前不能发送、停止或审批。
         </Notice>
       ) : null}
-      <div className="conversation-scroll">
+      {runtimeNotice ? (
+        <Notice
+          icon={runtimeNotice.category === "quota" ? "alert" : "activity"}
+          title={runtimeNotice.category === "quota" ? "额度不足" : "Codex 运行提示"}
+          tone={runtimeNotice.tone}
+        >
+          {runtimeNotice.message}
+        </Notice>
+      ) : null}
+      <InlineDecisionStack approvals={currentApprovals} onOpen={onOpenApproval} />
+      <div
+        className="conversation-scroll"
+        onScroll={(event) =>
+          writeConversationScrollPosition(window.localStorage, id, event.currentTarget.scrollTop)
+        }
+        ref={conversationScrollRef}
+      >
         <div className="conversation-stream">
-          {thread.items.map((item) => (
-            <MessageItem item={item} key={item.id} />
-          ))}
-          {!isSnapshot && thread.state === "running" ? (
+          {shouldShowConversationLoading(detailProjectionReady, visibleItems.length) ? (
             <div
-              aria-label="智能体正在工作"
-              className="working-indicator"
-              data-testid="turn-running"
+              aria-live="polite"
+              className="conversation-loading"
+              data-testid="conversation-loading"
+              role="status"
             >
-              <span />
-              <span />
-              <span />
-              <em>正在继续工作</em>
+              <Icon name="activity" size={17} />
+              <div>
+                <strong>正在加载最近对话</strong>
+                <span>输入框已经可用；较长的历史任务会继续在后台载入。</span>
+              </div>
             </div>
           ) : null}
+          {hiddenItemCount > 0 ? (
+            <button
+              className="conversation-history-more"
+              data-testid="conversation-history-more"
+              onClick={revealEarlierConversationItems}
+              type="button"
+            >
+              <Icon name="clock" size={16} />
+              显示更早内容（还有 {hiddenItemCount} 项）
+            </button>
+          ) : null}
+          <ConversationItems
+            {...(thread.activeTurnId === undefined ? {} : { activeTurnId: thread.activeTurnId })}
+            apiClient={apiClient}
+            items={visibleItems}
+            online={online}
+            {...(thread.projectId === undefined ? {} : { projectId: thread.projectId })}
+            showLivePhase={!isSnapshot && thread.state === "running"}
+            subagents={subagents}
+          />
           {thread.state === "failed" ? (
             <Notice
               action={
@@ -2114,10 +4295,27 @@ function ConversationPage({
       </div>
       {!isSnapshot && canCompose ? (
         <div className="composer-shell">
+          <QueueShelf
+            busyId={queueBusyId}
+            canSteer={Boolean(running && thread.activeTurnId && thread.availableActions.steer)}
+            items={queue}
+            onDelete={(item) => void deleteQueued(item)}
+            onDispatch={(item) => void dispatchQueued(item)}
+            onMove={(item, offset) => void moveQueued(item, offset)}
+            onSteer={(item) => void steerQueued(item)}
+            onUpdate={(item, prompt) => void updateQueuedPrompt(item, prompt)}
+            running={running}
+          />
+          {queueError ? (
+            <div className="composer-error" role="alert">
+              <Icon name="alert" size={16} />
+              {queueError}
+            </div>
+          ) : null}
           {actionStatus ? (
             <div aria-live="polite" className="action-status" data-testid={actionStatus}>
               <Icon name="check" size={15} />
-              {actionStatus === "steer-accepted" ? "补充要求已转交" : "已发送停止请求"}
+              {actionStatusCopy[actionStatus]}
             </div>
           ) : null}
           {actionError ? (
@@ -2127,62 +4325,141 @@ function ConversationPage({
             </div>
           ) : null}
           <div className="composer">
+            {running || composerPlan ? (
+              <div className="composer__context-bar">
+                {running ? (
+                  <DeliveryModeSwitch
+                    mode={deliveryMode}
+                    onChange={setDeliveryMode}
+                    queueSupported={queueSupported}
+                  />
+                ) : null}
+                {composerPlan ? <PlanProgressControl plan={composerPlan} /> : null}
+              </div>
+            ) : null}
             <textarea
-              aria-label={running ? "追加要求" : "回复"}
+              aria-label={
+                running && deliveryMode === "queue" ? "排队到下一轮" : running ? "追加要求" : "回复"
+              }
               data-testid="turn-composer"
               disabled={!online}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) void submit();
               }}
-              placeholder={running ? "追加要求，不会中断当前工作" : "说明接下来要做什么…"}
+              placeholder={
+                running && deliveryMode === "queue"
+                  ? "写下当前回复结束后要做的事…"
+                  : running
+                    ? thread.activeTurnId
+                      ? "引导正在运行的回复…"
+                      : "正在同步当前回复；文字会保留，也可先排队…"
+                    : "说明接下来要做什么…"
+              }
               rows={2}
               value={draft}
             />
+            <AttachmentChips
+              attachments={attachments}
+              onRemove={(reference) =>
+                setAttachments((current) =>
+                  current.filter(
+                    (item) => attachmentReferenceKey(item) !== attachmentReferenceKey(reference),
+                  ),
+                )
+              }
+            />
             <div className="composer__footer">
-              <span className="next-turn-badge">下一轮</span>
-              <ModelControls
-                ariaContext="下一轮"
-                disabled={!thread.availableActions.changeModelNextTurn}
-                effort={effort}
-                effortTestId="next-turn-effort"
-                model={model}
-                modelTestId="next-turn-model"
+              {hasComposerTools ? (
+                <Button
+                  aria-label="打开对话工具"
+                  data-testid="composer-tools-open"
+                  icon="plus"
+                  onClick={() => setComposerSheet("tools")}
+                  size="icon"
+                  variant="ghost"
+                />
+              ) : null}
+              <ComposerSettingsButton
+                disabled={
+                  !thread.availableActions.changeModelNextTurn &&
+                  !(settingsUpdateSupported && thread.availableActions.updateSettings !== false)
+                }
+                effort={nextTurnSettings.effort}
+                model={nextTurnSettings.model}
                 models={models}
-                onEffort={setEffort}
-                onModel={setModel}
+                onEffort={(effort) =>
+                  setNextTurnSettings((current) => updateNextTurnSettingsDraft(current, { effort }))
+                }
+                onModel={selectNextModel}
+                onOpen={() => setComposerSheet("settings")}
+                serviceTier={serviceTiersSupported ? serviceTier : null}
+                serviceTiersSupported={serviceTiersSupported}
               />
+              {permissionProfilesSupported ||
+              approvalPoliciesSupported ||
+              approvalReviewersSupported ? (
+                <PermissionButton
+                  label={[
+                    selectedPermissionLabel,
+                    selectedApprovalPolicyLabel,
+                    selectedReviewerLabel,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                  onOpen={() => setComposerSheet("permission")}
+                />
+              ) : null}
               <div className="composer__actions">
-                {running && thread.availableActions.interrupt ? (
+                {running && thread.availableActions.interrupt && !draft.trim() ? (
                   <Button
                     aria-label="停止当前工作"
                     data-testid="turn-interrupt"
                     disabled={!online || sending}
                     icon="stop"
                     onClick={() => void stop()}
-                    size="compact"
+                    size="icon"
                     variant="danger"
-                  >
-                    停止
-                  </Button>
-                ) : null}
-                <Button
-                  aria-label={running ? "发送补充要求" : "发送"}
-                  data-testid={running ? "turn-steer-submit" : "turn-reply-submit"}
-                  disabled={!draft.trim() || !online || sending}
-                  icon="send"
-                  onClick={() => void submit()}
-                  size="icon"
-                  variant="primary"
-                />
+                  />
+                ) : (
+                  <Button
+                    aria-label={
+                      running && deliveryMode === "queue"
+                        ? "加入下一轮队列"
+                        : running
+                          ? thread.activeTurnId
+                            ? "发送补充要求"
+                            : "同步状态并发送"
+                          : "发送"
+                    }
+                    data-testid={running ? "turn-steer-submit" : "turn-reply-submit"}
+                    disabled={!draft.trim() || !online || sending}
+                    icon="send"
+                    onClick={() => void submit()}
+                    size="icon"
+                    variant="primary"
+                  />
+                )}
               </div>
             </div>
           </div>
           <small className="next-turn-hint" data-testid="next-turn-model-notice">
             {running
-              ? "模型和思考等级的选择将在下一轮生效"
-              : "当前选择只应用于下一轮 · Ctrl + Enter 发送"}
+              ? deliveryMode === "queue"
+                ? "这条消息会进入网页下一轮队列；Desktop 会在真正发送后显示，模型、思考、速度与权限随消息保存"
+                : thread.activeTurnId
+                  ? "正在引导当前回复；设置按钮中的选择只会在下一轮生效"
+                  : "当前回复仍在运行，控制状态正在同步；文字不会丢失，也可以切换为排队"
+              : "模型、思考、速度与权限只应用于下一轮 · Ctrl + Enter 发送"}
           </small>
+        </div>
+      ) : !isSnapshot && !thread.parentThreadId && !control.available ? (
+        <div className="read-only-handoff" data-testid="runtime-control-unavailable">
+          <Icon name={online ? "alert" : "wifi-off"} size={19} />
+          <span>
+            <strong>当前只能查看</strong>
+            <small>{control.reason}。恢复后输入、停止和设置会自动重新出现。</small>
+          </span>
         </div>
       ) : !isSnapshot && thread.parentThreadId ? (
         <div className="read-only-handoff">
@@ -2196,6 +4473,105 @@ function ConversationPage({
           </Button>
         </div>
       ) : null}
+      <ComposerSettingsSheet
+        busy={settingsBusy}
+        demo={apiClient.demo}
+        effort={nextTurnSettings.effort}
+        model={nextTurnSettings.model}
+        models={models}
+        onApply={() =>
+          void persistNextTurnSettings({
+            ...(serviceTiersSupported ? { serviceTier } : {}),
+          })
+        }
+        onClose={() => setComposerSheet("")}
+        onEffort={(effort) =>
+          setNextTurnSettings((current) => updateNextTurnSettingsDraft(current, { effort }))
+        }
+        onModel={selectNextModel}
+        onServiceTier={(tier) => {
+          productSettingsDirtyRef.current = true;
+          setServiceTier(tier);
+        }}
+        open={composerSheet === "settings"}
+        serviceTier={serviceTiersSupported ? serviceTier : null}
+        serviceTiersSupported={serviceTiersSupported}
+      />
+      <AccessAndReviewerSheet
+        approvalPolicy={approvalPolicy}
+        approvalPolicies={approvalPoliciesSupported ? approvalPolicies : []}
+        approvalReviewer={approvalReviewer}
+        approvalReviewers={approvalReviewersSupported ? approvalReviewers : []}
+        busy={settingsBusy}
+        onApply={() =>
+          void persistNextTurnSettings({
+            ...(permissionProfilesSupported ? { permissionProfileId } : {}),
+            ...(approvalPoliciesSupported ? { approvalPolicy } : {}),
+            ...(approvalReviewersSupported ? { approvalsReviewer: approvalReviewer } : {}),
+          })
+        }
+        onApprovalPolicy={(policy) => {
+          productSettingsDirtyRef.current = true;
+          setApprovalPolicy(policy);
+        }}
+        onApprovalReviewer={(reviewer) => {
+          productSettingsDirtyRef.current = true;
+          setApprovalReviewer(reviewer);
+        }}
+        onClose={() => setComposerSheet("")}
+        onPermission={(profileId) => {
+          productSettingsDirtyRef.current = true;
+          setPermissionProfileId(profileId);
+        }}
+        open={composerSheet === "permission"}
+        permissionProfileId={permissionProfileId}
+        permissionProfiles={permissionProfilesSupported ? permissionProfiles : []}
+      />
+      <ComposerToolsSheet
+        canAttach
+        canCompact={canCompactNow}
+        capabilities={capabilities as ComposerCapabilities}
+        collaborationModes={collaborationModes}
+        onClose={() => setComposerSheet("")}
+        onAttach={() => setComposerSheet("attachments")}
+        onCompact={() => {
+          setComposerSheet("");
+          void compactContext();
+        }}
+        onGoal={() => setComposerSheet("goal")}
+        onPlan={() => setComposerSheet("plan")}
+        open={composerSheet === "tools"}
+      />
+      <AttachmentPickerSheet
+        apiClient={apiClient}
+        onApply={setAttachments}
+        onClose={() => setComposerSheet("")}
+        online={online}
+        open={composerSheet === "attachments"}
+        projectId={thread.projectId ?? ""}
+        selected={attachments}
+      />
+      <GoalSheet
+        busy={goalBusy}
+        onChange={setGoalDraft}
+        onClear={() => void clearGoal()}
+        onClose={() => setComposerSheet("")}
+        onSave={() => void saveGoal()}
+        open={composerSheet === "goal"}
+        value={goalDraft}
+      />
+      <PlanModeSheet
+        modes={collaborationModes}
+        onChange={(mode) => {
+          productSettingsDirtyRef.current = true;
+          collaborationModeDirtyRef.current = true;
+          setCollaborationMode(mode);
+          void persistNextTurnSettings({ collaborationMode: mode });
+        }}
+        onClose={() => setComposerSheet("")}
+        open={composerSheet === "plan"}
+        value={collaborationMode}
+      />
       <Sheet
         description="已完成的子智能体也会保留在这里。进入后可查看它的消息、工具与文件变更。"
         onClose={() => setShowAgents(false)}
@@ -2232,29 +4608,62 @@ function NewThreadPage({
   projects,
   models,
   collaborationModes,
+  capabilities,
   apiClient,
+  online,
 }: {
   projects: ProjectSummary[];
   models: ModelOption[];
   collaborationModes: CollaborationModeOption[];
+  capabilities: ComposerCapabilities | undefined;
   apiClient: ApiClient;
+  online: boolean;
 }) {
   const navigate = useNavigate();
   const location = useLocation();
+  const { copy } = useUiLocale();
   const selectableProjects = registeredProjects(projects);
   const requestedProject = new URLSearchParams(location.search).get("project");
-  const initialProject =
-    selectableProjects.find((project) => project.id === requestedProject)?.id ??
-    selectableProjects[0]?.id ??
-    "";
+  const recoveredDraft = readNewThreadDraft(window.localStorage);
+  const initialProject = initialNewThreadProject(
+    selectableProjects.map((project) => project.id),
+    requestedProject,
+    recoveredDraft?.projectId,
+  );
   const defaultModel = models.find((model) => model.isDefault) ?? models[0];
   const [projectId, setProjectId] = useState(initialProject);
-  const [prompt, setPrompt] = useState("");
+  const [prompt, setPrompt] = useState(recoveredDraft?.prompt ?? "");
+  const [attachments, setAttachments] = useState<LocalInputReference[]>([]);
+  const [attachmentPickerOpen, setAttachmentPickerOpen] = useState(false);
+  const [draftPersistence, setDraftPersistence] = useState<"saved" | "unavailable">("saved");
   const [model, setModel] = useState(defaultModel?.id ?? "");
-  const [effort, setEffort] = useState<ReasoningEffort>(
+  const [effort, setEffort] = useState<ReasoningEffort | undefined>(
     defaultReasoningEffortForModel(defaultModel),
   );
-  const [permission, setPermission] = useState<PermissionMode>("ask");
+  const permissionProfilesAvailable = composerFeatureSupported(capabilities, "permissionProfiles");
+  const approvalPoliciesAvailable = capabilities?.approvalPolicies === "available";
+  const approvalReviewersAvailable = capabilities?.approvalReviewers === "available";
+  const serviceTiersAvailable = composerFeatureSupported(capabilities, "serviceTiers");
+  const runtimeAvailable = appServerReady(capabilities);
+  const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([]);
+  const [permissionProfileId, setPermissionProfileId] = useState<string>();
+  const [permissionState, setPermissionState] = useState<
+    "unavailable" | "loading" | "ready" | "error"
+  >(permissionProfilesAvailable ? "loading" : "unavailable");
+  const [permissionError, setPermissionError] = useState("");
+  const [approvalPolicies, setApprovalPolicies] = useState<ApprovalPolicyOption[]>([]);
+  const [approvalPolicy, setApprovalPolicy] = useState("");
+  const [approvalPolicyState, setApprovalPolicyState] = useState<
+    "unavailable" | "loading" | "ready" | "error"
+  >(approvalPoliciesAvailable ? "loading" : "unavailable");
+  const [approvalReviewers, setApprovalReviewers] = useState<ApprovalReviewerOption[]>([]);
+  const [approvalReviewer, setApprovalReviewer] = useState("");
+  const [approvalReviewerState, setApprovalReviewerState] = useState<
+    "unavailable" | "loading" | "ready" | "error"
+  >(approvalReviewersAvailable ? "loading" : "unavailable");
+  const [serviceTier, setServiceTier] = useState<string | undefined>(
+    serviceTiersAvailable ? chooseServiceTier(defaultModel) : undefined,
+  );
   const [collaboration, setCollaboration] = useState(
     collaborationModes.find((mode) => mode.id === "auto" && mode.available)?.id ??
       collaborationModes.find((mode) => mode.available)?.id ??
@@ -2262,24 +4671,148 @@ function NewThreadPage({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const selectedModel = models.find((option) => option.id === model) ?? models[0];
+  const tierOptions = serviceTiersAvailable ? serviceTierOptions(selectedModel) : [];
+  const permissionReady =
+    !permissionProfilesAvailable ||
+    (permissionState === "ready" &&
+      permissionProfiles.some((profile) => profile.id === permissionProfileId && profile.allowed));
+
+  useEffect(() => {
+    setDraftPersistence(
+      writeNewThreadDraft(window.localStorage, { prompt, projectId }) ? "saved" : "unavailable",
+    );
+  }, [projectId, prompt]);
+
+  useEffect(() => {
+    if (!permissionProfilesAvailable) {
+      setPermissionProfiles([]);
+      setPermissionProfileId(undefined);
+      setPermissionState("unavailable");
+      setPermissionError("");
+      return;
+    }
+
+    let cancelled = false;
+    setPermissionState("loading");
+    setPermissionError("");
+    void apiClient
+      .permissionProfiles(projectId ? { projectId } : {})
+      .then((profiles) => {
+        if (cancelled) return;
+        const nextProfileId = choosePermissionProfileId(profiles);
+        setPermissionProfiles(profiles);
+        setPermissionProfileId(nextProfileId);
+        if (!nextProfileId) {
+          setPermissionState("error");
+          setPermissionError("Codex 当前没有返回可用的权限配置，已阻止用猜测值开始任务。");
+          return;
+        }
+        setPermissionState("ready");
+      })
+      .catch((profileError) => {
+        if (cancelled) return;
+        setPermissionProfiles([]);
+        setPermissionProfileId(undefined);
+        setPermissionState("error");
+        setPermissionError(`无法读取 Codex 的权限配置：${errorMessage(profileError)}`);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiClient, permissionProfilesAvailable, projectId]);
+
+  useEffect(() => {
+    if (!approvalPoliciesAvailable) {
+      setApprovalPolicies([]);
+      setApprovalPolicy("");
+      setApprovalPolicyState("unavailable");
+      return;
+    }
+    let cancelled = false;
+    setApprovalPolicyState("loading");
+    void apiClient
+      .approvalPolicies()
+      .then((policies) => {
+        if (cancelled) return;
+        const selected = chooseApprovalPolicy(policies);
+        setApprovalPolicies(policies);
+        setApprovalPolicy(selected);
+        setApprovalPolicyState(selected ? "ready" : "error");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setApprovalPolicies([]);
+        setApprovalPolicy("");
+        setApprovalPolicyState("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiClient, approvalPoliciesAvailable]);
+
+  useEffect(() => {
+    if (!approvalReviewersAvailable) {
+      setApprovalReviewers([]);
+      setApprovalReviewer("");
+      setApprovalReviewerState("unavailable");
+      return;
+    }
+    let cancelled = false;
+    setApprovalReviewerState("loading");
+    void apiClient
+      .approvalReviewers()
+      .then((reviewers) => {
+        if (cancelled) return;
+        const selected = chooseApprovalReviewer(reviewers);
+        setApprovalReviewers(reviewers);
+        setApprovalReviewer(selected);
+        setApprovalReviewerState(selected ? "ready" : "error");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setApprovalReviewers([]);
+        setApprovalReviewer("");
+        setApprovalReviewerState("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiClient, approvalReviewersAvailable]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!projectId || !prompt.trim()) return;
+    if (!prompt.trim() || !permissionReady || !runtimeAvailable) return;
     setBusy(true);
     setError("");
     try {
-      const created = await apiClient.createThread({
-        projectId,
-        prompt: prompt.trim(),
-        reasoningEffort: normalizeReasoningEffort(models, model, effort),
-        permissionMode: permission,
-        ...(model ? { model } : {}),
-        ...(collaboration ? { collaborationMode: collaboration } : {}),
+      const runtimeSettings = newThreadRuntimeSettings({
+        models,
+        modelId: model,
+        reasoningEffort: effort,
+        permissionProfilesAvailable,
+        permissionProfiles,
+        permissionProfileId,
+        serviceTiersAvailable,
+        serviceTier,
+        collaborationModes,
+        collaborationMode: collaboration,
       });
+      const created = await apiClient.createThread({
+        prompt: prompt.trim(),
+        ...(projectId ? { projectId } : {}),
+        ...(attachments.length ? { attachments } : {}),
+        ...runtimeSettings,
+        ...(approvalPolicyState === "ready" && approvalPolicy ? { approvalPolicy } : {}),
+        ...(approvalReviewerState === "ready" && approvalReviewer
+          ? { approvalsReviewer: approvalReviewer }
+          : {}),
+      });
+      clearNewThreadDraft(window.localStorage);
       void navigate(`/threads/${created.id}`, {
         replace: true,
-        state: threadNavigationState(created),
+        state: threadNavigationState(created, prompt.trim()),
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -2290,51 +4823,81 @@ function NewThreadPage({
 
   return (
     <>
-      <MobileHeader back title="新建对话" />
+      <MobileHeader back title={copy.newConversation} />
       <div className="page new-thread-page">
         <div className="page-heading">
-          <h1>开始新任务</h1>
-          <p>选择本机已登记的项目，再说明你希望完成什么。</p>
+          <h1>{copy.startNewTask}</h1>
+          <p>{copy.startNewTaskDescription}</p>
         </div>
+        {!runtimeAvailable ? (
+          <Notice icon="alert" title="暂时不能开始新任务">
+            Codex Desktop
+            运行时正在启动、刚刚更新，或兼容性状态无法确认。现有对话不会被中断；完成热更新确认后这里会自动恢复。
+          </Notice>
+        ) : null}
         <form data-testid="new-thread-form" onSubmit={(event) => void submit(event)}>
           <section className="form-section">
             <div className="form-section__title">
               <span>1</span>
               <div>
-                <h2>选择项目</h2>
-                <p>远程端不能添加任意目录</p>
+                <h2>{copy.chooseLocation}</h2>
+                <p>{copy.fixedProjectBoundary}</p>
               </div>
             </div>
-            {selectableProjects.length ? (
-              <div className="project-choice-grid">
-                {selectableProjects.map((project) => (
-                  <label
-                    className={projectId === project.id ? "is-selected" : ""}
-                    data-testid="project-option"
-                    key={project.id}
-                  >
-                    <input
-                      checked={projectId === project.id}
-                      name="project"
-                      onChange={() => setProjectId(project.id)}
-                      type="radio"
-                    />
-                    <span className="project-icon">
-                      <Icon name="folder" size={20} />
-                    </span>
-                    <span>
-                      <strong>{project.name}</strong>
-                      <small>{project.rootLabel}</small>
-                    </span>
-                    <Icon name="check" size={18} />
-                  </label>
-                ))}
-              </div>
-            ) : (
-              <Notice icon="folder" title="还没有可用项目" tone="warning">
-                请先在电脑本机登记项目目录。
+            <div className="project-choice-grid">
+              <label
+                className={`project-choice--general ${projectId === "" ? "is-selected" : ""}`}
+                data-testid="general-conversation-option"
+              >
+                <input
+                  checked={projectId === ""}
+                  name="project"
+                  onChange={() => {
+                    setProjectId("");
+                    setAttachments([]);
+                  }}
+                  type="radio"
+                />
+                <span className="project-icon">
+                  <Icon name="message" size={20} />
+                </span>
+                <span>
+                  <strong>{copy.noProject}</strong>
+                  <small>{copy.noProjectDescription}</small>
+                </span>
+                <Icon name="check" size={18} />
+              </label>
+              {selectableProjects.map((project) => (
+                <label
+                  className={projectId === project.id ? "is-selected" : ""}
+                  data-testid="project-option"
+                  key={project.id}
+                >
+                  <input
+                    checked={projectId === project.id}
+                    name="project"
+                    onChange={() => {
+                      setProjectId(project.id);
+                      setAttachments([]);
+                    }}
+                    type="radio"
+                  />
+                  <span className="project-icon">
+                    <Icon name="folder" size={20} />
+                  </span>
+                  <span>
+                    <strong>{project.name}</strong>
+                    <small>{project.rootLabel}</small>
+                  </span>
+                  <Icon name="check" size={18} />
+                </label>
+              ))}
+            </div>
+            {selectableProjects.length === 0 ? (
+              <Notice icon="folder" title="还没有已登记项目">
+                仍可开始无项目对话；项目目录只能在电脑本机登记。
               </Notice>
-            )}
+            ) : null}
           </section>
           <section className="form-section">
             <div className="form-section__title">
@@ -2353,7 +4916,35 @@ function NewThreadPage({
               rows={6}
               value={prompt}
             />
-            <span className="character-count">{prompt.length} 字</span>
+            <div className="prompt-attachments">
+              <Button
+                icon="paperclip"
+                onClick={() => setAttachmentPickerOpen(true)}
+                size="compact"
+                type="button"
+                variant="ghost"
+              >
+                添加文件
+              </Button>
+              <AttachmentChips
+                attachments={attachments}
+                onRemove={(reference) =>
+                  setAttachments((current) =>
+                    current.filter(
+                      (item) => attachmentReferenceKey(item) !== attachmentReferenceKey(reference),
+                    ),
+                  )
+                }
+              />
+            </div>
+            <span className="character-count" data-testid="new-thread-draft-status">
+              {prompt.length} 字
+              {prompt
+                ? draftPersistence === "saved"
+                  ? " · 草稿已自动保存"
+                  : " · 此浏览器无法保存草稿"
+                : ""}
+            </span>
           </section>
           <section className="form-section">
             <div className="form-section__title">
@@ -2371,31 +4962,131 @@ function NewThreadPage({
               modelTestId="new-thread-model"
               models={models}
               onEffort={setEffort}
-              onModel={setModel}
+              onModel={(nextModelId) => {
+                setModel(nextModelId);
+                setServiceTier(undefined);
+              }}
             />
-            <fieldset className="permission-fieldset">
-              <legend>文件权限</legend>
-              <div className="option-grid">
-                {permissionOptions.map((option) => (
-                  <label className={permission === option.id ? "is-selected" : ""} key={option.id}>
-                    <input
-                      checked={permission === option.id}
-                      name="permission"
-                      onChange={() => setPermission(option.id)}
-                      type="radio"
-                    />
-                    <Icon name={option.icon} size={20} />
-                    <span>
-                      <strong>{option.title}</strong>
-                      <small>{option.description}</small>
-                    </span>
-                    <i>
-                      <Icon name="check" size={14} />
-                    </i>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
+            {serviceTiersAvailable ? (
+              <label className="select-label">
+                <span>速度</span>
+                <select
+                  aria-label="新建对话速度"
+                  data-testid="new-thread-service-tier"
+                  onChange={(event) => setServiceTier(event.target.value || undefined)}
+                  value={chooseServiceTier(selectedModel, serviceTier) ?? ""}
+                >
+                  <option value="">{CODEX_DEFAULT_SERVICE_TIER.label}</option>
+                  {tierOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <small>
+                  {serviceTier
+                    ? (tierOptions.find((option) => option.id === serviceTier)?.description ??
+                      "使用 Codex 当前提供的额外速度档")
+                    : CODEX_DEFAULT_SERVICE_TIER.description}
+                </small>
+              </label>
+            ) : null}
+            {permissionProfilesAvailable ? (
+              <fieldset className="permission-fieldset">
+                <legend>文件与命令权限</legend>
+                {permissionState === "loading" ? (
+                  <div className="dynamic-options-status">正在读取 Codex 的可用权限…</div>
+                ) : null}
+                {permissionState === "error" ? (
+                  <Notice icon="alert" title="权限配置不可用">
+                    {permissionError}
+                  </Notice>
+                ) : null}
+                {permissionState === "ready" ? (
+                  <div className="option-grid">
+                    {permissionProfiles.map((profile) => (
+                      <label
+                        className={permissionProfileId === profile.id ? "is-selected" : ""}
+                        key={profile.id}
+                      >
+                        <input
+                          checked={permissionProfileId === profile.id}
+                          disabled={!profile.allowed}
+                          name="permission-profile"
+                          onChange={() => setPermissionProfileId(profile.id)}
+                          type="radio"
+                        />
+                        <Icon name="shield" size={20} />
+                        <span>
+                          <strong>{permissionProfileLabel(profile.id)}</strong>
+                          <small>
+                            {profile.description ??
+                              (profile.allowed ? "Codex 当前允许使用" : "Codex 当前不允许使用")}
+                          </small>
+                        </span>
+                        <i>
+                          <Icon name="check" size={14} />
+                        </i>
+                      </label>
+                    ))}
+                  </div>
+                ) : null}
+              </fieldset>
+            ) : (
+              <Notice icon="shield" title="当前运行时未公开权限配置">
+                不发送任何猜测的权限值，由 Codex 使用它自己的安全默认值。
+              </Notice>
+            )}
+            {approvalPoliciesAvailable ? (
+              approvalPolicyState === "ready" ? (
+                <label className="select-label">
+                  <span>何时询问我</span>
+                  <select
+                    data-testid="new-thread-approval-policy"
+                    onChange={(event) => setApprovalPolicy(event.target.value)}
+                    value={approvalPolicy}
+                  >
+                    {approvalPolicies.map((policy) => (
+                      <option key={policy.id} value={policy.id}>
+                        {approvalPolicyLabel(policy.id)}
+                      </option>
+                    ))}
+                  </select>
+                  <small>{approvalPolicyDescription(approvalPolicy)}</small>
+                </label>
+              ) : (
+                <Notice icon="shield" title="确认策略暂不可选">
+                  {approvalPolicyState === "loading"
+                    ? "正在读取当前 Codex 的确认策略…"
+                    : "Codex 没有返回可安全发送的策略，将沿用它自己的当前设置。"}
+                </Notice>
+              )
+            ) : null}
+            {approvalReviewersAvailable ? (
+              approvalReviewerState === "ready" ? (
+                <label className="select-label">
+                  <span>谁来确认</span>
+                  <select
+                    data-testid="new-thread-approval-reviewer"
+                    onChange={(event) => setApprovalReviewer(event.target.value)}
+                    value={approvalReviewer}
+                  >
+                    {approvalReviewers.map((reviewer) => (
+                      <option key={reviewer.id} value={reviewer.id}>
+                        {approvalReviewerLabel(reviewer.id)}
+                      </option>
+                    ))}
+                  </select>
+                  <small>{approvalReviewerDescription(approvalReviewer)}</small>
+                </label>
+              ) : (
+                <Notice icon="shield" title="审批方式暂不可选">
+                  {approvalReviewerState === "loading"
+                    ? "正在读取 Codex 的可用审批方式…"
+                    : "Codex 没有返回可选目录，将沿用它自己的当前设置。"}
+                </Notice>
+              )
+            ) : null}
             <label className="select-label">
               <span>协作模式</span>
               <select
@@ -2412,7 +5103,9 @@ function NewThreadPage({
               </select>
               <small>
                 {collaborationModes.find((mode) => mode.id === collaboration)?.description ??
-                  "当前服务未提供协作模式"}
+                  (collaborationModes.some((mode) => mode.available)
+                    ? "选项来自当前 Codex 运行时"
+                    : "当前服务未提供协作模式")}
               </small>
             </label>
           </section>
@@ -2428,7 +5121,7 @@ function NewThreadPage({
             </Button>
             <Button
               data-testid="new-thread-submit"
-              disabled={busy || !projectId || !prompt.trim()}
+              disabled={busy || !prompt.trim() || !permissionReady || !runtimeAvailable}
               icon="play"
               type="submit"
               variant="primary"
@@ -2437,8 +5130,433 @@ function NewThreadPage({
             </Button>
           </div>
         </form>
+        <AttachmentPickerSheet
+          apiClient={apiClient}
+          onApply={setAttachments}
+          onClose={() => setAttachmentPickerOpen(false)}
+          online={online}
+          open={attachmentPickerOpen}
+          projectId={projectId}
+          selected={attachments}
+        />
       </div>
     </>
+  );
+}
+
+function attachmentReferenceKey(reference: LocalInputReference): string {
+  return `${reference.projectId ?? reference.uploadId}:${reference.kind}:${reference.relativePath.toLocaleLowerCase("en-US")}`;
+}
+
+function attachmentName(reference: LocalInputReference): string {
+  return reference.relativePath.split("/").filter(Boolean).at(-1) ?? reference.relativePath;
+}
+
+function AttachmentChips({
+  attachments,
+  onRemove,
+}: {
+  attachments: readonly LocalInputReference[];
+  onRemove: (reference: LocalInputReference) => void;
+}) {
+  if (attachments.length === 0) return null;
+  return (
+    <div className="attachment-chips" aria-label="已添加的文件和文件夹">
+      {attachments.map((reference) => (
+        <span className="attachment-chip" key={attachmentReferenceKey(reference)}>
+          <Icon name={reference.kind === "directory" ? "folder" : "file"} size={14} />
+          <span>{attachmentName(reference)}</span>
+          <button
+            aria-label={`移除 ${attachmentName(reference)}`}
+            onClick={() => onRemove(reference)}
+            type="button"
+          >
+            <Icon name="close" size={13} />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function AttachmentPickerSheet({
+  apiClient,
+  onApply,
+  onClose,
+  online,
+  open,
+  projectId,
+  selected,
+}: {
+  apiClient: ApiClient;
+  onApply: (attachments: LocalInputReference[]) => void;
+  onClose: () => void;
+  online: boolean;
+  open: boolean;
+  projectId: string;
+  selected: readonly LocalInputReference[];
+}) {
+  const [path, setPath] = useState("");
+  const [listing, setListing] = useState<FileListing>();
+  const [draft, setDraft] = useState<LocalInputReference[]>([]);
+  const [query, setQuery] = useState("");
+  const [state, setState] = useState<LoadState>("loading");
+  const [error, setError] = useState("");
+  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number }>();
+
+  useEffect(() => {
+    if (!open) return;
+    setPath("");
+    setQuery("");
+    setDraft(
+      selected.filter(
+        (reference) => reference.uploadId !== undefined || reference.projectId === projectId,
+      ),
+    );
+    setUploadProgress(undefined);
+  }, [open, projectId, selected]);
+
+  useEffect(() => {
+    if (!open || !online || !projectId) return;
+    let active = true;
+    setState("loading");
+    setError("");
+    void apiClient
+      .files(projectId, path)
+      .then((next) => {
+        if (!active) return;
+        setListing(next);
+        setState("ready");
+      })
+      .catch((loadError: unknown) => {
+        if (!active) return;
+        setState("error");
+        setError(errorMessage(loadError));
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiClient, online, open, path, projectId]);
+
+  const parts = path.split("/").filter(Boolean);
+  const visibleEntries = (listing?.entries ?? []).filter((entry) =>
+    entry.name.toLocaleLowerCase("zh-CN").includes(query.toLocaleLowerCase("zh-CN")),
+  );
+  const selectedKeys = new Set(draft.map(attachmentReferenceKey));
+
+  function referenceFor(entry: FileEntry): LocalInputReference {
+    return {
+      kind: entry.kind,
+      projectId,
+      relativePath: entry.relativePath,
+    };
+  }
+
+  function toggle(entry: FileEntry) {
+    const reference = referenceFor(entry);
+    const key = attachmentReferenceKey(reference);
+    if (selectedKeys.has(key)) {
+      setDraft((current) => current.filter((item) => attachmentReferenceKey(item) !== key));
+      return;
+    }
+    if (draft.length >= 20) {
+      setError("一次最多添加 20 个文件或文件夹");
+      return;
+    }
+    setDraft((current) => [...current, reference]);
+    setError("");
+  }
+
+  async function uploadFiles(files: FileList | null) {
+    if (!files?.length) return;
+    if (!online) {
+      setError("连接已中断，恢复后再上传。");
+      return;
+    }
+    const incoming = Array.from(files);
+    if (draft.length + incoming.length > 20) {
+      setError(`一次最多添加 20 项；当前已选 ${draft.length} 项。`);
+      return;
+    }
+    const next = [...draft];
+    setError("");
+    try {
+      for (const [index, file] of incoming.entries()) {
+        setUploadProgress({ current: index + 1, total: incoming.length });
+        const reference = await apiClient.upload(file, file.webkitRelativePath || file.name);
+        if (
+          !next.some(
+            (candidate) => attachmentReferenceKey(candidate) === attachmentReferenceKey(reference),
+          )
+        ) {
+          next.push(reference);
+          setDraft([...next]);
+        }
+      }
+    } catch (uploadError) {
+      setError(errorMessage(uploadError));
+    } finally {
+      setUploadProgress(undefined);
+    }
+  }
+
+  const currentFolder: FileEntry | undefined = path
+    ? {
+        downloadable: false,
+        kind: "directory",
+        name: parts.at(-1) ?? path,
+        relativePath: path,
+      }
+    : undefined;
+
+  return (
+    <Sheet
+      description="设备文件会经加密公网连接上传到电脑；电脑已有文件只建立引用，不重复上传。"
+      footer={
+        <>
+          <Button
+            disabled={draft.length === 0 || uploadProgress !== undefined}
+            onClick={() => {
+              onApply(draft);
+              onClose();
+            }}
+            variant="primary"
+          >
+            添加{draft.length ? ` ${draft.length} 项` : ""}
+          </Button>
+          <Button onClick={onClose} variant="ghost">
+            取消
+          </Button>
+        </>
+      }
+      onClose={onClose}
+      open={open}
+      title="添加文件"
+    >
+      {!online ? (
+        <Notice icon="wifi-off" title="连接已中断" tone="danger">
+          恢复连接后才能上传或浏览文件。
+        </Notice>
+      ) : (
+        <div className="attachment-picker">
+          <section className="attachment-picker__device" aria-labelledby="device-upload-title">
+            <div className="attachment-picker__section-heading">
+              <span>
+                <strong id="device-upload-title">从此设备上传</strong>
+                <small>从手机或当前浏览器发送到电脑，再交给 Codex</small>
+              </span>
+              {uploadProgress ? (
+                <span className="attachment-picker__progress" role="status">
+                  {uploadProgress.current}/{uploadProgress.total}
+                </span>
+              ) : null}
+            </div>
+            <div className="attachment-picker__upload-actions">
+              <label className="attachment-picker__upload-button">
+                <Icon name="file" size={18} />
+                <span>
+                  <strong>选择文件</strong>
+                  <small>单个文件最大 50 MB</small>
+                </span>
+                <input
+                  aria-label="从此设备选择文件"
+                  disabled={uploadProgress !== undefined}
+                  multiple
+                  onChange={(event) => {
+                    const input = event.currentTarget;
+                    void uploadFiles(input.files).finally(() => {
+                      input.value = "";
+                    });
+                  }}
+                  type="file"
+                />
+              </label>
+              <label className="attachment-picker__upload-button">
+                <Icon name="folder" size={18} />
+                <span>
+                  <strong>选择文件夹</strong>
+                  <small>保留文件夹内相对路径</small>
+                </span>
+                <input
+                  aria-label="从此设备选择文件夹"
+                  disabled={uploadProgress !== undefined}
+                  multiple
+                  onChange={(event) => {
+                    const input = event.currentTarget;
+                    void uploadFiles(input.files).finally(() => {
+                      input.value = "";
+                    });
+                  }}
+                  ref={(input) => {
+                    input?.setAttribute("webkitdirectory", "");
+                    input?.setAttribute("directory", "");
+                  }}
+                  type="file"
+                />
+              </label>
+            </div>
+          </section>
+          <AttachmentChips
+            attachments={draft}
+            onRemove={(reference) =>
+              setDraft((current) =>
+                current.filter(
+                  (item) => attachmentReferenceKey(item) !== attachmentReferenceKey(reference),
+                ),
+              )
+            }
+          />
+          {projectId ? (
+            <>
+              <div className="attachment-picker__section-heading">
+                <span>
+                  <strong>选择电脑文件</strong>
+                  <small>引用电脑项目中已经存在的文件或文件夹，不会重复上传</small>
+                </span>
+              </div>
+              <div className="attachment-picker__toolbar">
+                <div className="breadcrumbs" aria-label="当前附件路径">
+                  <button onClick={() => setPath("")} type="button">
+                    <Icon name="folder" size={16} />
+                    项目
+                  </button>
+                  {parts.map((part, index) => (
+                    <Fragment key={`${part}-${index}`}>
+                      <Icon name="chevron-right" size={14} />
+                      <button
+                        onClick={() => setPath(parts.slice(0, index + 1).join("/"))}
+                        type="button"
+                      >
+                        {part}
+                      </button>
+                    </Fragment>
+                  ))}
+                </div>
+                <label className="attachment-picker__search">
+                  <Icon name="search" size={16} />
+                  <input
+                    aria-label="筛选文件和文件夹"
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="筛选当前文件夹"
+                    value={query}
+                  />
+                </label>
+              </div>
+              {currentFolder ? (
+                <button
+                  aria-pressed={selectedKeys.has(
+                    attachmentReferenceKey(referenceFor(currentFolder)),
+                  )}
+                  className="attachment-picker__current"
+                  onClick={() => toggle(currentFolder)}
+                  type="button"
+                >
+                  <Icon name="paperclip" size={17} />
+                  <span>
+                    <strong>
+                      {selectedKeys.has(attachmentReferenceKey(referenceFor(currentFolder)))
+                        ? "已添加当前文件夹"
+                        : "添加当前文件夹"}
+                    </strong>
+                    <small>{currentFolder.relativePath}</small>
+                  </span>
+                  <Icon
+                    name={
+                      selectedKeys.has(attachmentReferenceKey(referenceFor(currentFolder)))
+                        ? "check"
+                        : "plus"
+                    }
+                    size={17}
+                  />
+                </button>
+              ) : null}
+              {state === "loading" ? (
+                <div className="attachment-picker__loading">
+                  <Skeleton />
+                  <Skeleton />
+                  <Skeleton width="72%" />
+                </div>
+              ) : state === "error" ? (
+                <Notice icon="alert" title="无法读取文件夹" tone="danger">
+                  {error}
+                </Notice>
+              ) : visibleEntries.length ? (
+                <div className="attachment-picker__list">
+                  {path ? (
+                    <button
+                      className="attachment-picker__entry"
+                      onClick={() => setPath(parts.slice(0, -1).join("/"))}
+                      type="button"
+                    >
+                      <span className="attachment-picker__icon">
+                        <Icon name="arrow-left" size={17} />
+                      </span>
+                      <span>
+                        <strong>返回上一级</strong>
+                        <small>文件夹</small>
+                      </span>
+                    </button>
+                  ) : null}
+                  {visibleEntries.map((entry) => {
+                    const reference = referenceFor(entry);
+                    const checked = selectedKeys.has(attachmentReferenceKey(reference));
+                    return (
+                      <div className="attachment-picker__entry" key={entry.relativePath}>
+                        <button
+                          className="attachment-picker__entry-main"
+                          onClick={() =>
+                            entry.kind === "directory" ? setPath(entry.relativePath) : toggle(entry)
+                          }
+                          type="button"
+                        >
+                          <span className="attachment-picker__icon">
+                            <Icon name={entry.kind === "directory" ? "folder" : "file"} size={17} />
+                          </span>
+                          <span>
+                            <strong>{entry.name}</strong>
+                            <small>
+                              {entry.kind === "directory"
+                                ? "打开文件夹"
+                                : entry.size === undefined
+                                  ? "文件"
+                                  : `${number(entry.size)}B`}
+                            </small>
+                          </span>
+                          {entry.kind === "directory" ? (
+                            <Icon name="chevron-right" size={16} />
+                          ) : null}
+                        </button>
+                        <button
+                          aria-label={`${checked ? "移除" : "添加"} ${entry.name}`}
+                          aria-pressed={checked}
+                          className="attachment-picker__select"
+                          onClick={() => toggle(entry)}
+                          type="button"
+                        >
+                          <Icon name={checked ? "check" : "plus"} size={16} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="mini-empty">{query ? "没有匹配项" : "这个文件夹为空"}</div>
+              )}
+            </>
+          ) : (
+            <Notice icon="folder" title="当前对话没有关联项目">
+              仍可从手机或当前浏览器上传文件；只有“选择电脑文件”需要先关联已登记项目。
+            </Notice>
+          )}
+          {error && state !== "error" ? (
+            <div className="composer-error" role="alert">
+              <Icon name="alert" size={15} />
+              {error}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </Sheet>
   );
 }
 
@@ -2447,55 +5565,86 @@ function FilePreview({
   projectId,
   apiClient,
   onClose,
+  online,
+  embedded = false,
 }: {
   entry: FileEntry;
   projectId: string;
   apiClient: ApiClient;
-  onClose: () => void;
+  onClose?: () => void;
+  online: boolean;
+  embedded?: boolean;
 }) {
-  const [state, setState] = useState<LoadState>("loading");
-  const [text, setText] = useState("");
-  const [url, setUrl] = useState("");
-  const [contentType, setContentType] = useState("");
-  const [error, setError] = useState("");
+  const requestKey = filePreviewRequestKey(projectId, entry.relativePath);
+  const requestRef = useRef<FilePreviewRequest>({ generation: 1, requestKey });
+  if (requestRef.current.requestKey !== requestKey) {
+    requestRef.current = {
+      generation: requestRef.current.generation + 1,
+      requestKey,
+    };
+  }
+  const request = requestRef.current;
+  const [preview, setPreview] = useState<FilePreviewDerivedState>(() =>
+    loadingFilePreviewState(request),
+  );
+  const visiblePreview = visibleFilePreviewState(preview, request.requestKey, request.generation);
+  const { contentType, error, state, text, url } = visiblePreview;
 
   useEffect(() => {
+    if (!online) return;
     let active = true;
     let objectUrl = "";
-    setState("loading");
+    const effectRequest = requestRef.current;
+    setPreview(loadingFilePreviewState(effectRequest));
     void apiClient
       .preview(projectId, entry.relativePath)
       .then(async (result) => {
-        if (!active) return;
-        setContentType(result.contentType);
+        let nextText = "";
         if (
           result.contentType.startsWith("text/") ||
           /\.(md|txt|json|ya?ml|tsx?|jsx?|css|html)$/i.test(entry.name)
         ) {
-          setText(await result.blob.text());
+          nextText = await result.blob.text();
         } else if (
           result.contentType.startsWith("image/") ||
           result.contentType === "application/pdf"
         ) {
+          if (!active || !isCurrentFilePreviewRequest(requestRef.current, effectRequest)) {
+            return;
+          }
           objectUrl = URL.createObjectURL(result.blob);
-          setUrl(objectUrl);
         }
-        setState("ready");
+        if (!active || !isCurrentFilePreviewRequest(requestRef.current, effectRequest)) {
+          if (objectUrl) URL.revokeObjectURL(objectUrl);
+          objectUrl = "";
+          return;
+        }
+        setPreview({
+          ...effectRequest,
+          state: "ready",
+          text: nextText,
+          url: objectUrl,
+          contentType: result.contentType,
+          error: "",
+        });
       })
       .catch((previewError: unknown) => {
-        if (!active) return;
-        setError(errorMessage(previewError));
-        setState("error");
+        if (!active || !isCurrentFilePreviewRequest(requestRef.current, effectRequest)) return;
+        setPreview({
+          ...loadingFilePreviewState(effectRequest),
+          state: "error",
+          error: errorMessage(previewError),
+        });
       });
     return () => {
       active = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [apiClient, entry.name, entry.relativePath, projectId]);
+  }, [apiClient, entry.name, entry.relativePath, online, projectId]);
 
   const isMarkdown = /\.md$/i.test(entry.name) || contentType === "text/markdown";
   return (
-    <section className="file-preview">
+    <section className={`file-preview${embedded ? " file-preview--embedded" : ""}`}>
       <header>
         <div>
           <strong>{entry.name}</strong>
@@ -2504,7 +5653,15 @@ function FilePreview({
             {entry.relativePath}
           </span>
         </div>
-        <Button aria-label="关闭预览" icon="close" onClick={onClose} size="icon" variant="ghost" />
+        {onClose ? (
+          <Button
+            aria-label="关闭预览"
+            icon="close"
+            onClick={onClose}
+            size="icon"
+            variant="ghost"
+          />
+        ) : null}
       </header>
       <div className="file-preview__body">
         {state === "loading" ? (
@@ -2539,16 +5696,22 @@ function FilePreview({
         ) : null}
       </div>
       <footer>
-        <a
-          className="ui-button ui-button--primary ui-button--regular"
-          data-testid="file-download"
-          data-touch-target="primary"
-          download={entry.name}
-          href={apiClient.downloadUrl(projectId, entry.relativePath)}
-        >
-          <Icon name="download" size={18} />
-          下载文件
-        </a>
+        {online ? (
+          <a
+            className="ui-button ui-button--primary ui-button--regular"
+            data-testid="file-download"
+            data-touch-target="primary"
+            download={entry.name}
+            href={apiClient.downloadUrl(projectId, entry.relativePath)}
+          >
+            <Icon name="download" size={18} />
+            下载文件
+          </a>
+        ) : (
+          <Button disabled icon="wifi-off">
+            恢复连接后下载
+          </Button>
+        )}
       </footer>
     </section>
   );
@@ -2563,6 +5726,7 @@ function FileBrowserPage({
   apiClient: ApiClient;
   online: boolean;
 }) {
+  const { copy } = useUiLocale();
   const selectableProjects = registeredProjects(projects);
   const [projectId, setProjectId] = useState(selectableProjects[0]?.id ?? "");
   const [path, setPath] = useState("");
@@ -2573,6 +5737,10 @@ function FileBrowserPage({
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
+    if (!online) {
+      setState((current) => (current === "loading" ? "ready" : current));
+      return;
+    }
     if (!projectId) {
       setState("ready");
       return;
@@ -2586,7 +5754,7 @@ function FileBrowserPage({
       setError(errorMessage(loadError));
       setState("error");
     }
-  }, [apiClient, path, projectId]);
+  }, [apiClient, online, path, projectId]);
 
   useEffect(() => {
     void load();
@@ -2599,19 +5767,20 @@ function FileBrowserPage({
 
   return (
     <>
-      <MobileHeader title="文件" />
+      <MobileHeader title={copy.files} />
       <div
         className={`page files-page ${selected ? "has-preview" : ""}`}
         data-testid="file-browser"
       >
         <div className="files-browser">
           <div className="page-heading">
-            <h1>项目文件</h1>
-            <p>只读浏览已在电脑本机登记的项目。</p>
+            <h1>{copy.projectFiles}</h1>
+            <p>{copy.projectFilesDescription}</p>
           </div>
           <label className="select-label project-select">
-            <span>当前项目</span>
+            <span>{copy.currentProject}</span>
             <select
+              disabled={!online}
               onChange={(event) => {
                 setProjectId(event.target.value);
                 setPath("");
@@ -2633,7 +5802,7 @@ function FileBrowserPage({
           ) : null}
           <div className="file-toolbar">
             <div aria-label="当前路径" className="breadcrumbs">
-              <button onClick={() => setPath("")}>
+              <button disabled={!online} onClick={() => setPath("")}>
                 <Icon name="folder" size={17} />
                 <span>
                   {selectableProjects.find((project) => project.id === projectId)?.name ?? "项目"}
@@ -2642,7 +5811,10 @@ function FileBrowserPage({
               {parts.map((part, index) => (
                 <Fragment key={`${part}-${index}`}>
                   <Icon name="chevron-right" size={15} />
-                  <button onClick={() => setPath(parts.slice(0, index + 1).join("/"))}>
+                  <button
+                    disabled={!online}
+                    onClick={() => setPath(parts.slice(0, index + 1).join("/"))}
+                  >
                     {part}
                   </button>
                 </Fragment>
@@ -2653,7 +5825,7 @@ function FileBrowserPage({
               <input
                 aria-label="筛选当前文件夹"
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="筛选"
+                placeholder={copy.filterFiles}
                 value={query}
               />
             </div>
@@ -2668,7 +5840,7 @@ function FileBrowserPage({
             <Card>
               <EmptyState
                 action={
-                  <Button icon="refresh" onClick={() => void load()}>
+                  <Button disabled={!online} icon="refresh" onClick={() => void load()}>
                     重新加载
                   </Button>
                 }
@@ -2680,7 +5852,7 @@ function FileBrowserPage({
           ) : visible.length ? (
             <Card className="file-list">
               {path ? (
-                <button onClick={() => setPath(parts.slice(0, -1).join("/"))}>
+                <button disabled={!online} onClick={() => setPath(parts.slice(0, -1).join("/"))}>
                   <span className="file-icon file-icon--folder">
                     <Icon name="arrow-left" size={19} />
                   </span>
@@ -2698,6 +5870,7 @@ function FileBrowserPage({
                 >
                   <button
                     className="file-entry-main"
+                    disabled={!online}
                     onClick={() =>
                       entry.kind === "directory"
                         ? (setPath(entry.relativePath), setSelected(undefined))
@@ -2717,7 +5890,7 @@ function FileBrowserPage({
                     </span>
                     {entry.kind === "directory" ? <Icon name="chevron-right" size={18} /> : null}
                   </button>
-                  {entry.kind === "file" && entry.downloadable ? (
+                  {online && entry.kind === "file" && entry.downloadable ? (
                     <a
                       aria-label={`下载 ${entry.name}`}
                       data-testid="file-download"
@@ -2746,6 +5919,7 @@ function FileBrowserPage({
             apiClient={apiClient}
             entry={selected}
             onClose={() => setSelected(undefined)}
+            online={online}
             projectId={projectId}
           />
         ) : (
@@ -2773,32 +5947,33 @@ function SettingsPage({
   onLogout: () => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
+  const { copy } = useUiLocale();
   const [busy, setBusy] = useState(false);
   const diagnostics = data.diagnostics;
   const caps = diagnostics?.capabilities;
 
   return (
     <>
-      <MobileHeader title="设置" />
+      <MobileHeader title={copy.settings} />
       <div className="page settings-page">
         <div className="page-heading">
-          <h1>设置与诊断</h1>
-          <p>查看连接、额度、会话和当前服务能力。</p>
+          <h1>{copy.settingsAndDiagnostics}</h1>
+          <p>{copy.settingsDescription}</p>
         </div>
         <div className="settings-grid" data-testid="usage-panel">
           <section>
-            <h2>连接</h2>
+            <h2>{copy.connection}</h2>
             <Card className="settings-card">
               <div className="settings-row">
                 <span className="settings-row__icon">
                   <Icon name="activity" size={19} />
                 </span>
                 <span>
-                  <strong>公网入口</strong>
-                  <small>{online ? "托管任务实时事件连接正常" : "正在尝试重新连接"}</small>
+                  <strong>{copy.publicEntry}</strong>
+                  <small>{online ? copy.liveConnected : copy.reconnecting}</small>
                 </span>
                 <StatusPill tone={online ? "success" : "danger"}>
-                  {online ? "正常" : "断线"}
+                  {online ? copy.healthy : copy.disconnected}
                 </StatusPill>
               </div>
               <div className="settings-row">
@@ -2837,7 +6012,11 @@ function SettingsPage({
                   void onRefresh().finally(() => setBusy(false));
                 }}
               >
-                {busy ? "正在刷新…" : "刷新诊断"}
+                {busy
+                  ? copy.languageChoice === "EN"
+                    ? "正在刷新…"
+                    : "Refreshing…"
+                  : copy.refreshDiagnostics}
               </Button>
             </Card>
           </section>
@@ -2867,7 +6046,7 @@ function SettingsPage({
                       {remainingPercentLabel(window.remainingPercent)}
                       {" · "}
                       {window.resetsAt
-                        ? `${absoluteTime(window.resetsAt)} 重置`
+                        ? `${formatUtc8Time(window.resetsAt)} 重置`
                         : "重置时间暂时无法读取"}
                     </small>
                   </div>
@@ -3068,30 +6247,38 @@ function ApprovalSheet({
     <Sheet
       description={approval.explanation}
       footer={
-        <>
-          {approval.choices.map((choice) => (
-            <Button
-              disabled={!online || Boolean(busy)}
-              key={choice.id}
-              onClick={() => void resolve(choice.id)}
-              variant={
-                choice.tone === "primary"
-                  ? "primary"
-                  : choice.tone === "danger"
-                    ? "danger"
-                    : "secondary"
-              }
-            >
-              {busy === choice.id ? "正在处理…" : choice.label}
-            </Button>
-          ))}
-        </>
+        approval.choices.length > 0 ? (
+          <>
+            {approval.choices.map((choice) => (
+              <Button
+                data-testid={`approval-choice-${choice.id}`}
+                disabled={!online || Boolean(busy)}
+                key={choice.id}
+                onClick={() => void resolve(choice.id)}
+                variant={
+                  choice.tone === "primary"
+                    ? "primary"
+                    : choice.tone === "danger"
+                      ? "danger"
+                      : "secondary"
+                }
+              >
+                {busy === choice.id ? "正在处理…" : choice.label}
+              </Button>
+            ))}
+          </>
+        ) : undefined
       }
       onClose={onClose}
       open
       title={approval.title}
     >
       <div className="approval-detail">
+        {approval.limitation ? (
+          <Notice icon="alert" title="当前请求不能安全地从手机审批">
+            {approval.limitation}
+          </Notice>
+        ) : null}
         {approval.command ? (
           <div>
             <span>将执行</span>
@@ -3218,6 +6405,8 @@ function ApprovalSheet({
 }
 
 function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut: () => void }) {
+  const location = useLocation();
+  const eventThreadId = threadIdFromConversationPath(location.pathname);
   const [data, setData] = useState<WorkspaceData>(emptyWorkspace);
   const [state, setState] = useState<LoadState>("loading");
   const [error, setError] = useState("");
@@ -3235,59 +6424,169 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   const [archivedError, setArchivedError] = useState("");
   const [selectedApproval, setSelectedApproval] = useState<ApprovalRequest>();
   const refreshTimer = useRef<number | undefined>(undefined);
+  const recoveryTimer = useRef<number | undefined>(undefined);
   const loadInFlight = useRef<Promise<void> | undefined>(undefined);
   const initialReplayComplete = useRef(false);
   const liveDeliverySequence = useRef(0);
   const threadsRef = useRef<ThreadSummary[]>([]);
   const threadsNextCursorRef = useRef<string | undefined>(undefined);
   const threadsExtendedRef = useRef(false);
+  const threadTailIdsRef = useRef(new Set<string>());
   const workspaceReadyRef = useRef(false);
   const threadsMoreInFlightRef = useRef(false);
   const archivedThreadsRef = useRef<ThreadSummary[]>([]);
   const archivedNextCursorRef = useRef<string | undefined>(undefined);
+  const archivedTailIdsRef = useRef(new Set<string>());
+  const archivedLoadedRef = useRef(false);
   const archivedInFlightRef = useRef(false);
+  const locallyResolvedApprovalIdsRef = useRef(new Set<string>());
   const isDesktop = useMediaQuery("(min-width: 1100px)");
+  const runningThreadCount = data.threads.filter((thread) => thread.state === "running").length;
 
-  const load = useCallback(() => {
-    if (loadInFlight.current !== undefined) return loadInFlight.current;
-    const promise = (async () => {
-      try {
-        const [projects, models, collaborationModes, threadsPage, usage, diagnostics, approvals] =
-          await Promise.all([
-            api.projects(),
+  useEffect(() => {
+    setSelectedApproval((current) => reconcileSelectedApproval(current, data.approvals));
+  }, [data.approvals]);
+
+  useEffect(() => {
+    const previousTitle = document.title;
+    document.title = browserAttentionTitle({
+      approvalCount: data.approvals.length,
+      ...(currentThread?.state === undefined ? {} : { currentState: currentThread.state }),
+      ...(currentThread?.title === undefined ? {} : { currentTitle: currentThread.title }),
+      online,
+      runningCount: runningThreadCount,
+    });
+    return () => {
+      document.title = previousTitle;
+    };
+  }, [
+    currentThread?.state,
+    currentThread?.title,
+    data.approvals.length,
+    online,
+    runningThreadCount,
+  ]);
+
+  const load = useCallback(
+    function loadWorkspace() {
+      if (loadInFlight.current !== undefined) return loadInFlight.current;
+      const promise = (async () => {
+        try {
+          const archivedPagePromise: Promise<CursorPage<ThreadSummary> | undefined> =
+            archivedLoadedRef.current
+              ? api.threads({ archived: true }).catch((loadError: unknown) => {
+                  setArchivedError(errorMessage(loadError));
+                  setArchivedState("error");
+                  return undefined;
+                })
+              : Promise.resolve(undefined);
+          const [
+            models,
+            collaborationModes,
+            threadsPage,
+            usage,
+            diagnostics,
+            approvals,
+            archivedPage,
+          ] = await Promise.all([
             api.models(),
             api.collaborationModes().catch(() => [] as CollaborationModeOption[]),
             api.threads({ archived: false }),
             api.usage().catch(() => undefined),
             api.diagnostics().catch(() => undefined),
             api.approvals().catch(() => [] as ApprovalRequest[]),
+            archivedPagePromise,
           ]);
-        const threads = workspaceReadyRef.current
-          ? mergeCursorItems(threadsRef.current, threadsPage.items, (thread) => thread.id)
-          : threadsPage.items;
-        const nextCursor = nextCursorAfterRefresh(
-          threadsNextCursorRef.current,
-          threadsPage.nextCursor,
-          threadsExtendedRef.current || threadsMoreInFlightRef.current,
-        );
-        threadsRef.current = threads;
-        threadsNextCursorRef.current = nextCursor;
-        setThreadsNextCursor(nextCursor);
-        setData({ projects, models, collaborationModes, threads, usage, diagnostics, approvals });
-        workspaceReadyRef.current = true;
-        setState("ready");
-        setError("");
-      } catch (loadError) {
-        setError(errorMessage(loadError));
-        setState((current) => (current === "loading" ? "error" : current));
-      }
-    })();
-    loadInFlight.current = promise;
-    void promise.finally(() => {
-      if (loadInFlight.current === promise) loadInFlight.current = undefined;
-    });
-    return promise;
-  }, []);
+          const projects = await api.projects();
+          const approvalReconciliation = reconcileFetchedApprovals(
+            approvals,
+            locallyResolvedApprovalIdsRef.current,
+          );
+          locallyResolvedApprovalIdsRef.current = approvalReconciliation.remainingResolvedIds;
+          let threads = workspaceReadyRef.current
+            ? mergeRefreshedFirstPage(
+                threadsRef.current,
+                threadsPage.items,
+                (thread) => thread.id,
+                threadTailIdsRef.current,
+              )
+            : threadsPage.items;
+          if (!workspaceReadyRef.current) {
+            threadTailIdsRef.current.clear();
+          }
+          if (archivedPage !== undefined) {
+            let archived = mergeRefreshedFirstPage(
+              archivedThreadsRef.current,
+              archivedPage.items,
+              (thread) => thread.id,
+              archivedTailIdsRef.current,
+            );
+            const currentFirstPageIds = new Set(threadsPage.items.map((thread) => thread.id));
+            const archivedFirstPageIds = new Set(archivedPage.items.map((thread) => thread.id));
+            threads = threads.filter((thread) => !archivedFirstPageIds.has(thread.id));
+            archived = archived.filter((thread) => !currentFirstPageIds.has(thread.id));
+            const archivedNextCursor = nextCursorAfterRefresh(
+              archivedNextCursorRef.current,
+              archivedPage.nextCursor,
+              archivedTailIdsRef.current.size > 0 || archivedInFlightRef.current,
+            );
+            archivedThreadsRef.current = archived;
+            archivedNextCursorRef.current = archivedNextCursor;
+            setArchivedThreads(archived);
+            setArchivedNextCursor(archivedNextCursor);
+            setArchivedError("");
+            setArchivedState("ready");
+          }
+          const nextCursor = nextCursorAfterRefresh(
+            threadsNextCursorRef.current,
+            threadsPage.nextCursor,
+            threadsExtendedRef.current || threadsMoreInFlightRef.current,
+          );
+          threadsRef.current = threads;
+          threadsNextCursorRef.current = nextCursor;
+          setThreadsNextCursor(nextCursor);
+          setData({
+            projects,
+            models,
+            collaborationModes,
+            threads,
+            usage,
+            diagnostics,
+            approvals: approvalReconciliation.approvals,
+          });
+          workspaceReadyRef.current = true;
+          setState("ready");
+          setError("");
+          if (recoveryTimer.current !== undefined) {
+            window.clearTimeout(recoveryTimer.current);
+            recoveryTimer.current = undefined;
+          }
+        } catch (loadError) {
+          const policy = workspaceLoadFailurePolicy(loadError, workspaceReadyRef.current);
+          if (policy.kind === "authentication") {
+            onLoggedOut();
+            return;
+          }
+          setError(errorMessage(loadError));
+          if (!policy.preserveSnapshot) {
+            setState("error");
+          }
+          if (policy.retryAfterMs !== undefined && recoveryTimer.current === undefined) {
+            recoveryTimer.current = window.setTimeout(() => {
+              recoveryTimer.current = undefined;
+              void loadWorkspace();
+            }, policy.retryAfterMs);
+          }
+        }
+      })();
+      loadInFlight.current = promise;
+      void promise.finally(() => {
+        if (loadInFlight.current === promise) loadInFlight.current = undefined;
+      });
+      return promise;
+    },
+    [onLoggedOut],
+  );
 
   useEffect(() => {
     void load();
@@ -3309,6 +6608,9 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
       );
       threadsRef.current = threads;
       threadsExtendedRef.current = true;
+      for (const thread of page.items) {
+        threadTailIdsRef.current.add(thread.id);
+      }
       threadsNextCursorRef.current = page.nextCursor;
       setThreadsNextCursor(page.nextCursor);
       setData((current) => ({ ...current, threads }));
@@ -3334,6 +6636,14 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
       const threads = cursor
         ? mergeCursorItems(archivedThreadsRef.current, page.items, (thread) => thread.id, "append")
         : page.items;
+      if (cursor) {
+        for (const thread of page.items) {
+          archivedTailIdsRef.current.add(thread.id);
+        }
+      } else {
+        archivedTailIdsRef.current.clear();
+      }
+      archivedLoadedRef.current = true;
       archivedThreadsRef.current = threads;
       archivedNextCursorRef.current = page.nextCursor;
       setArchivedThreads(threads);
@@ -3377,27 +6687,68 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   }, [load]);
 
   useEffect(() => {
-    const unsubscribe = api.subscribe((event) => {
-      const envelope = {
-        deliveryId: ++liveDeliverySequence.current,
-        event,
-        replayed: !initialReplayComplete.current && event.type !== "connection.ready",
-      };
-      if (event.type === "connection.ready") {
-        initialReplayComplete.current = true;
-      }
-      setLiveEvents((current) => {
-        const next = [...current, envelope];
-        return next.length > MAX_LIVE_EVENTS ? next.slice(next.length - MAX_LIVE_EVENTS) : next;
-      });
-      if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
-      refreshTimer.current = window.setTimeout(() => void load(), 500);
-    }, setOnline);
+    const unsubscribe = api.subscribe(
+      (event) => {
+        const envelope = {
+          deliveryId: ++liveDeliverySequence.current,
+          event,
+          replayed: !initialReplayComplete.current && event.type !== "connection.ready",
+        };
+        if (event.type === "connection.ready") {
+          initialReplayComplete.current = true;
+        }
+        if (event.type === "connection.reset") {
+          locallyResolvedApprovalIdsRef.current.clear();
+        }
+        const remotelyResolvedApprovalId = resolvedApprovalId(event);
+        if (remotelyResolvedApprovalId !== undefined) {
+          locallyResolvedApprovalIdsRef.current.add(remotelyResolvedApprovalId);
+          setData((current) => ({
+            ...current,
+            approvals: current.approvals.filter(
+              (approval) => approval.id !== remotelyResolvedApprovalId,
+            ),
+          }));
+        }
+        const threadSnapshot = threadSummaryFromSnapshotEvent(event);
+        if (threadSnapshot) {
+          const reconciled = reconcileThreadSnapshotLists(
+            threadsRef.current,
+            archivedThreadsRef.current,
+            threadSnapshot,
+          );
+          threadsRef.current = reconciled.current;
+          archivedThreadsRef.current = reconciled.archived;
+          if (threadSnapshot.archived) {
+            threadTailIdsRef.current.delete(threadSnapshot.id);
+          } else {
+            archivedTailIdsRef.current.delete(threadSnapshot.id);
+          }
+          setData((current) => ({ ...current, threads: reconciled.current }));
+          setArchivedThreads(reconciled.archived);
+        }
+        setLiveEvents((current) => {
+          if (event.type === "connection.reset") return [envelope];
+          const next = [...current, envelope];
+          return next.length > MAX_LIVE_EVENTS ? next.slice(next.length - MAX_LIVE_EVENTS) : next;
+        });
+        if (workspaceEventNeedsRefresh(event)) {
+          if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
+          refreshTimer.current = window.setTimeout(() => void load(), 500);
+        }
+      },
+      setOnline,
+      eventThreadId ? { threadId: eventThreadId } : undefined,
+    );
     return () => {
       unsubscribe();
       if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
+      if (recoveryTimer.current !== undefined) {
+        window.clearTimeout(recoveryTimer.current);
+        recoveryTimer.current = undefined;
+      }
     };
-  }, [load]);
+  }, [eventThreadId, load]);
 
   async function logout() {
     await api.logout();
@@ -3405,6 +6756,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   }
 
   function resolvedApproval(id: string) {
+    locallyResolvedApprovalIdsRef.current.add(id);
     setData((current) => ({
       ...current,
       approvals: current.approvals.filter((approval) => approval.id !== id),
@@ -3442,33 +6794,36 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
       <main className="workspace-main">
         <Routes>
           <Route
-            element={<HomePage data={data} online={online} onOpenApproval={setSelectedApproval} />}
-            path="/"
-          />
-          <Route
             element={
               <ThreadsPage
                 archivedError={archivedError}
                 archivedNextCursor={archivedNextCursor}
                 archivedState={archivedState}
                 archivedThreads={archivedThreads}
+                data={data}
                 moreError={threadsMoreError}
                 moreState={threadsMoreState}
                 nextCursor={threadsNextCursor}
+                online={online}
+                onOpenApproval={setSelectedApproval}
                 onLoadArchived={() => void loadArchivedPage()}
                 onLoadMore={() => void loadMoreThreads()}
                 onLoadMoreArchived={() => void loadArchivedPage(archivedNextCursorRef.current)}
-                threads={data.threads}
               />
             }
-            path="/threads"
+            path="/"
           />
+          <Route element={<Navigate replace to="/" />} path="/threads" />
           <Route
             element={
               <ConversationPage
                 apiClient={api}
+                approvals={data.approvals}
+                capabilities={data.diagnostics?.capabilities}
+                collaborationModes={data.collaborationModes}
                 liveEvents={liveEvents}
                 models={data.models}
+                onOpenApproval={setSelectedApproval}
                 onSubagentsLoaded={setSubagents}
                 onThreadLoaded={setCurrentThread}
                 onUsageLoaded={setCurrentThreadUsage}
@@ -3482,8 +6837,10 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
             element={
               <NewThreadPage
                 apiClient={api}
+                capabilities={data.diagnostics?.capabilities}
                 collaborationModes={data.collaborationModes}
                 models={data.models}
+                online={online}
                 projects={data.projects}
               />
             }
@@ -3535,23 +6892,70 @@ export function App() {
   const [bootstrap, setBootstrap] = useState<PublicBootstrap>();
   const [session, setSession] = useState<AuthSession>();
   const [state, setState] = useState<LoadState>("loading");
+  const [locale, setLocaleState] = useState<UiLocale>(() => readUiLocale(window.localStorage));
+  const recoveryTimer = useRef<number | undefined>(undefined);
+  const localeContext = useMemo(
+    () => ({
+      copy: localeCopy(locale),
+      locale,
+      setLocale(nextLocale: UiLocale) {
+        setLocaleState(nextLocale);
+        writeUiLocale(window.localStorage, nextLocale);
+      },
+    }),
+    [locale],
+  );
 
-  const initialize = useCallback(async () => {
+  useEffect(() => {
+    document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+  }, [locale]);
+
+  const initialize = useCallback(async function initializeApp() {
+    if (recoveryTimer.current !== undefined) {
+      window.clearTimeout(recoveryTimer.current);
+      recoveryTimer.current = undefined;
+    }
     setState("loading");
     try {
       const result = await api.bootstrap();
       setBootstrap(result);
       if (result.authenticated) {
-        setSession(await api.session());
+        try {
+          setSession(await api.session());
+        } catch (sessionError) {
+          const policy = workspaceLoadFailurePolicy(sessionError, false);
+          if (policy.kind === "authentication") {
+            setSession(undefined);
+            setBootstrap(loggedOutBootstrap(result));
+            setState("ready");
+            return;
+          }
+          throw sessionError;
+        }
+      } else {
+        setSession(undefined);
       }
       setState("ready");
-    } catch {
+    } catch (initializationError) {
       setState("error");
+      const policy = workspaceLoadFailurePolicy(initializationError, false);
+      if (policy.retryAfterMs !== undefined && recoveryTimer.current === undefined) {
+        recoveryTimer.current = window.setTimeout(() => {
+          recoveryTimer.current = undefined;
+          void initializeApp();
+        }, policy.retryAfterMs);
+      }
     }
   }, []);
 
   useEffect(() => {
     void initialize();
+    return () => {
+      if (recoveryTimer.current !== undefined) {
+        window.clearTimeout(recoveryTimer.current);
+        recoveryTimer.current = undefined;
+      }
+    };
   }, [initialize]);
 
   if (state === "loading") {
@@ -3576,12 +6980,14 @@ export function App() {
     );
   }
   return (
-    <Workspace
-      onLoggedOut={() => {
-        setSession(undefined);
-        setBootstrap(loggedOutBootstrap(bootstrap));
-      }}
-      session={session}
-    />
+    <UiLocaleContext.Provider value={localeContext}>
+      <Workspace
+        onLoggedOut={() => {
+          setSession(undefined);
+          setBootstrap(loggedOutBootstrap(bootstrap));
+        }}
+        session={session}
+      />
+    </UiLocaleContext.Provider>
   );
 }

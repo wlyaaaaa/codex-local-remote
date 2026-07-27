@@ -3,7 +3,9 @@ import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from "react";
 export type IconName =
   | "activity"
   | "alert"
+  | "arrow-down"
   | "arrow-left"
+  | "arrow-up"
   | "branch"
   | "check"
   | "chevron-down"
@@ -11,7 +13,9 @@ export type IconName =
   | "clock"
   | "close"
   | "code"
+  | "copy"
   | "download"
+  | "edit"
   | "file"
   | "folder"
   | "home"
@@ -21,6 +25,7 @@ export type IconName =
   | "message"
   | "more"
   | "paperclip"
+  | "pin"
   | "play"
   | "plus"
   | "refresh"
@@ -31,7 +36,9 @@ export type IconName =
   | "spark"
   | "square"
   | "stop"
+  | "target"
   | "terminal"
+  | "trash"
   | "user"
   | "wifi-off";
 
@@ -43,7 +50,9 @@ const iconPaths: Record<IconName, ReactNode> = {
       <path d="M12 9v4m0 3.5v.01" />
     </>
   ),
+  "arrow-down": <path d="M12 4v16m-6-6 6 6 6-6" />,
   "arrow-left": <path d="m15 18-6-6 6-6" />,
+  "arrow-up": <path d="M12 20V4m-6 6 6-6 6 6" />,
   branch: (
     <>
       <circle cx="6" cy="4" r="2" />
@@ -63,7 +72,14 @@ const iconPaths: Record<IconName, ReactNode> = {
   ),
   close: <path d="m6 6 12 12M18 6 6 18" />,
   code: <path d="m9 18-6-6 6-6m6 0 6 6-6 6" />,
+  copy: (
+    <>
+      <rect height="13" rx="2" width="13" x="8" y="8" />
+      <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+    </>
+  ),
   download: <path d="M12 3v12m-5-5 5 5 5-5M5 21h14" />,
+  edit: <path d="m4 20 4.2-1 10.6-10.6a2 2 0 0 0-2.8-2.8L5.4 16.2 4 20Zm10.5-12 2.8 2.8" />,
   file: <path d="M6 2h8l4 4v16H6zM14 2v5h4" />,
   folder: <path d="M3 6h7l2 2h9v11H3z" />,
   home: <path d="m3 11 9-8 9 8v10h-6v-7H9v7H3z" />,
@@ -84,6 +100,7 @@ const iconPaths: Record<IconName, ReactNode> = {
     </>
   ),
   paperclip: <path d="m20 11-8 8a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 1 1-3-3l8-8" />,
+  pin: <path d="m14 4 6 6-3 1-4 4 .5 4.5-1.5 1.5-3-5-5-3L5.5 11l4.5.5 4-4zM8 16l-5 5" />,
   play: <path d="m8 5 11 7-11 7z" />,
   plus: <path d="M12 5v14M5 12h14" />,
   refresh: (
@@ -108,7 +125,15 @@ const iconPaths: Record<IconName, ReactNode> = {
   ),
   square: <rect x="5" y="5" width="14" height="14" rx="2" />,
   stop: <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />,
+  target: (
+    <>
+      <circle cx="12" cy="12" r="8" />
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
+    </>
+  ),
   terminal: <path d="m4 6 5 5-5 5m8 1h8" />,
+  trash: <path d="M4 7h16M9 7V4h6v3m-8 0 1 14h8l1-14M10 11v6m4-6v6" />,
   user: (
     <>
       <circle cx="12" cy="8" r="4" />

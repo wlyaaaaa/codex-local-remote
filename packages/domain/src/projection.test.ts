@@ -55,9 +55,23 @@ const rawThread = {
 };
 
 describe("thread projection", () => {
+  it("renders legacy percent-encoded Markdown titles as readable text", () => {
+    expect(
+      projectThreadSummary(
+        {
+          ...rawThread,
+          name: "%2A%2Asteamcommunity.com%2A%2A",
+        },
+        { managed: false },
+      ).title,
+    ).toBe("steamcommunity.com");
+  });
+
   it("projects an unowned desktop thread as a read-only snapshot", () => {
     const detail = projectThreadDetail(rawThread, {
+      childCount: 2,
       managed: false,
+      pinnedRank: 0,
       projectId: "project-1",
     });
 
@@ -66,7 +80,9 @@ describe("thread projection", () => {
       title: "修复移动端对话页",
       projectId: "project-1",
       cwdLabel: "sample-project",
+      childCount: 2,
       mode: "desktop-snapshot",
+      pinnedRank: 0,
       state: "complete",
       availableActions: {
         changeModelNextTurn: false,
@@ -76,12 +92,15 @@ describe("thread projection", () => {
       },
     });
     expect(JSON.stringify(detail)).not.toContain("隐藏推理");
-    expect(detail.items).toContainEqual({
-      id: "reasoning-1",
-      kind: "reasoning-summary",
-      text: "已定位到容器宽度问题",
-      createdAt: "2024-07-14T23:33:30.000Z",
-    });
+    expect(detail.items).toContainEqual(
+      expect.objectContaining({
+        id: "reasoning-1",
+        kind: "reasoning-summary",
+        text: "已定位到容器宽度问题",
+        turnStartedAt: "2024-07-14T23:33:30.000Z",
+        turnId: "turn-1",
+      }),
+    );
     expect(detail.items).toContainEqual(
       expect.objectContaining({
         id: "tool-1",
@@ -136,6 +155,99 @@ describe("thread projection", () => {
     });
   });
 
+  it("projects the latest actual thread and turn runtime settings without inventing defaults", () => {
+    const threadWithRuntimeSettings = {
+      ...rawThread,
+      model: "thread-model",
+      reasoningEffort: "low",
+      settings: {
+        activePermissionProfile: { id: "future-profile" },
+        approvalPolicy: "future-policy",
+        approvalsReviewer: "future-reviewer",
+        collaborationMode: { mode: "plan" },
+        effort: "medium",
+        model: "thread-settings-model",
+        serviceTier: "future-speed",
+      },
+      turns: [
+        ...rawThread.turns,
+        {
+          effort: "high",
+          id: "turn-runtime",
+          items: [],
+          model: "turn-model",
+          settings: {
+            model: "turn-settings-model",
+            reasoningEffort: "ultra",
+          },
+          status: "completed",
+        },
+      ],
+    };
+
+    expect(projectThreadSummary(threadWithRuntimeSettings, { managed: true })).toMatchObject({
+      approvalsReviewer: "future-reviewer",
+      approvalPolicy: "future-policy",
+      collaborationMode: "plan",
+      model: "thread-settings-model",
+      permissionProfileId: "future-profile",
+      reasoningEffort: "medium",
+      serviceTier: "future-speed",
+    });
+    expect(
+      projectThreadDetail(threadWithRuntimeSettings, {
+        managed: true,
+        model: "rerouted-model",
+        reasoningEffort: null,
+      }),
+    ).toMatchObject({
+      model: "rerouted-model",
+    });
+    expect(
+      projectThreadDetail(threadWithRuntimeSettings, {
+        managed: true,
+        model: "rerouted-model",
+        reasoningEffort: null,
+      }).reasoningEffort,
+    ).toBeUndefined();
+    expect(projectThreadSummary(rawThread, { managed: true }).model).toBeUndefined();
+    expect(projectThreadSummary(rawThread, { managed: true }).reasoningEffort).toBeUndefined();
+  });
+
+  it("selects the newest fallback turn settings regardless of thread turn array order", () => {
+    const older = {
+      id: "turn-older",
+      items: [],
+      settings: { effort: "low", model: "older-model" },
+      startedAt: 100,
+      status: "completed",
+    };
+    const newer = {
+      id: "turn-newer",
+      items: [],
+      settings: { effort: "high", model: "newer-model" },
+      startedAt: 200,
+      status: "completed",
+    };
+    for (const turns of [
+      [older, newer],
+      [newer, older],
+    ]) {
+      expect(
+        projectThreadSummary(
+          {
+            ...rawThread,
+            turns,
+          },
+          { managed: true },
+        ),
+      ).toMatchObject({
+        model: "newer-model",
+        reasoningEffort: "high",
+      });
+    }
+  });
+
   it("shows active approval and user-input waits as waiting instead of running", () => {
     expect(
       projectThreadSummary(
@@ -178,6 +290,20 @@ describe("thread projection", () => {
       summary: "pnpm test",
     });
     expect(tools[0]?.kind === "tool" ? tools[0].detail?.length : 0).toBeLessThanOrEqual(16_384);
+    expect(tools[0]?.kind === "tool" ? tools[0].occurrenceDetails : undefined).toHaveLength(10);
+    expect(tools[0]?.kind === "tool" ? tools[0].occurrenceDetails?.[0]?.id : undefined).toBe(
+      "tool-0",
+    );
+    expect(tools[0]?.kind === "tool" ? tools[0].occurrenceDetails?.[9]?.id : undefined).toBe(
+      "tool-9",
+    );
+    expect(
+      tools[0]?.kind === "tool"
+        ? tools[0].occurrenceDetails?.every(
+            (occurrence) => (occurrence.detail?.length ?? 0) <= 16_384,
+          )
+        : false,
+    ).toBe(true);
     expect(JSON.stringify(tools)).not.toContain("\\u0000");
   });
 
@@ -212,13 +338,14 @@ describe("thread projection", () => {
       { managed: true },
     );
     expect(detail.items).toEqual([
-      {
+      expect.objectContaining({
         id: "compaction-from-history",
         kind: "tool",
         operation: "context-compaction",
         status: "complete",
         title: "压缩对话上下文",
-      },
+        turnId: "turn-compaction",
+      }),
     ]);
   });
 
@@ -352,7 +479,12 @@ describe("thread projection", () => {
 
     expect(detail.items).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "subagent-started", status: "running" }),
+        expect.objectContaining({
+          agents: [{ label: "worker", threadId: "thread-worker" }],
+          id: "subagent-started",
+          kind: "subagent-activity",
+          status: "running",
+        }),
         expect.objectContaining({ id: "subagent-interacted", status: "complete" }),
         expect.objectContaining({ id: "subagent-interrupted", status: "failed" }),
       ]),
@@ -440,6 +572,65 @@ describe("thread projection", () => {
 });
 
 describe("notification projection", () => {
+  it("projects a complete thread/started notification as a bounded read-only upsert snapshot", () => {
+    const projected = projectAppServerNotification({
+      method: "thread/started",
+      params: {
+        thread: {
+          ...rawThread,
+          model: `${"m".repeat(300)}\u0000secret`,
+          name: `${"标题".repeat(80)}\n不得进入第二行`,
+          reasoningEffort: `${"e".repeat(180)}\u0000secret`,
+          turns: [],
+        },
+      },
+    });
+
+    expect(projected).toHaveLength(1);
+    expect(projected[0]).toMatchObject({
+      threadId: "thread-1",
+      type: "thread.snapshot",
+      payload: {
+        cwdLabel: "sample-project",
+        id: "thread-1",
+        mode: "desktop-snapshot",
+        state: "idle",
+        updatedAt: "2024-07-14T23:35:00.000Z",
+      },
+    });
+    const payload = projected[0]?.payload as {
+      model?: string;
+      reasoningEffort?: string;
+      title?: string;
+    };
+    expect(payload.title?.length).toBeLessThanOrEqual(100);
+    expect(payload.model?.length).toBeLessThanOrEqual(256);
+    expect(payload.reasoningEffort?.length).toBeLessThanOrEqual(128);
+    expect(JSON.stringify(projected)).not.toContain("secret");
+    expect(JSON.stringify(projected)).not.toContain("不得进入第二行");
+  });
+
+  it("defers an incomplete or oversized thread/started shell to safe service hydration", () => {
+    expect(
+      projectAppServerNotification({
+        method: "thread/started",
+        params: { thread: { id: "thread-shell" } },
+      }),
+    ).toEqual([]);
+    expect(
+      projectAppServerNotification({
+        method: "thread/started",
+        params: {
+          thread: {
+            ...rawThread,
+            id: "x".repeat(513),
+            turns: [],
+          },
+        },
+      }),
+    ).toEqual([]);
+  });
+
   it("projects the real context-compaction lifecycle without exposing protocol details", () => {
     const item = {
       id: "compaction-1",
@@ -491,6 +682,45 @@ describe("notification projection", () => {
         },
         threadId: "thread-1",
         turnId: "turn-compact",
+        type: "thread.item",
+      },
+    ]);
+  });
+
+  it("projects authoritative plan progress for a clickable step indicator", () => {
+    expect(
+      projectAppServerNotification({
+        method: "turn/plan/updated",
+        params: {
+          explanation: "按真实步骤推进",
+          plan: [
+            { status: "completed", step: "读取现状" },
+            { status: "inProgress", step: "修复界面" },
+            { status: "pending", step: "真实验收" },
+          ],
+          threadId: "thread-1",
+          turnId: "turn-1",
+        },
+      }),
+    ).toEqual([
+      {
+        payload: {
+          item: [
+            {
+              explanation: "按真实步骤推进",
+              id: "plan-progress-turn-1",
+              kind: "plan-progress",
+              steps: [
+                { status: "completed", text: "读取现状" },
+                { status: "inProgress", text: "修复界面" },
+                { status: "pending", text: "真实验收" },
+              ],
+            },
+          ],
+          lifecycle: "updated",
+        },
+        threadId: "thread-1",
+        turnId: "turn-1",
         type: "thread.item",
       },
     ]);

@@ -29,3 +29,25 @@ export function mergeCursorItems<T>(
   const incomingKeys = new Set(incoming.map(key));
   return [...incoming, ...current.filter((item) => !incomingKeys.has(key(item)))];
 }
+
+type RefreshableFirstPageItem = {
+  pinnedRank?: number | undefined;
+};
+
+export function mergeRefreshedFirstPage<T extends RefreshableFirstPageItem>(
+  current: readonly T[],
+  incoming: readonly T[],
+  key: (item: T) => string,
+  loadedTailKeys: ReadonlySet<string>,
+): T[] {
+  const incomingKeys = new Set(incoming.map(key));
+  return [
+    ...incoming,
+    ...current
+      .filter((item) => {
+        const itemKey = key(item);
+        return loadedTailKeys.has(itemKey) && !incomingKeys.has(itemKey);
+      })
+      .map((item) => (item.pinnedRank === undefined ? item : { ...item, pinnedRank: undefined })),
+  ];
+}

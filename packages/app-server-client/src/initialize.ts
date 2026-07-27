@@ -1,4 +1,9 @@
-import type { JsonlRpcConnection } from "./jsonl-connection.js";
+import type { RpcRequestOptions } from "./jsonl-connection.js";
+
+export interface AppServerRpcConnection {
+  notify(method: string, params?: unknown): Promise<void>;
+  request<T = unknown>(method: string, params?: unknown, options?: RpcRequestOptions): Promise<T>;
+}
 
 export interface InitializeAppServerOptions {
   clientVersion: string;
@@ -14,7 +19,7 @@ export interface AppServerInitialization {
 }
 
 export async function initializeAppServer(
-  connection: JsonlRpcConnection,
+  connection: AppServerRpcConnection,
   options: InitializeAppServerOptions,
 ): Promise<AppServerInitialization> {
   const result = await connection.request<unknown>(

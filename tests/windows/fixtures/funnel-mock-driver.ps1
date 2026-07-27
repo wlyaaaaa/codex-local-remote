@@ -9,7 +9,9 @@ param(
 
     [switch]$WhatIf,
 
-    [switch]$ConfirmFalse
+    [switch]$ConfirmFalse,
+
+    [switch]$Json
 )
 
 function Invoke-RestMethod {
@@ -25,12 +27,19 @@ function Invoke-RestMethod {
     }
 }
 
+function Invoke-WebRequest {
+    return [pscustomobject]@{ StatusCode = 503 }
+}
+
 function Get-ScheduledTask {
     return [pscustomobject]@{ State = 'Running' }
 }
 
 function Get-NetTCPConnection {
-    return [pscustomobject]@{ LocalAddress = '127.0.0.1' }
+    return [pscustomobject]@{
+        LocalAddress = '127.0.0.1'
+        OwningProcess = 0
+    }
 }
 
 $parameters = @{
@@ -43,6 +52,13 @@ if ($WhatIf) {
 if ($ConfirmFalse) {
     $parameters.Confirm = $false
 }
+if ($Json) {
+    $parameters.Json = $true
+}
 
 $result = & $TargetScript @parameters
-$result | ConvertTo-Json -Compress -Depth 20
+if ($Json) {
+    $result
+} else {
+    $result | ConvertTo-Json -Compress -Depth 20
+}

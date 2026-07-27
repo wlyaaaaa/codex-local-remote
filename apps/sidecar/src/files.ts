@@ -1,7 +1,7 @@
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
-import type { FileEntry, FileListing } from "@codex-local-remote/contracts";
+import type { FileEntry, FileListing, ResolvedFileEntry } from "@codex-local-remote/contracts";
 import {
   authorizeDownloadFromCanonicalRoot,
   evaluateDownload,
@@ -59,6 +59,10 @@ export interface AuthorizedProjectFile {
   contentType?: string;
   handle: Awaited<ReturnType<typeof authorizeDownloadFromCanonicalRoot>>["handle"];
   size: number;
+}
+
+export interface ResolvedProjectInputReference extends FileEntry {
+  absolutePath: string;
 }
 
 export async function listProjectFiles(
@@ -173,6 +177,136 @@ export async function getProjectDownload(
   return await authorizeProjectFile(state, projectId, relativePath, MAX_DOWNLOAD_BYTES);
 }
 
+export async function resolveProjectFileReference(
+  state: SidecarStateStore,
+  projectId: string | undefined,
+  sourcePath: string,
+): Promise<ResolvedFileEntry> {
+  const resolvedProjectId = await resolveReferenceProjectId(state, projectId, sourcePath);
+  const { absolutePath: _absolutePath, ...entry } = await resolveProjectInputReference(
+    state,
+    resolvedProjectId,
+    sourcePath,
+  );
+  return { ...entry, projectId: resolvedProjectId };
+}
+
+export async function resolveProjectInputReference(
+  state: SidecarStateStore,
+  projectId: string,
+  sourcePath: string,
+): Promise<ResolvedProjectInputReference> {
+  const root = await requireProjectRoot(state, projectId);
+  const source = sourcePath.trim();
+  if (!source) {
+    throw new ProductHttpError("FILE_NOT_FOUND", "找不到这个文件", 404);
+  }
+  const relativeSource = path.win32.isAbsolute(source)
+    ? path.win32.relative(root, path.win32.resolve(source))
+    : source;
+  const validation = validateSafeWindowsRelativePath(relativeSource);
+  if (!validation.ok) {
+    throw fileAccessDenied();
+  }
+  if (
+    validation.segments.some((segment) =>
+      HIDDEN_DIRECTORIES.has(segment.toLocaleLowerCase("en-US")),
+    )
+  ) {
+    throw protectedFileError();
+  }
+  const relativePath = validation.segments.join("\\");
+  let resolvedPath: string;
+  try {
+    resolvedPath = await resolveContainedPathFromCanonicalRoot(root, relativePath);
+  } catch {
+    throw fileAccessDenied();
+  }
+  const metadata = await safeStat(resolvedPath);
+  if (!metadata || (!metadata.isFile() && !metadata.isDirectory())) {
+    throw new ProductHttpError("FILE_NOT_FOUND", "文件已不存在或已经移动", 404);
+  }
+  const kind = metadata.isDirectory() ? "directory" : "file";
+  const decision =
+    kind === "file"
+      ? evaluateDownload({
+          kind,
+          maxBytes: MAX_DOWNLOAD_BYTES,
+          relativePath,
+          size: metadata.size,
+        })
+      : { allowed: false as const, reason: "not-file" as const };
+  if (
+    !decision.allowed &&
+    (decision.reason === "sensitive-directory" || decision.reason === "sensitive-file")
+  ) {
+    throw protectedFileError();
+  }
+  if (!decision.allowed && decision.reason === "unsafe-path") {
+    throw fileAccessDenied();
+  }
+  await assertProjectRootStillAuthorized(state, projectId, root);
+  return {
+    absolutePath: resolvedPath,
+    downloadable: decision.allowed,
+    kind,
+    modifiedAt: metadata.mtime.toISOString(),
+    name: path.win32.basename(resolvedPath),
+    relativePath: validation.segments.join("/"),
+    ...(kind === "file" ? { size: metadata.size } : {}),
+  };
+}
+
+async function resolveReferenceProjectId(
+  state: SidecarStateStore,
+  preferredProjectId: string | undefined,
+  sourcePath: string,
+): Promise<string> {
+  const source = sourcePath.trim();
+  if (!source) {
+    throw new ProductHttpError("FILE_NOT_FOUND", "找不到这个文件", 404);
+  }
+  if (!path.win32.isAbsolute(source)) {
+    if (!preferredProjectId) {
+      throw new ProductHttpError(
+        "FILE_PROJECT_REQUIRED",
+        "这条历史记录缺少可靠的项目归属，因此不能定位最新文件",
+        409,
+      );
+    }
+    await requireProjectRoot(state, preferredProjectId);
+    return preferredProjectId;
+  }
+
+  const absoluteSource = path.win32.resolve(source);
+  const candidates: Array<{ id: string; root: string }> = [];
+  for (const project of state.listProjects()) {
+    if (project.source !== "registered") continue;
+    const rootValidation = validateSafeWindowsProjectRoot(project.root);
+    if (!rootValidation.ok) continue;
+    const relative = path.win32.relative(rootValidation.normalized, absoluteSource);
+    const relativeValidation = validateSafeWindowsRelativePath(relative);
+    if (!relativeValidation.ok) continue;
+    candidates.push({ id: project.id, root: rootValidation.normalized });
+  }
+  candidates.sort((left, right) => {
+    if (left.root.length !== right.root.length) return right.root.length - left.root.length;
+    if (left.id === preferredProjectId) return -1;
+    if (right.id === preferredProjectId) return 1;
+    return left.id.localeCompare(right.id, "en-US");
+  });
+  const candidate = candidates[0];
+  if (!candidate) {
+    throw new ProductHttpError(
+      "FILE_PROJECT_REQUIRED",
+      "这个文件不属于任何已在电脑本机登记的项目",
+      409,
+    );
+  }
+  await requireProjectRoot(state, candidate.id);
+  return candidate.id;
+}
+
 async function requireProjectRoot(state: SidecarStateStore, projectId: string): Promise<string> {
   const project = state.listProjects().find((candidate) => candidate.id === projectId);
   if (!project) {
@@ -241,4 +375,12 @@ async function safeStat(candidate: string) {
 
 function fileAccessDenied(): ProductHttpError {
   return new ProductHttpError("FILE_ACCESS_DENIED", "这个文件不能通过远程端读取", 403);
+}
+
+function protectedFileError(): ProductHttpError {
+  return new ProductHttpError(
+    "FILE_PROTECTED",
+    "Git 内部目录、凭据目录和依赖缓存不会通过公网读取；修改差异仍可查看",
+    403,
+  );
 }

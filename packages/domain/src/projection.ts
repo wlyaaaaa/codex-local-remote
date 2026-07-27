@@ -9,10 +9,18 @@ import type {
 } from "@codex-local-remote/contracts";
 
 export interface ThreadProjectionOptions {
+  childCount?: number;
+  directInputAvailable?: boolean;
   managed: boolean;
-  model?: string;
+  model?: string | null;
+  approvalPolicy?: string | null;
+  approvalsReviewer?: string | null;
+  collaborationMode?: string | null;
+  permissionProfileId?: string | null;
+  pinnedRank?: number;
   projectId?: string;
-  reasoningEffort?: ReasoningEffort;
+  reasoningEffort?: ReasoningEffort | null;
+  serviceTier?: string | null;
 }
 
 export interface AppServerNotificationLike {
@@ -39,12 +47,16 @@ export function projectThreadSummary(
   options: ThreadProjectionOptions,
 ): ThreadSummary {
   const thread = requireRecord(rawThread, "对话");
-  const id = requireString(thread.id, "对话 id");
+  const id = requireBoundedIdentifier(thread.id, "对话 id", 512);
   const turns = asRecordArray(thread.turns);
   const activeTurn = turns.findLast((turn) => turn.status === "inProgress");
   const updatedAtSeconds =
     asFiniteNumber(thread.updatedAt) ?? asFiniteNumber(thread.createdAt) ?? 0;
   const parentThreadId = asNonEmptyString(thread.parentThreadId);
+  const runtimeSettings = projectRuntimeSettings(thread, options);
+  const cwd = boundedProductText(thread.cwd, 4_096);
+  const cwdLabel =
+    cwd === undefined ? undefined : boundedProductText(path.win32.basename(cwd), 256);
 
   return {
     id,
@@ -52,12 +64,29 @@ export function projectThreadSummary(
     state: projectRunState(thread, turns),
     title: chooseThreadTitle(thread),
     updatedAt: new Date(updatedAtSeconds * 1_000).toISOString(),
+    ...(options.childCount === undefined ? {} : { childCount: options.childCount }),
+    ...(options.pinnedRank === undefined ? {} : { pinnedRank: options.pinnedRank }),
     ...(options.projectId === undefined ? {} : { projectId: options.projectId }),
-    ...(options.model === undefined ? {} : { model: options.model }),
-    ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort }),
-    ...(asNonEmptyString(thread.cwd) === undefined
+    ...(runtimeSettings.model === undefined ? {} : { model: runtimeSettings.model }),
+    ...(runtimeSettings.reasoningEffort === undefined
       ? {}
-      : { cwdLabel: path.win32.basename(asNonEmptyString(thread.cwd) ?? "") }),
+      : { reasoningEffort: runtimeSettings.reasoningEffort }),
+    ...(runtimeSettings.serviceTier === undefined
+      ? {}
+      : { serviceTier: runtimeSettings.serviceTier }),
+    ...(runtimeSettings.permissionProfileId === undefined
+      ? {}
+      : { permissionProfileId: runtimeSettings.permissionProfileId }),
+    ...(runtimeSettings.approvalPolicy === undefined
+      ? {}
+      : { approvalPolicy: runtimeSettings.approvalPolicy }),
+    ...(runtimeSettings.approvalsReviewer === undefined
+      ? {}
+      : { approvalsReviewer: runtimeSettings.approvalsReviewer }),
+    ...(runtimeSettings.collaborationMode === undefined
+      ? {}
+      : { collaborationMode: runtimeSettings.collaborationMode }),
+    ...(cwdLabel === undefined ? {} : { cwdLabel }),
     ...(parentThreadId === undefined ? {} : { parentThreadId }),
     ...(activeTurn === undefined ? {} : {}),
   };
@@ -70,14 +99,27 @@ export function projectThreadDetail(
   const thread = requireRecord(rawThread, "对话");
   const turns = asRecordArray(thread.turns);
   const activeTurn = turns.findLast((turn) => turn.status === "inProgress");
-  const canControl = options.managed && thread.canAcceptDirectInput === true;
+  const canControl =
+    options.managed && (options.directInputAvailable ?? thread.canAcceptDirectInput === true);
   const items: ConversationItem[] = [];
 
   for (const turn of turns) {
     const createdAt = secondsToIso(asFiniteNumber(turn.startedAt));
+    const completedAt = secondsToIso(asFiniteNumber(turn.completedAt));
+    const turnId = asNonEmptyString(turn.id);
+    const turnContext = {
+      ...(turnId === undefined ? {} : { turnId }),
+      ...(createdAt === undefined ? {} : { turnStartedAt: createdAt }),
+      ...(completedAt === undefined ? {} : { turnCompletedAt: completedAt }),
+    };
     const turnItems: ConversationItem[] = [];
     for (const item of asRecordArray(turn.items)) {
-      turnItems.push(...projectThreadItem(item, createdAt, turn.status));
+      turnItems.push(
+        ...projectThreadItem(item, undefined, turn.status).map((projected) => ({
+          ...projected,
+          ...turnContext,
+        })),
+      );
     }
     items.push(...aggregateToolItems(turnItems));
   }
@@ -123,7 +165,21 @@ export function projectThreadItem(
     }
     case "agentMessage": {
       const text = asNonEmptyString(rawItem.text);
-      return text ? [{ id, kind: "assistant-message", text, ...timestamp }] : [];
+      const phase =
+        rawItem.phase === "commentary" || rawItem.phase === "final_answer"
+          ? rawItem.phase
+          : undefined;
+      return text
+        ? [
+            {
+              id,
+              kind: "assistant-message",
+              text,
+              ...(phase === undefined ? {} : { phase }),
+              ...timestamp,
+            },
+          ]
+        : [];
     }
     case "reasoning": {
       const summary = asStringArray(rawItem.summary).join("\n");
@@ -187,26 +243,56 @@ export function projectThreadItem(
         },
       ];
     }
-    case "collabAgentToolCall":
+    case "collabAgentToolCall": {
+      const agentsStates = isRecord(rawItem.agentsStates) ? rawItem.agentsStates : {};
+      const threadIds = [...asStringArray(rawItem.receiverThreadIds), ...Object.keys(agentsStates)]
+        .filter((threadId) => threadId.length > 0 && threadId.length <= 512)
+        .filter((threadId, index, all) => all.indexOf(threadId) === index)
+        .slice(0, 32);
+      if (threadIds.length === 0) {
+        return [
+          {
+            id,
+            kind: "tool",
+            status: projectToolStatus(rawItem.status),
+            title: "协作任务",
+            ...timestamp,
+          },
+        ];
+      }
+      const action = projectCollabAgentAction(rawItem.tool);
+      const summary = boundedProductText(rawItem.prompt, 1_024);
       return [
         {
           id,
-          kind: "tool",
+          kind: "subagent-activity",
+          action,
+          agents: threadIds.map((threadId) => ({ threadId })),
           status: projectToolStatus(rawItem.status),
-          title: "协作任务",
+          ...(summary === undefined ? {} : { summary }),
           ...timestamp,
         },
       ];
-    case "subAgentActivity":
+    }
+    case "subAgentActivity": {
+      const threadId = boundedProductText(rawItem.agentThreadId, 512);
+      if (threadId === undefined) return [];
+      const agentPath = boundedProductText(rawItem.agentPath, 1_024);
+      const label =
+        agentPath === undefined
+          ? undefined
+          : boundedProductText(path.posix.basename(agentPath.replaceAll("\\", "/")), 256);
       return [
         {
           id,
-          kind: "tool",
+          kind: "subagent-activity",
+          action: "activity",
+          agents: [{ threadId, ...(label === undefined ? {} : { label }) }],
           status: projectSubagentActivityStatus(rawItem.kind),
-          title: "协作任务",
           ...timestamp,
         },
       ];
+    }
     case "contextCompaction":
       return [
         {
@@ -265,6 +351,24 @@ export function projectAppServerNotification(
   };
 
   switch (notification.method) {
+    case "thread/started": {
+      const thread = isRecord(params.thread) ? params.thread : {};
+      if (!isCompleteThreadSnapshot(thread)) {
+        return [];
+      }
+      try {
+        const snapshot = projectThreadSummary(thread, { managed: false });
+        return [
+          {
+            type: "thread.snapshot",
+            threadId: snapshot.id,
+            payload: snapshot,
+          },
+        ];
+      } catch {
+        return [];
+      }
+    }
     case "item/reasoning/textDelta":
       return [];
     case "item/reasoning/summaryTextDelta":
@@ -295,6 +399,49 @@ export function projectAppServerNotification(
           ...context,
         },
       ];
+    case "turn/plan/updated": {
+      if (!threadId || !turnId) return [];
+      const steps = asRecordArray(params.plan)
+        .map((rawStep) => {
+          const text = boundedProductText(rawStep.step, 2_048);
+          const status =
+            rawStep.status === "pending" ||
+            rawStep.status === "inProgress" ||
+            rawStep.status === "completed"
+              ? rawStep.status
+              : undefined;
+          return text && status ? { text, status } : undefined;
+        })
+        .filter(
+          (
+            step,
+          ): step is {
+            text: string;
+            status: "pending" | "inProgress" | "completed";
+          } => step !== undefined,
+        )
+        .slice(0, 64);
+      if (steps.length === 0) return [];
+      const explanation = boundedProductText(params.explanation, 4_096);
+      return [
+        {
+          type: "thread.item",
+          threadId,
+          turnId,
+          payload: {
+            item: [
+              {
+                id: `plan-progress-${turnId}`,
+                kind: "plan-progress",
+                steps,
+                ...(explanation === undefined ? {} : { explanation }),
+              },
+            ],
+            lifecycle: "updated",
+          },
+        },
+      ];
+    }
     case "item/started":
     case "item/completed": {
       const item = projectThreadItem(params.item).map((projected) =>
@@ -399,6 +546,7 @@ export function projectAppServerNotification(
 }
 
 function aggregateToolItems(items: ConversationItem[]): ConversationItem[] {
+  const maxOccurrenceDetails = 50;
   const result: ConversationItem[] = [];
   const toolIndexes = new Map<string, number>();
   for (const item of items) {
@@ -415,9 +563,28 @@ function aggregateToolItems(items: ConversationItem[]): ConversationItem[] {
     }
     const existing = result[existingIndex];
     if (existing?.kind === "tool") {
+      const existingDetails = existing.occurrenceDetails ?? [
+        {
+          id: existing.id,
+          status: existing.status,
+          ...(existing.summary === undefined ? {} : { summary: existing.summary }),
+          ...(existing.detail === undefined ? {} : { detail: existing.detail }),
+          ...(existing.createdAt === undefined ? {} : { createdAt: existing.createdAt }),
+        },
+      ];
+      const nextDetails = item.occurrenceDetails ?? [
+        {
+          id: item.id,
+          status: item.status,
+          ...(item.summary === undefined ? {} : { summary: item.summary }),
+          ...(item.detail === undefined ? {} : { detail: item.detail }),
+          ...(item.createdAt === undefined ? {} : { createdAt: item.createdAt }),
+        },
+      ];
       result[existingIndex] = {
-        ...item,
+        ...existing,
         occurrences: (existing.occurrences ?? 1) + (item.occurrences ?? 1),
+        occurrenceDetails: [...existingDetails, ...nextDetails].slice(0, maxOccurrenceDetails),
       };
     }
   }
@@ -507,6 +674,25 @@ function projectSubagentActivityStatus(value: unknown): "running" | "complete" |
       return "failed";
     default:
       return "failed";
+  }
+}
+
+function projectCollabAgentAction(
+  value: unknown,
+): "spawn" | "update" | "resume" | "wait" | "close" | "activity" {
+  switch (value) {
+    case "spawnAgent":
+      return "spawn";
+    case "sendInput":
+      return "update";
+    case "resumeAgent":
+      return "resume";
+    case "wait":
+      return "wait";
+    case "closeAgent":
+      return "close";
+    default:
+      return "activity";
   }
 }
 
@@ -648,9 +834,221 @@ function countUnifiedDiff(value: unknown): { additions: number; deletions: numbe
 }
 
 function chooseThreadTitle(thread: Record<string, unknown>): string {
-  const title = asNonEmptyString(thread.name) ?? asNonEmptyString(thread.preview) ?? "未命名对话";
+  const rawTitle =
+    boundedProductText(thread.name, 4_096) ??
+    boundedProductText(thread.preview, 4_096) ??
+    "未命名对话";
+  let title = rawTitle;
+  if (/%[0-9a-f]{2}/iu.test(rawTitle)) {
+    try {
+      title = decodeURIComponent(rawTitle);
+    } catch {
+      // Keep malformed legacy names visible instead of dropping the task.
+    }
+  }
+  title = title
+    .replace(/\*\*([^*\r\n]+)\*\*/gu, "$1")
+    .replace(/__([^_\r\n]+)__/gu, "$1")
+    .replace(/~~([^~\r\n]+)~~/gu, "$1")
+    .replace(/`([^`\r\n]+)`/gu, "$1");
   const firstLine = title.split(/\r?\n/u)[0]?.trim() || "未命名对话";
   return firstLine.length <= 100 ? firstLine : `${firstLine.slice(0, 99)}…`;
+}
+
+function projectRuntimeSettings(
+  thread: Record<string, unknown>,
+  options: ThreadProjectionOptions,
+): RuntimeSettingsProjection {
+  const settings: RuntimeSettingsProjection = {};
+  const turn = preferredRuntimeSettingsTurn(asRecordArray(thread.turns));
+  if (turn !== undefined) {
+    applyRuntimeSettings(settings, turn);
+    applyRuntimeSettings(settings, isRecord(turn.settings) ? turn.settings : {});
+    applyRuntimeSettings(settings, isRecord(turn.turnSettings) ? turn.turnSettings : {});
+  }
+  applyRuntimeSettings(settings, thread);
+  applyRuntimeSettings(settings, isRecord(thread.settings) ? thread.settings : {});
+  applyRuntimeSettings(settings, isRecord(thread.threadSettings) ? thread.threadSettings : {});
+  if (Object.hasOwn(options, "model")) {
+    const model = boundedProductText(options.model, 256);
+    settings.model = model;
+  }
+  if (Object.hasOwn(options, "reasoningEffort")) {
+    const effort = boundedProductText(options.reasoningEffort, 128);
+    settings.reasoningEffort = effort;
+  }
+  for (const field of [
+    "serviceTier",
+    "permissionProfileId",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "collaborationMode",
+  ] as const) {
+    if (Object.hasOwn(options, field)) {
+      settings[field] = boundedProductText(options[field], 256);
+    }
+  }
+  return {
+    ...(settings.model === undefined ? {} : { model: settings.model }),
+    ...(settings.reasoningEffort === undefined
+      ? {}
+      : { reasoningEffort: settings.reasoningEffort }),
+    ...(settings.serviceTier === undefined ? {} : { serviceTier: settings.serviceTier }),
+    ...(settings.permissionProfileId === undefined
+      ? {}
+      : { permissionProfileId: settings.permissionProfileId }),
+    ...(settings.approvalPolicy === undefined ? {} : { approvalPolicy: settings.approvalPolicy }),
+    ...(settings.approvalsReviewer === undefined
+      ? {}
+      : { approvalsReviewer: settings.approvalsReviewer }),
+    ...(settings.collaborationMode === undefined
+      ? {}
+      : { collaborationMode: settings.collaborationMode }),
+  };
+}
+
+function applyRuntimeSettings(
+  target: RuntimeSettingsProjection,
+  source: Record<string, unknown>,
+): void {
+  if (Object.hasOwn(source, "model")) {
+    const model = boundedProductText(source.model, 256);
+    if (model !== undefined || source.model === null) {
+      target.model = model;
+    }
+  }
+  const effortField = Object.hasOwn(source, "reasoningEffort")
+    ? "reasoningEffort"
+    : Object.hasOwn(source, "effort")
+      ? "effort"
+      : Object.hasOwn(source, "reasoning_effort")
+        ? "reasoning_effort"
+        : undefined;
+  if (effortField !== undefined) {
+    const effort = boundedProductText(source[effortField], 128);
+    if (effort !== undefined || source[effortField] === null) {
+      target.reasoningEffort = effort;
+    }
+  }
+  applyNullableRuntimeString(target, source, "serviceTier");
+  applyNullableRuntimeString(target, source, "approvalPolicy");
+  applyNullableRuntimeString(target, source, "approvalsReviewer");
+  const permissionProfile =
+    asNonEmptyString(source.permissionProfileId) ??
+    asNonEmptyString(source.permissions) ??
+    asNonEmptyString(
+      isRecord(source.activePermissionProfile) ? source.activePermissionProfile.id : undefined,
+    );
+  if (
+    permissionProfile !== undefined ||
+    source.permissionProfileId === null ||
+    source.permissions === null ||
+    source.activePermissionProfile === null
+  ) {
+    target.permissionProfileId = boundedProductText(permissionProfile, 256);
+  }
+  if (Object.hasOwn(source, "collaborationMode")) {
+    const rawMode = source.collaborationMode;
+    const modeRecord = isRecord(rawMode) ? rawMode : {};
+    const mode =
+      asNonEmptyString(rawMode) ??
+      asNonEmptyString(modeRecord.name) ??
+      asNonEmptyString(modeRecord.mode);
+    if (mode !== undefined || rawMode === null) {
+      target.collaborationMode = boundedProductText(mode, 256);
+    }
+  }
+}
+
+interface RuntimeSettingsProjection {
+  model?: string | undefined;
+  reasoningEffort?: ReasoningEffort | undefined;
+  serviceTier?: string | undefined;
+  permissionProfileId?: string | undefined;
+  approvalPolicy?: string | undefined;
+  approvalsReviewer?: string | undefined;
+  collaborationMode?: string | undefined;
+}
+
+function applyNullableRuntimeString(
+  target: RuntimeSettingsProjection,
+  source: Record<string, unknown>,
+  field: "approvalPolicy" | "approvalsReviewer" | "serviceTier",
+): void {
+  if (!Object.hasOwn(source, field)) {
+    return;
+  }
+  const value = boundedProductText(source[field], 256);
+  if (value !== undefined || source[field] === null) {
+    target[field] = value;
+  }
+}
+
+function preferredRuntimeSettingsTurn(
+  turns: readonly Record<string, unknown>[],
+): Record<string, unknown> | undefined {
+  const candidates = turns.filter((turn) => hasRuntimeSettings(turn));
+  const active = candidates.filter((turn) => turn.status === "inProgress");
+  return (active.length > 0 ? active : candidates).sort(compareRuntimeTurns).at(-1);
+}
+
+function hasRuntimeSettings(turn: Record<string, unknown>): boolean {
+  return (
+    hasDirectRuntimeSetting(turn) ||
+    hasDirectRuntimeSetting(isRecord(turn.settings) ? turn.settings : {}) ||
+    hasDirectRuntimeSetting(isRecord(turn.turnSettings) ? turn.turnSettings : {})
+  );
+}
+
+function hasDirectRuntimeSetting(source: Record<string, unknown>): boolean {
+  return (
+    Object.hasOwn(source, "model") ||
+    Object.hasOwn(source, "reasoningEffort") ||
+    Object.hasOwn(source, "effort") ||
+    Object.hasOwn(source, "reasoning_effort") ||
+    Object.hasOwn(source, "serviceTier") ||
+    Object.hasOwn(source, "permissionProfileId") ||
+    Object.hasOwn(source, "permissions") ||
+    Object.hasOwn(source, "activePermissionProfile") ||
+    Object.hasOwn(source, "approvalPolicy") ||
+    Object.hasOwn(source, "approvalsReviewer") ||
+    Object.hasOwn(source, "collaborationMode")
+  );
+}
+
+function compareRuntimeTurns(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): number {
+  const leftTimestamp =
+    asFiniteNumber(left.startedAt) ??
+    asFiniteNumber(left.createdAt) ??
+    asFiniteNumber(left.completedAt) ??
+    Number.NEGATIVE_INFINITY;
+  const rightTimestamp =
+    asFiniteNumber(right.startedAt) ??
+    asFiniteNumber(right.createdAt) ??
+    asFiniteNumber(right.completedAt) ??
+    Number.NEGATIVE_INFINITY;
+  if (leftTimestamp !== rightTimestamp) {
+    return leftTimestamp - rightTimestamp;
+  }
+  return (asNonEmptyString(left.id) ?? "").localeCompare(asNonEmptyString(right.id) ?? "", "en-US");
+}
+
+function isCompleteThreadSnapshot(thread: Record<string, unknown>): boolean {
+  const status = isRecord(thread.status) ? thread.status.type : thread.status;
+  return (
+    asBoundedIdentifier(thread.id, 512) !== undefined &&
+    boundedProductText(thread.cwd, 4_096) !== undefined &&
+    (asFiniteNumber(thread.updatedAt) !== undefined ||
+      asFiniteNumber(thread.createdAt) !== undefined) &&
+    (status === "notLoaded" ||
+      status === "idle" ||
+      status === "systemError" ||
+      status === "active") &&
+    Array.isArray(thread.turns)
+  );
 }
 
 function secondsToIso(value: number | undefined): string | undefined {
@@ -670,6 +1068,27 @@ function requireString(value: unknown, label: string): string {
     throw new TypeError(`${label}无效`);
   }
   return result;
+}
+
+function requireBoundedIdentifier(value: unknown, label: string, maxLength: number): string {
+  const result = asBoundedIdentifier(value, maxLength);
+  if (!result) {
+    throw new TypeError(`${label}无效`);
+  }
+  return result;
+}
+
+function asBoundedIdentifier(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
+    return undefined;
+  }
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint < 32 || codePoint === 127) {
+      return undefined;
+    }
+  }
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

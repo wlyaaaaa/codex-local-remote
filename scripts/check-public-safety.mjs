@@ -10,6 +10,11 @@ const root = resolve(
   rootFlag >= 0 ? "." : "..",
 );
 const maximumFileSize = 2_000_000;
+const reviewedBinaryAssets = new Map([
+  ["docs/assets/desktop-tasks-en.jpg", "jpeg"],
+  ["docs/assets/mobile-conversation-zh.jpg", "jpeg"],
+  ["docs/assets/mobile-tasks-en.jpg", "jpeg"],
+]);
 
 const candidates = execFileSync(
   "git",
@@ -154,6 +159,23 @@ function decodeText(buffer) {
   }
 }
 
+function hasReviewedImageSignature(candidate, buffer) {
+  const normalized = candidate.replaceAll("\\", "/");
+  const format = reviewedBinaryAssets.get(normalized);
+  if (!format) return false;
+  if (format === "jpeg") {
+    return (
+      buffer.length >= 4 &&
+      buffer[0] === 0xff &&
+      buffer[1] === 0xd8 &&
+      buffer[2] === 0xff &&
+      buffer.at(-2) === 0xff &&
+      buffer.at(-1) === 0xd9
+    );
+  }
+  return false;
+}
+
 function lineNumberAt(source, index) {
   return source.slice(0, index).split(/\r\n|[\n\r]/u).length;
 }
@@ -207,7 +229,11 @@ for (const candidate of candidates) {
     continue;
   }
 
-  const source = decodeText(readFileSync(absolute));
+  const content = readFileSync(absolute);
+  if (hasReviewedImageSignature(candidate, content)) {
+    continue;
+  }
+  const source = decodeText(content);
   if (source === undefined) {
     findings.push(`${candidate}:1 binary or unsupported encoding was rejected instead of skipped`);
     continue;

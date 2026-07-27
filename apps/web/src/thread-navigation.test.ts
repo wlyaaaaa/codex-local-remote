@@ -1,6 +1,17 @@
-import type { ThreadDetail } from "@codex-local-remote/contracts";
+import type { RemoteEvent, ThreadDetail } from "@codex-local-remote/contracts";
 import { describe, expect, it } from "vitest";
-import { mergeThreadRefresh, threadSeedFromNavigationState } from "./thread-navigation";
+import {
+  compactThreadNavigationState,
+  findCreationPromptLiveAliasItemId,
+  mergeAuthoritativeThreadControl,
+  mergeThreadRefresh,
+  sortThreadsForDisplay,
+  reconcileLiveCreationPromptAlias,
+  readThreadNavigationCache,
+  threadInitialPromptFromNavigationState,
+  threadSeedFromNavigationState,
+  writeThreadNavigationCache,
+} from "./thread-navigation";
 
 function threadDetail(
   overrides: Partial<ThreadDetail> & Pick<ThreadDetail, "id" | "updatedAt">,
@@ -22,6 +33,62 @@ function threadDetail(
 }
 
 describe("新任务详情首屏", () => {
+  it("发送前权威回读即使时间戳相同也覆盖陈旧的空闲控制状态", () => {
+    const idleWithFormerTurn = threadDetail({
+      id: "thread-control-race",
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const { activeTurnId: _formerTurnId, ...idle } = idleWithFormerTurn;
+    const active = threadDetail({
+      id: idle.id,
+      updatedAt: idle.updatedAt,
+      activeTurnId: "turn-authoritative",
+    });
+
+    expect(mergeAuthoritativeThreadControl(idle, active)).toMatchObject({
+      activeTurnId: "turn-authoritative",
+      availableActions: { reply: false, steer: true },
+      state: "running",
+    });
+  });
+
+  it("置顶对话按 Desktop 顺序位于最近对话之前", () => {
+    const threads = [
+      threadDetail({
+        id: "recent-new",
+        updatedAt: "2026-07-25T12:00:03.000Z",
+      }),
+      threadDetail({
+        id: "pinned-second",
+        pinnedRank: 1,
+        updatedAt: "2026-07-25T12:00:02.000Z",
+      }),
+      threadDetail({
+        id: "pinned-first",
+        pinnedRank: 0,
+        updatedAt: "2026-07-25T12:00:01.000Z",
+      }),
+      threadDetail({
+        id: "recent-old",
+        updatedAt: "2026-07-25T12:00:00.000Z",
+      }),
+    ];
+
+    expect(sortThreadsForDisplay(threads).map((thread) => thread.id)).toEqual([
+      "pinned-first",
+      "pinned-second",
+      "recent-new",
+      "recent-old",
+    ]);
+  });
+
   it("只接受与当前路由匹配的完整创建结果", () => {
     const seed = threadDetail({
       id: "thread-created",
@@ -29,9 +96,72 @@ describe("新任务详情首屏", () => {
     });
 
     expect(threadSeedFromNavigationState({ threadSeed: seed }, seed.id)).toBe(seed);
+    expect(
+      threadInitialPromptFromNavigationState(
+        { initialPrompt: String.raw`检查 V:\workspace\sample`, threadSeed: seed },
+        seed.id,
+      ),
+    ).toBe(String.raw`检查 V:\workspace\sample`);
     expect(threadSeedFromNavigationState({ threadSeed: seed }, "thread-other")).toBeUndefined();
     expect(threadSeedFromNavigationState({ threadSeed: { id: seed.id } }, seed.id)).toBeUndefined();
     expect(threadSeedFromNavigationState(null, seed.id)).toBeUndefined();
+  });
+
+  it("刷新历史只保留轻量运行态，并为新任务保留首轮别名", () => {
+    const thread = threadDetail({
+      id: "thread-refresh-seed",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      items: [
+        { id: "initial-user", kind: "user-message", text: "执行真实验收" },
+        { id: "assistant-1", kind: "assistant-message", text: "正在执行" },
+        {
+          id: "command-1",
+          kind: "tool",
+          status: "running",
+          title: "运行命令",
+          detail: "很长的命令输出",
+        },
+      ],
+    });
+
+    const compact = compactThreadNavigationState(thread, "执行真实验收");
+    expect(compact.threadSeed).toMatchObject({
+      id: thread.id,
+      activeTurnId: "turn-1",
+      state: "running",
+      availableActions: thread.availableActions,
+    });
+    expect(compact.threadSeed.items).toEqual([
+      { id: "initial-user", kind: "user-message", text: "执行真实验收" },
+    ]);
+    expect(compact.initialPrompt).toBe("执行真实验收");
+
+    expect(compactThreadNavigationState(thread).threadSeed.items).toEqual([]);
+  });
+
+  it("同一标签刷新可从短期会话缓存立即恢复轻量运行态", () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      removeItem: (key: string) => void values.delete(key),
+      setItem: (key: string, value: string) => void values.set(key, value),
+    };
+    const thread = threadDetail({
+      id: "thread-session-refresh",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      items: [
+        { id: "user-1", kind: "user-message", text: "大段历史不应进入刷新缓存" },
+        { id: "assistant-1", kind: "assistant-message", text: "已收到" },
+      ],
+    });
+    const state = compactThreadNavigationState(thread);
+
+    writeThreadNavigationCache(storage, state, 1_000);
+
+    expect(readThreadNavigationCache(storage, thread.id, 2_000)).toEqual(state);
+    expect(
+      readThreadNavigationCache(storage, thread.id, 6 * 60 * 60 * 1000 + 1_001),
+    ).toBeUndefined();
   });
 
   it("静默刷新不能用较旧快照覆盖更近的实时事件", () => {
@@ -60,6 +190,34 @@ describe("新任务详情首屏", () => {
     expect(mergeThreadRefresh(current, stale)).toEqual(current);
   });
 
+  it("相同时间戳的完整详情会替换只读列表占位并恢复运行控制", () => {
+    const current = threadDetail({
+      id: "thread-running",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      items: [],
+      state: "running",
+      availableActions: {
+        changeModelNextTurn: false,
+        interrupt: false,
+        reply: false,
+        steer: false,
+      },
+    });
+    const { activeTurnId: _placeholderTurnId, ...summaryPlaceholder } = current;
+    const incoming = threadDetail({
+      id: current.id,
+      updatedAt: current.updatedAt,
+      activeTurnId: "turn-running",
+      items: [{ id: "user-1", kind: "user-message", text: "执行真实任务" }],
+    });
+
+    const merged = mergeThreadRefresh(summaryPlaceholder, incoming);
+
+    expect(merged.activeTurnId).toBe("turn-running");
+    expect(merged.availableActions).toEqual(incoming.availableActions);
+    expect(merged.items).toEqual(incoming.items);
+  });
+
   it("首次持久化刷新只替换创建 seed 的临时首轮用户消息", () => {
     const seed = threadDetail({
       id: "thread-created",
@@ -83,7 +241,10 @@ describe("新任务详情首屏", () => {
     });
     const { activeTurnId: _incomingTurnId, ...incoming } = incomingWithActiveTurn;
 
-    const merged = mergeThreadRefresh(seed, incoming, seed);
+    const merged = mergeThreadRefresh(seed, incoming, {
+      creationSeed: seed,
+      initialPrompt: "执行真实验收",
+    });
 
     expect(merged.items).toEqual(incoming.items);
     expect(merged.items.some((item) => item.id === "seed-user")).toBe(false);
@@ -106,7 +267,10 @@ describe("新任务详情首屏", () => {
       items: [{ id: "persisted-first-user", kind: "user-message", text: "再检查一次" }],
     });
 
-    const merged = mergeThreadRefresh(current, incoming, seed);
+    const merged = mergeThreadRefresh(current, incoming, {
+      creationSeed: seed,
+      initialPrompt: "再检查一次",
+    });
     const repeatedMessages = merged.items.filter(
       (item) => item.kind === "user-message" && item.text === "再检查一次",
     );
@@ -116,6 +280,125 @@ describe("新任务详情首屏", () => {
       "later-live-user",
     ]);
     expect(merged.items.some((item) => item.id === "seed-user")).toBe(false);
+  });
+
+  it("首轮实时 user-message 只登记一个别名，刷新后不重复且保留后续同文本", () => {
+    const prompt = "执行复杂任务";
+    const seed = threadDetail({
+      id: "thread-created",
+      activeTurnId: "turn-initial",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      items: [{ id: "seed-user", kind: "user-message", text: prompt }],
+    });
+    const events = [
+      {
+        emittedAt: "2026-07-25T12:00:01.000Z",
+        payload: {
+          item: [{ id: "later-turn-repeat", kind: "user-message", text: prompt }],
+          lifecycle: "started",
+        },
+        schemaVersion: 1,
+        seq: 1,
+        threadId: seed.id,
+        turnId: "turn-later",
+        type: "thread.item",
+      },
+      {
+        emittedAt: "2026-07-25T12:00:02.000Z",
+        payload: {
+          item: [{ id: "live-first-alias", kind: "user-message", text: prompt }],
+          lifecycle: "started",
+        },
+        schemaVersion: 1,
+        seq: 2,
+        threadId: seed.id,
+        turnId: "turn-initial",
+        type: "thread.item",
+      },
+      {
+        emittedAt: "2026-07-25T12:00:03.000Z",
+        payload: {
+          item: [{ id: "same-turn-repeat", kind: "user-message", text: prompt }],
+          lifecycle: "started",
+        },
+        schemaVersion: 1,
+        seq: 3,
+        threadId: seed.id,
+        turnId: "turn-initial",
+        type: "thread.item",
+      },
+    ] satisfies RemoteEvent[];
+    const liveAliasItemId = findCreationPromptLiveAliasItemId(events, {
+      creationSeed: seed,
+      initialPrompt: prompt,
+    });
+    expect(liveAliasItemId).toBe("live-first-alias");
+    if (!liveAliasItemId) throw new Error("没有识别首轮实时提示词别名");
+
+    const current = threadDetail({
+      id: seed.id,
+      updatedAt: "2026-07-25T12:00:04.000Z",
+      items: [
+        { id: "persisted-first", kind: "user-message", text: prompt },
+        { id: "steer", kind: "user-message", text: "追加要求" },
+        { id: "seed-user", kind: "user-message", text: prompt },
+        { id: "live-first-alias", kind: "user-message", text: prompt },
+        { id: "later-deliberate-repeat", kind: "user-message", text: prompt },
+      ],
+    });
+    const incoming = threadDetail({
+      id: seed.id,
+      updatedAt: "2026-07-25T12:00:05.000Z",
+      items: [
+        { id: "persisted-first", kind: "user-message", text: prompt },
+        { id: "steer", kind: "user-message", text: "追加要求" },
+      ],
+    });
+    const merged = mergeThreadRefresh(current, incoming, {
+      creationSeed: seed,
+      initialPrompt: prompt,
+      liveAliasItemId,
+    });
+    expect(merged.items.map((item) => item.id)).toEqual([
+      "persisted-first",
+      "steer",
+      "later-deliberate-repeat",
+    ]);
+
+    const liveOnly = reconcileLiveCreationPromptAlias(
+      threadDetail({
+        id: seed.id,
+        updatedAt: "2026-07-25T12:00:03.000Z",
+        items: [
+          ...seed.items,
+          { id: "live-first-alias", kind: "user-message", text: prompt },
+          { id: "later-deliberate-repeat", kind: "user-message", text: prompt },
+        ],
+      }),
+      { creationSeed: seed, initialPrompt: prompt, liveAliasItemId },
+    );
+    expect(liveOnly.items.map((item) => item.id)).toEqual([
+      "live-first-alias",
+      "later-deliberate-repeat",
+    ]);
+
+    const persistedWins = reconcileLiveCreationPromptAlias(
+      threadDetail({
+        id: seed.id,
+        updatedAt: "2026-07-25T12:00:05.000Z",
+        items: [
+          { id: "persisted-first", kind: "user-message", text: prompt },
+          { id: "live-first-alias", kind: "user-message", text: prompt },
+          { id: "later-deliberate-repeat", kind: "user-message", text: prompt },
+        ],
+      }),
+      { creationSeed: seed, initialPrompt: prompt, liveAliasItemId },
+      "persisted-first",
+    );
+    expect(persistedWins.items.map((item) => item.id)).toEqual([
+      "persisted-first",
+      "later-deliberate-repeat",
+    ]);
   });
 
   it("较新刷新保留尚未持久化的实时项目，同时采用新的运行状态", () => {
@@ -228,6 +511,123 @@ describe("新任务详情首屏", () => {
     expect(merged.availableActions.reply).toBe(true);
   });
 
+  it("终态刷新会按临近时间合并上下文压缩的实时别名而保留历史压缩", () => {
+    const current = threadDetail({
+      id: "thread-compaction-alias",
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:10.000Z",
+      items: [
+        {
+          createdAt: "2026-07-25T10:00:00.000Z",
+          id: "persisted-old-compaction",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+        },
+        {
+          id: "live-current-compaction",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+        },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const incomingWithActiveTurn = threadDetail({
+      id: current.id,
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:09.000Z",
+      items: [
+        {
+          createdAt: "2026-07-25T10:00:00.000Z",
+          id: "persisted-old-compaction",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+        },
+        {
+          createdAt: "2026-07-25T12:00:05.000Z",
+          id: "persisted-current-compaction",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+        },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const { activeTurnId: _incomingTurnId, ...incoming } = incomingWithActiveTurn;
+
+    expect(mergeThreadRefresh(current, incoming).items.map((item) => item.id)).toEqual([
+      "persisted-old-compaction",
+      "persisted-current-compaction",
+    ]);
+  });
+
+  it("不会把时间相隔较远的两次上下文压缩错误合并", () => {
+    const current = threadDetail({
+      id: "thread-distinct-compactions",
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:10.000Z",
+      items: [
+        {
+          createdAt: "2026-07-25T11:00:00.000Z",
+          id: "live-earlier-compaction",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+        },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const incomingWithActiveTurn = threadDetail({
+      id: current.id,
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:09.000Z",
+      items: [
+        {
+          createdAt: "2026-07-25T12:00:05.000Z",
+          id: "persisted-current-compaction",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+        },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const { activeTurnId: _incomingTurnId, ...incoming } = incomingWithActiveTurn;
+
+    expect(mergeThreadRefresh(current, incoming).items.map((item) => item.id)).toEqual([
+      "persisted-current-compaction",
+      "live-earlier-compaction",
+    ]);
+  });
+
   it("较新的 running 快照不能把同一工具项目的终态降级", () => {
     const currentWithActiveTurn = threadDetail({
       id: "thread-created",
@@ -268,5 +668,211 @@ describe("新任务详情首屏", () => {
     expect(merged.items).toContainEqual(
       expect.objectContaining({ id: "compaction-current", status: "complete" }),
     );
+  });
+
+  it("终态权威刷新会移除实时流留下的同文别名而保留仅实时可见的工具", () => {
+    const current = threadDetail({
+      id: "thread-aliases",
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:01.000Z",
+      items: [
+        { id: "persisted-user", kind: "user-message", text: "开始" },
+        { id: "live-user-alias", kind: "user-message", text: "开始" },
+        { id: "persisted-assistant", kind: "assistant-message", text: "完成" },
+        { id: "live-assistant-alias", kind: "assistant-message", text: "完成" },
+        {
+          id: "live-command",
+          kind: "tool",
+          status: "complete",
+          title: "运行命令",
+          summary: "node --test",
+        },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const incomingWithActiveTurn = threadDetail({
+      id: current.id,
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+      items: [
+        { id: "persisted-user", kind: "user-message", text: "开始" },
+        { id: "persisted-assistant", kind: "assistant-message", text: "完成" },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const { activeTurnId: _incomingTurnId, ...incoming } = incomingWithActiveTurn;
+
+    const merged = mergeThreadRefresh(current, incoming);
+    expect(merged.items.map((item) => item.id)).toEqual([
+      "persisted-user",
+      "persisted-assistant",
+      "live-command",
+    ]);
+  });
+
+  it("进行中的权威刷新会移除当前轮助手同文别名但保留实时工具", () => {
+    const current = threadDetail({
+      id: "thread-active-assistant-alias",
+      state: "running",
+      updatedAt: "2026-07-25T12:00:02.000Z",
+      items: [
+        { id: "persisted-user", kind: "user-message", text: "开始长任务" },
+        { id: "persisted-assistant", kind: "assistant-message", text: "正在执行" },
+        { id: "live-assistant-alias", kind: "assistant-message", text: "正在执行" },
+        {
+          id: "live-command",
+          kind: "tool",
+          status: "running",
+          title: "运行命令",
+        },
+      ],
+    });
+    const incoming = threadDetail({
+      id: current.id,
+      state: "running",
+      updatedAt: "2026-07-25T12:00:03.000Z",
+      items: [
+        { id: "persisted-user", kind: "user-message", text: "开始长任务" },
+        { id: "persisted-assistant", kind: "assistant-message", text: "正在执行" },
+      ],
+    });
+
+    expect(mergeThreadRefresh(current, incoming).items.map((item) => item.id)).toEqual([
+      "persisted-user",
+      "persisted-assistant",
+      "live-command",
+    ]);
+  });
+
+  it("不会把上一轮相同文字误认为当前轮助手别名", () => {
+    const current = threadDetail({
+      id: "thread-repeated-assistant-text",
+      state: "running",
+      updatedAt: "2026-07-25T12:00:02.000Z",
+      items: [
+        { id: "old-user", kind: "user-message", text: "第一轮" },
+        { id: "old-assistant", kind: "assistant-message", text: "收到" },
+        { id: "new-user", kind: "user-message", text: "第二轮" },
+        { id: "new-live-assistant", kind: "assistant-message", text: "收到" },
+      ],
+    });
+    const incoming = threadDetail({
+      id: current.id,
+      state: "running",
+      updatedAt: "2026-07-25T12:00:03.000Z",
+      items: [
+        { id: "old-user", kind: "user-message", text: "第一轮" },
+        { id: "old-assistant", kind: "assistant-message", text: "收到" },
+        { id: "new-user", kind: "user-message", text: "第二轮" },
+      ],
+    });
+
+    expect(mergeThreadRefresh(current, incoming).items.map((item) => item.id)).toContain(
+      "new-live-assistant",
+    );
+  });
+
+  it("中断终态以当前轮用户消息确认并移除未持久化的运行工具", () => {
+    const current = threadDetail({
+      id: "thread-interrupted",
+      state: "running",
+      updatedAt: "2026-07-25T12:00:05.000Z",
+      items: [
+        { id: "current-user", kind: "user-message", text: "运行长命令" },
+        { id: "persisted-assistant", kind: "assistant-message", text: "开始执行" },
+        { id: "live-assistant", kind: "assistant-message", text: "开始执行" },
+        {
+          id: "live-command",
+          kind: "tool",
+          status: "running",
+          title: "运行命令",
+        },
+      ],
+    });
+    const incomingWithActiveTurn = threadDetail({
+      id: current.id,
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:01.000Z",
+      items: [
+        { id: "current-user", kind: "user-message", text: "运行长命令" },
+        { id: "persisted-assistant", kind: "assistant-message", text: "开始执行" },
+      ],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+    const { activeTurnId: _incomingTurnId, ...incoming } = incomingWithActiveTurn;
+
+    const merged = mergeThreadRefresh(current, incoming);
+    expect(merged.state).toBe("complete");
+    expect(merged.items.map((item) => item.id)).toEqual(["current-user", "persisted-assistant"]);
+  });
+
+  it("进行中的当前轮不会因旧终态刷新丢掉同文新消息", () => {
+    const current = threadDetail({
+      id: "thread-active-alias",
+      state: "running",
+      updatedAt: "2026-07-25T12:00:03.000Z",
+      items: [
+        { id: "persisted-user", kind: "user-message", text: "重复文本" },
+        { id: "new-live-user", kind: "user-message", text: "重复文本" },
+      ],
+    });
+    const incoming = threadDetail({
+      id: current.id,
+      state: "complete",
+      updatedAt: "2026-07-25T12:00:04.000Z",
+      items: [{ id: "persisted-user", kind: "user-message", text: "重复文本" }],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+
+    expect(mergeThreadRefresh(current, incoming).items.map((item) => item.id)).toEqual([
+      "persisted-user",
+      "new-live-user",
+    ]);
+  });
+
+  it("刷新持久化引导消息后移除同文乐观回显，但保留普通重复消息", () => {
+    const current = threadDetail({
+      id: "thread-steer-alias",
+      state: "running",
+      updatedAt: "2026-07-25T12:00:03.000Z",
+      items: [
+        { id: "earlier-repeat", kind: "user-message", text: "继续检查" },
+        { id: "pending-steer-42", kind: "user-message", text: "继续检查" },
+      ],
+    });
+    const incoming = threadDetail({
+      id: current.id,
+      state: "running",
+      updatedAt: "2026-07-25T12:00:04.000Z",
+      items: [
+        { id: "earlier-repeat", kind: "user-message", text: "继续检查" },
+        { id: "persisted-steer", kind: "user-message", text: "继续检查" },
+      ],
+    });
+
+    expect(mergeThreadRefresh(current, incoming).items.map((item) => item.id)).toEqual([
+      "earlier-repeat",
+      "persisted-steer",
+    ]);
   });
 });

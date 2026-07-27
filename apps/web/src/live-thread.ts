@@ -1,13 +1,44 @@
 import type {
   ConversationItem,
+  ModelOption,
+  ReasoningEffort,
   RemoteEvent,
   RunState,
   ThreadDetail,
   ThreadSummary,
+  ToolOccurrenceDetail,
   UsageCredits,
   UsageSnapshot,
   UsageWindow,
 } from "@codex-local-remote/contracts";
+import { defaultReasoningEffortForModel, normalizeReasoningEffortForModel } from "./model-effort";
+
+export type NextTurnSettingsDraft = {
+  model: string;
+  effort: ReasoningEffort | undefined;
+  dirty: boolean;
+  runtimeModelKnown: boolean;
+  runtimeEffortKnown: boolean;
+};
+
+export type ThreadRemoteEventProjectionState = {
+  generation: number;
+  sequenceFloorByThread: Map<string, number>;
+  authoritativeSnapshotByThread: Set<string>;
+  accumulatedDeltaByItem: Map<string, string>;
+  replayBaselineByItem: Map<string, string>;
+  submittedTurnUserAliasByThread: Map<
+    string,
+    {
+      itemId: string;
+      text: string;
+      turnId?: string;
+      pending?: boolean;
+      canonicalConsumed?: boolean;
+    }
+  >;
+  consumedLiveUserAliasIds: Set<string>;
+};
 
 const runStates = new Set<RunState>([
   "idle",
@@ -30,24 +61,180 @@ export function detailFromThreadSummary(summary: ThreadSummary): ThreadDetail {
   };
 }
 
+export function nextTurnSettingsDraft(
+  models: readonly ModelOption[],
+  runtime: Pick<ThreadSummary, "model" | "reasoningEffort"> | undefined,
+  fallback?: Pick<NextTurnSettingsDraft, "model" | "effort">,
+): NextTurnSettingsDraft {
+  const runtimeModel = runtime?.model;
+  const model =
+    runtimeModel ??
+    fallback?.model ??
+    models.find((item) => item.isDefault)?.id ??
+    models[0]?.id ??
+    "";
+  const selected =
+    models.find((item) => item.id === model) ??
+    (runtimeModel === undefined && fallback?.model === undefined
+      ? (models.find((item) => item.isDefault) ?? models[0])
+      : undefined);
+  const runtimeEffort = runtime?.reasoningEffort;
+  const effort =
+    runtimeEffort ??
+    (runtimeModel === undefined
+      ? normalizeReasoningEffortForModel(
+          selected,
+          fallback?.effort ?? defaultReasoningEffortForModel(selected),
+        )
+      : undefined);
+  return {
+    model,
+    effort,
+    dirty: false,
+    runtimeModelKnown: runtimeModel !== undefined,
+    runtimeEffortKnown: runtimeEffort !== undefined,
+  };
+}
+
+export function updateNextTurnSettingsDraft(
+  current: NextTurnSettingsDraft,
+  update: Partial<Pick<NextTurnSettingsDraft, "model" | "effort">>,
+): NextTurnSettingsDraft {
+  return { ...current, ...update, dirty: true };
+}
+
+export function reconcileNextTurnSettingsDraft(
+  current: NextTurnSettingsDraft,
+  models: readonly ModelOption[],
+  runtime: Pick<ThreadSummary, "model" | "reasoningEffort"> | undefined,
+): NextTurnSettingsDraft {
+  return current.dirty ? current : nextTurnSettingsDraft(models, runtime, current);
+}
+
+export function consumeNextTurnSettingsDraft(
+  current: NextTurnSettingsDraft,
+  models: readonly ModelOption[],
+  response: Pick<ThreadSummary, "model" | "reasoningEffort"> | undefined,
+): NextTurnSettingsDraft {
+  return nextTurnSettingsDraft(models, response, current);
+}
+
+export function nextTurnSettingsInput(
+  draft: NextTurnSettingsDraft,
+  models: readonly ModelOption[],
+): { model?: string; reasoningEffort?: ReasoningEffort } {
+  if (!draft.dirty) return {};
+  const selected = models.find((model) => model.id === draft.model);
+  if (!selected) return {};
+  const reasoningEffort = normalizeReasoningEffortForModel(selected, draft.effort);
+  return {
+    model: selected.id,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  };
+}
+
+export function createThreadRemoteEventProjectionState(): ThreadRemoteEventProjectionState {
+  return {
+    generation: 0,
+    sequenceFloorByThread: new Map(),
+    authoritativeSnapshotByThread: new Set(),
+    accumulatedDeltaByItem: new Map(),
+    replayBaselineByItem: new Map(),
+    submittedTurnUserAliasByThread: new Map(),
+    consumedLiveUserAliasIds: new Set(),
+  };
+}
+
+export function rememberSubmittedTurnUserAlias(
+  projection: ThreadRemoteEventProjectionState,
+  response: ThreadDetail,
+  prompt: string,
+): void {
+  const reservation = projection.submittedTurnUserAliasByThread.get(response.id);
+  if (reservation?.pending !== true || reservation.text !== prompt) return;
+  const item = response.items.findLast(
+    (candidate) => candidate.kind === "user-message" && candidate.text === prompt,
+  );
+  if (!item || item.kind !== "user-message") {
+    projection.submittedTurnUserAliasByThread.delete(response.id);
+    return;
+  }
+  const turnId = item.turnId ?? response.activeTurnId;
+  projection.submittedTurnUserAliasByThread.set(response.id, {
+    itemId: item.id,
+    text: item.text,
+    ...(turnId ? { turnId } : {}),
+  });
+}
+
+export function reserveSubmittedTurnUserAlias(
+  projection: ThreadRemoteEventProjectionState,
+  threadId: string,
+  prompt: string,
+): void {
+  projection.submittedTurnUserAliasByThread.set(threadId, {
+    itemId: "",
+    pending: true,
+    text: prompt,
+  });
+}
+
+export function cancelSubmittedTurnUserAlias(
+  projection: ThreadRemoteEventProjectionState,
+  threadId: string,
+  prompt: string,
+): void {
+  const reservation = projection.submittedTurnUserAliasByThread.get(threadId);
+  if (reservation?.pending === true && reservation.text === prompt) {
+    projection.submittedTurnUserAliasByThread.delete(threadId);
+  }
+}
+
+export function synchronizeThreadRemoteEventProjection(
+  projection: ThreadRemoteEventProjectionState,
+  snapshot: ThreadDetail & { snapshotEventSeq?: number },
+  expectedGeneration: number = projection.generation,
+): boolean {
+  if (projection.generation !== expectedGeneration) return false;
+  const sequence = asUnsignedInteger(snapshot.snapshotEventSeq);
+  if (sequence === undefined) return false;
+  const current = projection.sequenceFloorByThread.get(snapshot.id);
+  projection.sequenceFloorByThread.set(
+    snapshot.id,
+    current === undefined ? sequence : Math.max(current, sequence),
+  );
+  projection.authoritativeSnapshotByThread.add(snapshot.id);
+  clearReplayDeltaState(projection, snapshot.id);
+  return true;
+}
+
 export function applyThreadRemoteEvents(
   snapshot: ThreadDetail,
   events: readonly RemoteEvent[],
-  options: { replayed?: boolean } = {},
+  options: { projection?: ThreadRemoteEventProjectionState; replayed?: boolean } = {},
 ): ThreadDetail {
   let thread = snapshot;
-  const accumulatedDeltas = new Map<string, string>();
+  const projection = options.projection ?? createThreadRemoteEventProjectionState();
 
   for (const event of events) {
+    if (event.type === "connection.reset") {
+      resetThreadRemoteEventProjection(projection);
+      continue;
+    }
     if (event.threadId !== snapshot.id) {
       continue;
     }
+    const sequenceFloor = projection.sequenceFloorByThread.get(snapshot.id);
+    if (sequenceFloor !== undefined && event.seq <= sequenceFloor) {
+      continue;
+    }
+    projection.sequenceFloorByThread.set(snapshot.id, event.seq);
     switch (event.type) {
       case "turn.state":
         thread = applyTurnState(thread, event);
         break;
       case "thread.item":
-        thread = applyThreadItem(thread, event, accumulatedDeltas, options.replayed === true);
+        thread = applyThreadItem(thread, event, projection, options.replayed === true);
         break;
       case "thread.updated":
         thread = applyThreadUpdate(thread, event);
@@ -57,6 +244,76 @@ export function applyThreadRemoteEvents(
     }
   }
   return thread;
+}
+
+export function threadSummaryFromSnapshotEvent(event: RemoteEvent): ThreadSummary | undefined {
+  if (event.type !== "thread.snapshot") return undefined;
+  const payload = asRecord(event.payload);
+  const id = productString(payload.id, 512);
+  const title = productString(payload.title, 200);
+  const mode =
+    payload.mode === "managed" || payload.mode === "desktop-snapshot" ? payload.mode : undefined;
+  const state = asRunState(payload.state);
+  const updatedAt = productString(payload.updatedAt, 128);
+  if (
+    !id ||
+    (event.threadId !== undefined && event.threadId !== id) ||
+    !title ||
+    !mode ||
+    !state ||
+    !updatedAt
+  ) {
+    return undefined;
+  }
+  const projectId = productString(payload.projectId, 512);
+  const cwdLabel = productString(payload.cwdLabel, 4_096);
+  const model = productString(payload.model, 256);
+  const reasoningEffort = productString(payload.reasoningEffort, 128);
+  const serviceTier = productString(payload.serviceTier, 128);
+  const permissionProfileId = productString(payload.permissionProfileId, 256);
+  const approvalPolicy = productString(payload.approvalPolicy, 256);
+  const approvalsReviewer = productString(payload.approvalsReviewer, 256);
+  const collaborationMode = productString(payload.collaborationMode, 256);
+  const parentThreadId = productString(payload.parentThreadId, 512);
+  const childCount = asUnsignedInteger(payload.childCount);
+  const pinnedRank = asUnsignedInteger(payload.pinnedRank);
+  return {
+    id,
+    title,
+    mode,
+    state,
+    updatedAt,
+    ...(payload.archived === true ? { archived: true } : {}),
+    ...(projectId === undefined ? {} : { projectId }),
+    ...(cwdLabel === undefined ? {} : { cwdLabel }),
+    ...(model === undefined ? {} : { model }),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    ...(serviceTier === undefined ? {} : { serviceTier }),
+    ...(permissionProfileId === undefined ? {} : { permissionProfileId }),
+    ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+    ...(approvalsReviewer === undefined ? {} : { approvalsReviewer }),
+    ...(collaborationMode === undefined ? {} : { collaborationMode }),
+    ...(parentThreadId === undefined ? {} : { parentThreadId }),
+    ...(childCount === undefined ? {} : { childCount }),
+    ...(pinnedRank === undefined ? {} : { pinnedRank }),
+  };
+}
+
+export function reconcileThreadSnapshotLists(
+  current: readonly ThreadSummary[],
+  archived: readonly ThreadSummary[],
+  snapshot: ThreadSummary,
+): { current: ThreadSummary[]; archived: ThreadSummary[] } {
+  if (snapshot.archived) {
+    return {
+      current: current.filter((thread) => thread.id !== snapshot.id),
+      archived: upsertThreadSummary(archived, snapshot),
+    };
+  }
+  return {
+    current: upsertThreadSummary(current, snapshot),
+    archived: archived.filter((thread) => thread.id !== snapshot.id),
+  };
 }
 
 export function applyUsageRemoteEvents(
@@ -96,12 +353,30 @@ export function applyUsageRemoteEvents(
     usage = {
       ...current,
       updatedAt: event.emittedAt,
-      ...(windows.length === 0 ? {} : { windows }),
-      ...(credits.length === 0 ? {} : { credits }),
+      ...(windows.length === 0 ? {} : { windows: mergeUsageEntries(current.windows, windows) }),
+      ...(credits.length === 0
+        ? {}
+        : { credits: mergeUsageEntries(current.credits ?? [], credits) }),
       ...(context === undefined ? {} : { context }),
     };
   }
   return usage;
+}
+
+function mergeUsageEntries<T extends { id: string }>(
+  current: readonly T[],
+  incoming: readonly T[],
+): T[] {
+  const incomingById = new Map(incoming.map((entry) => [entry.id, entry]));
+  const merged = current.map((entry) => incomingById.get(entry.id) ?? entry);
+  const seen = new Set(current.map((entry) => entry.id));
+  for (const entry of incoming) {
+    if (!seen.has(entry.id)) {
+      merged.push(entry);
+      seen.add(entry.id);
+    }
+  }
+  return merged;
 }
 
 function applyTurnState(thread: ThreadDetail, event: RemoteEvent): ThreadDetail {
@@ -112,13 +387,38 @@ function applyTurnState(thread: ThreadDetail, event: RemoteEvent): ThreadDetail 
   }
   const turn = asRecord(payload.turn);
   const turnId = productString(event.turnId, 256) ?? productString(turn.id, 256);
-  return withRunState(thread, state, event.emittedAt, turnId);
+  const startedAtSeconds = asFiniteNumber(turn.startedAt);
+  const completedAtSeconds = asFiniteNumber(turn.completedAt);
+  const turnStartedAt =
+    startedAtSeconds === undefined ? undefined : new Date(startedAtSeconds * 1_000).toISOString();
+  const turnCompletedAt =
+    completedAtSeconds === undefined
+      ? state === "running" || state === "waiting-for-approval"
+        ? undefined
+        : event.emittedAt
+      : new Date(completedAtSeconds * 1_000).toISOString();
+  const timedThread =
+    turnId === undefined
+      ? thread
+      : {
+          ...thread,
+          items: thread.items.map((item) =>
+            item.turnId === turnId
+              ? {
+                  ...item,
+                  ...(turnStartedAt === undefined ? {} : { turnStartedAt }),
+                  ...(turnCompletedAt === undefined ? {} : { turnCompletedAt }),
+                }
+              : item,
+          ),
+        };
+  return withRunState(timedThread, state, event.emittedAt, turnId);
 }
 
 function applyThreadItem(
   thread: ThreadDetail,
   event: RemoteEvent,
-  accumulatedDeltas: Map<string, string>,
+  projection: ThreadRemoteEventProjectionState,
   replayed: boolean,
 ): ThreadDetail {
   const payload = asRecord(event.payload);
@@ -130,10 +430,30 @@ function applyThreadItem(
       return thread;
     }
     const itemKind = kind === "reasoning-summary-delta" ? "reasoning-summary" : "assistant-message";
-    const deltaKey = `${itemKind}:${itemId}`;
-    const aggregate = `${accumulatedDeltas.get(deltaKey) ?? ""}${delta}`;
-    accumulatedDeltas.set(deltaKey, aggregate);
+    const deltaKey = `${thread.id}:${itemKind}:${itemId}`;
     const index = thread.items.findIndex((item) => item.id === itemId && item.kind === itemKind);
+    const existing = index < 0 ? undefined : thread.items[index];
+    const existingText = existing && "text" in existing ? existing.text : "";
+    const conservativeReplay = replayed && !projection.authoritativeSnapshotByThread.has(thread.id);
+    if (!conservativeReplay) {
+      projection.accumulatedDeltaByItem.delete(deltaKey);
+      projection.replayBaselineByItem.delete(deltaKey);
+    }
+    const baseline = conservativeReplay
+      ? (projection.replayBaselineByItem.get(deltaKey) ?? existingText)
+      : existingText;
+    if (conservativeReplay && !projection.replayBaselineByItem.has(deltaKey)) {
+      projection.replayBaselineByItem.set(deltaKey, baseline);
+    }
+    const aggregate = conservativeReplay
+      ? `${projection.accumulatedDeltaByItem.get(deltaKey) ?? ""}${delta}`
+      : delta;
+    if (conservativeReplay) {
+      projection.accumulatedDeltaByItem.set(deltaKey, aggregate);
+    }
+    const projectedText = conservativeReplay
+      ? reconcileReplayedStreamText(baseline, aggregate)
+      : `${existingText}${delta}`;
     if (index < 0) {
       return {
         ...thread,
@@ -143,26 +463,27 @@ function applyThreadItem(
           {
             id: itemId,
             kind: itemKind,
-            text: aggregate,
+            text: projectedText,
             createdAt: event.emittedAt,
+            ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
           },
         ],
       };
     }
-    const existing = thread.items[index];
     if (!existing || !("text" in existing)) {
       return thread;
     }
-    const text = replayed
-      ? reconcileReplayedStreamText(existing.text, aggregate, delta)
-      : `${existing.text}${delta}`;
-    if (text === existing.text) {
+    if (projectedText === existing.text) {
       return thread.updatedAt === event.emittedAt
         ? thread
         : { ...thread, updatedAt: event.emittedAt };
     }
     const items = [...thread.items];
-    items[index] = { ...existing, text };
+    items[index] = {
+      ...existing,
+      text: projectedText,
+      ...(existing.createdAt === undefined ? { createdAt: event.emittedAt } : {}),
+    };
     return { ...thread, items, updatedAt: event.emittedAt };
   }
 
@@ -170,13 +491,97 @@ function applyThreadItem(
     ? payload.item
         .map((item) => asConversationItem(item))
         .filter((item): item is ConversationItem => item !== undefined)
+        .map((item) => ({
+          ...item,
+          ...(item.createdAt === undefined ? { createdAt: event.emittedAt } : {}),
+          ...(item.turnId === undefined && event.turnId !== undefined
+            ? { turnId: event.turnId }
+            : {}),
+        }))
     : [];
   if (incoming.length === 0) {
     // Deliberately ignore unknown item payloads, including raw reasoning text.
     return thread;
   }
+  if (payload.localRemoteAlias === "steer-cancel") {
+    const cancelledIds = new Set(
+      incoming.filter((item) => item.kind === "user-message").map((item) => item.id),
+    );
+    if (cancelledIds.size === 0) return thread;
+    const submittedAlias = projection.submittedTurnUserAliasByThread.get(thread.id);
+    if (submittedAlias && cancelledIds.has(submittedAlias.itemId)) {
+      projection.submittedTurnUserAliasByThread.delete(thread.id);
+    }
+    return {
+      ...thread,
+      items: thread.items.filter((item) => !cancelledIds.has(item.id)),
+      updatedAt: event.emittedAt,
+    };
+  }
   let items = thread.items;
   for (const item of incoming) {
+    const liveAliasKey = `${thread.id}:${item.id}`;
+    if (projection.consumedLiveUserAliasIds.has(liveAliasKey)) {
+      continue;
+    }
+    const submittedAlias = projection.submittedTurnUserAliasByThread.get(thread.id);
+    const matchesSubmittedAlias =
+      item.kind === "user-message" &&
+      submittedAlias !== undefined &&
+      submittedAlias.itemId !== item.id &&
+      submittedAlias.text === item.text &&
+      (submittedAlias.turnId === undefined ||
+        item.turnId === undefined ||
+        submittedAlias.turnId === item.turnId);
+    const isLocalRemoteSteerAlias =
+      item.kind === "user-message" && payload.localRemoteAlias === "steer";
+    if (isLocalRemoteSteerAlias && matchesSubmittedAlias) {
+      projection.consumedLiveUserAliasIds.add(liveAliasKey);
+      continue;
+    }
+    if (isLocalRemoteSteerAlias && item.kind === "user-message") {
+      const existingAlias = items.find(
+        (candidate) =>
+          candidate.kind === "user-message" &&
+          candidate.text === item.text &&
+          (candidate.turnId === undefined ||
+            item.turnId === undefined ||
+            candidate.turnId === item.turnId),
+      );
+      if (existingAlias) {
+        projection.consumedLiveUserAliasIds.add(liveAliasKey);
+        continue;
+      }
+      projection.submittedTurnUserAliasByThread.set(thread.id, {
+        itemId: item.id,
+        text: item.text,
+        ...(item.turnId === undefined ? {} : { turnId: item.turnId }),
+      });
+    } else if (matchesSubmittedAlias && submittedAlias !== undefined) {
+      if (submittedAlias.pending === true) {
+        projection.submittedTurnUserAliasByThread.set(thread.id, {
+          ...submittedAlias,
+          canonicalConsumed: true,
+          itemId: item.id,
+          ...(item.turnId === undefined ? {} : { turnId: item.turnId }),
+        });
+      } else {
+        projection.submittedTurnUserAliasByThread.delete(thread.id);
+      }
+      projection.consumedLiveUserAliasIds.add(liveAliasKey);
+      continue;
+    }
+    const lastItem = items.at(-1);
+    if (
+      item.kind === "user-message" &&
+      lastItem?.kind === "user-message" &&
+      lastItem.text === item.text
+    ) {
+      // A turn/start response (or the optimistic steer row) already contains
+      // the user text, while app-server lifecycle notifications use a
+      // different transient item id for the same message.
+      continue;
+    }
     const index = items.findIndex((candidate) => candidate.id === item.id);
     if (index < 0) {
       items = [...items, item];
@@ -235,6 +640,28 @@ function applyThreadUpdate(thread: ThreadDetail, event: RemoteEvent): ThreadDeta
       next = { ...next, reasoningEffort: effort };
     }
   }
+  for (const key of [
+    "serviceTier",
+    "permissionProfileId",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "collaborationMode",
+  ] as const) {
+    const direct = Object.hasOwn(payload, key);
+    const nested = Object.hasOwn(settings, key);
+    if (!direct && !nested) continue;
+    const raw = direct ? payload[key] : settings[key];
+    if (raw === null) {
+      const withoutSetting = { ...next };
+      delete withoutSetting[key];
+      next = withoutSetting;
+      continue;
+    }
+    const value = productString(raw, 256);
+    if (value !== undefined) {
+      next = { ...next, [key]: value };
+    }
+  }
   return state ? withRunState(next, state, event.emittedAt) : next;
 }
 
@@ -267,14 +694,58 @@ function withRunState(
   };
 }
 
-function reconcileReplayedStreamText(current: string, aggregate: string, delta: string): string {
-  if (current === aggregate || current.startsWith(aggregate) || current.endsWith(aggregate)) {
-    return current;
-  }
-  if (aggregate.startsWith(current)) {
+function reconcileReplayedStreamText(baseline: string, aggregate: string): string {
+  if (!baseline) return aggregate;
+  if (baseline.includes(aggregate)) return baseline;
+  if (aggregate.startsWith(baseline)) {
     return aggregate;
   }
-  return `${current}${delta}`;
+  const overlap = suffixPrefixOverlap(baseline, aggregate);
+  return `${baseline}${aggregate.slice(overlap)}`;
+}
+
+function suffixPrefixOverlap(left: string, right: string): number {
+  for (let length = Math.min(left.length, right.length); length > 0; length -= 1) {
+    if (left.endsWith(right.slice(0, length))) return length;
+  }
+  return 0;
+}
+
+function clearReplayDeltaState(
+  projection: ThreadRemoteEventProjectionState,
+  threadId: string,
+): void {
+  const prefix = `${threadId}:`;
+  for (const key of projection.accumulatedDeltaByItem.keys()) {
+    if (key.startsWith(prefix)) projection.accumulatedDeltaByItem.delete(key);
+  }
+  for (const key of projection.replayBaselineByItem.keys()) {
+    if (key.startsWith(prefix)) projection.replayBaselineByItem.delete(key);
+  }
+  for (const key of projection.consumedLiveUserAliasIds) {
+    if (key.startsWith(prefix)) projection.consumedLiveUserAliasIds.delete(key);
+  }
+}
+
+function resetThreadRemoteEventProjection(projection: ThreadRemoteEventProjectionState): void {
+  projection.generation += 1;
+  projection.sequenceFloorByThread.clear();
+  projection.authoritativeSnapshotByThread.clear();
+  projection.accumulatedDeltaByItem.clear();
+  projection.replayBaselineByItem.clear();
+  projection.submittedTurnUserAliasByThread.clear();
+  projection.consumedLiveUserAliasIds.clear();
+}
+
+function upsertThreadSummary(
+  threads: readonly ThreadSummary[],
+  snapshot: ThreadSummary,
+): ThreadSummary[] {
+  const index = threads.findIndex((thread) => thread.id === snapshot.id);
+  if (index < 0) return [snapshot, ...threads];
+  const next = [...threads];
+  next[index] = snapshot;
+  return next;
 }
 
 function projectStatus(value: unknown): RunState | undefined {
@@ -311,6 +782,15 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
   const id = productString(item.id, 512);
   const kind = productString(item.kind, 64);
   const createdAt = productString(item.createdAt, 128);
+  const turnId = productString(item.turnId, 512);
+  const turnStartedAt = productString(item.turnStartedAt, 128);
+  const turnCompletedAt = productString(item.turnCompletedAt, 128);
+  const itemContext = {
+    ...(createdAt === undefined ? {} : { createdAt }),
+    ...(turnId === undefined ? {} : { turnId }),
+    ...(turnStartedAt === undefined ? {} : { turnStartedAt }),
+    ...(turnCompletedAt === undefined ? {} : { turnCompletedAt }),
+  };
   if (!id || !kind) {
     return undefined;
   }
@@ -322,7 +802,11 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
       id,
       kind,
       text: item.text,
-      ...(createdAt === undefined ? {} : { createdAt }),
+      ...(kind === "assistant-message" &&
+      (item.phase === "commentary" || item.phase === "final_answer")
+        ? { phase: item.phase }
+        : {}),
+      ...itemContext,
     };
   }
   if (kind === "tool") {
@@ -337,6 +821,32 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
     const summary = productString(item.summary, 1_024, true);
     const detail = productString(item.detail, 16_384, true);
     const occurrences = asPositiveInteger(item.occurrences);
+    const occurrenceDetails = Array.isArray(item.occurrenceDetails)
+      ? item.occurrenceDetails
+          .slice(0, 50)
+          .map((candidate): ToolOccurrenceDetail | undefined => {
+            const occurrence = asRecord(candidate);
+            const occurrenceId = productString(occurrence.id, 512);
+            const occurrenceStatus =
+              occurrence.status === "running" ||
+              occurrence.status === "complete" ||
+              occurrence.status === "failed"
+                ? occurrence.status
+                : undefined;
+            if (!occurrenceId || !occurrenceStatus) return undefined;
+            const occurrenceSummary = productString(occurrence.summary, 1_024, true);
+            const occurrenceDetail = productString(occurrence.detail, 16_384, true);
+            const occurrenceCreatedAt = productString(occurrence.createdAt, 128);
+            return {
+              id: occurrenceId,
+              status: occurrenceStatus,
+              ...(occurrenceSummary === undefined ? {} : { summary: occurrenceSummary }),
+              ...(occurrenceDetail === undefined ? {} : { detail: occurrenceDetail }),
+              ...(occurrenceCreatedAt === undefined ? {} : { createdAt: occurrenceCreatedAt }),
+            };
+          })
+          .filter((candidate): candidate is ToolOccurrenceDetail => candidate !== undefined)
+      : undefined;
     const operation = item.operation === "context-compaction" ? item.operation : undefined;
     return {
       id,
@@ -347,7 +857,10 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
       ...(summary === undefined ? {} : { summary }),
       ...(detail === undefined ? {} : { detail }),
       ...(occurrences === undefined ? {} : { occurrences }),
-      ...(createdAt === undefined ? {} : { createdAt }),
+      ...(occurrenceDetails === undefined || occurrenceDetails.length === 0
+        ? {}
+        : { occurrenceDetails }),
+      ...itemContext,
     };
   }
   if (kind === "file-change") {
@@ -380,7 +893,85 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
       ...(diff === undefined ? {} : { diff }),
       ...(additions === undefined ? {} : { additions }),
       ...(deletions === undefined ? {} : { deletions }),
-      ...(createdAt === undefined ? {} : { createdAt }),
+      ...itemContext,
+    };
+  }
+  if (kind === "subagent-activity") {
+    const action =
+      item.action === "spawn" ||
+      item.action === "update" ||
+      item.action === "resume" ||
+      item.action === "wait" ||
+      item.action === "close" ||
+      item.action === "activity"
+        ? item.action
+        : undefined;
+    const status =
+      item.status === "running" || item.status === "complete" || item.status === "failed"
+        ? item.status
+        : undefined;
+    const agents = Array.isArray(item.agents)
+      ? item.agents
+          .map((rawAgent) => {
+            const agent = asRecord(rawAgent);
+            const threadId = productString(agent.threadId, 512);
+            const label = productString(agent.label, 256);
+            return threadId ? { threadId, ...(label === undefined ? {} : { label }) } : undefined;
+          })
+          .filter(
+            (
+              agent,
+            ): agent is {
+              threadId: string;
+              label?: string;
+            } => agent !== undefined,
+          )
+          .slice(0, 32)
+      : [];
+    if (!action || !status || agents.length === 0) return undefined;
+    const summary = productString(item.summary, 1_024, true);
+    return {
+      id,
+      kind,
+      action,
+      agents,
+      status,
+      ...(summary === undefined ? {} : { summary }),
+      ...itemContext,
+    };
+  }
+  if (kind === "plan-progress") {
+    const steps = Array.isArray(item.steps)
+      ? item.steps
+          .map((rawStep) => {
+            const step = asRecord(rawStep);
+            const text = productString(step.text, 2_048);
+            const status =
+              step.status === "pending" ||
+              step.status === "inProgress" ||
+              step.status === "completed"
+                ? step.status
+                : undefined;
+            return text && status ? { text, status } : undefined;
+          })
+          .filter(
+            (
+              step,
+            ): step is {
+              text: string;
+              status: "pending" | "inProgress" | "completed";
+            } => step !== undefined,
+          )
+          .slice(0, 64)
+      : [];
+    if (steps.length === 0) return undefined;
+    const explanation = productString(item.explanation, 4_096, true);
+    return {
+      id,
+      kind,
+      steps,
+      ...(explanation === undefined ? {} : { explanation }),
+      ...itemContext,
     };
   }
   return undefined;

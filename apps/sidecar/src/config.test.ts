@@ -13,6 +13,7 @@ describe("resolveSidecarConfig", () => {
         },
       }),
     ).toMatchObject({
+      appServerUrl: "ws://127.0.0.1:18791/",
       basePath: "/codex-remote",
       dataDir: path.win32.join("C:\\Users\\fixture\\AppData\\Local", "CodexLocalRemote"),
       desktopSyncEnabled: true,
@@ -25,6 +26,7 @@ describe("resolveSidecarConfig", () => {
     expect(
       resolveSidecarConfig({
         cli: {
+          appServerUrl: "ws://127.0.0.1:19002/shared",
           basePath: "/phone/",
           dataDir: "D:\\Remote State",
           host: "::1",
@@ -37,6 +39,7 @@ describe("resolveSidecarConfig", () => {
         },
       }),
     ).toMatchObject({
+      appServerUrl: "ws://127.0.0.1:19002/shared",
       basePath: "/phone",
       dataDir: "D:\\Remote State",
       host: "::1",
@@ -60,6 +63,15 @@ describe("resolveSidecarConfig", () => {
         environment: { LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local" },
       }),
     ).toThrow("回环地址");
+
+    expect(() =>
+      resolveSidecarConfig({
+        environment: {
+          CODEX_REMOTE_APP_SERVER_WS_URL: "ws://0.0.0.0:18791",
+          LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local",
+        },
+      }),
+    ).toThrow("loopback");
   });
 
   it("allows an explicit environment opt-out from Desktop thread synchronization", () => {
@@ -92,19 +104,25 @@ describe("parseCliInvocation", () => {
     expect(
       parseCliInvocation([
         "serve",
+        "--app-server-url",
+        "ws://127.0.0.1:18791",
         "--host",
         "127.0.0.1",
         "--port",
         "18790",
         "--base-path",
         "/codex-remote",
+        "--codex-path",
+        "C:\\Codex\\codex.exe",
         "--data-dir",
         "D:\\Remote State",
       ]),
     ).toEqual({
       command: "serve",
       config: {
+        appServerUrl: "ws://127.0.0.1:18791/",
         basePath: "/codex-remote",
+        codexPath: "C:\\Codex\\codex.exe",
         dataDir: "D:\\Remote State",
         host: "127.0.0.1",
         port: 18_790,

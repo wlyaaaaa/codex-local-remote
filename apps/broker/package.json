@@ -1,0 +1,25 @@
+{
+  "name": "@codex-local-remote/broker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "codex-local-remote-broker": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && esbuild src/cli.ts --bundle --platform=node --target=node24 --format=esm --outfile=dist/cli.js --sourcemap --external:ws",
+    "start": "node dist/cli.js serve",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1",
+    "esbuild": "0.28.1"
+  }
+}

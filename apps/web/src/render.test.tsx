@@ -15,7 +15,12 @@ import { registeredProjects } from "./project-access";
 import { authenticatedBootstrap, loggedOutBootstrap } from "./auth-state";
 import { WORKSPACE_REFRESH_MS, canRefreshDocument, threadRefreshDelay } from "./refresh";
 import { PaginationFooter } from "./PaginationFooter";
-import { mergeCursorItems, nextCursorAfterRefresh, nextCursorFrom } from "./pagination";
+import {
+  mergeCursorItems,
+  mergeRefreshedFirstPage,
+  nextCursorAfterRefresh,
+  nextCursorFrom,
+} from "./pagination";
 import { threadRuntimeSummary } from "./thread-runtime";
 import {
   defaultReasoningEffortForModel,
@@ -27,6 +32,7 @@ import {
   creditBalanceLabel,
   remainingFromUsedPercent,
   remainingPercentLabel,
+  usageWindowForDisplay,
   usedPercentLabel,
 } from "./usage-display";
 
@@ -188,8 +194,8 @@ describe("界面基础渲染", () => {
   });
 
   it("只在页面可见时按运行状态选择静默刷新频率", () => {
-    expect(threadRefreshDelay("running")).toBe(3_000);
-    expect(threadRefreshDelay("complete")).toBe(10_000);
+    expect(threadRefreshDelay("running")).toBe(15_000);
+    expect(threadRefreshDelay("complete")).toBe(30_000);
     expect(WORKSPACE_REFRESH_MS).toBe(10_000);
     expect(canRefreshDocument("visible")).toBe(true);
     expect(canRefreshDocument("hidden")).toBe(false);
@@ -234,6 +240,38 @@ describe("界面基础渲染", () => {
       { id: "new", value: 1 },
       { id: "same", value: 1 },
       { id: "old", value: 1 },
+    ]);
+  });
+
+  it("首屏刷新权威移除已取消置顶或已归档的旧行，同时保留明确加载的尾页", () => {
+    expect(
+      mergeRefreshedFirstPage(
+        [
+          { id: "recent", pinnedRank: undefined, value: 1 },
+          { id: "stale-pin", pinnedRank: 0, value: 1 },
+          { id: "loaded-tail", pinnedRank: undefined, value: 1 },
+        ],
+        [{ id: "recent", pinnedRank: undefined, value: 2 }],
+        (item) => item.id,
+        new Set(["loaded-tail"]),
+      ),
+    ).toEqual([
+      { id: "recent", pinnedRank: undefined, value: 2 },
+      { id: "loaded-tail", pinnedRank: undefined, value: 1 },
+    ]);
+  });
+
+  it("首屏刷新后清除已加载尾页残留的旧置顶排名", () => {
+    expect(
+      mergeRefreshedFirstPage(
+        [{ id: "loaded-tail", pinnedRank: 4, value: 1 }],
+        [{ id: "fresh-pin", pinnedRank: 0, value: 2 }],
+        (item) => item.id,
+        new Set(["loaded-tail"]),
+      ),
+    ).toEqual([
+      { id: "fresh-pin", pinnedRank: 0, value: 2 },
+      { id: "loaded-tail", pinnedRank: undefined, value: 1 },
     ]);
   });
 
@@ -288,7 +326,7 @@ describe("界面基础渲染", () => {
       threadRuntimeSummary({
         mode: "managed",
       }),
-    ).toBe("默认模型 · 默认思考");
+    ).toBe("模型未知 / 思考等级未知");
     expect(
       threadRuntimeSummary({
         mode: "managed",
@@ -343,6 +381,14 @@ describe("界面基础渲染", () => {
     expect(defaultReasoningEffortForModel(models[2])).toBe("minimal");
     expect(normalizeReasoningEffort(models, "fast", "high")).toBe("low");
     expect(normalizeReasoningEffort(models, "fast", "none")).toBe("none");
+    expect(
+      defaultReasoningEffortForModel({
+        id: "no-effort",
+        displayName: "No effort selector",
+        supportedReasoningEfforts: [],
+        isDefault: false,
+      }),
+    ).toBeUndefined();
   });
 
   it("终端失败与拒绝状态使用真实文案", () => {
@@ -366,7 +412,7 @@ describe("界面基础渲染", () => {
         unlimited: false,
         balance: "18.50",
       }),
-    ).toBe("余额 18.50");
+    ).toBe("额外 Credits 余额 18.50");
     expect(
       creditBalanceLabel({
         id: "credits",
@@ -374,6 +420,33 @@ describe("界面基础渲染", () => {
         hasCredits: true,
         unlimited: true,
       }),
-    ).toBe("无限额度");
+    ).toBe("额外 Credits 不限");
+    expect(
+      creditBalanceLabel({
+        id: "credits",
+        label: "Credits",
+        hasCredits: false,
+        unlimited: false,
+      }),
+    ).toBe("无额外 Credits");
+  });
+
+  it("额度摘要优先当前模型且不受运行时对象键顺序影响", () => {
+    const windows = [
+      {
+        id: "codex-primary",
+        label: "Codex · 当前周期",
+        usedPercent: 100,
+        remainingPercent: 0,
+      },
+      {
+        id: "spark-primary",
+        label: "GPT-5.3-Codex-Spark · 当前周期",
+        usedPercent: 4,
+        remainingPercent: 96,
+      },
+    ];
+    expect(usageWindowForDisplay(windows, "gpt-5.3-codex-spark")?.id).toBe("spark-primary");
+    expect(usageWindowForDisplay([...windows].reverse(), "gpt-5.6-sol")?.id).toBe("codex-primary");
   });
 });

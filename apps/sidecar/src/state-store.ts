@@ -260,6 +260,18 @@ export class SidecarStateStore {
       : { valid: false };
   }
 
+  isSessionActive(tokenDigest: string, now: number): boolean {
+    if (!/^[A-Za-z0-9_-]{43}$/u.test(tokenDigest) || !Number.isSafeInteger(now) || now < 0) {
+      return false;
+    }
+    const stored = this.#state.sessions[tokenDigest];
+    return (
+      stored?.tokenDigest === tokenDigest &&
+      now < stored.absoluteExpiresAtMs &&
+      now < stored.idleExpiresAtMs
+    );
+  }
+
   async touchSession(token: string, now: number): Promise<SessionLookup> {
     const digest = digestSessionToken(token);
     const stored = this.#state.sessions[digest];

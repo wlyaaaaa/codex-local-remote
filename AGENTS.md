@@ -5,14 +5,28 @@ This repository is a public, unofficial companion for the Codex desktop app.
 ## Product boundaries
 
 - The browser UI is a product surface, not a raw JSON-RPC or log viewer.
-- The supported control path owns its own `codex app-server` child process over
-  stdio. Never expose app-server directly to the network.
-- Threads already running inside the native desktop process are read-only
-  snapshots. Do not claim that they can be steered or interrupted.
+- The supported control path uses one loopback-only Broker that owns one
+  `codex app-server`. Codex Desktop and the Sidecar connect to that Broker as
+  separate WebSocket clients. Never expose either raw WebSocket listener to the
+  LAN or public network.
+- app-server subscriptions are connection-scoped. Before a phone-created
+  thread may start its first turn, the Broker must make the idle shell durable
+  with a hidden `thread/name/set` when needed, complete the Desktop
+  `thread/resume` barrier, and fail closed if Desktop is absent.
+- Desktop must remain usable through the Broker when the Sidecar is absent.
+  Sidecar loss must not create a second app-server owner or terminate Desktop's
+  task.
+- New conversations may use a locally registered project or an isolated
+  projectless temporary root. The file gateway remains limited to registered
+  projects.
 - Show only reasoning summaries and tool activity exposed by Codex. Never claim
   access to hidden chain-of-thought.
 - Model and reasoning changes apply to a new turn; they do not hot-swap an
   in-flight turn.
+- Windows Desktop integration currently depends on the hidden
+  `CODEX_APP_SERVER_WS_URL` compatibility hook. Treat every Desktop or bundled
+  Codex upgrade as unverified until the shared-owner path passes a real-machine
+  acceptance test.
 - The public repository must never contain real hostnames, credentials,
   passwords, cookies, auth databases, conversation logs, private file paths, or
   screenshots from a real machine.
@@ -22,6 +36,8 @@ This repository is a public, unofficial companion for the Codex desktop app.
 - TypeScript is strict across the monorepo.
 - Browser code depends only on project-owned contracts, never raw app-server
   protocol types.
+- Broker-injected RPC ids are reserved implementation details and must never be
+  forwarded to either product client.
 - Treat model output, Markdown, ANSI, tool results, filenames, and diff content
   as untrusted input.
 - File APIs are read-only and constrained to registered project roots. Resolve
@@ -41,5 +57,9 @@ This repository is a public, unofficial companion for the Codex desktop app.
   symlink/junction escape, origin checks, unsafe Markdown, and session expiry.
 - Browser tests cover 360x800, 390x844, 412x915, 768x1024, 1280x800, and
   1440x900 viewports.
-- A completion claim requires a real app-server smoke test when Codex is
-  available and an explicit degraded result when it is not.
+- A completion claim for the shared-owner path requires real-machine smoke
+  tests with Desktop and Sidecar attached to the same Broker, covering one
+  registered-project thread and one isolated projectless thread. It must verify
+  sidebar visibility, matching thread/turn ids, live events, and fail-closed
+  behavior when Desktop is absent. Record an explicit degraded result when that
+  test cannot run.

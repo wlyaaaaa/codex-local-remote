@@ -1,19 +1,25 @@
 import os from "node:os";
 import path from "node:path";
 
+import { normalizeLoopbackWebSocketEndpoint } from "@codex-local-remote/app-server-client";
+
 export interface SidecarConfig {
+  appServerUrl: string;
   host: "127.0.0.1" | "::1";
   port: number;
   basePath: string;
+  codexPath?: string;
   dataDir: string;
   desktopSyncEnabled: boolean;
   webDir: string;
 }
 
 export interface SidecarConfigOverrides {
+  appServerUrl?: string;
   host?: string;
   port?: number;
   basePath?: string;
+  codexPath?: string;
   dataDir?: string;
   desktopSyncEnabled?: boolean;
   webDir?: string;
@@ -57,14 +63,34 @@ export function resolveSidecarConfig(options: ResolveSidecarConfigOptions = {}):
       environment.CODEX_REMOTE_DATA_DIR ??
       path.win32.join(localAppData, "CodexLocalRemote"),
   );
+  const codexPathValue = cli.codexPath ?? environment.CODEX_REMOTE_CODEX_PATH;
+  const codexPath =
+    codexPathValue === undefined || codexPathValue.length === 0
+      ? undefined
+      : path.win32.resolve(codexPathValue);
   const webDir =
     cli.webDir ??
     environment.CODEX_REMOTE_WEB_DIR ??
     path.resolve(import.meta.dirname, "../../web/dist");
   const desktopSyncEnabled =
     cli.desktopSyncEnabled ?? parseBooleanSwitch(environment.CODEX_REMOTE_DESKTOP_SYNC) ?? true;
+  const appServerUrl = normalizeLoopbackWebSocketEndpoint(
+    cli.appServerUrl ??
+      environment.CODEX_REMOTE_APP_SERVER_WS_URL ??
+      environment.CODEX_APP_SERVER_WS_URL ??
+      "ws://127.0.0.1:18791",
+  );
 
-  return { basePath, dataDir, desktopSyncEnabled, host, port, webDir };
+  return {
+    appServerUrl,
+    basePath,
+    ...(codexPath === undefined ? {} : { codexPath }),
+    dataDir,
+    desktopSyncEnabled,
+    host,
+    port,
+    webDir,
+  };
 }
 
 export function parseCliInvocation(args: string[]): CliInvocation {
@@ -82,7 +108,9 @@ export function parseCliInvocation(args: string[]): CliInvocation {
 
   if (command === "serve") {
     assertAllowedFlags(values, [
+      "app-server-url",
       "base-path",
+      "codex-path",
       "data-dir",
       "host",
       "no-desktop-sync",
@@ -92,7 +120,9 @@ export function parseCliInvocation(args: string[]): CliInvocation {
     return {
       command,
       config: compactConfig({
+        appServerUrl: normalizeOptionalAppServerUrl(values.get("app-server-url")),
         basePath: values.get("base-path"),
+        codexPath: values.get("codex-path"),
         dataDir: values.get("data-dir"),
         desktopSyncEnabled: values.has("no-desktop-sync") ? false : undefined,
         host: values.get("host"),
@@ -213,21 +243,29 @@ function assertAllowedFlags(values: Map<string, string>, allowed: string[]): voi
 }
 
 function compactConfig(input: {
+  appServerUrl?: string | undefined;
   host?: string | undefined;
   port?: number | undefined;
   basePath?: string | undefined;
+  codexPath?: string | undefined;
   dataDir?: string | undefined;
   desktopSyncEnabled?: boolean | undefined;
   webDir?: string | undefined;
 }): SidecarConfigOverrides {
   return {
+    ...(input.appServerUrl === undefined ? {} : { appServerUrl: input.appServerUrl }),
     ...(input.host === undefined ? {} : { host: input.host }),
     ...(input.port === undefined ? {} : { port: input.port }),
     ...(input.basePath === undefined ? {} : { basePath: input.basePath }),
+    ...(input.codexPath === undefined ? {} : { codexPath: input.codexPath }),
     ...(input.dataDir === undefined ? {} : { dataDir: input.dataDir }),
     ...(input.desktopSyncEnabled === undefined
       ? {}
       : { desktopSyncEnabled: input.desktopSyncEnabled }),
     ...(input.webDir === undefined ? {} : { webDir: input.webDir }),
   };
+}
+
+function normalizeOptionalAppServerUrl(value: string | undefined): string | undefined {
+  return value === undefined ? undefined : normalizeLoopbackWebSocketEndpoint(value);
 }

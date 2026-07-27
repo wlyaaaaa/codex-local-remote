@@ -12,12 +12,13 @@ export interface InboundServerRequest {
 
 export type ApprovalResolution = ApprovalResolutionInput;
 
-type ApprovalKind = "command" | "file-change" | "permissions" | "user-input";
+type ApprovalKind = "decision" | "unsupported" | "user-input";
 
 interface PendingApproval {
   kind: ApprovalKind;
   params: Record<string, unknown>;
   productRequest: ApprovalRequest;
+  protocolChoices?: Map<string, unknown>;
   request: InboundServerRequest;
 }
 
@@ -36,13 +37,18 @@ export class ApprovalResolutionError extends Error {
 export class ApprovalCoordinator {
   readonly #events: RemoteEventBuffer;
   readonly #pending = new Map<string, PendingApproval>();
+  readonly #serverRequestDecisionFallbacks: Readonly<Record<string, readonly unknown[]>>;
 
-  constructor(events: RemoteEventBuffer) {
+  constructor(
+    events: RemoteEventBuffer,
+    serverRequestDecisionFallbacks: Readonly<Record<string, readonly unknown[]>> = {},
+  ) {
     this.#events = events;
+    this.#serverRequestDecisionFallbacks = serverRequestDecisionFallbacks;
   }
 
   handleServerRequest(request: InboundServerRequest): boolean {
-    const pending = projectApproval(request);
+    const pending = projectApproval(request, this.#serverRequestDecisionFallbacks);
     if (!pending) {
       void request.reject({
         code: -32_601,
@@ -125,10 +131,13 @@ export class ApprovalCoordinator {
   }
 }
 
-function projectApproval(request: InboundServerRequest): PendingApproval | undefined {
+function projectApproval(
+  request: InboundServerRequest,
+  serverRequestDecisionFallbacks: Readonly<Record<string, readonly unknown[]>>,
+): PendingApproval | undefined {
   const id = String(request.id);
   const params = asRecord(request.params);
-  const threadId = asString(params.threadId);
+  const threadId = asString(params.threadId) ?? asString(params.conversationId);
   if (!threadId) {
     return undefined;
   }
@@ -143,18 +152,19 @@ function projectApproval(request: InboundServerRequest): PendingApproval | undef
     case "item/commandExecution/requestApproval": {
       const command = asString(params.command);
       const explanation = asString(params.reason);
-      const choices = commandChoices(params.availableDecisions);
-      if (choices.length === 0) {
-        return undefined;
-      }
+      const projectedDecisions = decisionChoices(
+        advertisedDecisionsOrFallback(params, serverRequestDecisionFallbacks[request.method]),
+      );
       return {
-        kind: "command",
+        kind: projectedDecisions.choices.length > 0 ? "decision" : "unsupported",
         params,
+        protocolChoices: projectedDecisions.protocolChoices,
         request,
         productRequest: {
           ...base,
           title: "允许运行此操作？",
-          choices,
+          choices: projectedDecisions.choices,
+          ...(projectedDecisions.choices.length > 0 ? {} : { limitation: choicesNotAdvertised() }),
           ...(command === undefined ? {} : { command }),
           ...(explanation === undefined ? {} : { explanation }),
         },
@@ -163,14 +173,19 @@ function projectApproval(request: InboundServerRequest): PendingApproval | undef
     case "item/fileChange/requestApproval": {
       const grantRoot = asString(params.grantRoot);
       const explanation = asString(params.reason);
+      const projectedDecisions = decisionChoices(
+        advertisedDecisionsOrFallback(params, serverRequestDecisionFallbacks[request.method]),
+      );
       return {
-        kind: "file-change",
+        kind: projectedDecisions.choices.length > 0 ? "decision" : "unsupported",
         params,
+        protocolChoices: projectedDecisions.protocolChoices,
         request,
         productRequest: {
           ...base,
           title: "允许修改项目文件？",
-          choices: standardChoices(),
+          choices: projectedDecisions.choices,
+          ...(projectedDecisions.choices.length > 0 ? {} : { limitation: choicesNotAdvertised() }),
           ...(explanation === undefined ? {} : { explanation }),
           ...(grantRoot === undefined ? {} : { paths: [grantRoot] }),
         },
@@ -178,14 +193,19 @@ function projectApproval(request: InboundServerRequest): PendingApproval | undef
     }
     case "item/permissions/requestApproval": {
       const explanation = asString(params.reason);
+      const projectedDecisions = decisionChoices(
+        advertisedDecisionsOrFallback(params, serverRequestDecisionFallbacks[request.method]),
+      );
       return {
-        kind: "permissions",
+        kind: projectedDecisions.choices.length > 0 ? "decision" : "unsupported",
         params,
+        protocolChoices: projectedDecisions.protocolChoices,
         request,
         productRequest: {
           ...base,
           title: "允许临时扩大访问范围？",
-          choices: standardChoices(),
+          choices: projectedDecisions.choices,
+          ...(projectedDecisions.choices.length > 0 ? {} : { limitation: choicesNotAdvertised() }),
           ...(explanation === undefined ? {} : { explanation }),
         },
       };
@@ -211,7 +231,12 @@ function projectApproval(request: InboundServerRequest): PendingApproval | undef
       };
     }
     default:
-      return undefined;
+      return projectFutureDecisionApproval(
+        request,
+        params,
+        base,
+        serverRequestDecisionFallbacks[request.method],
+      );
   }
 }
 
@@ -231,31 +256,90 @@ function resolutionFor(pending: PendingApproval, resolution: ApprovalResolution)
     throw invalidChoice();
   }
 
-  const decision =
-    pending.kind === "command"
-      ? commandDecision(pending.params.availableDecisions, resolution.choiceId)
-      : resolution.choiceId === "allow-once"
-        ? "accept"
-        : resolution.choiceId === "allow-session"
-          ? "acceptForSession"
-          : resolution.choiceId === "deny"
-            ? "decline"
-            : undefined;
-  if (!decision) {
-    throw invalidChoice();
+  if (pending.kind === "decision") {
+    if (!pending.protocolChoices?.has(resolution.choiceId)) {
+      throw invalidChoice();
+    }
+    const decision = pending.protocolChoices.get(resolution.choiceId);
+    return { decision };
   }
 
-  if (pending.kind === "permissions") {
-    const permissions =
-      resolution.choiceId === "deny"
-        ? {}
-        : compactPermissionProfile(asRecord(pending.params.permissions));
+  throw invalidChoice();
+}
+
+function projectFutureDecisionApproval(
+  request: InboundServerRequest,
+  params: Record<string, unknown>,
+  base: { id: string; threadId: string; turnId?: string },
+  fallbackDecisions: readonly unknown[] | undefined,
+): PendingApproval | undefined {
+  const questions = projectQuestions(params.questions);
+  if (questions) {
     return {
-      permissions,
-      scope: resolution.choiceId === "allow-session" ? "session" : "turn",
+      kind: "user-input",
+      params,
+      request,
+      productRequest: {
+        ...base,
+        title: "Codex 需要你的选择",
+        choices: [
+          { id: "submit", label: "提交回答", tone: "primary" },
+          { id: "cancel", label: "跳过", tone: "danger" },
+        ],
+        questions,
+      },
     };
   }
-  return { decision };
+
+  const decisionsAdvertised = Array.isArray(params.availableDecisions);
+  const schemaDecisions =
+    fallbackDecisions === undefined ? undefined : Array.from(fallbackDecisions);
+  if (
+    !request.method.endsWith("/requestApproval") &&
+    !decisionsAdvertised &&
+    schemaDecisions === undefined
+  ) {
+    return undefined;
+  }
+  const projectedDecisions = decisionChoices(
+    decisionsAdvertised ? params.availableDecisions : schemaDecisions,
+  );
+  const explanation = asString(params.reason);
+  const command = displayCommand(params.command);
+  const fileChanges = asRecord(params.fileChanges);
+  const paths = Object.keys(fileChanges).slice(0, 100);
+  return {
+    kind: projectedDecisions.choices.length > 0 ? "decision" : "unsupported",
+    params,
+    protocolChoices: projectedDecisions.protocolChoices,
+    request,
+    productRequest: {
+      ...base,
+      title:
+        command !== undefined
+          ? "允许运行此操作？"
+          : paths.length > 0
+            ? "允许修改项目文件？"
+            : "Codex 请求批准",
+      choices: projectedDecisions.choices,
+      ...(projectedDecisions.choices.length > 0 ? {} : { limitation: choicesNotAdvertised() }),
+      ...(command === undefined ? {} : { command }),
+      ...(explanation === undefined ? {} : { explanation }),
+      ...(paths.length === 0 ? {} : { paths }),
+    },
+  };
+}
+
+function choicesNotAdvertised(): string {
+  return "当前 Codex 请求没有声明可返回的选择。为避免替你猜测，手机端不会发送审批结果；请在 Desktop 处理或停止当前任务。";
+}
+
+function advertisedDecisionsOrFallback(
+  params: Record<string, unknown>,
+  fallbackDecisions: readonly unknown[] | undefined,
+): unknown {
+  const advertised = params.availableDecisions;
+  return Array.isArray(advertised) && advertised.length > 0 ? advertised : fallbackDecisions;
 }
 
 function projectQuestions(value: unknown): ApprovalRequest["questions"] | undefined {
@@ -337,63 +421,161 @@ function validateUserInputAnswers(
   return result;
 }
 
-function compactPermissionProfile(requested: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...(isRecord(requested.network) ? { network: requested.network } : {}),
-    ...(isRecord(requested.fileSystem) ? { fileSystem: requested.fileSystem } : {}),
-  };
+function decisionChoices(value: unknown): {
+  choices: ApprovalRequest["choices"];
+  protocolChoices: Map<string, unknown>;
+} {
+  const advertised = Array.isArray(value) ? value : [];
+  const choices: ApprovalRequest["choices"] = [];
+  const protocolChoices = new Map<string, unknown>();
+
+  for (const [index, decision] of advertised.entries()) {
+    if (decision === "accept" || decision === "approved") {
+      addProtocolChoice(
+        choices,
+        protocolChoices,
+        { id: "allow-once", label: "仅本次允许", tone: "primary" },
+        decision,
+      );
+      continue;
+    }
+    if (decision === "acceptForSession" || decision === "approved_for_session") {
+      addProtocolChoice(
+        choices,
+        protocolChoices,
+        { id: "allow-session", label: "本次对话允许", tone: "neutral" },
+        decision,
+      );
+      continue;
+    }
+    if (decision === "decline" || decision === "cancel" || decision === "abort") {
+      addProtocolChoice(
+        choices,
+        protocolChoices,
+        {
+          id: decision === "decline" ? "deny" : decision === "abort" ? "abort" : "cancel",
+          label: decision === "decline" ? "拒绝" : decision === "abort" ? "拒绝并停止" : "取消",
+          tone: "danger",
+        },
+        decision,
+      );
+      continue;
+    }
+
+    const record = asRecord(decision);
+    const denied = asRecord(record.denied);
+    if (
+      Object.keys(record).length === 1 &&
+      typeof denied.rejection === "string" &&
+      denied.rejection.length > 0
+    ) {
+      addProtocolChoice(
+        choices,
+        protocolChoices,
+        { id: "deny", label: "拒绝", tone: "danger" },
+        decision,
+      );
+      continue;
+    }
+    const execPolicy = asRecord(record.acceptWithExecpolicyAmendment);
+    if (
+      Object.keys(record).length === 1 &&
+      Array.isArray(execPolicy.execpolicy_amendment) &&
+      execPolicy.execpolicy_amendment.every((part) => typeof part === "string")
+    ) {
+      addProtocolChoice(
+        choices,
+        protocolChoices,
+        {
+          id: `protocol-decision-${index}`,
+          label: "允许类似命令",
+          tone: "neutral",
+        },
+        decision,
+      );
+      continue;
+    }
+
+    const networkContainer = asRecord(record.applyNetworkPolicyAmendment);
+    const network = asRecord(networkContainer.network_policy_amendment);
+    const host = boundedString(network.host, 512);
+    const action = asString(network.action);
+    if (Object.keys(record).length === 1 && host && (action === "allow" || action === "deny")) {
+      addProtocolChoice(
+        choices,
+        protocolChoices,
+        {
+          id: `protocol-decision-${index}`,
+          label: action === "allow" ? `以后允许访问 ${host}` : `以后阻止访问 ${host}`,
+          tone: "neutral",
+        },
+        decision,
+      );
+      continue;
+    }
+
+    const label = safeDecisionLabel(decision, index);
+    if (label) {
+      addProtocolChoice(
+        choices,
+        protocolChoices,
+        {
+          id: `protocol-decision-${index}`,
+          label,
+          tone: "neutral",
+        },
+        decision,
+      );
+    }
+  }
+  return { choices, protocolChoices };
 }
 
-function standardChoices(): ApprovalRequest["choices"] {
-  return [
-    { id: "allow-once", label: "仅本次允许", tone: "primary" },
-    { id: "allow-session", label: "本次对话允许", tone: "neutral" },
-    { id: "deny", label: "拒绝", tone: "danger" },
-  ];
+function safeDecisionLabel(decision: unknown, index: number): string | undefined {
+  const record = asRecord(decision);
+  for (const key of ["label", "title", "name", "action", "id"]) {
+    const advertisedLabel = boundedString(record[key], 512);
+    if (advertisedLabel) {
+      return advertisedLabel;
+    }
+  }
+
+  if (typeof decision === "string") {
+    const token = humanizeProtocolToken(decision);
+    return token ? `Codex 选项 ${index + 1}：${token}` : undefined;
+  }
+  if (typeof decision === "number" || typeof decision === "boolean") {
+    return `Codex 选项 ${index + 1}：${String(decision)}`;
+  }
+
+  const keys = Object.keys(record);
+  if (keys.length === 1) {
+    const token = humanizeProtocolToken(keys[0] ?? "");
+    return token ? `Codex 选项 ${index + 1}：${token}` : `Codex 选项 ${index + 1}`;
+  }
+  return keys.length > 0 ? `Codex 选项 ${index + 1}` : undefined;
 }
 
-function commandChoices(value: unknown): ApprovalRequest["choices"] {
-  const decisions = commandDecisionSet(value);
-  return [
-    ...(decisions.has("accept")
-      ? [{ id: "allow-once", label: "仅本次允许", tone: "primary" as const }]
-      : []),
-    ...(decisions.has("acceptForSession")
-      ? [{ id: "allow-session", label: "本次对话允许", tone: "neutral" as const }]
-      : []),
-    ...(decisions.has("decline") || decisions.has("cancel")
-      ? [{ id: "deny", label: "拒绝", tone: "danger" as const }]
-      : []),
-  ];
+function humanizeProtocolToken(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .replace(/[_-]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 480);
 }
 
-function commandDecision(value: unknown, choiceId: string): string | undefined {
-  const decisions = commandDecisionSet(value);
-  if (choiceId === "allow-once" && decisions.has("accept")) {
-    return "accept";
+function addProtocolChoice(
+  choices: ApprovalRequest["choices"],
+  protocolChoices: Map<string, unknown>,
+  choice: ApprovalRequest["choices"][number],
+  decision: unknown,
+): void {
+  if (protocolChoices.has(choice.id)) {
+    return;
   }
-  if (choiceId === "allow-session" && decisions.has("acceptForSession")) {
-    return "acceptForSession";
-  }
-  if (choiceId === "deny") {
-    return decisions.has("decline") ? "decline" : decisions.has("cancel") ? "cancel" : undefined;
-  }
-  return undefined;
-}
-
-function commandDecisionSet(value: unknown): Set<string> {
-  if (!Array.isArray(value)) {
-    return new Set(["accept", "acceptForSession", "decline"]);
-  }
-  return new Set(
-    (value as unknown[]).filter(
-      (decision): decision is string =>
-        decision === "accept" ||
-        decision === "acceptForSession" ||
-        decision === "decline" ||
-        decision === "cancel",
-    ),
-  );
+  choices.push(choice);
+  protocolChoices.set(choice.id, decision);
 }
 
 function invalidChoice(): ApprovalResolutionError {
@@ -416,4 +598,19 @@ function boundedString(value: unknown, maxLength: number): string | undefined {
   return typeof value === "string" && value.length > 0 && value.length <= maxLength
     ? value
     : undefined;
+}
+
+function displayCommand(value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  if (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    value.every((part) => typeof part === "string")
+  ) {
+    return value.join(" ").slice(0, 16_384);
+  }
+  return undefined;
 }

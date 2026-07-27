@@ -11,11 +11,12 @@ import { SidecarStateStore } from "./state-store.js";
 const HELP = `Codex Local Remote
 
 用法:
-  codex-local-remote serve [--host 127.0.0.1] [--port 18790] [--base-path /codex-remote] [--data-dir PATH] [--no-desktop-sync]
+  codex-local-remote serve [--host 127.0.0.1] [--port 18790] [--app-server-url ws://127.0.0.1:18791] [--base-path /codex-remote] [--codex-path PATH] [--data-dir PATH] [--no-desktop-sync]
   codex-local-remote setup-password [--data-dir PATH]
   codex-local-remote register-project --id ID --name NAME --root PATH [--data-dir PATH]
 
 访问密码只从本机交互输入或标准输入读取，不能通过参数或环境变量传入。
+Sidecar 只连接本机共享 Broker，不会静默启动第二个 Codex 后台。
 默认会让 Codex Desktop 载入新对话；如需关闭，请使用 --no-desktop-sync。`;
 
 export async function main(args = process.argv.slice(2)): Promise<void> {

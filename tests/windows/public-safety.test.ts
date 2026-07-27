@@ -69,4 +69,17 @@ describe("public-safety scanner", () => {
     expect(result.stderr).toContain("real Funnel hostname");
     expect(result.stderr).not.toContain(".env.example");
   });
+
+  it("allows only explicitly reviewed product screenshots with a valid image signature", () => {
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9]);
+    const result = scan({
+      "docs/assets/desktop-tasks-en.jpg": jpeg,
+      "docs/assets/unreviewed.jpg": jpeg,
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).not.toContain("desktop-tasks-en.jpg");
+    expect(result.stderr).toContain("unreviewed.jpg");
+    expect(result.stderr).toContain("binary or unsupported encoding");
+  });
 });
