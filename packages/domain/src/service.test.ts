@@ -43,6 +43,37 @@ afterEach(async () => {
   }
 });
 
+function adaptLegacyHistoryRequest(
+  request: (method: string, params?: unknown) => Promise<unknown>,
+): <T = unknown>(method: string, params?: unknown) => Promise<T> {
+  const shellReads = new Map<string, Promise<unknown>>();
+  return async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+    const threadId = (params as { threadId?: string } | undefined)?.threadId;
+    if (method === "thread/turns/list" && threadId) {
+      const shell =
+        shellReads.get(threadId) ??
+        Promise.resolve(
+          request("thread/read", {
+            includeTurns: false,
+            threadId,
+          }),
+        );
+      const response = (await shell) as {
+        thread?: {
+          turns?: unknown[];
+        };
+      };
+      return { data: response.thread?.turns ?? [] } as T;
+    }
+    if (method === "thread/read" && threadId) {
+      const shell = Promise.resolve(request(method, params));
+      shellReads.set(threadId, shell);
+      return (await shell) as T;
+    }
+    return (await request(method, params)) as T;
+  };
+}
+
 function createService(
   request: (method: string, params?: unknown) => Promise<unknown>,
   resolveRegisteredProjectRoot: (projectId: string) => Promise<string | undefined> = async (
@@ -72,10 +103,17 @@ function createService(
     sharedResumeDelaysMs?: number[];
   } = {},
 ): CodexDomainService {
+  // Most pre-pagination fixtures expose their turns on thread/read. Adapt those
+  // fixtures to the bounded turn-page contract so legacy unit setup does not
+  // accidentally require the production unbounded-history path.
+  const adaptLegacyHistoryFixture = options.protocolCatalog === undefined;
+  const adaptedRequest = adaptLegacyHistoryFixture
+    ? adaptLegacyHistoryRequest(request)
+    : async <T = unknown>(method: string, params?: unknown): Promise<T> =>
+        (await request(method, params)) as T;
   return new CodexDomainService({
     gateway: {
-      request: async <T = unknown>(method: string, params?: unknown): Promise<T> =>
-        (await request(method, params)) as T,
+      request: adaptedRequest,
     },
     ...(options.events === undefined ? {} : { events: options.events }),
     ...(options.managedThreadIds === undefined
@@ -92,7 +130,11 @@ function createService(
     ...(options.listPinnedThreadIds === undefined
       ? {}
       : { listPinnedThreadIds: options.listPinnedThreadIds }),
-    ...(options.protocolCatalog === undefined ? {} : { protocolCatalog: options.protocolCatalog }),
+    protocolCatalog:
+      options.protocolCatalog ??
+      ({
+        clientMethods: ["thread/turns/list"],
+      } as const),
     ...(options.readPersistedUsageContext === undefined
       ? {}
       : { readPersistedUsageContext: options.readPersistedUsageContext }),
@@ -992,30 +1034,31 @@ describe("CodexDomainService", () => {
           return { thread: { ...threadFixture, cwd: generalConversationRoot } };
         }
         if (method === "thread/read") {
-          const includeTurns = (params as { includeTurns?: boolean }).includeTurns;
           return {
             thread: {
               ...threadFixture,
               cwd: generalConversationRoot,
               status: { type: "idle" },
-              turns:
-                includeTurns === true
-                  ? [
-                      {
-                        id: "turn-queued",
-                        items: [
-                          {
-                            clientId: clientUserMessageId,
-                            content: [{ text: "不会投影到对账结果", type: "text" }],
-                            id: "user-message-queued",
-                            type: "userMessage",
-                          },
-                        ],
-                        status: "completed",
-                      },
-                    ]
-                  : [],
+              turns: [],
             },
+          };
+        }
+        if (method === "thread/turns/list") {
+          return {
+            data: [
+              {
+                id: "turn-queued",
+                items: [
+                  {
+                    clientId: clientUserMessageId,
+                    content: [{ text: "不会投影到对账结果", type: "text" }],
+                    id: "user-message-queued",
+                    type: "userMessage",
+                  },
+                ],
+                status: "completed",
+              },
+            ],
           };
         }
         if (method === "turn/start") {
@@ -1033,7 +1076,10 @@ describe("CodexDomainService", () => {
       },
       undefined,
       undefined,
-      { generalConversationRoot },
+      {
+        generalConversationRoot,
+        protocolCatalog: { clientMethods: ["thread/turns/list"] },
+      },
     );
     await service.createThread({ prompt: "创建队列测试对话" });
     service.handleNotification({
@@ -1061,6 +1107,7 @@ describe("CodexDomainService", () => {
     await expect(
       service.reconcileClientUserMessage("thread-new", clientUserMessageId),
     ).resolves.toEqual({
+      lifecycle: "completed",
       state: "accepted",
       turnId: "turn-queued",
     });
@@ -1077,7 +1124,7 @@ describe("CodexDomainService", () => {
     });
     const service = new CodexDomainService({
       gateway: {
-        request: async <T = unknown>(method: string): Promise<T> => {
+        request: adaptLegacyHistoryRequest(async <T = unknown>(method: string): Promise<T> => {
           sequence.push(method);
           if (method === "thread/start") {
             return {
@@ -1111,7 +1158,7 @@ describe("CodexDomainService", () => {
             } as T;
           }
           throw new Error(`unexpected method ${method}`);
-        },
+        }),
       },
       notifyManagedThreadCreated,
       clearPendingDesktopNotification: async (createdThreadId) => {
@@ -1123,6 +1170,7 @@ describe("CodexDomainService", () => {
       projects: new ProjectRegistry([
         { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
       ]),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
     });
 
@@ -1329,7 +1377,7 @@ describe("CodexDomainService", () => {
     const service = new CodexDomainService({
       clearPendingDesktopNotification,
       gateway: {
-        request: async <T = unknown>(method: string): Promise<T> => {
+        request: adaptLegacyHistoryRequest(async <T = unknown>(method: string): Promise<T> => {
           methods.push(method);
           if (method === "thread/start") {
             return { thread: { ...threadFixture, id: threadId } } as T;
@@ -1338,13 +1386,14 @@ describe("CodexDomainService", () => {
             throw new Error("turn start failed");
           }
           throw new Error(`unexpected method ${method}`);
-        },
+        }),
       },
       notifyManagedThreadCreated,
       persistManagedThread,
       projects: new ProjectRegistry([
         { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
       ]),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
     });
 
@@ -1377,7 +1426,7 @@ describe("CodexDomainService", () => {
     const service = new CodexDomainService({
       clearPendingDesktopNotification,
       gateway: {
-        request: async <T = unknown>(method: string): Promise<T> => {
+        request: adaptLegacyHistoryRequest(async <T = unknown>(method: string): Promise<T> => {
           methods.push(method);
           if (method === "thread/start") {
             return { thread: { ...threadFixture, id: threadId } } as T;
@@ -1409,13 +1458,14 @@ describe("CodexDomainService", () => {
             } as T;
           }
           throw new Error(`unexpected method ${method}`);
-        },
+        }),
       },
       notifyManagedThreadCreated,
       persistManagedThread: async () => undefined,
       projects: new ProjectRegistry([
         { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
       ]),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
     });
 
@@ -1462,49 +1512,52 @@ describe("CodexDomainService", () => {
     const service = new CodexDomainService({
       clearPendingDesktopNotification,
       gateway: {
-        request: async <T = unknown>(method: string, params?: unknown): Promise<T> => {
-          if (method !== "thread/read") {
-            throw new Error(`unexpected method ${method}`);
-          }
-          const threadId = (params as { threadId?: string }).threadId ?? "";
-          reads.push(threadId);
-          if (threadId === activeId) {
-            activeReads += 1;
+        request: adaptLegacyHistoryRequest(
+          async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+            if (method !== "thread/read") {
+              throw new Error(`unexpected method ${method}`);
+            }
+            const threadId = (params as { threadId?: string }).threadId ?? "";
+            reads.push(threadId);
+            if (threadId === activeId) {
+              activeReads += 1;
+              return {
+                thread: {
+                  ...threadFixture,
+                  id: threadId,
+                  status: { type: "active" },
+                  turns: [
+                    {
+                      id: "turn-active",
+                      items: activeReads === 1 ? [] : [{ id: "user-active", type: "userMessage" }],
+                      status: "inProgress",
+                    },
+                  ],
+                },
+              } as T;
+            }
             return {
               thread: {
                 ...threadFixture,
                 id: threadId,
-                status: { type: "active" },
+                status: { type: "idle" },
                 turns: [
                   {
-                    id: "turn-active",
-                    items: activeReads === 1 ? [] : [{ id: "user-active", type: "userMessage" }],
-                    status: "inProgress",
+                    id: "turn-complete",
+                    items: [{ id: "user-complete", type: "userMessage" }],
+                    status: "completed",
                   },
                 ],
               },
             } as T;
-          }
-          return {
-            thread: {
-              ...threadFixture,
-              id: threadId,
-              status: { type: "idle" },
-              turns: [
-                {
-                  id: "turn-complete",
-                  items: [{ id: "user-complete", type: "userMessage" }],
-                  status: "completed",
-                },
-              ],
-            },
-          } as T;
-        },
+          },
+        ),
       },
       managedThreadIds: [historicalId, terminalId, activeId],
       notifyManagedThreadCreated,
       pendingDesktopNotificationThreadIds: [terminalId, activeId],
       projects: new ProjectRegistry(),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => undefined,
     });
 
@@ -1531,7 +1584,7 @@ describe("CodexDomainService", () => {
     const service = new CodexDomainService({
       clearPendingDesktopNotification,
       gateway: {
-        request: async <T = unknown>(method: string): Promise<T> => {
+        request: adaptLegacyHistoryRequest(async <T = unknown>(method: string): Promise<T> => {
           if (method === "thread/start") {
             return { thread: { ...threadFixture, id: threadId } } as T;
           }
@@ -1562,13 +1615,14 @@ describe("CodexDomainService", () => {
             } as T;
           }
           throw new Error(`unexpected method ${method}`);
-        },
+        }),
       },
       notifyManagedThreadCreated,
       persistManagedThread: async () => undefined,
       projects: new ProjectRegistry([
         { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
       ]),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
     });
 
@@ -1589,25 +1643,28 @@ describe("CodexDomainService", () => {
     const service = new CodexDomainService({
       clearPendingDesktopNotification,
       gateway: {
-        request: async <T = unknown>(method: string, params?: unknown): Promise<T> => {
-          if (method !== "thread/read") {
-            throw new Error(`unexpected method ${method}`);
-          }
-          reads.push((params as { threadId: string }).threadId);
-          return {
-            thread: {
-              ...threadFixture,
-              id: threadId,
-              status: { type: "idle" },
-              turns: [],
-            },
-          } as T;
-        },
+        request: adaptLegacyHistoryRequest(
+          async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+            if (method !== "thread/read") {
+              throw new Error(`unexpected method ${method}`);
+            }
+            reads.push((params as { threadId: string }).threadId);
+            return {
+              thread: {
+                ...threadFixture,
+                id: threadId,
+                status: { type: "idle" },
+                turns: [],
+              },
+            } as T;
+          },
+        ),
       },
       managedThreadIds: [threadId],
       notifyManagedThreadCreated,
       pendingDesktopNotificationThreadIds: [threadId],
       projects: new ProjectRegistry(),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => undefined,
     });
 
@@ -1743,18 +1800,21 @@ describe("CodexDomainService", () => {
     };
     const service = new CodexDomainService({
       gateway: {
-        request: async <T = unknown>(method: string, params?: unknown): Promise<T> => {
-          calls.push({ method, params });
-          if (method === "thread/resume" || method === "thread/read") {
-            return { thread: desktopThread } as T;
-          }
-          throw new Error(`unexpected method ${method}`);
-        },
+        request: adaptLegacyHistoryRequest(
+          async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+            calls.push({ method, params });
+            if (method === "thread/resume" || method === "thread/read") {
+              return { thread: desktopThread } as T;
+            }
+            throw new Error(`unexpected method ${method}`);
+          },
+        ),
       },
       persistManagedThread,
       projects: new ProjectRegistry([
         { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
       ]),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
       sharedAppServer: true,
       sharedResumeDelaysMs: [0],
@@ -1788,7 +1848,11 @@ describe("CodexDomainService", () => {
       },
       undefined,
       undefined,
-      { sharedAppServer: true, sharedResumeDelaysMs: [0] },
+      {
+        protocolCatalog: { clientMethods: ["thread/turns/list"] },
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
     );
 
     await expect(service.resumeThread("desktop-history")).rejects.toMatchObject({
@@ -1884,7 +1948,11 @@ describe("CodexDomainService", () => {
       },
       undefined,
       undefined,
-      { sharedAppServer: true, sharedResumeDelaysMs: [0] },
+      {
+        protocolCatalog: { clientMethods: ["thread/turns/list"] },
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
     );
 
     await service.resubscribeSharedThreads();
@@ -1906,8 +1974,8 @@ describe("CodexDomainService", () => {
     expect(calls).toContainEqual({
       method: "thread/turns/list",
       params: {
-        itemsView: "summary",
-        limit: 1,
+        itemsView: "full",
+        limit: 12,
         sortDirection: "desc",
         threadId: desktopThread.id,
       },
@@ -2151,6 +2219,52 @@ describe("CodexDomainService", () => {
         threadId: threadFixture.id,
       },
     });
+  });
+
+  it("never falls back to an unbounded thread read when bounded history fails", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          expect(params).toEqual({ includeTurns: false, threadId: threadFixture.id });
+          return { thread: { ...threadFixture, turns: [] } };
+        }
+        if (method === "thread/turns/list") {
+          throw new Error("future protocol mismatch");
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { protocolCatalog: { clientMethods: ["thread/turns/list"] } },
+    );
+
+    await expect(service.getThread(threadFixture.id)).rejects.toMatchObject({
+      code: "FEATURE_UNAVAILABLE",
+    });
+    expect(calls).not.toContainEqual({
+      method: "thread/read",
+      params: { includeTurns: true, threadId: threadFixture.id },
+    });
+  });
+
+  it("refuses unbounded history when the runtime has no paginated thread method", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { protocolCatalog: { clientMethods: [] } },
+    );
+
+    await expect(service.getThread(threadFixture.id)).rejects.toMatchObject({
+      code: "FEATURE_UNAVAILABLE",
+    });
+    expect(calls).toEqual([]);
   });
 
   it("keeps an active Desktop status conservative when the turn-head capability is unavailable", async () => {
@@ -2702,7 +2816,7 @@ describe("CodexDomainService", () => {
     expect(calls).toEqual([
       {
         method: "thread/read",
-        params: { includeTurns: true, threadId: historicalThread.id },
+        params: { includeTurns: false, threadId: historicalThread.id },
       },
     ]);
   });
@@ -3038,7 +3152,7 @@ describe("CodexDomainService", () => {
       if (method === "thread/read") {
         if (
           laggingCompactionSnapshot &&
-          (params as { includeTurns?: boolean } | undefined)?.includeTurns === true
+          (params as { includeTurns?: boolean } | undefined)?.includeTurns === false
         ) {
           return {
             thread: {
@@ -3532,11 +3646,11 @@ describe("CodexDomainService", () => {
       },
       {
         method: "thread/read",
-        params: { includeTurns: true, threadId: "thread-root" },
+        params: { includeTurns: false, threadId: "thread-root" },
       },
       {
         method: "thread/read",
-        params: { includeTurns: true, threadId: "sub-legacy-source" },
+        params: { includeTurns: false, threadId: "sub-legacy-source" },
       },
     ]);
     expect(subagents.data).toMatchObject([
@@ -4065,16 +4179,17 @@ describe("CodexDomainService", () => {
     const service = new CodexDomainService({
       events,
       gateway: {
-        request: async <T = unknown>(method: string): Promise<T> => {
+        request: adaptLegacyHistoryRequest(async <T = unknown>(method: string): Promise<T> => {
           if (method !== "thread/read") {
             throw new Error(`unexpected method ${method}`);
           }
           return { thread: threadFixture } as T;
-        },
+        }),
       },
       projects: new ProjectRegistry([
         { id: "project-1", name: "示例项目", root: "C:\\workspace\\sample" },
       ]),
+      protocolCatalog: { clientMethods: ["thread/turns/list"] },
       resolveRegisteredProjectRoot: async () => "C:\\workspace\\sample",
     });
 

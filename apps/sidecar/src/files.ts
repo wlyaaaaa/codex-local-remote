@@ -98,6 +98,9 @@ export async function listProjectFiles(
     } catch {
       continue;
     }
+    if (hasProtectedPhysicalSegment(root, resolvedPath)) {
+      continue;
+    }
     const metadata = await safeStat(resolvedPath);
     if (!metadata || (!metadata.isFile() && !metadata.isDirectory())) {
       continue;
@@ -221,6 +224,9 @@ export async function resolveProjectInputReference(
     resolvedPath = await resolveContainedPathFromCanonicalRoot(root, relativePath);
   } catch {
     throw fileAccessDenied();
+  }
+  if (hasProtectedPhysicalSegment(root, resolvedPath)) {
+    throw protectedFileError();
   }
   const metadata = await safeStat(resolvedPath);
   if (!metadata || (!metadata.isFile() && !metadata.isDirectory())) {
@@ -371,6 +377,14 @@ async function safeStat(candidate: string) {
   } catch {
     return undefined;
   }
+}
+
+function hasProtectedPhysicalSegment(root: string, resolvedPath: string): boolean {
+  return path
+    .relative(root, resolvedPath)
+    .split(/[\\/]+/u)
+    .filter(Boolean)
+    .some((segment) => HIDDEN_DIRECTORIES.has(segment.toLocaleLowerCase("en-US")));
 }
 
 function fileAccessDenied(): ProductHttpError {

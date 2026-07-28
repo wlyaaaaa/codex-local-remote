@@ -52,6 +52,62 @@ test.describe("单密码登录与完整远程旅程", () => {
     await expect(page.getByTestId("turn-steer-submit")).toBeVisible();
   });
 
+  test("切换任务时草稿和附件始终留在各自任务", async ({ page }) => {
+    await login(page);
+    await page.evaluate(() => {
+      window.localStorage.setItem("draft:thread-active", "A 的草稿");
+      window.localStorage.setItem("draft:thread-desktop-running", "B 的草稿");
+      window.localStorage.setItem(
+        "conversation-attachments:thread-active",
+        JSON.stringify([
+          {
+            kind: "file",
+            relativePath: "a-only.txt",
+            uploadId: "11111111-1111-4111-8111-111111111111",
+          },
+        ]),
+      );
+      window.localStorage.setItem(
+        "conversation-attachments:thread-desktop-running",
+        JSON.stringify([
+          {
+            kind: "file",
+            relativePath: "b-only.txt",
+            uploadId: "22222222-2222-4222-8222-222222222222",
+          },
+        ]),
+      );
+    });
+    await page.goto("./?demo=1#/threads/thread-active");
+    await expect(page.getByTestId("turn-composer")).toHaveValue("A 的草稿");
+    await page.getByTestId("turn-composer").focus();
+    await expect(page.getByText("a-only.txt", { exact: true })).toBeVisible();
+
+    await page.evaluate(() => {
+      window.location.hash = "#/threads/thread-desktop-running";
+    });
+
+    await expect(page.getByTestId("turn-composer")).toHaveValue("B 的草稿");
+    await page.getByTestId("turn-composer").focus();
+    await expect(page.getByText("b-only.txt", { exact: true })).toBeVisible();
+    await expect(page.getByText("a-only.txt", { exact: true })).toHaveCount(0);
+    expect(
+      await page.evaluate(() => ({
+        attachments: window.localStorage.getItem("conversation-attachments:thread-desktop-running"),
+        draft: window.localStorage.getItem("draft:thread-desktop-running"),
+      })),
+    ).toEqual({
+      attachments: JSON.stringify([
+        {
+          kind: "file",
+          relativePath: "b-only.txt",
+          uploadId: "22222222-2222-4222-8222-222222222222",
+        },
+      ]),
+      draft: "B 的草稿",
+    });
+  });
+
   test("登录、启动对话、引导、停止并查看额度、子智能体与文件", async ({ page }) => {
     await test.step("只使用一个密码登录", async () => {
       await login(page);

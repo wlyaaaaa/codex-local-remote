@@ -550,6 +550,59 @@ export class DurableTurnOutbox {
     });
   }
 
+  async reconcileAcceptedTerminal(
+    queueId: string,
+    options: { issue?: string; status: "completed" | "failed"; turnId?: string },
+  ): Promise<void> {
+    await this.#mutate(async () => {
+      const item = this.#state.items.find((candidate) => candidate.id === queueId);
+      if (
+        !item ||
+        (item.state !== "dispatching" && item.state !== "ambiguous" && item.state !== "started")
+      ) {
+        return;
+      }
+      if (
+        options.turnId !== undefined &&
+        item.turnId !== undefined &&
+        item.turnId !== options.turnId
+      ) {
+        return;
+      }
+      const revision = this.#nextRevision(item.threadId);
+      const updatedAt = this.#clock().toISOString();
+      this.#state.items = this.#state.items.filter((candidate) => candidate.id !== item.id);
+      const remaining = this.#state.items.filter(
+        (candidate) => candidate.threadId === item.threadId,
+      );
+      if (options.status === "failed") {
+        const pendingIds = new Set(
+          remaining
+            .filter((candidate) => candidate.state === "queued")
+            .map((candidate) => candidate.id),
+        );
+        this.#state.items = this.#state.items.map((candidate) =>
+          pendingIds.has(candidate.id)
+            ? withState(candidate, "paused", revision, updatedAt, {
+                issue: options.issue ?? "PREVIOUS_TURN_DID_NOT_COMPLETE",
+              })
+            : candidate,
+        );
+        if (remaining.length > 0) {
+          this.#state.threadGates[item.threadId] = "paused";
+        } else {
+          delete this.#state.threadGates[item.threadId];
+        }
+      } else if (remaining.length > 0) {
+        this.#state.threadGates[item.threadId] = "ready";
+      } else {
+        delete this.#state.threadGates[item.threadId];
+      }
+      await this.#persist();
+      this.#emitThread(remaining.length > 0 ? "state-changed" : "removed", item.threadId, revision);
+    });
+  }
+
   async markAmbiguous(queueId: string, issue = "SEND_RESULT_UNKNOWN"): Promise<void> {
     await this.#mutate(async () => {
       const item = this.#state.items.find((candidate) => candidate.id === queueId);

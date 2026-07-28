@@ -2735,8 +2735,7 @@ details.file-change {
 }
 
 .composer-shell--collapsed .composer__context-bar,
-.composer-shell--collapsed .attachment-chips,
-.composer-shell--collapsed .composer__footer {
+.composer-shell--collapsed .attachment-chips {
   display: none;
 }
 
@@ -2749,8 +2748,28 @@ details.file-change {
   height: 44px;
   min-height: 44px;
   overflow: hidden;
-  padding: 10px 12px;
+  padding: 10px 62px 10px 12px;
   white-space: nowrap;
+}
+
+.composer-shell--collapsed .composer__footer {
+  inset: 0 4px 0 auto;
+  padding: 0;
+  pointer-events: none;
+  position: absolute;
+}
+
+.composer-shell--collapsed .composer__footer > :not(.composer__actions),
+.composer-shell--collapsed .composer__actions > :not([data-testid="turn-interrupt"]) {
+  display: none;
+}
+
+.composer-shell--collapsed .composer__actions {
+  margin: auto 0;
+}
+
+.composer-shell--collapsed .composer__actions [data-testid="turn-interrupt"] {
+  pointer-events: auto;
 }
 
 .composer textarea {

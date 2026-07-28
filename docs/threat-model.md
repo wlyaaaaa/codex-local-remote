@@ -48,7 +48,8 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 
 - 强密码哈希与随机盐；
 - 单因素密码至少 15 个 Unicode 字符，鼓励使用长口令短语；
-- 单来源、账户全局双重限速；
+- 单来源、账户全局双重限速；额度在异步密码哈希开始前原子预留，验证完成或
+  取消后结算，不能用并发 scrypt 请求绕过；
 - 指数退避和临时锁定；
 - 审计失败尝试但不记录输入值；
 - 一致的失败响应，避免用户名或状态枚举。
@@ -84,6 +85,8 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 - Windows 路径规范化和真实路径校验；
 - 注册时持久化 canonical path 与目录的 device/file identity；每次文件访问和
   新建任务前重新核对，根被移动、替换或重绑定后立即失效；
+- 最终文件物理路径还会再次检查敏感分段；指向 `.git`、`.codex`、`.ssh`、
+  `.gnupg` 或 `node_modules` 的 junction/symlink 即使别名本身无敏感名称也拒绝；
 - 根目录包含判断使用路径分段而非字符串前缀；
 - 拒绝 UNC、设备路径、ADS 和保留名称；
 - 每一次目录下降与文件打开都相对原 canonical root 重新验证，下载还会核对
@@ -105,6 +108,8 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 ### 订阅混淆与双 owner
 
 - Broker 独占一个 app-server；Sidecar 断线时不启动独立 stdio 实例；
+- Broker owner 租约以 data dir 的物理 `realpath` 为身份；junction/符号链接
+  别名不能为同一物理目录取得第二份 owner 租约；
 - Desktop 与 Sidecar 各自保持连接级订阅，不把广播的 `thread/started` 当作
   已订阅证明；
 - 手机第一轮先完成隐藏 `thread/name/set` 持久化和 Desktop
@@ -128,6 +133,19 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 - Desktop 或随附 Codex 升级后，必须重新执行同实例、实时订阅和故障路径
   的实机验收；
 - 未验收版本明确降级，不静默回退到独立 app-server。
+
+### 安装、更新与回滚
+
+- 注册前从当前构建生成内容寻址的不可变运行目录，目录 id 是清单中文件内容的
+  SHA-256；清单另行记录源码 commit、dirty 状态、文件大小和逐文件 SHA-256；
+- 计划任务和“Codex Remote（安全启动）”快捷方式只指向已完成清单回读验证的
+  不可变目录，不直接执行可变 Git 工作树；
+- `runtime-current.json` 原子保存当前版本、上一版本及两个 manifest hash；
+  状态查询和卸载会重新验证指针与全部文件，篡改后失败关闭；
+- 更新任务定义不会替换当前正在承载 Desktop 的进程；下一次自然启动才使用
+  新版。`Rollback-CodexLocalRemoteRuntime.ps1` 同样只切换下一次启动版本；
+- 卸载在第一次 mutation 前先验证 Desktop 已断开、活动/未知轮次为零、Broker
+  listener/PID/命令/状态和 `/ready` 一致，预检失败时不先停止任何组件。
 
 ### Sidecar 或手机断线
 

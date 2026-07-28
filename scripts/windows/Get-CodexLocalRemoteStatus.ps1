@@ -46,6 +46,18 @@ if (-not [string]::IsNullOrWhiteSpace($UserEnvironmentFixturePath) -and
     $env:CODEX_REMOTE_TEST_FIXTURE -cne '1') {
     throw 'UserEnvironmentFixturePath is reserved for the isolated test fixture.'
 }
+$effectiveInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+$currentRuntimePackage = $null
+if ($env:CODEX_REMOTE_TEST_FIXTURE -cne '1') {
+    $currentRuntimePackage = Get-CodexLocalRemoteCurrentRuntime -DataDir $DataDir
+    if ($null -ne $currentRuntimePackage) {
+        $effectiveInstallRoot = [string]$currentRuntimePackage.CurrentRoot
+    }
+}
+$immutableRuntimeReady = (
+    $env:CODEX_REMOTE_TEST_FIXTURE -ceq '1' -or
+    $null -ne $currentRuntimePackage
+)
 $desktopRuntimeStatus = 'unavailable'
 $desktopRuntimeError = ''
 $desktopRuntime = $null
@@ -66,10 +78,10 @@ if ([string]::IsNullOrWhiteSpace($PwshPath)) {
         Select-Object -First 1).Source
 }
 $brokerCli = [System.IO.Path]::GetFullPath(
-    (Join-Path ([System.IO.Path]::GetFullPath($InstallRoot)) 'apps\broker\dist\cli.js')
+    (Join-Path $effectiveInstallRoot 'apps\broker\dist\cli.js')
 )
 $sidecarCli = [System.IO.Path]::GetFullPath(
-    (Join-Path ([System.IO.Path]::GetFullPath($InstallRoot)) 'apps\sidecar\dist\cli.js')
+    (Join-Path $effectiveInstallRoot 'apps\sidecar\dist\cli.js')
 )
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
 $capabilityTokenPath = Get-BrokerCapabilityTokenPath -DataDir $resolvedDataDir
@@ -172,7 +184,7 @@ function Test-StatusPathEqual {
 }
 
 function Get-StatusLauncherShortcutDefinition {
-    $resolvedInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+    $resolvedInstallRoot = $effectiveInstallRoot
     $launcher = [System.IO.Path]::GetFullPath(
         (Join-Path $resolvedInstallRoot 'scripts\windows\Launch-CodexWithRemote.ps1')
     )
@@ -562,7 +574,7 @@ function Test-LiveRuntimeReceiptProcess {
                     -TaskName $TaskName `
                     -NodePath $NodePath `
                     -PwshPath $PwshPath `
-                    -InstallRoot $InstallRoot `
+                    -InstallRoot $effectiveInstallRoot `
                     -DataDir $resolvedDataDir `
                     -Port $Port `
                     -BrokerPort $BrokerPort `
@@ -628,7 +640,7 @@ if ($null -ne $task) {
                 -TaskName $TaskName `
                 -NodePath $NodePath `
                 -PwshPath $PwshPath `
-                -InstallRoot $InstallRoot `
+                -InstallRoot $effectiveInstallRoot `
                 -DataDir $DataDir `
                 -Port $Port `
                 -BrokerPort $BrokerPort `
@@ -661,7 +673,7 @@ if ($null -ne $task) {
                                 [string]$arguments[$codexSwitchIndexes[0] + 1]
                             ) `
                             -PwshPath $PwshPath `
-                            -InstallRoot $InstallRoot `
+                            -InstallRoot $effectiveInstallRoot `
                             -DataDir $DataDir `
                             -Port $Port `
                             -BrokerPort $BrokerPort `
@@ -1356,6 +1368,7 @@ $status = [pscustomobject]@{
         -not $legacyPersistentOverrideBlocked -and
         $forceCliScopes.Count -eq 0 -and
         $desktopStdioPids.Count -eq 0 -and
+        $immutableRuntimeReady -and
         $desktopRuntimeStatus -ceq 'current'
     )
     TaskState = $taskState
@@ -1385,6 +1398,18 @@ $status = [pscustomobject]@{
     UpstreamIdentityReady = $upstreamIdentityReady
     StartupInvocationReady = $startupInvocationReady
     RuntimeReceiptReady = $runtimeReceiptReady
+    ImmutableRuntimeReady = $immutableRuntimeReady
+    RuntimeVersionId = if ($null -eq $currentRuntimePackage) {
+        $null
+    } else {
+        [string]$currentRuntimePackage.CurrentVersionId
+    }
+    RuntimeRoot = $effectiveInstallRoot
+    PreviousRuntimeVersionId = if ($null -eq $currentRuntimePackage) {
+        $null
+    } else {
+        $currentRuntimePackage.PreviousVersionId
+    }
     CapabilityTokenReady = $capabilityTokenReady
     LauncherScriptReady = $launcherScriptReady
     LauncherShortcutReady = $launcherShortcutReady

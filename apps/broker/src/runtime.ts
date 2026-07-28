@@ -3,7 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync, unlinkSync } from "node:fs";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { createServer as createTcpServer, isIP } from "node:net";
@@ -356,7 +356,7 @@ export function appServerUpstreamTokenFilePath(dataDir: string): string {
 export async function acquireAppServerDataDirLease(
   dataDir: string,
 ): Promise<AppServerDataDirLease> {
-  const absoluteDataDir = resolve(dataDir);
+  const absoluteDataDir = await realpath(resolve(dataDir));
   if (process.platform === "win32") {
     return await acquireWindowsPipeLease(absoluteDataDir);
   }

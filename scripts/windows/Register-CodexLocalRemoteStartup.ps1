@@ -52,11 +52,36 @@ if (-not [string]::IsNullOrWhiteSpace($LauncherShortcutPath) -and
 }
 Assert-ForceCliDisabled
 
+$sourceInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+$useImmutableRuntime = (
+    -not $SkipEnvironmentConfiguration -and
+    $env:CODEX_REMOTE_TEST_FIXTURE -cne '1'
+)
+$runtimePlan = $null
+$effectiveInstallRoot = $sourceInstallRoot
+$activeRuntimeBefore = $null
+if ($useImmutableRuntime) {
+    $activeRuntimeBefore = Get-CodexLocalRemoteCurrentRuntime -DataDir $DataDir
+    $runtimePlan = Get-CodexLocalRemoteRuntimeVersionPlan `
+        -SourceRoot $sourceInstallRoot `
+        -DataDir $DataDir
+    $effectiveInstallRoot = [string]$runtimePlan.RuntimeRoot
+}
+$sourceExpected = Get-StartupTaskDefinition `
+    -TaskName $TaskName `
+    -NodePath $NodePath `
+    -PwshPath $PwshPath `
+    -InstallRoot $sourceInstallRoot `
+    -DataDir $DataDir `
+    -Port $Port `
+    -BrokerPort $BrokerPort `
+    -BrokerUpstreamPort $BrokerUpstreamPort `
+    -BasePath $BasePath
 $expected = Get-StartupTaskDefinition `
     -TaskName $TaskName `
     -NodePath $NodePath `
     -PwshPath $PwshPath `
-    -InstallRoot $InstallRoot `
+    -InstallRoot $effectiveInstallRoot `
     -DataDir $DataDir `
     -Port $Port `
     -BrokerPort $BrokerPort `
@@ -67,7 +92,7 @@ $dataDirectoryPlan = Get-CodexLocalRemoteDataDirectoryOwnershipPlan `
 $legacyExpected = Get-LegacyStartupTaskDefinition `
     -TaskName $TaskName `
     -NodePath $NodePath `
-    -InstallRoot $InstallRoot `
+    -InstallRoot $sourceInstallRoot `
     -DataDir $DataDir `
     -Port $Port `
     -BasePath $BasePath
@@ -80,6 +105,15 @@ function Test-ExistingTaskOwnership {
     $current = Test-ManagedStartupTask -Task $Task -Expected $expected
     if ($current.IsManaged) {
         return [pscustomobject]@{ IsManaged = $true; Kind = 'current'; Mismatches = @() }
+    }
+    $mutableV3 = Test-ManagedStartupTask -Task $Task -Expected $sourceExpected
+    if ($mutableV3.IsManaged) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Kind = 'mutable-v3'
+            Mismatches = @()
+            Definition = $sourceExpected
+        }
     }
     $actions = @($Task.Actions)
     if ($actions.Count -eq 1) {
@@ -116,6 +150,52 @@ function Test-ExistingTaskOwnership {
                         IsManaged = $true
                         Kind = 'pinned-v2'
                         Mismatches = @()
+                    }
+                }
+            }
+            $installRootSwitchIndexes = @(
+                for ($index = 0; $index -lt $arguments.Count; $index++) {
+                    if ([string]$arguments[$index] -ceq '-InstallRoot') {
+                        $index
+                    }
+                }
+            )
+            if ($installRootSwitchIndexes.Count -eq 1 -and
+                $installRootSwitchIndexes[0] + 1 -lt $arguments.Count) {
+                $taskInstallRoot = [System.IO.Path]::GetFullPath(
+                    [string]$arguments[$installRootSwitchIndexes[0] + 1]
+                )
+                $versionsRoot = [System.IO.Path]::GetFullPath(
+                    (Join-Path $expected.DataDir 'RuntimeVersions')
+                ).TrimEnd('\') + '\'
+                if ($taskInstallRoot.StartsWith(
+                    $versionsRoot,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $runtimeValidation = Test-CodexLocalRemoteRuntimeVersion `
+                        -RuntimeRoot $taskInstallRoot
+                    if ($runtimeValidation.IsValid) {
+                        $versionedExpected = Get-StartupTaskDefinition `
+                            -TaskName $TaskName `
+                            -NodePath $NodePath `
+                            -PwshPath $PwshPath `
+                            -InstallRoot $taskInstallRoot `
+                            -DataDir $DataDir `
+                            -Port $Port `
+                            -BrokerPort $BrokerPort `
+                            -BrokerUpstreamPort $BrokerUpstreamPort `
+                            -BasePath $BasePath
+                        $versioned = Test-ManagedStartupTask `
+                            -Task $Task `
+                            -Expected $versionedExpected
+                        if ($versioned.IsManaged) {
+                            return [pscustomobject]@{
+                                IsManaged = $true
+                                Kind = 'versioned-v3'
+                                Mismatches = @()
+                                Definition = $versionedExpected
+                            }
+                        }
                     }
                 }
             }
@@ -256,8 +336,13 @@ function Remove-LegacyPersistentOverride {
 }
 
 function Get-ManagedLauncherShortcutDefinition {
+    param(
+        [string]$RuntimeRoot = ([string]$expected.WorkingDirectory)
+    )
+
+    $resolvedRuntimeRoot = [System.IO.Path]::GetFullPath($RuntimeRoot)
     $launcher = [System.IO.Path]::GetFullPath(
-        (Join-Path $PSScriptRoot 'Launch-CodexWithRemote.ps1')
+        (Join-Path $resolvedRuntimeRoot 'scripts\windows\Launch-CodexWithRemote.ps1')
     )
     $safeLaunchName = 'Codex Remote (' +
         (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
@@ -299,7 +384,7 @@ function Get-ManagedLauncherShortcutDefinition {
                     ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
                 }
         ) -join ' '
-        WorkingDirectory = [System.IO.Path]::GetFullPath($expected.WorkingDirectory)
+        WorkingDirectory = $resolvedRuntimeRoot
         Description = "$safeLaunchName - Uses Remote when ready and otherwise starts Codex Desktop natively."
     }
 }
@@ -370,7 +455,10 @@ function Test-LegacyVisibleManagedLauncherShortcut {
 }
 
 function Install-ManagedLauncherShortcut {
-    param([Parameter(Mandatory)][object]$Definition)
+    param(
+        [Parameter(Mandatory)][object]$Definition,
+        [AllowNull()][object]$PreviousDefinition
+    )
 
     $upgradeExisting = $false
     if (Test-Path -LiteralPath $Definition.ShortcutPath) {
@@ -380,8 +468,13 @@ function Install-ManagedLauncherShortcut {
                 ShortcutPath = [string]$Definition.ShortcutPath
             }
         }
-        if (-not (Test-LegacyVisibleManagedLauncherShortcut `
-            -Definition $Definition)) {
+        $previousManaged = (
+            $null -ne $PreviousDefinition -and
+            (Test-ManagedLauncherShortcut -Definition $PreviousDefinition)
+        )
+        if (-not $previousManaged -and
+            -not (Test-LegacyVisibleManagedLauncherShortcut `
+                -Definition $Definition)) {
             throw "Launcher shortcut '$($Definition.ShortcutPath)' exists but is not the exact managed Codex Remote entry; refusing to overwrite it."
         }
         $upgradeExisting = $true
@@ -443,17 +536,22 @@ if ($null -ne $existing) {
 }
 
 $launcherDefinition = Get-ManagedLauncherShortcutDefinition
+$previousLauncherDefinition = if ($null -ne $activeRuntimeBefore) {
+    Get-ManagedLauncherShortcutDefinition -RuntimeRoot $activeRuntimeBefore.CurrentRoot
+} else {
+    Get-ManagedLauncherShortcutDefinition -RuntimeRoot $sourceInstallRoot
+}
 $requiredRuntimes = @(
-    @{ Name = 'PowerShell'; Path = $expected.Execute },
-    @{ Name = 'Node'; Path = $expected.Node },
-    @{ Name = 'startup bootstrap'; Path = $expected.Bootstrap },
-    @{ Name = 'built shared broker'; Path = $expected.BrokerCli },
-    @{ Name = 'built sidecar'; Path = $expected.Cli }
+    @{ Name = 'PowerShell'; Path = $sourceExpected.Execute },
+    @{ Name = 'Node'; Path = $sourceExpected.Node },
+    @{ Name = 'startup bootstrap'; Path = $sourceExpected.Bootstrap },
+    @{ Name = 'built shared broker'; Path = $sourceExpected.BrokerCli },
+    @{ Name = 'built sidecar'; Path = $sourceExpected.Cli }
 )
 if (-not $SkipEnvironmentConfiguration) {
     $requiredRuntimes += @{
         Name = 'fail-open Desktop launcher'
-        Path = $launcherDefinition.LauncherPath
+        Path = (Join-Path $sourceInstallRoot 'scripts\windows\Launch-CodexWithRemote.ps1')
     }
 }
 foreach ($runtime in $requiredRuntimes) {
@@ -489,26 +587,41 @@ $settings = New-ScheduledTaskSettingsSet `
 $legacyOverrideStatus = 'not-applied'
 $launcherStatus = 'not-applied'
 $tokenStatus = 'not-applied'
+$runtimePackageStatus = if (-not $useImmutableRuntime) {
+    'fixture-skipped'
+} else {
+    'not-applied'
+}
+$runtimeVersionId = if ($null -eq $runtimePlan) {
+    $null
+} else {
+    [string]$runtimePlan.VersionId
+}
 $resultStatus = if ($ownership.Kind -ceq 'current') {
     'already-registered'
 } else {
     'what-if'
 }
 
-if ($ownership.Kind -cin @('current', 'pinned-v2')) {
+if ($ownership.Kind -cin @('current', 'pinned-v2', 'mutable-v3', 'versioned-v3')) {
     if ($PSCmdlet.ShouldProcess(
         $TaskName,
-        "Ensure ancillary state for the exact V2 startup task"
+        "Install and activate the immutable runtime for the managed startup task"
     )) {
         $null = Protect-CodexLocalRemoteDataDirectory -DataDir $expected.DataDir
         $token = $null
         $launcher = $null
+        $runtime = $null
         try {
             if ($SkipEnvironmentConfiguration) {
                 $legacyOverrideStatus = 'fixture-skipped'
                 $launcherStatus = 'fixture-skipped'
                 $tokenStatus = 'fixture-skipped'
             } else {
+                if ($useImmutableRuntime) {
+                    $runtime = Install-CodexLocalRemoteRuntimeVersion -Plan $runtimePlan
+                    $runtimePackageStatus = [string]$runtime.Status
+                }
                 $legacyOverride = Remove-LegacyPersistentOverride `
                     -ManagedDataDir $expected.DataDir `
                     -ManagedBrokerPort $BrokerPort
@@ -516,20 +629,21 @@ if ($ownership.Kind -cin @('current', 'pinned-v2')) {
                 $token = Install-BrokerCapabilityToken -DataDir $expected.DataDir
                 $tokenStatus = $token.Status
                 $launcher = Install-ManagedLauncherShortcut `
-                    -Definition $launcherDefinition
+                    -Definition $launcherDefinition `
+                    -PreviousDefinition $previousLauncherDefinition
                 $launcherStatus = $launcher.Status
             }
 
-            if ($ownership.Kind -ceq 'pinned-v2') {
-                $pinnedTask = Get-ScheduledTask `
+            if ($ownership.Kind -cne 'current') {
+                $previousTask = Get-ScheduledTask `
                     -TaskName $TaskName `
                     -TaskPath '\' `
                     -ErrorAction SilentlyContinue
-                $pinnedOwnership = Test-ExistingTaskOwnership -Task $pinnedTask
-                if ($null -eq $pinnedTask -or
-                    -not $pinnedOwnership.IsManaged -or
-                    [string]$pinnedOwnership.Kind -cne 'pinned-v2') {
-                    throw "Scheduled task '$TaskName' changed before its pinned-runtime upgrade."
+                $previousOwnership = Test-ExistingTaskOwnership -Task $previousTask
+                if ($null -eq $previousTask -or
+                    -not $previousOwnership.IsManaged -or
+                    [string]$previousOwnership.Kind -cne [string]$ownership.Kind) {
+                    throw "Scheduled task '$TaskName' changed before its immutable-runtime upgrade."
                 }
                 Register-ScheduledTask `
                     -TaskName $TaskName `
@@ -550,11 +664,17 @@ if ($ownership.Kind -cin @('current', 'pinned-v2')) {
                     [string]$upgradedOwnership.Kind -cne 'current') {
                     throw "Scheduled task '$TaskName' did not converge to the dynamic-runtime V3 definition."
                 }
-                if ([string]$pinnedTask.State -ceq 'Running' -and
+                if ([string]$previousTask.State -ceq 'Running' -and
                     [string]$upgradedTask.State -cne 'Running') {
-                    throw "The running pinned V2 task did not remain Running after its definition-only V3 upgrade."
+                    throw 'The running managed task did not remain Running after its definition-only immutable-runtime upgrade.'
                 }
-                $resultStatus = 'upgraded-pinned-v2'
+                $resultStatus = "upgraded-$($ownership.Kind)-to-versioned-v3"
+            }
+
+            if ($useImmutableRuntime) {
+                $null = Set-CodexLocalRemoteCurrentRuntime `
+                    -DataDir $expected.DataDir `
+                    -Runtime $runtime
             }
 
             if (-not $NoStart) {
@@ -598,12 +718,17 @@ if ($ownership.Kind -cin @('current', 'pinned-v2')) {
     $null = Protect-CodexLocalRemoteDataDirectory -DataDir $expected.DataDir
     $token = $null
     $launcher = $null
+    $runtime = $null
     try {
         if ($SkipEnvironmentConfiguration) {
             $legacyOverrideStatus = 'fixture-skipped'
             $launcherStatus = 'fixture-skipped'
             $tokenStatus = 'fixture-skipped'
         } else {
+            if ($useImmutableRuntime) {
+                $runtime = Install-CodexLocalRemoteRuntimeVersion -Plan $runtimePlan
+                $runtimePackageStatus = [string]$runtime.Status
+            }
             $legacyOverride = Remove-LegacyPersistentOverride `
                 -ManagedDataDir $expected.DataDir `
                 -ManagedBrokerPort $BrokerPort
@@ -611,7 +736,8 @@ if ($ownership.Kind -cin @('current', 'pinned-v2')) {
             $token = Install-BrokerCapabilityToken -DataDir $expected.DataDir
             $tokenStatus = $token.Status
             $launcher = Install-ManagedLauncherShortcut `
-                -Definition $launcherDefinition
+                -Definition $launcherDefinition `
+                -PreviousDefinition $previousLauncherDefinition
             $launcherStatus = $launcher.Status
         }
         Register-ScheduledTask `
@@ -623,6 +749,11 @@ if ($ownership.Kind -cin @('current', 'pinned-v2')) {
             -Settings $settings `
             -Description $expected.Description | Out-Null
         $resultStatus = 'registered'
+        if ($useImmutableRuntime) {
+            $null = Set-CodexLocalRemoteCurrentRuntime `
+                -DataDir $expected.DataDir `
+                -Runtime $runtime
+        }
     } catch {
         if ($null -ne $launcher -and $launcher.Status -ceq 'created') {
             Remove-Item `
@@ -660,6 +791,9 @@ if ($ownership.Kind -cin @('current', 'pinned-v2')) {
     LauncherShortcut = $launcherStatus
     LegacyPersistentOverride = $legacyOverrideStatus
     BrokerCapabilityToken = $tokenStatus
+    RuntimePackage = $runtimePackageStatus
+    RuntimeVersionId = $runtimeVersionId
+    RuntimeRoot = [string]$expected.WorkingDirectory
     DataDirectoryAction = [string]$dataDirectoryPlan.Action
     DataDir = [string]$dataDirectoryPlan.DataDir
 }

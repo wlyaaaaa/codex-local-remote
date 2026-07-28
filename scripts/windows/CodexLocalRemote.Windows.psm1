@@ -2373,6 +2373,584 @@ function Write-AtomicJsonFile {
     }
 }
 
+function Get-CodexLocalRemoteRuntimeVersionPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $resolvedSourceRoot = [System.IO.Path]::GetFullPath($SourceRoot)
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    if (-not (Test-Path -LiteralPath $resolvedSourceRoot -PathType Container)) {
+        throw "Runtime source root '$resolvedSourceRoot' does not exist."
+    }
+    $sourceRootItem = Get-Item -LiteralPath $resolvedSourceRoot -Force -ErrorAction Stop
+    if (($sourceRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Runtime source root '$resolvedSourceRoot' is a reparse point."
+    }
+
+    $relativeFiles = [System.Collections.Generic.Dictionary[string, string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $requiredFile = Join-Path $resolvedSourceRoot 'package.json'
+    if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+        throw "Runtime package source '$requiredFile' is missing."
+    }
+    $relativeFiles['package.json'] = $requiredFile
+
+    foreach ($relativeDirectory in @(
+        'apps\broker\dist',
+        'apps\sidecar\dist',
+        'apps\web\dist',
+        'scripts\windows'
+    )) {
+        $directoryPath = Join-Path $resolvedSourceRoot $relativeDirectory
+        if (-not (Test-Path -LiteralPath $directoryPath -PathType Container)) {
+            throw "Runtime package source directory '$directoryPath' is missing. Run pnpm build first."
+        }
+        foreach ($directory in @(
+            Get-Item -LiteralPath $directoryPath -Force -ErrorAction Stop
+            Get-ChildItem -LiteralPath $directoryPath -Directory -Recurse -Force -ErrorAction Stop
+        )) {
+            if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Runtime package source directory '$($directory.FullName)' is a reparse point."
+            }
+        }
+        foreach ($file in @(
+            Get-ChildItem -LiteralPath $directoryPath -File -Recurse -Force -ErrorAction Stop
+        )) {
+            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Runtime package source file '$($file.FullName)' is a reparse point."
+            }
+            $relativePath = [System.IO.Path]::GetRelativePath(
+                $resolvedSourceRoot,
+                [string]$file.FullName
+            ).Replace('\', '/')
+            $relativeFiles[$relativePath] = [string]$file.FullName
+        }
+    }
+
+    $copyFiles = [System.Collections.Generic.List[object]]::new()
+    $manifestFiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($relativePath in @($relativeFiles.Keys | Sort-Object)) {
+        $sourcePath = [System.IO.Path]::GetFullPath($relativeFiles[$relativePath])
+        $item = Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Runtime package source '$sourcePath' is not an ordinary file."
+        }
+        $sha256 = (
+            Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256 -ErrorAction Stop
+        ).Hash.ToLowerInvariant()
+        $entry = [pscustomobject]@{
+            Path = $relativePath
+            Sha256 = $sha256
+            Size = [long]$item.Length
+        }
+        $manifestFiles.Add($entry)
+        $copyFiles.Add([pscustomobject]@{
+            Path = $relativePath
+            SourcePath = $sourcePath
+            Sha256 = $sha256
+            Size = [long]$item.Length
+        })
+    }
+    if ($copyFiles.Count -lt 5) {
+        throw 'The runtime package source set is unexpectedly incomplete.'
+    }
+
+    $sourceCommit = $null
+    $sourceDirty = $false
+    if ($null -ne (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+        $commitOutput = @(
+            & git.exe -C $resolvedSourceRoot rev-parse HEAD 2>$null
+        )
+        if ($LASTEXITCODE -eq 0 -and
+            $commitOutput.Count -eq 1 -and
+            [string]$commitOutput[0] -cmatch '^[a-f0-9]{40}$') {
+            $sourceCommit = [string]$commitOutput[0]
+            $statusOutput = @(
+                & git.exe -C $resolvedSourceRoot status --porcelain=v1 --untracked-files=all 2>$null
+            )
+            if ($LASTEXITCODE -eq 0) {
+                $sourceDirty = $statusOutput.Count -gt 0
+            }
+        }
+    }
+
+    $identity = [ordered]@{
+        Signature = 'codex-local-remote/runtime-content/v1'
+        Files = @($manifestFiles)
+    }
+    $versionId = Get-StringSha256 -Value (ConvertTo-CanonicalJson $identity)
+    $runtimeRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path (Join-Path $resolvedDataDir 'RuntimeVersions') $versionId)
+    )
+    $manifest = [ordered]@{
+        Signature = 'codex-local-remote/runtime-manifest/v1'
+        Version = 1
+        VersionId = $versionId
+        SourceCommit = $sourceCommit
+        SourceDirty = $sourceDirty
+        FileCount = $manifestFiles.Count
+        Files = @($manifestFiles)
+    }
+
+    return [pscustomobject]@{
+        Signature = 'codex-local-remote/runtime-plan/v1'
+        Version = 1
+        VersionId = $versionId
+        SourceRoot = $resolvedSourceRoot
+        DataDir = $resolvedDataDir
+        RuntimeRoot = $runtimeRoot
+        ManifestPath = Join-Path $runtimeRoot 'runtime-manifest.json'
+        SourceCommit = $sourceCommit
+        SourceDirty = $sourceDirty
+        Files = @($copyFiles)
+        Manifest = $manifest
+    }
+}
+
+function Test-CodexLocalRemoteRuntimeVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [string]$ExpectedVersionId,
+
+        [switch]$AllowStagingDirectory
+    )
+
+    $resolvedRuntimeRoot = [System.IO.Path]::GetFullPath($RuntimeRoot)
+    function New-InvalidRuntimeResult {
+        param([Parameter(Mandatory)][string]$Reason)
+
+        return [pscustomobject]@{
+            IsValid = $false
+            Reason = $Reason
+            VersionId = $null
+            RuntimeRoot = $resolvedRuntimeRoot
+            ManifestPath = Join-Path $resolvedRuntimeRoot 'runtime-manifest.json'
+            ManifestSha256 = $null
+            SourceCommit = $null
+            SourceDirty = $null
+        }
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $resolvedRuntimeRoot -PathType Container)) {
+            return New-InvalidRuntimeResult "runtime root '$resolvedRuntimeRoot' is missing"
+        }
+        $runtimeItem = Get-Item -LiteralPath $resolvedRuntimeRoot -Force -ErrorAction Stop
+        if (($runtimeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return New-InvalidRuntimeResult "runtime root '$resolvedRuntimeRoot' is a reparse point"
+        }
+        foreach ($directory in @(
+            Get-ChildItem -LiteralPath $resolvedRuntimeRoot -Directory -Recurse -Force -ErrorAction Stop
+        )) {
+            if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return New-InvalidRuntimeResult "runtime directory '$($directory.FullName)' is a reparse point"
+            }
+        }
+
+        $manifestPath = Join-Path $resolvedRuntimeRoot 'runtime-manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            return New-InvalidRuntimeResult "runtime manifest '$manifestPath' is missing"
+        }
+        $manifestItem = Get-Item -LiteralPath $manifestPath -Force -ErrorAction Stop
+        if (($manifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$manifestItem.Length -lt 32 -or
+            [long]$manifestItem.Length -gt 16777216) {
+            return New-InvalidRuntimeResult "runtime manifest '$manifestPath' is not an ordinary bounded file"
+        }
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 |
+            ConvertFrom-Json -Depth 50 -ErrorAction Stop
+        if ([string]$manifest.Signature -cne 'codex-local-remote/runtime-manifest/v1' -or
+            [int]$manifest.Version -ne 1 -or
+            [string]$manifest.VersionId -cnotmatch '^[a-f0-9]{64}$') {
+            return New-InvalidRuntimeResult 'runtime manifest schema is invalid'
+        }
+        $versionId = [string]$manifest.VersionId
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedVersionId) -and
+            $versionId -cne $ExpectedVersionId) {
+            return New-InvalidRuntimeResult "runtime version '$versionId' does not match expected '$ExpectedVersionId'"
+        }
+        if (-not $AllowStagingDirectory -and
+            [System.IO.Path]::GetFileName($resolvedRuntimeRoot) -cne $versionId) {
+            return New-InvalidRuntimeResult 'runtime directory name does not match its version id'
+        }
+        $manifestFiles = @($manifest.Files)
+        if ([int]$manifest.FileCount -ne $manifestFiles.Count -or
+            $manifestFiles.Count -lt 5) {
+            return New-InvalidRuntimeResult 'runtime manifest file count is invalid'
+        }
+
+        $seenPaths = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+        $normalizedFiles = [System.Collections.Generic.List[object]]::new()
+        foreach ($file in $manifestFiles) {
+            $relativePath = [string]$file.Path
+            if ([string]::IsNullOrWhiteSpace($relativePath) -or
+                $relativePath.Contains('\') -or
+                [System.IO.Path]::IsPathRooted($relativePath) -or
+                @($relativePath.Split('/')) | Where-Object { $_ -in @('', '.', '..') }) {
+                return New-InvalidRuntimeResult "runtime manifest path '$relativePath' is invalid"
+            }
+            if (-not $seenPaths.Add($relativePath)) {
+                return New-InvalidRuntimeResult "runtime manifest path '$relativePath' is duplicated"
+            }
+            $fileSha256 = [string]$file.Sha256
+            $fileSize = [long]$file.Size
+            if ($fileSha256 -cnotmatch '^[a-f0-9]{64}$' -or $fileSize -lt 0) {
+                return New-InvalidRuntimeResult "runtime manifest metadata for '$relativePath' is invalid"
+            }
+            $filePath = [System.IO.Path]::GetFullPath(
+                (Join-Path $resolvedRuntimeRoot $relativePath.Replace('/', '\'))
+            )
+            $runtimePrefix = $resolvedRuntimeRoot.TrimEnd('\') + '\'
+            if (-not $filePath.StartsWith(
+                $runtimePrefix,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                return New-InvalidRuntimeResult "runtime manifest path '$relativePath' escapes its root"
+            }
+            if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+                return New-InvalidRuntimeResult "runtime file '$relativePath' is missing"
+            }
+            $fileItem = Get-Item -LiteralPath $filePath -Force -ErrorAction Stop
+            if (($fileItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return New-InvalidRuntimeResult "runtime file '$relativePath' is a reparse point"
+            }
+            if ([long]$fileItem.Length -ne $fileSize) {
+                return New-InvalidRuntimeResult "runtime file '$relativePath' size does not match its manifest"
+            }
+            $actualSha256 = (
+                Get-FileHash -LiteralPath $filePath -Algorithm SHA256 -ErrorAction Stop
+            ).Hash.ToLowerInvariant()
+            if ($actualSha256 -cne $fileSha256) {
+                return New-InvalidRuntimeResult "runtime file '$relativePath' hash does not match its manifest"
+            }
+            $normalizedFiles.Add([pscustomobject]@{
+                Path = $relativePath
+                Sha256 = $fileSha256
+                Size = $fileSize
+            })
+        }
+        $identity = [ordered]@{
+            Signature = 'codex-local-remote/runtime-content/v1'
+            Files = @($normalizedFiles | Sort-Object Path)
+        }
+        $computedVersionId = Get-StringSha256 -Value (ConvertTo-CanonicalJson $identity)
+        if ($computedVersionId -cne $versionId) {
+            return New-InvalidRuntimeResult 'runtime manifest identity hash does not match its version id'
+        }
+        $manifestSha256 = (
+            Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256 -ErrorAction Stop
+        ).Hash.ToLowerInvariant()
+        return [pscustomobject]@{
+            IsValid = $true
+            Reason = 'valid'
+            VersionId = $versionId
+            RuntimeRoot = $resolvedRuntimeRoot
+            ManifestPath = $manifestPath
+            ManifestSha256 = $manifestSha256
+            SourceCommit = if ($null -eq $manifest.SourceCommit) {
+                $null
+            } else {
+                [string]$manifest.SourceCommit
+            }
+            SourceDirty = [bool]$manifest.SourceDirty
+        }
+    } catch {
+        return New-InvalidRuntimeResult $_.Exception.Message
+    }
+}
+
+function Install-CodexLocalRemoteRuntimeVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Plan
+    )
+
+    if ([string]$Plan.Signature -cne 'codex-local-remote/runtime-plan/v1' -or
+        [int]$Plan.Version -ne 1 -or
+        [string]$Plan.VersionId -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'The runtime version plan is invalid.'
+    }
+    $dataDir = [System.IO.Path]::GetFullPath([string]$Plan.DataDir)
+    $runtimeRoot = [System.IO.Path]::GetFullPath([string]$Plan.RuntimeRoot)
+    $versionsRoot = [System.IO.Path]::GetFullPath((Join-Path $dataDir 'RuntimeVersions'))
+    $expectedRuntimeRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $versionsRoot ([string]$Plan.VersionId))
+    )
+    if (-not [string]::Equals(
+        $runtimeRoot,
+        $expectedRuntimeRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'The runtime version plan target is outside the managed version directory.'
+    }
+
+    $null = Protect-CodexLocalRemoteDataDirectory -DataDir $dataDir
+    $null = [System.IO.Directory]::CreateDirectory($versionsRoot)
+    if (Test-Path -LiteralPath $runtimeRoot) {
+        $existing = Test-CodexLocalRemoteRuntimeVersion `
+            -RuntimeRoot $runtimeRoot `
+            -ExpectedVersionId ([string]$Plan.VersionId)
+        if (-not $existing.IsValid) {
+            throw "Existing runtime version '$runtimeRoot' is invalid: $($existing.Reason)."
+        }
+        return [pscustomobject]@{
+            Status = 'reused'
+            VersionId = [string]$existing.VersionId
+            RuntimeRoot = [string]$existing.RuntimeRoot
+            ManifestPath = [string]$existing.ManifestPath
+            ManifestSha256 = [string]$existing.ManifestSha256
+            SourceCommit = $existing.SourceCommit
+            SourceDirty = [bool]$existing.SourceDirty
+        }
+    }
+
+    $temporaryRoot = Join-Path $versionsRoot ".$([string]$Plan.VersionId).$([guid]::NewGuid().ToString('N')).installing"
+    $temporaryRoot = [System.IO.Path]::GetFullPath($temporaryRoot)
+    $createdTemporaryRoot = $false
+    try {
+        $null = [System.IO.Directory]::CreateDirectory($temporaryRoot)
+        $createdTemporaryRoot = $true
+        foreach ($file in @($Plan.Files)) {
+            $sourcePath = [System.IO.Path]::GetFullPath([string]$file.SourcePath)
+            $currentSource = Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop
+            if ($currentSource.PSIsContainer -or
+                ($currentSource.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Runtime package source '$sourcePath' is no longer an ordinary file."
+            }
+            $currentSha256 = (
+                Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256 -ErrorAction Stop
+            ).Hash.ToLowerInvariant()
+            if ($currentSha256 -cne [string]$file.Sha256 -or
+                [long]$currentSource.Length -ne [long]$file.Size) {
+                throw "Runtime package source '$sourcePath' changed after planning."
+            }
+            $destination = Join-Path $temporaryRoot ([string]$file.Path).Replace('/', '\')
+            $null = [System.IO.Directory]::CreateDirectory((Split-Path -Parent $destination))
+            Copy-Item -LiteralPath $sourcePath -Destination $destination
+        }
+        $temporaryManifestPath = Join-Path $temporaryRoot 'runtime-manifest.json'
+        ConvertTo-CanonicalJson $Plan.Manifest |
+            Set-Content -LiteralPath $temporaryManifestPath -Encoding utf8NoBOM
+        $temporaryValidation = Test-CodexLocalRemoteRuntimeVersion `
+            -RuntimeRoot $temporaryRoot `
+            -ExpectedVersionId ([string]$Plan.VersionId) `
+            -AllowStagingDirectory
+        if (-not $temporaryValidation.IsValid) {
+            throw "Staged runtime version is invalid: $($temporaryValidation.Reason)."
+        }
+        Move-Item -LiteralPath $temporaryRoot -Destination $runtimeRoot
+        $createdTemporaryRoot = $false
+        $installed = Test-CodexLocalRemoteRuntimeVersion `
+            -RuntimeRoot $runtimeRoot `
+            -ExpectedVersionId ([string]$Plan.VersionId)
+        if (-not $installed.IsValid) {
+            throw "Installed runtime version is invalid: $($installed.Reason)."
+        }
+        return [pscustomobject]@{
+            Status = 'installed'
+            VersionId = [string]$installed.VersionId
+            RuntimeRoot = [string]$installed.RuntimeRoot
+            ManifestPath = [string]$installed.ManifestPath
+            ManifestSha256 = [string]$installed.ManifestSha256
+            SourceCommit = $installed.SourceCommit
+            SourceDirty = [bool]$installed.SourceDirty
+        }
+    } finally {
+        if ($createdTemporaryRoot -and
+            (Test-Path -LiteralPath $temporaryRoot -PathType Container)) {
+            $temporaryParent = [System.IO.Path]::GetFullPath(
+                (Split-Path -Parent $temporaryRoot)
+            )
+            if ([string]::Equals(
+                $temporaryParent,
+                $versionsRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -and
+                [System.IO.Path]::GetFileName($temporaryRoot) -cmatch
+                '^\.[a-f0-9]{64}\.[a-f0-9]{32}\.installing$') {
+                Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
+            }
+        }
+    }
+}
+
+function Get-CodexLocalRemoteCurrentRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $pointerPath = Join-Path $resolvedDataDir 'runtime-current.json'
+    if (-not (Test-Path -LiteralPath $pointerPath -PathType Leaf)) {
+        return $null
+    }
+    $pointerItem = Get-Item -LiteralPath $pointerPath -Force -ErrorAction Stop
+    if (($pointerItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$pointerItem.Length -lt 32 -or
+        [long]$pointerItem.Length -gt 65536) {
+        throw "Runtime pointer '$pointerPath' is not an ordinary bounded file."
+    }
+    $pointer = Get-Content -LiteralPath $pointerPath -Raw -Encoding utf8 |
+        ConvertFrom-Json -Depth 20 -ErrorAction Stop
+    if ([string]$pointer.Signature -cne 'codex-local-remote/runtime-current/v1' -or
+        [int]$pointer.Version -ne 1 -or
+        [string]$pointer.CurrentVersionId -cnotmatch '^[a-f0-9]{64}$') {
+        throw "Runtime pointer '$pointerPath' has an invalid schema."
+    }
+
+    $versionsRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $resolvedDataDir 'RuntimeVersions')
+    )
+    $currentRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $versionsRoot ([string]$pointer.CurrentVersionId))
+    )
+    if (-not [string]::Equals(
+        $currentRoot,
+        [System.IO.Path]::GetFullPath([string]$pointer.CurrentRoot),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Runtime pointer '$pointerPath' current root is inconsistent."
+    }
+    $currentValidation = Test-CodexLocalRemoteRuntimeVersion `
+        -RuntimeRoot $currentRoot `
+        -ExpectedVersionId ([string]$pointer.CurrentVersionId)
+    if (-not $currentValidation.IsValid -or
+        [string]$currentValidation.ManifestSha256 -cne
+        [string]$pointer.CurrentManifestSha256) {
+        throw "Current runtime pointer is invalid: $($currentValidation.Reason)."
+    }
+
+    $previousVersionId = $pointer.PreviousVersionId
+    $previousRoot = $null
+    if ($null -ne $previousVersionId) {
+        if ([string]$previousVersionId -cnotmatch '^[a-f0-9]{64}$') {
+            throw "Runtime pointer '$pointerPath' previous version is invalid."
+        }
+        $previousRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $versionsRoot ([string]$previousVersionId))
+        )
+        if (-not [string]::Equals(
+            $previousRoot,
+            [System.IO.Path]::GetFullPath([string]$pointer.PreviousRoot),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "Runtime pointer '$pointerPath' previous root is inconsistent."
+        }
+        $previousValidation = Test-CodexLocalRemoteRuntimeVersion `
+            -RuntimeRoot $previousRoot `
+            -ExpectedVersionId ([string]$previousVersionId)
+        if (-not $previousValidation.IsValid -or
+            [string]$previousValidation.ManifestSha256 -cne
+            [string]$pointer.PreviousManifestSha256) {
+            throw "Previous runtime pointer is invalid: $($previousValidation.Reason)."
+        }
+    } elseif ($null -ne $pointer.PreviousRoot) {
+        throw "Runtime pointer '$pointerPath' has a previous root without a version."
+    }
+
+    return [pscustomobject]@{
+        Signature = [string]$pointer.Signature
+        Version = [int]$pointer.Version
+        CurrentVersionId = [string]$pointer.CurrentVersionId
+        CurrentRoot = $currentRoot
+        CurrentManifestSha256 = [string]$pointer.CurrentManifestSha256
+        PreviousVersionId = if ($null -eq $previousVersionId) {
+            $null
+        } else {
+            [string]$previousVersionId
+        }
+        PreviousRoot = $previousRoot
+        PreviousManifestSha256 = if ($null -eq $previousVersionId) {
+            $null
+        } else {
+            [string]$pointer.PreviousManifestSha256
+        }
+        UpdatedAtUtc = [string]$pointer.UpdatedAtUtc
+        PointerPath = $pointerPath
+    }
+}
+
+function Set-CodexLocalRemoteCurrentRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [object]$Runtime
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $runtimeRoot = [System.IO.Path]::GetFullPath([string]$Runtime.RuntimeRoot)
+    $runtimeValidation = Test-CodexLocalRemoteRuntimeVersion `
+        -RuntimeRoot $runtimeRoot `
+        -ExpectedVersionId ([string]$Runtime.VersionId)
+    if (-not $runtimeValidation.IsValid) {
+        throw "Refusing to activate an invalid runtime: $($runtimeValidation.Reason)."
+    }
+    $expectedRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path (Join-Path $resolvedDataDir 'RuntimeVersions') ([string]$Runtime.VersionId))
+    )
+    if (-not [string]::Equals(
+        $runtimeRoot,
+        $expectedRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'Refusing to activate a runtime outside the managed version directory.'
+    }
+
+    $previous = Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+    $previousVersionId = $null
+    $previousRoot = $null
+    $previousManifestSha256 = $null
+    if ($null -ne $previous) {
+        if ([string]$previous.CurrentVersionId -ceq [string]$Runtime.VersionId) {
+            $previousVersionId = $previous.PreviousVersionId
+            $previousRoot = $previous.PreviousRoot
+            $previousManifestSha256 = $previous.PreviousManifestSha256
+        } else {
+            $previousVersionId = [string]$previous.CurrentVersionId
+            $previousRoot = [string]$previous.CurrentRoot
+            $previousManifestSha256 = [string]$previous.CurrentManifestSha256
+        }
+    }
+    $pointer = [ordered]@{
+        Signature = 'codex-local-remote/runtime-current/v1'
+        Version = 1
+        CurrentVersionId = [string]$runtimeValidation.VersionId
+        CurrentRoot = [string]$runtimeValidation.RuntimeRoot
+        CurrentManifestSha256 = [string]$runtimeValidation.ManifestSha256
+        PreviousVersionId = $previousVersionId
+        PreviousRoot = $previousRoot
+        PreviousManifestSha256 = $previousManifestSha256
+        UpdatedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $pointerPath = Join-Path $resolvedDataDir 'runtime-current.json'
+    Write-AtomicJsonFile -Path $pointerPath -Value $pointer
+    $readBack = Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+    if ($null -eq $readBack -or
+        [string]$readBack.CurrentVersionId -cne [string]$Runtime.VersionId) {
+        throw 'The active runtime pointer failed read-back verification.'
+    }
+    return $readBack
+}
+
 function Get-UserEnvironmentValueState {
     [CmdletBinding()]
     param(
@@ -3305,6 +3883,11 @@ Export-ModuleMember -Function @(
     'Test-IndependentDesktopAppServer',
     'Assert-ForceCliDisabled',
     'Write-AtomicJsonFile',
+    'Get-CodexLocalRemoteRuntimeVersionPlan',
+    'Test-CodexLocalRemoteRuntimeVersion',
+    'Install-CodexLocalRemoteRuntimeVersion',
+    'Get-CodexLocalRemoteCurrentRuntime',
+    'Set-CodexLocalRemoteCurrentRuntime',
     'Get-UserEnvironmentValueState',
     'New-BrokerEnvironmentBackupState',
     'Set-UserEnvironmentValue',

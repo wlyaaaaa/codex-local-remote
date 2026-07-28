@@ -139,6 +139,20 @@ describe("project file boundary", () => {
     }
   });
 
+  it("rejects a harmless-looking junction whose physical target is Git internals", async () => {
+    const { root, state } = await createFixture();
+    await writeFile(path.join(root, ".git", "config"), "[core]\n", "utf8");
+    await symlink(path.join(root, ".git"), path.join(root, "safe-alias"), "junction");
+
+    const listing = await listProjectFiles(state, "project-1", "");
+    expect(listing.entries.map((entry) => entry.name)).not.toContain("safe-alias");
+    await expect(
+      resolveProjectFileReference(state, "project-1", "safe-alias/config"),
+    ).rejects.toMatchObject({
+      code: "FILE_PROTECTED",
+    });
+  });
+
   it("rejects every file sink when a registered root is rebound to a junction", async () => {
     const { root, state } = await createFixture();
     const originalRoot = `${root}-original`;

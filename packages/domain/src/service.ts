@@ -1025,11 +1025,10 @@ export class CodexDomainService {
     }
 
     if (!this.#protocolClientMethods.has("thread/turns/list")) {
-      return asRecord(
-        await this.#gateway.request("thread/read", {
-          includeTurns: true,
-          threadId,
-        }),
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "当前 Codex 版本不支持安全的长对话分页；远程端不会读取无界历史",
+        409,
       );
     }
 
@@ -1057,14 +1056,10 @@ export class CodexDomainService {
         },
       };
     } catch {
-      // Older or temporarily incompatible app-server builds keep the stable
-      // full-read path. The protocol catalog is regenerated after upgrades, so
-      // supported builds never pay the unbounded transcript cost on first load.
-      return asRecord(
-        await this.#gateway.request("thread/read", {
-          includeTurns: true,
-          threadId,
-        }),
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "当前 Codex 版本的分页接口暂时不可用；为避免长对话卡死，未回退到无界历史读取",
+        409,
       );
     }
   }
@@ -1673,16 +1668,24 @@ export class CodexDomainService {
     threadId: string,
     clientUserMessageId: string,
   ): Promise<
-    { state: "accepted"; turnId?: string } | { state: "active" | "absent-idle" | "unknown" }
+    | {
+        lifecycle: "active" | "completed" | "failed" | "unknown";
+        state: "accepted";
+        turnId?: string;
+      }
+    | { state: "active" | "absent-idle" | "unknown" }
   > {
     await this.#prepareManagedThread(threadId);
     const normalizedClientId = requireNonEmpty(clientUserMessageId, "消息标识");
     if (normalizedClientId.length > 512) {
       throw new DomainError("INVALID_INPUT", "消息标识无效", 400);
     }
-    const response = asRecord(
-      await this.#gateway.request("thread/read", { includeTurns: true, threadId }),
-    );
+    let response: Record<string, unknown>;
+    try {
+      response = await this.#readThreadForDisplay(threadId, true);
+    } catch {
+      return { state: "unknown" };
+    }
     const thread = asRecord(response.thread);
     const turns = asRecordArray(thread.turns);
     for (const turn of turns) {
@@ -1691,7 +1694,17 @@ export class CodexDomainService {
       );
       if (matched) {
         const turnId = asString(turn.id);
+        const status = asString(turn.status);
+        const lifecycle =
+          status === "inProgress"
+            ? "active"
+            : status === "completed"
+              ? "completed"
+              : status === "cancelled" || status === "failed" || status === "interrupted"
+                ? "failed"
+                : "unknown";
         return {
+          lifecycle,
           state: "accepted",
           ...(turnId === undefined ? {} : { turnId }),
         };
@@ -1931,9 +1944,7 @@ export class CodexDomainService {
       const responses = await Promise.all(
         batch.map(async (threadId) => {
           try {
-            const response = asRecord(
-              await this.#gateway.request("thread/read", { includeTurns: true, threadId }),
-            );
+            const response = await this.#readThreadForDisplay(threadId, true);
             const thread = asRecord(response.thread);
             return asString(thread.id) ? thread : undefined;
           } catch {
@@ -2301,9 +2312,7 @@ export class CodexDomainService {
     );
     for (const threadId of candidates) {
       try {
-        const response = asRecord(
-          await this.#gateway.request("thread/read", { includeTurns: true, threadId }),
-        );
+        const response = await this.#readThreadForDisplay(threadId, true);
         const thread = asRecord(response.thread);
         const safelyTerminal = isInitialTurnSafelyTerminal(thread);
         const restoredWithPersistedItem =

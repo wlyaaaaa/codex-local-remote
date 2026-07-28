@@ -27,6 +27,10 @@ node apps/sidecar/dist/cli.js register-project `
 .\scripts\windows\Register-CodexLocalRemoteStartup.ps1 -NoStart
 ```
 
+注册器会把当前构建安装到内容寻址的不可变版本目录；计划任务和开始菜单入口
+不会直接绑定可变 Git 工作树。状态命令中的 `RuntimeVersionId` 可用于确认
+实际登记版本。
+
 首次接入共享运行时需要一次人工门禁：完成手头任务，完全退出 Codex
 Desktop，启动 `Codex Local Remote` 计划任务，再从开始菜单打开
 “Codex Remote（安全启动）”。以后日常都使用这个入口；Remote 未就绪时它会
@@ -61,10 +65,12 @@ Tailscale 或本项目 App；“添加到主屏幕”只是可选快捷方式。
 
 ## 更新
 
-普通源码更新先运行 `pnpm check`。正在使用 Desktop 时，不要停止 Broker，
-不要设置用户级 `CODEX_APP_SERVER_WS_URL`。Web/Sidecar 可以单独更新；
-Broker 或 Codex Desktop 兼容层留到下一次自然、受控的 Desktop 重启窗口
-切换。状态为 `update-pending` 表示旧链被安全保留，不代表要立刻强制重启。
+普通源码更新先运行 `pnpm check`，再执行
+`Register-CodexLocalRemoteStartup.ps1 -NoStart` 登记新的不可变版本。正在
+使用 Desktop 时不要停止 Broker，也不要设置用户级
+`CODEX_APP_SERVER_WS_URL`；当前运行代继续工作，下一次自然启动才切换。需要
+撤回下一次启动版本时运行 `Rollback-CodexLocalRemoteRuntime.ps1`。状态为
+`update-pending` 表示旧链被安全保留，不代表要立刻强制重启。
 
 遇到问题先运行：
 

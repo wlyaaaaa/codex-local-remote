@@ -14,7 +14,8 @@
 **[Five-minute setup](docs/quickstart.md)** ·
 **[Install with AI](docs/ai-install-prompt.md)** ·
 **[中文介绍](#中文介绍)** ·
-**[Latest release](https://github.com/wlyaaaaa/codex-local-remote/releases/latest)**
+**[Latest release](https://github.com/wlyaaaaa/codex-local-remote/releases/latest)** ·
+**[v0.1.1 notes](docs/release-notes-v0.1.1.md)**
 
 ## Install with AI — one prompt
 
@@ -196,10 +197,13 @@ Broker 和 Sidecar 先完成传输握手，再启动并等待 Desktop 接入；�
 Codex Desktop 或随附 Codex 后，仍必须重新进行 Desktop、Sidecar、Broker
 同实例的实机验收，不能只凭单元测试宣称兼容。
 
-Remote 自身更新也遵循同一条桌面优先边界：新构建可以写入磁盘，Sidecar
-可以在任务空闲时单独热更新；只要 Desktop 或任何远程任务仍依赖当前 Broker，
-停止脚本就会拒绝终止它。Broker 代码与 Codex Desktop 新安装代只在自然的
-受控重启窗口切换，不能为了“让更新立即生效”打断桌面登录或正在运行的任务。
+Remote 自身更新也遵循同一条桌面优先边界：注册器把构建安装到
+`RuntimeVersions/<content-sha256>`，manifest 记录源码 commit 和逐文件
+SHA-256；计划任务与安全启动快捷方式不直接执行可变 Git 工作树。
+`runtime-current.json` 保留当前/上一版本，支持只切换下一次启动版本的回滚。
+只要 Desktop 或任何远程任务仍依赖当前 Broker，停止脚本就会拒绝终止它；
+新运行代只在自然的受控启动窗口切换，不能为了“让更新立即生效”打断桌面登录
+或正在运行的任务。
 
 ## 当前状态
 

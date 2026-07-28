@@ -14,6 +14,7 @@ export interface LoginRateLimiterConfig {
 
 interface AttemptState {
   failures: number[];
+  inFlight: number;
   nextAllowedAt: number;
   lockedUntil: number;
   lastSeenAt: number;
@@ -38,6 +39,7 @@ function validateScope(config: LoginRateLimitScopeConfig, label: string): void {
 function emptyState(): AttemptState {
   return {
     failures: [],
+    inFlight: 0,
     nextAllowedAt: 0,
     lockedUntil: 0,
     lastSeenAt: 0,
@@ -87,17 +89,74 @@ export class LoginRateLimiter {
     return this.#decision(state, now, "source");
   }
 
+  reserveAttempt(source: string, now: number): LoginRateLimitDecision {
+    this.#validateSource(source);
+    this.#validateNow(now);
+    this.#prune(this.#global, this.#config.global, now);
+    const globalDecision = this.#reservationDecision(
+      this.#global,
+      this.#config.global,
+      now,
+      "global",
+    );
+    if (!globalDecision.allowed) {
+      return globalDecision;
+    }
+    const sourceState = this.#getOrCreateSource(source, now);
+    this.#prune(sourceState, this.#config.source, now);
+    const sourceDecision = this.#reservationDecision(
+      sourceState,
+      this.#config.source,
+      now,
+      "source",
+    );
+    if (!sourceDecision.allowed) {
+      return sourceDecision;
+    }
+    sourceState.inFlight += 1;
+    sourceState.lastSeenAt = now;
+    this.#global.inFlight += 1;
+    this.#global.lastSeenAt = now;
+    return { allowed: true };
+  }
+
   recordFailure(source: string, now: number): void {
     this.#validateSource(source);
     this.#validateNow(now);
     const sourceState = this.#getOrCreateSource(source, now);
+    this.#releaseReservation(sourceState);
+    this.#releaseReservation(this.#global);
     this.#recordFailureForState(sourceState, this.#config.source, now, true);
     this.#recordFailureForState(this.#global, this.#config.global, now, false);
   }
 
   recordSuccess(source: string): void {
     this.#validateSource(source);
-    this.#sources.delete(source);
+    const sourceState = this.#sources.get(source);
+    if (sourceState !== undefined) {
+      this.#releaseReservation(sourceState);
+      sourceState.failures = [];
+      sourceState.lockedUntil = 0;
+      sourceState.nextAllowedAt = 0;
+      if (sourceState.inFlight === 0) {
+        this.#sources.delete(source);
+      }
+    }
+    this.#releaseReservation(this.#global);
+  }
+
+  cancelAttempt(source: string, now: number): void {
+    this.#validateSource(source);
+    this.#validateNow(now);
+    const sourceState = this.#sources.get(source);
+    if (sourceState !== undefined) {
+      this.#releaseReservation(sourceState);
+      sourceState.lastSeenAt = now;
+      if (sourceState.inFlight === 0 && sourceState.failures.length === 0) {
+        this.#sources.delete(source);
+      }
+    }
+    this.#releaseReservation(this.#global);
   }
 
   #recordFailureForState(
@@ -131,6 +190,30 @@ export class LoginRateLimiter {
       };
     }
     return { allowed: true };
+  }
+
+  #reservationDecision(
+    state: AttemptState,
+    config: LoginRateLimitScopeConfig,
+    now: number,
+    scope: "source" | "global",
+  ): LoginRateLimitDecision {
+    const current = this.#decision(state, now, scope);
+    if (!current.allowed) {
+      return current;
+    }
+    if (state.failures.length + state.inFlight >= config.maxAttempts) {
+      return {
+        allowed: false,
+        retryAfterMs: this.#config.baseDelayMs,
+        scope,
+      };
+    }
+    return { allowed: true };
+  }
+
+  #releaseReservation(state: AttemptState): void {
+    state.inFlight = Math.max(0, state.inFlight - 1);
   }
 
   #prune(state: AttemptState, scope: LoginRateLimitScopeConfig, now: number): void {

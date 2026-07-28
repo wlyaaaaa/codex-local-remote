@@ -2566,20 +2566,7 @@ function AccessAndReviewerSheet({
   );
 }
 
-function ConversationPage({
-  apiClient,
-  approvals,
-  capabilities,
-  collaborationModes,
-  liveEvents,
-  models,
-  online,
-  onOpenApproval,
-  onThreadLoaded,
-  onSubagentsLoaded,
-  onUsageLoaded,
-  threadSummaries,
-}: {
+type ConversationPageProps = {
   apiClient: ApiClient;
   approvals: ApprovalRequest[];
   capabilities: ProductCapabilities | undefined;
@@ -2592,8 +2579,28 @@ function ConversationPage({
   onSubagentsLoaded: (agents: SubagentSummary[]) => void;
   onUsageLoaded: (usage?: UsageSnapshot) => void;
   threadSummaries: ThreadSummary[];
-}) {
+};
+
+function ConversationPage(props: ConversationPageProps) {
   const { id = "" } = useParams();
+  return <ConversationPageInstance key={id} {...props} id={id} />;
+}
+
+function ConversationPageInstance({
+  apiClient,
+  approvals,
+  capabilities,
+  collaborationModes,
+  liveEvents,
+  models,
+  online,
+  onOpenApproval,
+  onThreadLoaded,
+  onSubagentsLoaded,
+  onUsageLoaded,
+  threadSummaries,
+  id,
+}: ConversationPageProps & { id: string }) {
   const navigate = useNavigate();
   const location = useLocation();
   const summary = threadSummaries.find((candidate) => candidate.id === id);

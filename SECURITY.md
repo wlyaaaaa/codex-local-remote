@@ -23,8 +23,9 @@ Particularly sensitive reports include:
 ## Supported versions
 
 Until the first stable release, only the most recent tagged preview is supported.
-Protocol compatibility is checked against the Codex version listed in each
-release note.
+Protocol compatibility is checked against the exact Codex Desktop package/runtime
+receipt recorded by a release when that evidence exists. A release without that
+receipt is explicitly compatibility-unverified rather than silently covered.
 
 ## Safe defaults
 

@@ -216,4 +216,20 @@ describe("SidecarStateStore", () => {
     ) as { sessions: Record<string, { lastSeenAtMs: number }> };
     expect(afterInterval.sessions[session.record.tokenDigest]?.lastSeenAtMs).toBe(61_001);
   });
+
+  it("recovers later persistence after one state-file I/O failure", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    const statePath = path.join(directory, "state.json");
+    await mkdir(statePath);
+
+    await expect(store.createSession(1_000, "csrf-fails-once")).rejects.toThrow();
+
+    await rm(statePath, { force: true, recursive: true });
+    await expect(store.setPasswordHash("fixture-password-hash")).resolves.toBeUndefined();
+    await expect(readFile(statePath, "utf8")).resolves.toContain("fixture-password-hash");
+  });
 });

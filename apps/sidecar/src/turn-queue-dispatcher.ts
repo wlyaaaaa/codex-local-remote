@@ -16,7 +16,12 @@ export interface TurnQueueGateway {
     threadId: string,
     clientUserMessageId: string,
   ): Promise<
-    { state: "accepted"; turnId?: string } | { state: "active" | "absent-idle" | "unknown" }
+    | {
+        lifecycle?: "active" | "completed" | "failed" | "unknown";
+        state: "accepted";
+        turnId?: string;
+      }
+    | { state: "active" | "absent-idle" | "unknown" }
   >;
   startTurn(
     threadId: string,
@@ -234,7 +239,20 @@ export class TurnQueueDispatcher {
           item.clientUserMessageId,
         );
         if (result.state === "accepted") {
-          await this.#outbox.markStarted(item.id, result.turnId);
+          if (result.lifecycle === "completed") {
+            await this.#outbox.reconcileAcceptedTerminal(item.id, {
+              status: "completed",
+              ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
+            });
+          } else if (result.lifecycle === "failed") {
+            await this.#outbox.reconcileAcceptedTerminal(item.id, {
+              issue: "PREVIOUS_TURN_DID_NOT_COMPLETE",
+              status: "failed",
+              ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
+            });
+          } else {
+            await this.#outbox.markStarted(item.id, result.turnId);
+          }
         } else {
           await this.#outbox.markAmbiguous(item.id);
         }

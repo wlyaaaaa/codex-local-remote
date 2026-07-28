@@ -54,11 +54,19 @@ if (-not [string]::IsNullOrWhiteSpace($LauncherShortcutPath) -and
     $env:CODEX_REMOTE_TEST_FIXTURE -cne '1') {
     throw 'LauncherShortcutPath is reserved for the isolated test fixture.'
 }
+$sourceInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+$effectiveInstallRoot = $sourceInstallRoot
+if (-not $SkipEnvironmentConfiguration) {
+    $currentRuntime = Get-CodexLocalRemoteCurrentRuntime -DataDir $DataDir
+    if ($null -ne $currentRuntime) {
+        $effectiveInstallRoot = [string]$currentRuntime.CurrentRoot
+    }
+}
 $expected = Get-StartupTaskDefinition `
     -TaskName $TaskName `
     -NodePath $NodePath `
     -PwshPath $PwshPath `
-    -InstallRoot $InstallRoot `
+    -InstallRoot $effectiveInstallRoot `
     -DataDir $DataDir `
     -Port $Port `
     -BrokerPort $BrokerPort `
@@ -67,12 +75,12 @@ $expected = Get-StartupTaskDefinition `
 $legacyExpected = Get-LegacyStartupTaskDefinition `
     -TaskName $TaskName `
     -NodePath $NodePath `
-    -InstallRoot $InstallRoot `
+    -InstallRoot $sourceInstallRoot `
     -DataDir $DataDir `
     -Port $Port `
     -BasePath $BasePath
-$sidecarStopScript = Join-Path $PSScriptRoot 'Stop-CodexLocalRemoteSidecar.ps1'
-$brokerStopScript = Join-Path $PSScriptRoot 'Stop-CodexAppServerBroker.ps1'
+$sidecarStopScript = Join-Path $effectiveInstallRoot 'scripts\windows\Stop-CodexLocalRemoteSidecar.ps1'
+$brokerStopScript = Join-Path $effectiveInstallRoot 'scripts\windows\Stop-CodexAppServerBroker.ps1'
 
 function Test-ExistingTaskOwnership {
     param([AllowNull()][object]$Task)
@@ -105,7 +113,7 @@ function Test-ExistingTaskOwnership {
                     -NodePath $NodePath `
                     -CodexPath ([string]$arguments[$codexSwitchIndexes[0] + 1]) `
                     -PwshPath $PwshPath `
-                    -InstallRoot $InstallRoot `
+                    -InstallRoot $sourceInstallRoot `
                     -DataDir $DataDir `
                     -Port $Port `
                     -BrokerPort $BrokerPort `
@@ -257,7 +265,7 @@ function Remove-LegacyPersistentOverride {
 
 function Get-ManagedLauncherShortcutDefinition {
     $launcher = [System.IO.Path]::GetFullPath(
-        (Join-Path $PSScriptRoot 'Launch-CodexWithRemote.ps1')
+        (Join-Path $expected.WorkingDirectory 'scripts\windows\Launch-CodexWithRemote.ps1')
     )
     $safeLaunchName = 'Codex Remote (' +
         (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
@@ -341,6 +349,112 @@ function Test-ManagedLauncherShortcut {
     }
 }
 
+function Get-UninstallRuntimePreflight {
+    if ($SkipEnvironmentConfiguration -or $SkipRuntimeStop) {
+        return [pscustomobject]@{
+            Status = 'fixture-skipped'
+            BrokerProcessId = $null
+            SidecarConnected = $false
+        }
+    }
+
+    $listeners = @(
+        Get-NetTCPConnection `
+            -State Listen `
+            -LocalPort $BrokerPort `
+            -ErrorAction SilentlyContinue
+    )
+    if ($listeners.Count -eq 0) {
+        return [pscustomobject]@{
+            Status = 'not-running'
+            BrokerProcessId = $null
+            SidecarConnected = $false
+        }
+    }
+    if (@(
+        $listeners |
+            Where-Object {
+                -not (Test-IsLoopbackListenerAddress -Address $_.LocalAddress)
+            }
+    ).Count -gt 0) {
+        throw "Broker port $BrokerPort has a non-loopback listener; refusing uninstall before any mutation."
+    }
+    $managedListeners = @(Get-ManagedIpv4Listeners -Listeners $listeners)
+    $listenerPids = @(
+        $managedListeners |
+            Select-Object -ExpandProperty OwningProcess -Unique
+    )
+    if ($managedListeners.Count -eq 0 -or $listenerPids.Count -ne 1) {
+        throw "Broker port $BrokerPort has ambiguous listener ownership; refusing uninstall before any mutation."
+    }
+
+    $statePath = Join-Path $expected.DataDir 'app-server-broker.json'
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        throw "Broker port $BrokerPort is live without its exact managed state; refusing uninstall before any mutation."
+    }
+    $state = Get-Content -LiteralPath $statePath -Raw |
+        ConvertFrom-Json -Depth 20
+    $brokerCli = [System.IO.Path]::GetFullPath(
+        (Join-Path ([System.IO.Path]::GetFullPath($expected.WorkingDirectory)) 'apps\broker\dist\cli.js')
+    )
+    $processId = [int]$listenerPids[0]
+    $process = Get-CimInstance `
+        Win32_Process `
+        -Filter "ProcessId = $processId" `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $process -or
+        [int]$state.ProcessId -ne $processId -or
+        [string]$state.NodePath -cne [System.IO.Path]::GetFullPath($expected.Node) -or
+        [string]$state.BrokerCliPath -cne $brokerCli) {
+        throw "Broker listener and managed startup state disagree; refusing uninstall before any mutation."
+    }
+    $ownership = Test-ManagedBrokerProcess `
+        -CommandLine ([string]$process.CommandLine) `
+        -ExecutablePath ([string]$process.ExecutablePath) `
+        -ExpectedNodePath $expected.Node `
+        -ExpectedBrokerCliPath $brokerCli `
+        -BrokerPort $BrokerPort `
+        -UpstreamPort $BrokerUpstreamPort `
+        -ExpectedCodexPath ([string]$state.CodexPath) `
+        -DataDir $expected.DataDir `
+        -CapabilityTokenFilePath (Get-BrokerCapabilityTokenPath -DataDir $expected.DataDir)
+    if (-not $ownership.IsManaged) {
+        throw "Broker process is not the exact managed runtime ($($ownership.Reason)); refusing uninstall before any mutation."
+    }
+
+    $readiness = try {
+        Invoke-RestMethod `
+            -Method Get `
+            -Uri "http://127.0.0.1:$BrokerPort/ready" `
+            -TimeoutSec 2
+    } catch {
+        $null
+    }
+    if ($null -eq $readiness -or
+        $null -eq $readiness.PSObject.Properties['brokerProcessId'] -or
+        $null -eq $readiness.PSObject.Properties['desktopConnected'] -or
+        $null -eq $readiness.PSObject.Properties['sidecarConnected'] -or
+        $null -eq $readiness.PSObject.Properties['unsafeThreadCount'] -or
+        -not (Test-NonNegativeInteger -Value $readiness.brokerProcessId) -or
+        [int]$readiness.brokerProcessId -ne $processId -or
+        $readiness.desktopConnected -isnot [bool] -or
+        $readiness.sidecarConnected -isnot [bool] -or
+        -not (Test-NonNegativeInteger -Value $readiness.unsafeThreadCount)) {
+        throw 'Unable to prove managed Broker quiescence; refusing uninstall before any mutation.'
+    }
+    if ([bool]$readiness.desktopConnected) {
+        throw 'Codex Desktop is connected to the shared Broker. Close Desktop before uninstall; no task or process was changed.'
+    }
+    if ([int]$readiness.unsafeThreadCount -gt 0) {
+        throw 'At least one turn lifecycle is active, pending, or unknown. Uninstall was refused before any task or process change.'
+    }
+    return [pscustomobject]@{
+        Status = 'quiescent'
+        BrokerProcessId = $processId
+        SidecarConnected = [bool]$readiness.sidecarConnected
+    }
+}
+
 $launcherDefinition = Get-ManagedLauncherShortcutDefinition
 $existing = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
 $ownership = Test-ExistingTaskOwnership -Task $existing
@@ -365,6 +479,7 @@ $launcherPreflight = if ($SkipEnvironmentConfiguration) {
 } else {
     throw "Launcher shortcut '$($launcherDefinition.ShortcutPath)' is not the exact managed Codex Remote entry; refusing to remove it."
 }
+$runtimeStopPreflight = Get-UninstallRuntimePreflight
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task')) {
     # Re-check immediately before the first mutation so a same-name replacement
@@ -375,6 +490,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task')) {
         throw "Scheduled task '$TaskName' changed before removal and is not the exact managed task; refusing to stop or remove it."
     }
     $expectedTaskKind = [string]$currentOwnership.Kind
+    $runtimeStopPreflight = Get-UninstallRuntimePreflight
 
     if ($null -ne $current) {
         Stop-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction Stop
@@ -401,7 +517,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task')) {
             -Confirm:$false | Out-Null
         & $brokerStopScript `
             -NodePath $expected.Node `
-            -InstallRoot $InstallRoot `
+            -InstallRoot $expected.WorkingDirectory `
             -DataDir $expected.DataDir `
             -BrokerPort $BrokerPort `
             -BrokerUpstreamPort $BrokerUpstreamPort `

@@ -285,6 +285,42 @@ describe("TurnQueueDispatcher", () => {
     expect(accepted.clientUserMessageId).toBeTruthy();
   });
 
+  it("removes an already-completed accepted turn after restart and dispatches the next message", async () => {
+    const current = await fixture("idle");
+    await current.outbox.enqueue({
+      idempotencyScope: "completed-before-restart",
+      input: { prompt: "已经完成，不应在重启后卡住队列" },
+      threadId: "thread-completed",
+    });
+    await current.outbox.claimNext("thread-completed");
+    await current.outbox.enqueue({
+      idempotencyScope: "next-after-completed",
+      input: { prompt: "完成项清理后应继续发送" },
+      threadId: "thread-completed",
+    });
+    current.reconcileClientUserMessage.mockResolvedValueOnce({
+      lifecycle: "completed",
+      state: "accepted",
+      turnId: "turn-already-completed",
+    });
+
+    await current.dispatcher.reconcileAfterRestart();
+
+    expect(current.startTurn).toHaveBeenCalledTimes(1);
+    expect(current.startTurn).toHaveBeenCalledWith(
+      "thread-completed",
+      expect.objectContaining({ prompt: "完成项清理后应继续发送" }),
+    );
+    await expect(current.outbox.snapshot("thread-completed")).resolves.toMatchObject({
+      items: [
+        {
+          state: "started",
+          turnId: "turn-dispatched",
+        },
+      ],
+    });
+  });
+
   it("pauses an unknown previous lifecycle after restart instead of dispatching from idle alone", async () => {
     const beforeRestart = await fixture("active");
     await beforeRestart.outbox.enqueue({

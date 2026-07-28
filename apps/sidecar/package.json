@@ -1,6 +1,6 @@
 {
   "name": "@codex-local-remote/sidecar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "bin": {
@@ -10,7 +10,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && esbuild src/cli.ts --bundle --platform=node --target=node24 --format=esm --outfile=dist/cli.js --sourcemap --external:fastify --external:@fastify/static",
+    "build": "tsc -p tsconfig.build.json && esbuild src/cli.ts --bundle --platform=node --target=node24 --format=esm --banner:js=\"import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);\" --outfile=dist/cli.js --sourcemap",
     "dev": "tsx watch src/cli.ts serve",
     "start": "node dist/cli.js serve",
     "test": "vitest run",

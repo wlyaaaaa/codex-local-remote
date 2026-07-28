@@ -327,7 +327,7 @@ export class SidecarStateStore {
 
   async #persist(): Promise<void> {
     const snapshot = JSON.stringify(this.#state, null, 2);
-    this.#writeChain = this.#writeChain.then(async () => {
+    const operation = this.#writeChain.then(async () => {
       const temporaryPath = path.join(
         this.#dataDir,
         `.state-${process.pid}-${randomBytes(6).toString("hex")}.tmp`,
@@ -335,7 +335,11 @@ export class SidecarStateStore {
       await writeFile(temporaryPath, snapshot, { encoding: "utf8", mode: 0o600 });
       await rename(temporaryPath, this.#statePath);
     });
-    await this.#writeChain;
+    this.#writeChain = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    await operation;
   }
 }
 

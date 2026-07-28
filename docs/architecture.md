@@ -149,7 +149,7 @@ Sidecar 为每个宿主维持有界 ring buffer。浏览器携带
 - 密码哈希参数；
 - 会话哈希、创建/到期/最后活动时间；
 - 电脑本机显式登记的项目白名单、显示元数据，以及绑定注册目录所需的
-  canonical path 与 device/file identity；
+  canonical path、物理 realpath 与 device/file identity；
 - 已知共享任务 id、客户端恢复所需的有界运行元数据；
 - 下一轮队列的有界元数据、修订号和由 Windows 当前用户 DPAPI 加密的提示词；
 - “无项目”对话所用隔离根的配置引用；
@@ -263,7 +263,8 @@ app-server 没有稳定的桌面 project/list。项目来源按优先级合并�
 - 空闲与绝对过期。
 
 写请求还需要可信 Origin、Fetch Metadata 和 CSRF token。连续登录失败按
-来源和全局双重限速，达到阈值后临时锁定。
+来源和全局双重限速，达到阈值后临时锁定；并发额度在异步密码验证前原子
+预留，验证取消或完成后再结算，不能通过同时发起大量 scrypt 绕过。
 
 ## 10. 反向代理
 
@@ -314,3 +315,9 @@ current；短暂断连后也会重做同一验证。版本漂移会保留已验�
 以实时模型/任务能力探针决定是否继续服务：探针通过则带更新待切换提示继续
 可用，探针失败或身份无法验证则拒绝新执行。实现不热换 app-server、不重启
 Desktop，也不回退到 PATH 中的 CLI。
+
+Remote 自身则使用另一条独立的版本边界：构建产物与 Windows 脚本安装到
+内容寻址的不可变 `RuntimeVersions/<sha256>` 目录；计划任务和 fail-open
+快捷方式只指向通过 manifest 回读验证的目录。原子 current/previous 指针
+保存两个 manifest hash，更新和回滚都只改变下一次启动版本，不热替换当前
+Broker/Desktop 运行代。

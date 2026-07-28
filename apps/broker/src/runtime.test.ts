@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -63,6 +63,26 @@ describe("startBroker", () => {
 
     const replacement = await acquireAppServerDataDirLease(dataDir);
     await replacement.release();
+  });
+
+  it("serializes junction aliases that resolve to the same physical data directory", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "broker-lease-alias-test-"));
+    cleanup.push(async () => {
+      await rm(parent, { force: true, recursive: true });
+    });
+    const dataDir = join(parent, "physical");
+    const alias = join(parent, "alias");
+    await mkdir(dataDir);
+    await symlink(dataDir, alias, process.platform === "win32" ? "junction" : "dir").catch(
+      async () => {
+        await rm(alias, { force: true, recursive: true });
+        throw new Error("test alias could not be created");
+      },
+    );
+    const first = await acquireAppServerDataDirLease(dataDir);
+
+    await expect(acquireAppServerDataDirLease(alias)).rejects.toThrow("lease");
+    await first.release();
   });
 
   it("generates a high-entropy downstream capability when none is supplied", async () => {

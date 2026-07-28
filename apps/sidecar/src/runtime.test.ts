@@ -29,7 +29,7 @@ const stateWithoutProjects = {
 describe("createSharedAppServerSupervisorOptions", () => {
   it("gives Desktop capability probes a bounded recovery window during loaded-thread backfill", () => {
     expect(createSharedAppServerSupervisorOptions("ws://127.0.0.1:18791/ws/capability")).toEqual({
-      clientVersion: "0.1.0",
+      clientVersion: "0.1.1",
       endpoint: "ws://127.0.0.1:18791/ws/capability",
       maxFrameBytes: 128 * 1024 * 1024,
       mode: "shared-websocket",

@@ -132,6 +132,13 @@ marker/ACL 变化前拒绝。
 .\scripts\windows\Register-CodexLocalRemoteStartup.ps1
 ```
 
+注册器不会让计划任务直接执行 Git 工作树。它先把 `package.json`、Broker/
+Sidecar 独立 bundle、Web `dist` 和 Windows 脚本复制到
+`%LOCALAPPDATA%\CodexLocalRemote\RuntimeVersions\<content-sha256>`，写入并
+回读 `runtime-manifest.json`。manifest 记录源码 commit、dirty 状态以及每个
+文件的大小和 SHA-256；任务与安全启动快捷方式只在验证通过后指向该不可变目录。
+`runtime-current.json` 原子保留当前和上一版的目录与 manifest hash。
+
 如果 Codex Desktop 当前仍开着，首次迁移仍需等当前工作结束后再进入一次
 受控关闭/打开门禁，避免短暂出现两个 app-server owner：
 
@@ -147,39 +154,25 @@ Start-ScheduledTask -TaskName 'Codex Local Remote'
 `Migrate-CodexLocalRemoteSharedOwner.ps1`；该迁移器会按 V1 合约停止并重新
 启动 Desktop。
 
-最终构建完成后，pinned V2 → dynamic V3 应使用热更新路径，无需退出或重启
-Codex Desktop，也不得停止 Broker：
+最终构建完成后的普通更新只登记下一次启动版本，无需退出或重启 Codex
+Desktop，也不得停止 Broker：
 
 ```powershell
-# 1. 只更新任务定义；运行中的 V2 bootstrap、Broker、Desktop 和 Sidecar 保持不动。
+# 构建、验证并把任务定义切到新的不可变目录；当前运行代保持不动。
+pnpm build
 .\scripts\windows\Register-CodexLocalRemoteStartup.ps1 -NoStart
-
-# 2. 只停止已经精确验证的旧 Sidecar。V2 bootstrap 随后非零退出，
-#    Task Scheduler 按 V3 定义重启 bootstrap；新 bootstrap 复用原 Broker。
-$nodePath = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source
-$sidecarCli = (Resolve-Path .\apps\sidecar\dist\cli.js).Path
-$sidecarOwner = @(
-    Get-NetTCPConnection -State Listen -LocalPort 18790 -ErrorAction Stop |
-        Where-Object LocalAddress -CEQ '127.0.0.1' |
-        Select-Object -ExpandProperty OwningProcess -Unique
-)
-if ($sidecarOwner.Count -ne 1) {
-    throw 'Sidecar listener owner is not unique; refusing the hot update.'
-}
-.\scripts\windows\Stop-CodexLocalRemoteSidecar.ps1 `
-    -NodePath $nodePath `
-    -ExpectedSidecarCliPath $sidecarCli `
-    -ExpectedProcessId ([int]$sidecarOwner[0]) `
-    -Confirm:$false
 ```
 
-执行前记录 18791 Broker listener PID；任务恢复为 `Running` 后再次读取并要求
-PID 不变，再用 `Get-CodexLocalRemoteStatus.ps1 -Json` 验证
-`TaskRuntimeBinding=dynamic-v3`、`BrokerReady=true`、
-`DesktopConnected=true`、`SidecarConnected=true`。若一分钟内计划任务尚未
-自动重启，只能在确认旧 bootstrap 已退出、18790 无 listener 且 18791 Broker
-PID 未变后手工 `Start-ScheduledTask`；该操作启动 V3 bootstrap 并复用 Broker，
-仍不需要重启 Desktop。
+当前正在运行的 bootstrap/Broker/Desktop/Sidecar 不会因“登记更新”被替换；
+下一次注销、重启或自然受控的运行代切换才执行新版。需要撤回下一次启动版本时：
+
+```powershell
+.\scripts\windows\Rollback-CodexLocalRemoteRuntime.ps1
+```
+
+回滚同样只更新任务定义和 current/previous 指针，不终止当前 Desktop。切换后
+用 `Get-CodexLocalRemoteStatus.ps1 -Json` 验证 `ImmutableRuntimeReady=true`、
+`RuntimeVersionId`、`RuntimeRoot` 和 `PreviousRuntimeVersionId`。
 
 V3 bootstrap 复用旧 Broker 时不会只凭旧版本号放行。它先核对精确 Broker
 和 upstream 身份，再要求 Desktop 已连接，并将活跃 app-server 的规范路径与
@@ -193,7 +186,10 @@ V3 bootstrap 复用旧 Broker 时不会只凭旧版本号放行。它先核对�
 自己刚创建、尚未承载用户工作的精确进程。通过共享入口重新打开后，用状态
 命令确认 Desktop 已不再拥有独立 stdio app-server。
 
-移除启动项不会删除密码哈希、项目设置或其他运行数据。卸载脚本会校验任务
+移除启动项不会删除密码哈希、项目设置、不可变运行版本或其他运行数据，便于
+恢复和取证。卸载脚本在第一次 mutation 前先证明 Desktop 已断开、活动/未知
+轮次为零，并校验 Broker listener、PID、命令行、state 与 `/ready` 一致；
+任一条件失败时不会先停止任务、Sidecar 或 Broker。随后它会校验任务
 签名、名称、Action、命令和工作目录；只会依据 PID state 停止路径、命令行
 和 loopback listener 都精确匹配的 Broker。即使 Broker 已强制退出或 state
 缺失，也只检查固定 18792 端口，并仅停止命令、Codex 路径、官方认证参数和

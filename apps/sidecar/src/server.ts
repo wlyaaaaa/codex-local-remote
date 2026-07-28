@@ -240,16 +240,23 @@ export async function createSidecarServer(
     if (!state.configured) {
       throw new ProductHttpError("SETUP_REQUIRED", "请先在电脑上设置访问密码", 409);
     }
+    const password = requireString(asRecord(request.body).password, "请输入访问密码");
     const now = Date.now();
     const source = loginRateSource(request);
-    const decision = loginLimiter.beforeAttempt(source, now);
+    const decision = loginLimiter.reserveAttempt(source, now);
     if (!decision.allowed) {
       reply.header("Retry-After", String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))));
       throw new ProductHttpError("LOGIN_RATE_LIMITED", "尝试次数过多，请稍后再试", 429);
     }
-    const password = requireString(asRecord(request.body).password, "请输入访问密码");
-    if (!(await state.verifyPassword(password))) {
-      loginLimiter.recordFailure(source, now);
+    let verified: boolean;
+    try {
+      verified = await state.verifyPassword(password);
+    } catch (error) {
+      loginLimiter.cancelAttempt(source, Date.now());
+      throw error;
+    }
+    if (!verified) {
+      loginLimiter.recordFailure(source, Date.now());
       throw new ProductHttpError("INVALID_CREDENTIALS", "访问密码不正确", 401);
     }
     loginLimiter.recordSuccess(source);

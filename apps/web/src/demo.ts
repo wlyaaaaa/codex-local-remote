@@ -578,7 +578,7 @@ export const demoFiles: Record<string, FileListing> = {
 
 export const demoDiagnostics: DiagnosticSnapshot = {
   generatedAt: new Date(now).toISOString(),
-  version: "0.1.0",
+  version: "0.1.1",
   appServerVersion: "0.78.0",
   capabilities: demoCapabilities,
   listener: {

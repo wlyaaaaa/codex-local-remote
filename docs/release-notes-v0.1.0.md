@@ -32,10 +32,16 @@ without exposing the local app-server to the public internet.
 
 ## Verification
 
-- Full repository acceptance: 80 test files, 943 tests.
-- Public-safety scan: 257 files.
-- Real public-browser acceptance covered mobile and wide layouts, task creation,
-  live task state, file upload/download, approval rendering, and persistent
-  notice dismissal.
+These were the historical release-time reports, not evidence for later `main`:
+
+- repository acceptance reported 80 test files and 943 tests;
+- public-safety reported 257 files;
+- public-browser checks covered mobile and wide layouts, task creation, live
+  state, file upload/download, approval rendering, and notice dismissal.
+
+The exact Codex Desktop package/runtime version was not recorded for v0.1.0.
+Compatibility is therefore **unverified**, and later independent review found
+lifecycle and long-thread defects that are not backported to this tag. The tag
+remains immutable for provenance; use a newer repaired release.
 
 This is an unofficial, self-hosted companion for ChatGPT / Codex Desktop.

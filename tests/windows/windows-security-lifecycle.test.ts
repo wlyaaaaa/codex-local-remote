@@ -301,6 +301,32 @@ describe("Windows capability and lifecycle safety contract", () => {
     );
   });
 
+  it("proves Desktop and turn quiescence before the first uninstall mutation", () => {
+    const removal = windowsScript("Unregister-CodexLocalRemoteStartup.ps1");
+    const initialPreflight = removal.indexOf(
+      "$runtimeStopPreflight = Get-UninstallRuntimePreflight",
+    );
+    const mutationGate = removal.indexOf(
+      "if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task'))",
+    );
+    const finalPreflight = removal.indexOf(
+      "$runtimeStopPreflight = Get-UninstallRuntimePreflight",
+      initialPreflight + 1,
+    );
+    const firstTaskStop = removal.indexOf("Stop-ScheduledTask", mutationGate);
+    const firstSidecarStop = removal.indexOf("& $sidecarStopScript", mutationGate);
+
+    expect(removal).toContain("function Get-UninstallRuntimePreflight");
+    expect(removal).toContain("$readiness.desktopConnected");
+    expect(removal).toContain("$readiness.unsafeThreadCount");
+    expect(removal).toContain("Test-ManagedBrokerProcess");
+    expect(initialPreflight).toBeGreaterThan(-1);
+    expect(initialPreflight).toBeLessThan(mutationGate);
+    expect(finalPreflight).toBeGreaterThan(mutationGate);
+    expect(finalPreflight).toBeLessThan(firstTaskStop);
+    expect(firstTaskStop).toBeLessThan(firstSidecarStop);
+  });
+
   it("keeps capability endpoints and applied secrets out of command and status objects", () => {
     const module = windowsScript("CodexLocalRemote.Windows.psm1");
     const registration = windowsScript("Register-CodexLocalRemoteStartup.ps1");

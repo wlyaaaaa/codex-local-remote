@@ -468,6 +468,40 @@ describe("SSE backpressure", () => {
 });
 
 describe("sidecar REST surface", () => {
+  it("atomically reserves login capacity before asynchronous password verification", async () => {
+    const fixture = await createFixture();
+    let releaseVerification: ((accepted: boolean) => void) | undefined;
+    const verification = new Promise<boolean>((resolve) => {
+      releaseVerification = resolve;
+    });
+    const verifyPassword = vi
+      .spyOn(fixture.state, "verifyPassword")
+      .mockImplementation(async () => await verification);
+    const attempts = Array.from(
+      { length: 200 },
+      async () =>
+        await fixture.app.inject({
+          method: "POST",
+          url: "/codex-remote/api/v1/auth/login",
+          headers: {
+            host: "127.0.0.1:18790",
+            origin: "http://127.0.0.1:18790",
+            "sec-fetch-site": "same-origin",
+          },
+          payload: { password: "全部并发等待同一个慢验证" },
+        }),
+    );
+    await vi.waitFor(() => {
+      expect(verifyPassword).toHaveBeenCalledTimes(5);
+    });
+    releaseVerification?.(false);
+
+    const responses = await Promise.all(attempts);
+    expect(responses.filter((response) => response.statusCode === 401)).toHaveLength(5);
+    expect(responses.filter((response) => response.statusCode === 429)).toHaveLength(195);
+    await fixture.app.close();
+  });
+
   it("accepts one authenticated browser file upload as a durable local input reference", async () => {
     const fixture = await createFixture();
     const session = await login(fixture);
