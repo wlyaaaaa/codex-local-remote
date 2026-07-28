@@ -79,3 +79,7 @@ Tailscale 或本项目 App；“添加到主屏幕”只是可选快捷方式。
 ```
 
 状态输出不包含密码、Cookie、提示词、对话正文或能力 token。
+其中 `DesktopLaunchStatus` / `DesktopLaunchRemoteEnabled` /
+`DesktopLaunchDecision` 是最近一次安全启动的无敏感回执；它们用于告诉你
+当次究竟是远程接入还是原生降级。当前已经打开的原生 Desktop 不能热切换成
+共享 Broker，登记更新会在下一次自然启动时生效。

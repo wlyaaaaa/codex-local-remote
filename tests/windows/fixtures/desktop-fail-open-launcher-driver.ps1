@@ -99,16 +99,19 @@ $result = Invoke-CodexDesktopFailOpenLaunch `
         return $capabilityEndpoint
     } `
     -StartDesktopAction {
-        param([string]$DesktopExecutablePath)
+        param(
+            [string]$DesktopExecutablePath,
+            [AllowNull()]
+            [string]$RemoteEndpoint
+        )
         $state.DesktopLaunchCalls++
-        $childEnvironment = Get-Item `
-            Env:\CODEX_APP_SERVER_WS_URL `
-            -ErrorAction SilentlyContinue
-        $state.ChildOverridePresent = $null -ne $childEnvironment
-        $state.ChildOverride = if ($null -eq $childEnvironment) {
-            $null
+        $state.ChildOverridePresent = -not [string]::IsNullOrWhiteSpace(
+            $RemoteEndpoint
+        )
+        $state.ChildOverride = if ($state.ChildOverridePresent) {
+            $RemoteEndpoint
         } else {
-            [string]$childEnvironment.Value
+            $null
         }
         $state.LaunchOverrides.Add($state.ChildOverride)
         $processId = 42001 + $state.DesktopLaunchCalls
@@ -160,4 +163,4 @@ $feedback = Get-CodexRemoteLaunchFeedback -Result $result
     ParentOverride = [string]$env:CODEX_APP_SERVER_WS_URL
     OriginalOverride = $originalOverride
     CapabilityEndpoint = $capabilityEndpoint
-} | ConvertTo-Json -Compress -Depth 10
+} | ConvertTo-Json -Compress -Depth 10 -EscapeHandling EscapeNonAscii

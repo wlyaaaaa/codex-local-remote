@@ -1268,6 +1268,81 @@ $launchMode = if ($legacyPersistentOverrideBlocked) {
 } else {
     'native-only'
 }
+$desktopLaunchReceiptReady = $false
+$desktopLaunchStatus = 'not-recorded'
+$desktopLaunchRemoteEnabled = $null
+$desktopLaunchDecision = ''
+$desktopLaunchRecordedAtUtc = $null
+try {
+    $desktopLaunchReceiptPath = Join-Path `
+        $resolvedDataDir `
+        'desktop-launch-last.json'
+    if (Test-StatusOrdinaryFile `
+        -Path $desktopLaunchReceiptPath `
+        -MinimumBytes 2 `
+        -MaximumBytes 65536) {
+        $desktopLaunchReceipt = Read-StatusJsonText `
+            -Path $desktopLaunchReceiptPath |
+                ConvertFrom-Json -Depth 10 -ErrorAction Stop
+        $desktopLaunchReceiptReady = (
+            (Test-StatusExactProperties `
+                -Value $desktopLaunchReceipt `
+                -Names @(
+                    'DesktopProcessId',
+                    'RecordedAtUtc',
+                    'RemoteDecision',
+                    'RemoteEnabled',
+                    'RemoteFallbackAttempts',
+                    'RemoteStopAttempts',
+                    'Signature',
+                    'Status',
+                    'Version'
+                )) -and
+            [string]$desktopLaunchReceipt.Signature -ceq
+                'codex-local-remote/desktop-launch/v1' -and
+            (Test-NonNegativeInteger -Value $desktopLaunchReceipt.Version) -and
+            [int]$desktopLaunchReceipt.Version -eq 1 -and
+            [string]$desktopLaunchReceipt.Status -cin @(
+                'already-running',
+                'launched-native',
+                'launched-remote',
+                'remote-launch-unverified'
+            ) -and
+            ($desktopLaunchReceipt.RemoteEnabled -is [bool] -or
+                $null -eq $desktopLaunchReceipt.RemoteEnabled) -and
+            (Test-NonNegativeInteger `
+                -Value $desktopLaunchReceipt.RemoteFallbackAttempts) -and
+            (Test-NonNegativeInteger `
+                -Value $desktopLaunchReceipt.RemoteStopAttempts) -and
+            ($null -eq $desktopLaunchReceipt.DesktopProcessId -or
+                (Test-StatusPositiveInteger `
+                    -Value $desktopLaunchReceipt.DesktopProcessId)) -and
+            -not [string]::IsNullOrWhiteSpace(
+                [string]$desktopLaunchReceipt.RemoteDecision
+            ) -and
+            (Test-StatusRecordedAtUtc `
+                -Value $desktopLaunchReceipt.RecordedAtUtc)
+        )
+        if ($desktopLaunchReceiptReady) {
+            $desktopLaunchStatus = [string]$desktopLaunchReceipt.Status
+            $desktopLaunchRemoteEnabled =
+                $desktopLaunchReceipt.RemoteEnabled
+            $desktopLaunchDecision =
+                [string]$desktopLaunchReceipt.RemoteDecision
+            $desktopLaunchRecordedAtUtc = (
+                [DateTimeOffset]$desktopLaunchReceipt.RecordedAtUtc
+            ).UtcDateTime.ToString('o')
+        } else {
+            $desktopLaunchStatus = 'invalid'
+        }
+    }
+} catch {
+    $desktopLaunchReceiptReady = $false
+    $desktopLaunchStatus = 'invalid'
+    $desktopLaunchRemoteEnabled = $null
+    $desktopLaunchDecision = ''
+    $desktopLaunchRecordedAtUtc = $null
+}
 
 $localUrl = Join-BasePathUrl -Origin "http://127.0.0.1:$Port" -BasePath $BasePath
 $bootstrap = $null
@@ -1415,6 +1490,11 @@ $status = [pscustomobject]@{
     LauncherShortcutReady = $launcherShortcutReady
     LauncherConfigured = $launcherConfigured
     LaunchMode = $launchMode
+    DesktopLaunchReceiptReady = $desktopLaunchReceiptReady
+    DesktopLaunchStatus = $desktopLaunchStatus
+    DesktopLaunchRemoteEnabled = $desktopLaunchRemoteEnabled
+    DesktopLaunchDecision = $desktopLaunchDecision
+    DesktopLaunchRecordedAtUtc = $desktopLaunchRecordedAtUtc
     LegacyPersistentOverrideBlocked = $legacyPersistentOverrideBlocked
     LegacyEnvironmentState = $legacyEnvironmentState
     DesktopConnected = $desktopConnected

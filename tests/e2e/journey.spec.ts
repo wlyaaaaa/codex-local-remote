@@ -167,7 +167,11 @@ test.describe("单密码登录与完整远程旅程", () => {
       });
       await expect(page.getByTestId("context-compact-status")).toContainText("已受理");
       await expect(page.getByTestId("turn-composer")).toBeVisible();
-      await expect(page.getByText("压缩对话上下文", { exact: true })).toHaveCount(1);
+      const compactionRecord = page.getByTestId("context-compaction-record");
+      await expect(compactionRecord).toHaveCount(1);
+      await expect(compactionRecord).toHaveAttribute("aria-label", "上下文压缩记录");
+      await expect(compactionRecord).toContainText("上下文已压缩");
+      await expect(compactionRecord).toContainText("后续内容已使用新的上下文继续");
       await expect(page.getByTestId("context-compact-status")).toContainText("已压缩", {
         timeout: 6_000,
       });

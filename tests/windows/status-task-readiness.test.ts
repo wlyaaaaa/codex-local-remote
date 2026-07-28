@@ -26,6 +26,11 @@ interface StatusResult {
   LauncherShortcutReady: boolean;
   LauncherConfigured: boolean;
   LaunchMode: string;
+  DesktopLaunchReceiptReady: boolean;
+  DesktopLaunchStatus: string;
+  DesktopLaunchRemoteEnabled: boolean | null;
+  DesktopLaunchDecision: string;
+  DesktopLaunchRecordedAtUtc: string | null;
   LegacyPersistentOverrideBlocked: boolean;
 }
 
@@ -97,6 +102,28 @@ windowsOnly("Windows scheduled-task readiness status", () => {
       LauncherConfigured: true,
       LaunchMode: "process-scoped-fail-open",
       LegacyPersistentOverrideBlocked: false,
+    });
+  });
+
+  it("reports the latest token-free Desktop launch result", () => {
+    const status = getStatus("valid-launch-receipt");
+    expect(status).toMatchObject({
+      DesktopLaunchReceiptReady: true,
+      DesktopLaunchStatus: "launched-remote",
+      DesktopLaunchRemoteEnabled: true,
+      DesktopLaunchDecision: "remote-ready",
+      DesktopLaunchRecordedAtUtc: "2026-07-27T12:34:56.0000000Z",
+    });
+  });
+
+  it("fails the launch receipt closed without changing current readiness", () => {
+    const status = getStatus("invalid-launch-receipt");
+    expect(status).toMatchObject({
+      DesktopLaunchReceiptReady: false,
+      DesktopLaunchStatus: "invalid",
+      DesktopLaunchRemoteEnabled: null,
+      DesktopLaunchDecision: "",
+      DesktopLaunchRecordedAtUtc: null,
     });
   });
 

@@ -20,6 +20,12 @@ unchanged.
 - Reserves login-attempt capacity before asynchronous password verification, so
   concurrent requests cannot bypass the configured limits.
 - Performs every uninstall safety check before the first mutation.
+- Starts the exact Desktop child with `UseShellExecute=false`, preserving the
+  process-scoped Broker endpoint that packaged-app ShellExecute could silently
+  drop. Native fallback explicitly removes any inherited stale endpoint.
+- Writes a strict, token-free `desktop-launch-last.json` receipt so diagnostics
+  can distinguish a remote launch, native fallback, and missing or invalid
+  evidence without exposing the capability URL.
 - Installs each runtime into a content-addressed, immutable
   `RuntimeVersions/<sha256>` directory. The scheduled task and the managed
   shortcut point to the selected version; one previous validated version is
@@ -35,6 +41,10 @@ Normal use remains:
    when that endpoint is ready.
 4. If Remote cannot start, the launcher opens native Desktop without a persistent
    app-server override.
+
+An already-running native Desktop cannot be hot-switched onto the shared Broker.
+Installing this update is non-disruptive: the selected immutable version applies
+at the next natural Desktop start.
 
 Use `scripts/windows/Rollback-CodexLocalRemoteRuntime.ps1` to select the previous
 validated runtime for the next start. Rollback does not kill a running Desktop
@@ -56,12 +66,25 @@ usable and report Remote as unavailable.
 
 ## Verification
 
-The frozen candidate passed the repository's local `pnpm check` chain: 83 test
-files and 978 tests, production builds, and a scan of 270 public files. The six
-supported browser viewports passed the stop/steer journey, and the immutable
-version test covered two installs, current/previous switching, and tamper
-rejection. Publication still requires one cold start from the exact packaged
-runtime.
+The frozen tree passed formatting, lint, and type checking; all 83 test files
+passed with 981/981 tests; production builds completed; and the public-safety
+scan accepted 271 files.
+
+The six supported browser viewports passed the stop/steer/compaction journey.
+Windows tests launch a real child process and prove that the capability endpoint
+reaches only the remote child, native fallback receives no endpoint, and the
+parent environment is unchanged. Immutable-version tests cover two installs,
+current/previous switching, and tamper rejection.
+
+The final candidate is installed with `-NoStart`, so the running Desktop, Broker,
+and Sidecar are not restarted or interrupted. A live packaged-Desktop cold start
+is intentionally deferred to the next natural launch; the exact child-process
+test is the non-disruptive release substitute, not a claim that the
+already-running native Desktop was hot-switched.
+
+Release acceptance is therefore **PASS for the frozen repository candidate**
+and explicitly **DEGRADED for the live shared-owner smoke test**: the currently
+open Desktop remains on its native app-server until the next natural start.
 
 GitHub CI is useful follow-up evidence but is not used as a substitute for these
 local functional checks.

@@ -8,6 +8,11 @@ const windowsOnly = process.platform === "win32" ? describe : describe.skip;
 const repositoryRoot = resolve(import.meta.dirname, "..", "..");
 const launcherPath = join(repositoryRoot, "scripts", "windows", "Launch-CodexWithRemote.ps1");
 const driverPath = join(import.meta.dirname, "fixtures", "desktop-fail-open-launcher-driver.ps1");
+const environmentDriverPath = join(
+  import.meta.dirname,
+  "fixtures",
+  "desktop-process-environment-driver.ps1",
+);
 
 interface FixtureResult {
   Result: {
@@ -56,6 +61,30 @@ function runFixture(mode: string): FixtureResult {
   );
   expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
   return JSON.parse(result.stdout) as FixtureResult;
+}
+
+function runEnvironmentFixture() {
+  const result = spawnSync(
+    "pwsh",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-File",
+      environmentDriverPath,
+      "-LauncherPath",
+      launcherPath,
+    ],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+  expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+  return JSON.parse(result.stdout) as {
+    RemoteChildOverride: string;
+    NativeChildOverride: string;
+    ParentOverride: string;
+    OriginalOverride: string;
+    CapabilityEndpoint: string;
+  };
 }
 
 windowsOnly("Codex Desktop fail-open launcher", () => {
@@ -215,6 +244,15 @@ windowsOnly("Codex Desktop fail-open launcher", () => {
     expect(launcher).not.toMatch(/EnvironmentVariableTarget\]::User/u);
     expect(launcher).not.toMatch(/setx(?:\.exe)?\b/iu);
     expect(launcher).not.toContain("explorer.exe");
-    expect(launcher).toContain("Start-Process");
+    expect(launcher).toContain("$startInfo.UseShellExecute = $false");
+    expect(launcher).toContain("$startInfo.Environment['CODEX_APP_SERVER_WS_URL']");
+  });
+
+  it("places the endpoint on the exact child without leaking or inheriting a stale override", () => {
+    const receipt = runEnvironmentFixture();
+
+    expect(receipt.RemoteChildOverride).toBe(receipt.CapabilityEndpoint);
+    expect(receipt.NativeChildOverride).toBe("");
+    expect(receipt.ParentOverride).toBe(receipt.OriginalOverride);
   });
 });

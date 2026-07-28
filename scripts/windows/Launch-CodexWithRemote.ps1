@@ -204,31 +204,83 @@ function Invoke-CodexDesktopScopedProcessStart {
         [scriptblock]$StartDesktopAction
     )
 
-    $previousEnvironment = Get-Item `
-        Env:\CODEX_APP_SERVER_WS_URL `
-        -ErrorAction SilentlyContinue
-    try {
-        if ([string]::IsNullOrWhiteSpace($RemoteEndpoint)) {
-            Remove-Item `
-                Env:\CODEX_APP_SERVER_WS_URL `
-                -ErrorAction SilentlyContinue
-        } else {
-            Set-Item `
-                Env:\CODEX_APP_SERVER_WS_URL `
-                -Value $RemoteEndpoint
-        }
-        return & $StartDesktopAction $DesktopExecutablePath
-    } finally {
-        if ($null -eq $previousEnvironment) {
-            Remove-Item `
-                Env:\CODEX_APP_SERVER_WS_URL `
-                -ErrorAction SilentlyContinue
-        } else {
-            Set-Item `
-                Env:\CODEX_APP_SERVER_WS_URL `
-                -Value ([string]$previousEnvironment.Value)
-        }
+    return & $StartDesktopAction $DesktopExecutablePath $RemoteEndpoint
+}
+
+function Start-CodexDesktopProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DesktopExecutablePath,
+
+        [AllowNull()]
+        [string]$RemoteEndpoint,
+
+        [AllowEmptyCollection()]
+        [string[]]$ArgumentList = @(),
+
+        [switch]$RedirectStandardOutput
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = [System.IO.Path]::GetFullPath(
+        $DesktopExecutablePath
+    )
+    $startInfo.WorkingDirectory = Split-Path `
+        -Parent `
+        $startInfo.FileName
+    # Windows PowerShell's Start-Process may delegate through ShellExecute for
+    # packaged applications. That path can create the real Electron process
+    # outside the launcher's environment, silently dropping the scoped Broker
+    # endpoint. CreateProcess semantics keep the endpoint on the exact child.
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $false
+    $startInfo.RedirectStandardOutput = [bool]$RedirectStandardOutput
+    foreach ($argument in $ArgumentList) {
+        $startInfo.ArgumentList.Add($argument)
     }
+    $null = $startInfo.Environment.Remove('CODEX_APP_SERVER_WS_URL')
+    if (-not [string]::IsNullOrWhiteSpace($RemoteEndpoint)) {
+        $startInfo.Environment['CODEX_APP_SERVER_WS_URL'] = $RemoteEndpoint
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Codex Desktop process creation returned false.'
+        }
+        return $process
+    } catch {
+        $process.Dispose()
+        throw
+    }
+}
+
+function Write-CodexDesktopLaunchReceipt {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [object]$Result
+    )
+
+    $receipt = [pscustomobject][ordered]@{
+        Signature = 'codex-local-remote/desktop-launch/v1'
+        Version = 1
+        Status = [string]$Result.Status
+        RemoteEnabled = $Result.RemoteEnabled
+        RemoteDecision = [string]$Result.RemoteDecision
+        RemoteFallbackAttempts = [int]$Result.RemoteFallbackAttempts
+        RemoteStopAttempts = [int]$Result.RemoteStopAttempts
+        DesktopProcessId = $Result.DesktopProcessId
+        RecordedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    Write-AtomicJsonFile `
+        -Path (Join-Path $DataDir 'desktop-launch-last.json') `
+        -Value $receipt
 }
 
 function Get-CodexDesktopLaunchIdentity {
@@ -824,10 +876,14 @@ if (-not $DefinitionOnly) {
                 )
         } `
         -StartDesktopAction {
-            param([string]$DesktopExecutablePath)
-            Start-Process `
-                -FilePath $DesktopExecutablePath `
-                -PassThru
+            param(
+                [string]$DesktopExecutablePath,
+                [AllowNull()]
+                [string]$RemoteEndpoint
+            )
+            Start-CodexDesktopProcess `
+                -DesktopExecutablePath $DesktopExecutablePath `
+                -RemoteEndpoint $RemoteEndpoint
         } `
         -GetCreatedDesktopStateAction {
             param(
@@ -853,6 +909,15 @@ if (-not $DefinitionOnly) {
         -RemoteAttachTimeoutMilliseconds (
             $DesktopAttachTimeoutSeconds * 1000
         )
+    if ($script:WindowsModuleAvailable) {
+        try {
+            Write-CodexDesktopLaunchReceipt `
+                -DataDir $resolvedDataDir `
+                -Result $launchResult
+        } catch {
+            # Receipt failure must never block Desktop startup.
+        }
+    }
     $launchFeedback = Get-CodexRemoteLaunchFeedback -Result $launchResult
     if (-not $SuppressNotification) {
         Show-CodexRemoteLaunchFeedback -Feedback $launchFeedback

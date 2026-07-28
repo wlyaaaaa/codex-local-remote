@@ -190,7 +190,11 @@ Windows 兼容层通过 fail-open 启动器，在单次 Desktop 子进程范围�
 隐藏的 `CODEX_APP_SERVER_WS_URL` override。项目不会把该值持久写入用户或
 系统环境：只有精确受管的 Broker 与 app-server 已通过就绪检查时才注入；
 Remote 未启动、端口不可达、身份不匹配或检查超时时，启动器会去掉 override
-并照常打开原生 Desktop。冷启动最多等待 30 秒，让动态 Desktop 版本发现、
+并照常打开原生 Desktop。启动器使用 `UseShellExecute=false` 直接创建
+Desktop 进程，避免 Windows 打包应用经 ShellExecute 跳转后丢失仅属于本次
+子进程的 endpoint；父进程环境不会被临时改写。每次启动还会写入不含 token
+或 endpoint 的结果回执，状态命令可明确报告远程接入、原生降级或无有效回执。
+冷启动最多等待 30 秒，让动态 Desktop 版本发现、
 Broker 和 Sidecar 先完成传输握手，再启动并等待 Desktop 接入；在 Desktop
 尚未接入时进程保持存活但执行 API 明确禁用，避免启动器与 Sidecar 互相等待。
 最坏结果只能是“远程离线”。这个隐藏入口不是稳定的公开 Desktop 接口；升级

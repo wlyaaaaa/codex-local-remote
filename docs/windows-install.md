@@ -102,7 +102,10 @@ Windows 用户、`SYSTEM`、内置管理员和 Windows Task Scheduler 服务共�
 解析当前 Desktop，在受管 Broker 基础就绪时只向本次 Desktop 子进程注入
 带高熵能力路径的 loopback endpoint；任何检查失败、超时或 Remote 未运行
 都会清除继承值并打开无 override 的原生 Desktop。重复安装会验证并复用
-同一个 token。冷启动会给动态版本发现、Broker 与 Sidecar 最多 30 秒完成
+同一个 token。启动器使用 `ProcessStartInfo` 和
+`UseShellExecute=false` 直接创建 Desktop 子进程，不依赖可能让打包应用脱离
+调用者环境的 ShellExecute；父进程环境保持不变。冷启动会给动态版本发现、
+Broker 与 Sidecar 最多 30 秒完成
 基础握手，避免在服务仍正常启动时过早回退。历史安装若留下本项目可证明的持久 override，升级时只做一次
 精确恢复/清理；第三方值或无法证明的状态绝不覆盖。
 
@@ -297,6 +300,10 @@ PowerShell 的格式化文本误当成对象：
   “Codex Remote（安全启动）”入口是否存在且精确匹配当前安装；
 - `LauncherConfigured` / `LaunchMode`：聚合入口是否可用，正式模式必须为
   `process-scoped-fail-open`；
+- `DesktopLaunchReceiptReady` / `DesktopLaunchStatus` /
+  `DesktopLaunchRemoteEnabled` / `DesktopLaunchDecision`：最近一次安全启动
+  是否留下了严格、无 token 的结果回执，以及当次是远程接入、原生降级还是
+  无有效回执；历史回执只解释最近一次启动，不冒充当前 `Ready`；
 - `LegacyPersistentOverrideBlocked` / `LegacyEnvironmentState`：任何持久
   `CODEX_APP_SERVER_WS_URL` 都会阻断 Ready；旧受管状态必须精确退休为
   `none`，不能让 Desktop 启动依赖本地端口；

@@ -39,6 +39,9 @@ Broker 启动时已经完成完整 hash 校验的运行时回执，并批量读�
 - Desktop 和 Sidecar 必须连接同一 Broker；不能用独立 CLI 后台冒充同步。
 - 不得持久设置 `CODEX_APP_SERVER_WS_URL`。Desktop 只能从受管 fail-open
   启动器获得进程级变量。
+- 启动器必须以 `UseShellExecute=false` 直接创建精确 Desktop 子进程；不能用
+  可能把 Windows 打包应用重新交给 ShellExecute 的方式冒充“已注入”。用真实
+  子进程环境回读验证 endpoint 只存在于远程子进程，并保留无 token 启动回执。
 - 冷启动必须允许 Broker 与 Sidecar 在 Desktop 接入前以传输就绪、执行禁用
   的状态持续运行；不要把请求级 `/ready` 当作启动 Desktop 的前置条件。
 - Desktop 已连接、Sidecar 已连接或 Broker 仍有 active/pending/unknown

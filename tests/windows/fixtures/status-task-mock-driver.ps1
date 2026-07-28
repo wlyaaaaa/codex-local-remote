@@ -29,7 +29,9 @@ param(
         'sidecar-ipv6-loopback-neighbor',
         'sidecar-multiple',
         'sidecar-foreign',
-        'persistent-user-override'
+        'persistent-user-override',
+        'valid-launch-receipt',
+        'invalid-launch-receipt'
     )]
     [string]$Mode,
 
@@ -299,6 +301,26 @@ $userEnvironmentFixture = if ($Mode -ceq 'persistent-user-override') {
 $userEnvironmentFixture |
     ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath $userEnvironmentFixturePath -Encoding utf8NoBOM
+$desktopLaunchReceiptPath = Join-Path $resolvedDataDir 'desktop-launch-last.json'
+if ($Mode -cin @('valid-launch-receipt', 'invalid-launch-receipt')) {
+    $desktopLaunchReceipt = [ordered]@{
+        Signature = 'codex-local-remote/desktop-launch/v1'
+        Version = 1
+        Status = 'launched-remote'
+        RemoteEnabled = $true
+        RemoteDecision = 'remote-ready'
+        RemoteFallbackAttempts = 0
+        RemoteStopAttempts = 0
+        DesktopProcessId = 42424
+        RecordedAtUtc = '2026-07-27T12:34:56.0000000Z'
+    }
+    if ($Mode -ceq 'invalid-launch-receipt') {
+        $desktopLaunchReceipt.Unexpected = 'not-allowed'
+    }
+    $desktopLaunchReceipt |
+        ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath $desktopLaunchReceiptPath -Encoding utf8NoBOM
+}
 $launcherArguments = @(
     '-NoLogo',
     '-NoProfile',
