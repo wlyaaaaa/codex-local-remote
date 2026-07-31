@@ -3,7 +3,8 @@
 ## 1. 保护对象
 
 - 本机 Codex/ChatGPT 登录状态；
-- 项目源码、文档和生成结果；
+- 当前 Windows 登录用户以管理员运行级别能够访问的磁盘、源码、文档和生成
+  结果；
 - Codex 对话、工具输出与审批；
 - 执行本机命令和修改文件的能力；
 - Sidecar 密码、会话和审计元数据。
@@ -26,7 +27,7 @@ Sidecar 认证与授权边界
         ▼
 Desktop ── 本机 Broker ── 单一 Codex app-server
         │
-        └─ 已注册项目只读文件网关
+        └─ 所有者文件管理器（同一用户的管理员令牌）
 ```
 
 Funnel 提供传输与公网入口，不替代应用认证。公网只能到达 Sidecar 的产品
@@ -36,8 +37,10 @@ API；Broker 与 app-server 的原始 WebSocket 都只接受回环连接。
 服务属于本产品的本地可信边界。任务级 ACL/安全描述符会按机器和域被服务
 规范化，无法跨机器作稳定的逐字节精确验证；计划任务的完整定义指纹用于防止
 误认和覆盖，不声称隔离这些本地可信主体。
-Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启动器与它创建
-的 Desktop 子进程环境中，不写入 HKCU 或机器环境。相同 Windows 用户仍能
+Desktop 兼容钩子的带能力回环 URL 只会短暂存在于显式 `Open` 创建的受管
+Desktop 子进程环境中，不写入 HKCU 或机器环境。Desktop 由同一用户、同一
+交互会话的 medium-integrity Explorer primary token 创建；提升后的控制器和
+`Highest` 计划任务均不是 Desktop token owner。相同 Windows 用户仍能
 读取受其账户保护的 token 文件或检查同用户进程，因此本项目不声称隔离同
 用户恶意软件；不要让不受信任的人或服务共用这个 Windows 账号。其他本地
 账号由 DataDir 的受保护 ACL 隔离。
@@ -79,21 +82,22 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 - 工具输出、ANSI、文件名与 diff 作为文本；
 - CSP 禁止不需要的脚本、框架与对象。
 
-### 路径穿越与 junction/symlink 逃逸
+### 文件权限、路径混淆与误操作
 
-- API 只接受项目内相对路径；
-- Windows 路径规范化和真实路径校验；
-- 注册时持久化 canonical path 与目录的 device/file identity；每次文件访问和
-  新建任务前重新核对，根被移动、替换或重绑定后立即失效；
-- 最终文件物理路径还会再次检查敏感分段；指向 `.git`、`.codex`、`.ssh`、
-  `.gnupg` 或 `node_modules` 的 junction/symlink 即使别名本身无敏感名称也拒绝；
-- 根目录包含判断使用路径分段而非字符串前缀；
-- 拒绝 UNC、设备路径、ADS 和保留名称；
-- 每一次目录下降与文件打开都相对原 canonical root 重新验证，下载还会核对
-  已打开 handle 与最终路径的文件身份；
-- 无项目对话使用隔离、有界的 cwd，但不分配项目 id，也不进入文件
-  网关；
-- 测试 junction/symlink、大小写、长路径与竞态。
+- 文件页按已检测磁盘签发不透明 root id，客户端只能提交该卷内的相对路径；
+- 拒绝绝对、UNC、设备路径、ADS、保留名称和 `..`，根目录包含判断使用路径
+  分段而非字符串前缀；
+- 不把“敏感目录”或 junction/symlink 越界当成阻断：产品按设计使用同一
+  登录用户的管理员令牌，Windows 实际允许的目标就是所有者可访问的目标；
+- 下载在已打开句柄上核对文件身份与大小，任务正文中的绝对路径只换取短时、
+  当前进程内的不透明授权，不生成永久裸链；
+- 写操作要求登录、同源、Fetch Metadata、CSRF 和幂等键；同名目标默认冲突，
+  覆盖必须显式选择；
+- 删除默认进入 Windows 回收站；永久删除是独立选项并要求再次确认。回收站
+  只缓解误点，不构成权限隔离或可靠备份；
+- 盘符消失、文件换绑、占用或 ACL 拒绝只返回对应错误，不降权重试，也不
+  影响其他磁盘；
+- 测试 traversal、junction、隐藏文件、大小写、长路径、换绑、覆盖与删除。
 
 ### 公网 RCE
 
@@ -102,8 +106,16 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 - 不提供 shellCommand/process/spawn HTTP 端点；
 - 审批保留明确的人类动作；
 - 不提供永久全部批准；
-- 文件网关只读；
-- Sidecar 以当前用户而非 LocalSystem 运行。
+- Sidecar 以当前交互用户的 `Highest` 运行级别运行，而非 `LocalSystem`；
+  显式 `Open` 需要特权协调时，提升后的 token 只执行控制面和运行代切换；
+  Desktop UI 必须从同会话 Explorer 的非 elevated medium-integrity primary
+  token 创建。
+
+文件管理器是明确的高权限产品面，而不是 RCE 缓解层。任一有效登录会话都可
+按当前用户的管理员令牌修改或删除文件；因此密码、Cookie 或已登录浏览器被
+控制时，应视为该用户的管理员文件权限已经泄露。本项目不声称用单密码抵御
+同用户恶意软件，也不提供多用户权限分级。`Highest` 不会解锁 BitLocker、
+挂载离线卷或取得其他账号的加密密钥。
 
 ### 订阅混淆与双 owner
 
@@ -123,33 +135,67 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 
 - Windows 集成只在一次 Desktop 子进程范围内注入回环
   `CODEX_APP_SERVER_WS_URL`，不持久化用户或机器环境；
+- 普通 vendor 启动、Codex 更新、Windows 重启和睡眠恢复保持原生，不产生
+  Remote 租约或 Desktop 重启授权；
+- 稳定 DataDir dispatcher 只接受 `Open`、`Close`、`Status`，并在分派前验证
+  current pointer、不可变 runtime root、manifest、文件大小和 SHA-256；
+- `Status` 必须只读；`Open` 必须幂等，只有无法安全热接入时才可在单独授权后
+  至多重开一次 Desktop；`Close` 只清公网 intent 并停止 Sidecar，不重开
+  Desktop，已连接的 Broker/app-server/Desktop owner 保持到自然退出；
+- 启动器必须验证 Explorer token 与当前用户 SID、交互会话、可执行路径、
+  非 elevated 和 medium integrity 全部一致；找不到唯一候选时失败关闭；
+- Desktop 的显式环境由该 primary token 构造，先移除继承的 override，再按
+  本次受管结果加入一次性 endpoint；环境内存用后清零；
+- `Interactive` / `Highest` 计划任务中的 coordinator 是唯一受管 Desktop
+  process owner；只有显式 on-demand intent 可以请求它接管 Desktop，普通
+  vendor 根进程不得被观察逻辑自动提升为 takeover cause；
+- owner 在启动新 Desktop 前必须把活动 Broker/app-server receipt 与当前动态
+  发现的 Codex package path/hash/generation 绑定比较；任何已有 Desktop 在
+  缺少显式 `Open` 与重启授权时都必须 preserve；
+- worker 只能 compare-delete 自己的 IntentId；supervisor 必须在同一 owner
+  mutex 内 fresh-read suppression/live claim，不能产生重复 Desktop root；
 - 启动器先清除继承的 override；Broker 缺席、身份不匹配、超时或版本漂移
-  时直接走无 override 的原生 Desktop 分支；
+  时保持或恢复无 override 的原生 Desktop；
 - 共享启动后必须等待同一 Broker 运行代的 Desktop attach 回执；预检后发生
   故障时，只能对启动器本次创建且身份仍精确一致、尚未承载用户工作的进程
-  执行最多一次原生回退，绝不终止既有 Desktop；
+  做有界补偿，绝不终止未经显式授权的既有 Desktop；
 - 升级/卸载只对能精确证明属于历史版本的持久 override 做恢复或清理，绝不
   猜测、覆盖第三方后来写入的值；
 - Desktop 或随附 Codex 升级后，必须重新执行同实例、实时订阅和故障路径
-  的实机验收；
+  的实机验收；启动器每次动态发现当前包、随附 app-server 与能力目录，不
+  固定 WindowsApps 版本路径；
 - 未验收版本明确降级，不静默回退到独立 app-server。
 
 ### 安装、更新与回滚
 
 - 注册前从当前构建生成内容寻址的不可变运行目录，目录 id 是清单中文件内容的
   SHA-256；清单另行记录源码 commit、dirty 状态、文件大小和逐文件 SHA-256；
-- 计划任务和“Codex Remote（安全启动）”快捷方式只指向已完成清单回读验证的
-  不可变目录，不直接执行可变 Git 工作树；
+- 计划任务和稳定 DataDir dispatcher 只调用已完成清单回读验证的不可变目录，
+  不直接执行可变 Git 工作树；
 - `runtime-current.json` 原子保存当前版本、上一版本及两个 manifest hash；
   状态查询和卸载会重新验证指针与全部文件，篡改后失败关闭；
-- 更新任务定义不会替换当前正在承载 Desktop 的进程；下一次自然启动才使用
-  新版。`Rollback-CodexLocalRemoteRuntime.ps1` 同样只切换下一次启动版本；
+- `managed-config.json` 原子保存实际 Sidecar/Broker/upstream 端口、BasePath
+  和任务名；显式控制、状态、回滚、停止与卸载默认读取它；
+- 登记更新不会替换当前 Desktop、自动启动 Remote 或等待下次 vendor 启动接管；
+  新运行代只能由显式 `Open` 核验采用。
+  `Rollback-CodexLocalRemoteRuntime.ps1` 同样只改变待采用版本；
+- 既有显式租约可在 Broker 兼容门、无不安全工作和精确身份复核均通过时，
+  有界滚动 Web/Sidecar 公网层；该事务不得停止 Broker、app-server 或 Desktop，
+  新 Sidecar 失败必须恢复旧 Sidecar，owner 漂移则失败关闭；
+- 已有 selected 运行代尚未采用时，新的登记在任何写入前阻断；显式修复必须
+  事务恢复并复核活动任务/指针对，不能覆盖不确定的 rollback 祖先；
+- 任务停止后的屏障要求其所属 Sidecar 已断开；所选 Sidecar、Broker 或启动
+  流程失败时，补偿路径恢复原任务和指针并有界重启精确旧运行代；
 - 卸载在第一次 mutation 前先验证 Desktop 已断开、活动/未知轮次为零、Broker
   listener/PID/命令/状态和 `/ready` 一致，预检失败时不先停止任何组件。
 
 ### Sidecar 或手机断线
 
 - Broker 独立拥有 app-server 生命周期，Sidecar 退出不终止 Desktop 任务；
+- 显式租约内的普通 Sidecar crash 可以在保持 Broker/app-server/Desktop 不动时
+  恢复精确租约；Broker 或 app-server 丢失必须失败关闭并等待新的显式恢复决策。
+  采用更新、Windows reboot/resume 或创建新租约必须走各自门禁，不能冒充
+  Sidecar crash recovery；
 - 手机恢复前禁用实时变更动作，重连后按事件序号和持久化状态校正；
 - Broker 或 app-server 失效时拒绝新的执行请求，不伪装成仍可用。
 
@@ -199,8 +245,9 @@ Desktop 兼容钩子的带能力回环 URL 只会短暂存在于 fail-open 启�
 - 未通过 Desktop 订阅屏障就放行手机创建任务的第一轮；
 - Desktop 缺席时仍在后台创建手机专属任务；
 - 用字符串 `startsWith` 作为唯一目录 containment；
-- 允许浏览器指定任意绝对路径；
-- 让非项目临时目录进入文件网关；
+- 允许未认证浏览器把任意绝对路径直接换成长期公网裸链；
+- 用任务项目边界冒充文件权限边界，或静默隐藏当前 Windows 管理员身份本可
+  管理的磁盘、隐藏文件和扩展名；
 - 在 Service Worker 中缓存对话或文件响应；
 - 以明文或浏览器持久存储保存下一轮队列正文；
 - 在发送结果不明时自动重试并可能重复提交；

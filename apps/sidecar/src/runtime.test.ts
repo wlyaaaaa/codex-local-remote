@@ -8,6 +8,7 @@ import {
   createDiagnostics,
   createSharedThreadReconnectHandler,
   isSidecarRequestReady,
+  persistedConversationHistoryIntegrity,
   runtimeConnectionHealthChanged,
 } from "./runtime.js";
 import type { SidecarStateStore } from "./state-store.js";
@@ -26,10 +27,42 @@ const stateWithoutProjects = {
   listProjects: () => [],
 } as unknown as SidecarStateStore;
 
+describe("persistedConversationHistoryIntegrity", () => {
+  it.each(["invalid-json", "unterminated-line"] as const)(
+    "maps %s reader diagnostics to precise partial history integrity",
+    (reason) => {
+      expect(
+        persistedConversationHistoryIntegrity("complete", 2, {
+          capturedBytes: "128",
+          processedBytes: "128",
+          reason,
+          skippedItems: 0,
+          skippedLines: 1,
+          status: "truncated",
+        }),
+      ).toEqual({
+        observedCount: 2,
+        reason,
+        scope: "complete",
+        status: "partial",
+      });
+    },
+  );
+
+  it("fails closed when a persisted-history diagnostic is unavailable", () => {
+    expect(persistedConversationHistoryIntegrity("complete", 0, undefined)).toEqual({
+      observedCount: 0,
+      reason: "diagnostic-unavailable",
+      scope: "complete",
+      status: "failed",
+    });
+  });
+});
+
 describe("createSharedAppServerSupervisorOptions", () => {
   it("gives Desktop capability probes a bounded recovery window during loaded-thread backfill", () => {
     expect(createSharedAppServerSupervisorOptions("ws://127.0.0.1:18791/ws/capability")).toEqual({
-      clientVersion: "0.1.1",
+      clientVersion: "0.1.2",
       endpoint: "ws://127.0.0.1:18791/ws/capability",
       maxFrameBytes: 128 * 1024 * 1024,
       mode: "shared-websocket",
@@ -101,6 +134,13 @@ describe("isSidecarRequestReady", () => {
     expect(
       isSidecarRequestReady(
         snapshot,
+        { state: "runtime-check-blocked", warning: "启动回执暂时无法确认" },
+        { state: "current" },
+      ),
+    ).toBe(true);
+    expect(
+      isSidecarRequestReady(
+        snapshot,
         { state: "current" },
         { state: "application-degraded", warning: "历史任务正在后台恢复" },
       ),
@@ -108,12 +148,12 @@ describe("isSidecarRequestReady", () => {
     expect(isSidecarRequestReady(snapshot, { state: "current" }, { state: "current" })).toBe(true);
   });
 
-  it("fails closed on unverifiable runtime health, Broker degradation, missing core probes, or reconnect", () => {
+  it("fails closed when neither the startup receipt nor the live Broker can prove the connection", () => {
     expect(
       isSidecarRequestReady(
         snapshot,
         { state: "runtime-check-blocked", warning: "无法验证更新" },
-        { state: "current" },
+        { state: "degraded", warning: "断开" },
       ),
     ).toBe(false);
     expect(
@@ -286,7 +326,7 @@ describe("createDiagnostics", () => {
       } satisfies DesktopRuntimeHealth,
     },
     {
-      appServer: "degraded",
+      appServer: "available",
       health: {
         state: "runtime-check-blocked",
         warning: "无法确认 Codex Desktop 更新兼容性",
@@ -335,6 +375,24 @@ describe("createDiagnostics", () => {
     if (health.warning) {
       expect(diagnostics.warnings).toContain(health.warning);
     }
+  });
+
+  it("does not let a stale startup receipt override a real Broker disconnect", () => {
+    const diagnostics = createDiagnostics(
+      config,
+      {
+        diagnostics: [],
+        mode: "shared-websocket",
+        restartAttempt: 0,
+        state: "running",
+      },
+      false,
+      stateWithoutProjects,
+      { state: "runtime-check-blocked", warning: "启动回执暂时无法确认" },
+      { state: "degraded", warning: "实时 Broker 已断开" },
+    );
+
+    expect(diagnostics.capabilities.appServer).toBe("degraded");
   });
 
   it("keeps core app-server controls available during exact-identity application backfill", () => {

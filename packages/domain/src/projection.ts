@@ -49,7 +49,6 @@ export function projectThreadSummary(
   const thread = requireRecord(rawThread, "对话");
   const id = requireBoundedIdentifier(thread.id, "对话 id", 512);
   const turns = asRecordArray(thread.turns);
-  const activeTurn = turns.findLast((turn) => turn.status === "inProgress");
   const updatedAtSeconds =
     asFiniteNumber(thread.updatedAt) ?? asFiniteNumber(thread.createdAt) ?? 0;
   const parentThreadId = asNonEmptyString(thread.parentThreadId);
@@ -88,7 +87,6 @@ export function projectThreadSummary(
       : { collaborationMode: runtimeSettings.collaborationMode }),
     ...(cwdLabel === undefined ? {} : { cwdLabel }),
     ...(parentThreadId === undefined ? {} : { parentThreadId }),
-    ...(activeTurn === undefined ? {} : {}),
   };
 }
 
@@ -98,7 +96,7 @@ export function projectThreadDetail(
 ): ThreadDetail {
   const thread = requireRecord(rawThread, "对话");
   const turns = asRecordArray(thread.turns);
-  const activeTurn = turns.findLast((turn) => turn.status === "inProgress");
+  const activeTurn = projectActiveTurn(thread, turns);
   const canControl =
     options.managed && (options.directInputAvailable ?? thread.canAcceptDirectInput === true);
   const items: ConversationItem[] = [];
@@ -162,12 +160,40 @@ export function projectThreadItem(
 
   switch (type) {
     case "userMessage": {
-      const text = asRecordArray(rawItem.content)
+      const content = asRecordArray(rawItem.content);
+      const text = content
         .filter((item) => item.type === "text")
         .map((item) => asNonEmptyString(item.text))
         .filter((item): item is string => item !== undefined)
         .join("\n");
-      return text.length === 0 ? [] : [{ id, kind: "user-message", text, ...timestamp }];
+      const attachments = content.flatMap((item) => {
+        if (item.type !== "localImage" && item.type !== "mention") {
+          return [];
+        }
+        const sourcePath = boundedProductText(item.path, 32_768);
+        if (!sourcePath) {
+          return [];
+        }
+        const providedName = boundedProductText(item.name, 255);
+        return [
+          {
+            kind: item.type === "localImage" ? ("image" as const) : ("file" as const),
+            name: providedName ?? (path.win32.basename(sourcePath) || "附件"),
+            path: sourcePath,
+          },
+        ];
+      });
+      return text.length === 0 && attachments.length === 0
+        ? []
+        : [
+            {
+              id,
+              kind: "user-message",
+              text,
+              ...(attachments.length === 0 ? {} : { attachments }),
+              ...timestamp,
+            },
+          ];
     }
     case "agentMessage": {
       const text = asNonEmptyString(rawItem.text);
@@ -195,7 +221,7 @@ export function projectThreadItem(
     }
     case "plan": {
       const text = asNonEmptyString(rawItem.text);
-      return text ? [{ id, kind: "reasoning-summary", text, ...timestamp }] : [];
+      return text ? [{ id, kind: "formal-plan", text, ...timestamp }] : [];
     }
     case "commandExecution": {
       const command = boundedProductText(rawItem.command, 1_024);
@@ -312,8 +338,29 @@ export function projectThreadItem(
       ];
     case "webSearch":
       return [{ id, kind: "tool", status: "complete", title: "查询网页", ...timestamp }];
-    case "imageView":
+    case "imageView": {
+      const viewedPaths = imagePathsFromItem(rawItem);
+      if (viewedPaths.length > 0) {
+        return [
+          {
+            id,
+            kind: "image-activity",
+            action: "viewed",
+            attachments: viewedPaths.map((imagePath) => ({
+              kind: "image",
+              name:
+                boundedProductText(path.win32.basename(imagePath.replaceAll("/", "\\")), 512) ??
+                "已查看的图片",
+              path: imagePath,
+            })),
+            status: "complete",
+            summary: `已查看 ${viewedPaths.length} 张图像`,
+            ...timestamp,
+          },
+        ];
+      }
       return [{ id, kind: "tool", status: "complete", title: "查看图片", ...timestamp }];
+    }
     case "sleep": {
       const durationMs = asFiniteNumber(rawItem.durationMs);
       return [
@@ -328,7 +375,27 @@ export function projectThreadItem(
       ];
     }
     case "imageGeneration": {
-      const summary = boundedProductText(rawItem.revisedPrompt, 1_024);
+      const summary = boundedProductText(rawItem.revisedPrompt ?? rawItem.revised_prompt, 1_024);
+      const savedPath = boundedProductText(rawItem.savedPath ?? rawItem.saved_path, 32_768);
+      if (savedPath !== undefined) {
+        return [
+          {
+            id,
+            kind: "image-activity",
+            action: "generated",
+            attachments: [
+              {
+                kind: "image",
+                name: boundedProductText(path.win32.basename(savedPath), 512) ?? "生成的图片",
+                path: savedPath,
+              },
+            ],
+            status: projectToolStatus(rawItem.status),
+            ...(summary === undefined ? {} : { summary }),
+            ...timestamp,
+          },
+        ];
+      }
       return [
         {
           id,
@@ -496,9 +563,35 @@ export function projectAppServerNotification(
       ];
     }
     case "thread/status/changed":
-    case "thread/name/updated":
     case "thread/settings/updated":
       return [{ type: "thread.updated", payload: params, ...context }];
+    case "thread/name/updated":
+      return [
+        {
+          type: "thread.updated",
+          payload: {
+            ...params,
+            ...(typeof params.threadName === "string" ? { name: params.threadName } : {}),
+          },
+          ...context,
+        },
+      ];
+    case "thread/archived":
+      return [
+        {
+          type: "thread.updated",
+          payload: { ...params, archived: true },
+          ...context,
+        },
+      ];
+    case "thread/unarchived":
+      return [
+        {
+          type: "thread.updated",
+          payload: { ...params, archived: false },
+          ...context,
+        },
+      ];
     case "model/rerouted": {
       const fromModel = boundedProductText(params.fromModel, 256);
       const toModel = boundedProductText(params.toModel, 256);
@@ -531,7 +624,32 @@ export function projectAppServerNotification(
       return [{ type: "usage.updated", payload: params, ...context }];
     case "serverRequest/resolved":
       return [{ type: "approval.resolved", payload: params, ...context }];
-    case "error":
+    case "error": {
+      const diagnostic: RemoteEventDraft = {
+        type: "diagnostic",
+        payload: {
+          category: notification.method,
+          message: projectDiagnosticMessage(notification.method, params),
+        },
+        ...context,
+      };
+      return params.willRetry === false && threadId !== undefined && turnId !== undefined
+        ? [
+            diagnostic,
+            {
+              type: "turn.state",
+              payload: {
+                state: "failed",
+                turn: {
+                  id: turnId,
+                  status: "failed",
+                },
+              },
+              ...context,
+            },
+          ]
+        : [diagnostic];
+    }
     case "warning":
     case "guardianWarning":
     case "deprecationNotice":
@@ -622,6 +740,36 @@ function boundedProductText(value: unknown, maxLength: number): string | undefin
   return `${text.slice(0, Math.max(0, maxLength - suffix.length))}${suffix}`;
 }
 
+function imagePathsFromItem(item: Record<string, unknown>): string[] {
+  const candidates: unknown[] = [
+    item.path,
+    item.imagePath,
+    item.image_path,
+    item.savedPath,
+    item.saved_path,
+    ...asStringArray(item.paths),
+    ...asStringArray(item.imagePaths),
+    ...asStringArray(item.image_paths),
+    ...asStringArray(item.local_images),
+  ];
+  for (const image of asRecordArray(item.images)) {
+    candidates.push(
+      image.path,
+      image.imagePath,
+      image.image_path,
+      image.savedPath,
+      image.saved_path,
+    );
+  }
+  const paths = new Set<string>();
+  for (const candidate of candidates) {
+    const value = boundedProductText(candidate, 32_768);
+    if (value === undefined || /^(?:data|https?):/i.test(value)) continue;
+    paths.add(value);
+  }
+  return [...paths];
+}
+
 function projectRunState(
   thread: Record<string, unknown>,
   turns: Record<string, unknown>[],
@@ -639,7 +787,36 @@ function projectRunState(
     return "running";
   }
   const lastTurn = turns.at(-1);
-  return lastTurn ? projectTurnState(lastTurn.status) : "idle";
+  const lastTurnState = lastTurn ? projectTurnState(lastTurn.status) : "idle";
+  if (status === "idle" || status === "notLoaded") {
+    return lastTurnState === "running" ? "idle" : lastTurnState;
+  }
+  if (status === "failed" || status === "systemError") {
+    return "failed";
+  }
+  if (status === "complete" || status === "completed") {
+    return "complete";
+  }
+  return lastTurnState;
+}
+
+function projectActiveTurn(
+  thread: Record<string, unknown>,
+  turns: Record<string, unknown>[],
+): Record<string, unknown> | undefined {
+  const statusRecord = isRecord(thread.status) ? thread.status : {};
+  const status = isRecord(thread.status) ? statusRecord.type : thread.status;
+  if (
+    status === "idle" ||
+    status === "notLoaded" ||
+    status === "systemError" ||
+    status === "failed" ||
+    status === "complete" ||
+    status === "completed"
+  ) {
+    return undefined;
+  }
+  return turns.findLast((turn) => turn.status === "inProgress");
 }
 
 function projectTurnState(value: unknown): RunState {

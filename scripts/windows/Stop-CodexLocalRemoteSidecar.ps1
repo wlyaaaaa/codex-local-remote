@@ -20,6 +20,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $expectedProcessIdWasProvided = $PSBoundParameters.ContainsKey('ExpectedProcessId')
 Import-Module (Join-Path $PSScriptRoot 'CodexLocalRemote.Windows.psm1') -Force
+$managedConfiguration = Get-CodexLocalRemoteManagedConfiguration -DataDir $DataDir
+if ($null -ne $managedConfiguration) {
+    if (-not $PSBoundParameters.ContainsKey('Port')) {
+        $Port = [int]$managedConfiguration.SidecarPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BasePath')) {
+        $BasePath = [string]$managedConfiguration.BasePath
+    }
+}
 Assert-CanonicalBasePath -BasePath $BasePath
 
 $resolvedNode = [System.IO.Path]::GetFullPath($NodePath)

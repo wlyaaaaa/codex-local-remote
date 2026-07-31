@@ -2,6 +2,7 @@ import type { ConversationItem } from "@codex-local-remote/contracts";
 import { describe, expect, it } from "vitest";
 
 import {
+  activeWorkLogSegmentIndex,
   activitySummary,
   assistantPhaseForDisplay,
   conversationContentItems,
@@ -10,6 +11,10 @@ import {
   latestActiveReasoning,
   latestPlanProgress,
   latestReasoningText,
+  subagentActivityStatusForDisplay,
+  workLogSegmentBelongsToActiveTurn,
+  workLogHeadline,
+  workLogSummary,
 } from "./conversation-presentation";
 
 describe("conversation presentation", () => {
@@ -40,11 +45,12 @@ describe("conversation presentation", () => {
     ];
 
     expect(groupConversationItems(items).map((segment) => segment.kind)).toEqual([
-      "content",
-      "activity",
+      "work",
       "content",
     ]);
     expect(activitySummary(items.slice(1, 3))).toBe("编辑了 1 个文件 · 运行了 1 个命令");
+    expect(workLogSummary(items.slice(0, 3))).toBe("1 条思考 · 2 项操作");
+    expect(workLogHeadline(items.slice(0, 3))).toBe("先检查");
   });
 
   it("keeps context compaction as a permanent standalone history record", () => {
@@ -68,7 +74,7 @@ describe("conversation presentation", () => {
 
     expect(groupConversationItems(items).map((segment) => segment.kind)).toEqual([
       "compaction",
-      "activity",
+      "work",
     ]);
   });
 
@@ -102,7 +108,181 @@ describe("conversation presentation", () => {
 
     const segments = groupConversationItems(items);
     expect(segments).toHaveLength(2);
-    expect(segments[0]?.kind === "subagents" ? segments[0].items : []).toHaveLength(2);
+    expect(segments[0]?.kind === "work" ? segments[0].items : []).toHaveLength(2);
+  });
+
+  it("collapses a long completed thought chain into one reversible work log without losing order", () => {
+    const items: ConversationItem[] = [
+      { id: "user", kind: "user-message", text: "开始", turnId: "turn-1" },
+      {
+        id: "reasoning-1",
+        kind: "reasoning-summary",
+        text: "先检查",
+        turnId: "turn-1",
+      },
+      {
+        id: "commentary-1",
+        kind: "assistant-message",
+        phase: "commentary",
+        text: "再实现",
+        turnId: "turn-1",
+      },
+      {
+        id: "command",
+        kind: "tool",
+        status: "complete",
+        title: "运行命令",
+        turnId: "turn-1",
+      },
+      {
+        id: "commentary-2",
+        kind: "assistant-message",
+        phase: "commentary",
+        text: "最后验证",
+        turnId: "turn-1",
+      },
+      {
+        id: "answer",
+        kind: "assistant-message",
+        phase: "final_answer",
+        text: "完成",
+        turnId: "turn-1",
+      },
+    ];
+
+    const segments = groupConversationItems(items);
+    expect(segments.map((segment) => segment.kind)).toEqual(["content", "work", "content"]);
+    expect(segments[1]?.kind === "work" ? segments[1].items.map((item) => item.id) : []).toEqual([
+      "reasoning-1",
+      "commentary-1",
+      "command",
+      "commentary-2",
+    ]);
+  });
+
+  it("never labels a historical subagent record as live work after its turn completed", () => {
+    const historical: ConversationItem[] = [
+      {
+        action: "activity",
+        agents: [{ threadId: "agent-old" }],
+        id: "subagent-stale-running",
+        kind: "subagent-activity",
+        status: "running",
+        turnId: "turn-old",
+      },
+    ];
+
+    const segments = groupConversationItems(historical);
+    expect(activeWorkLogSegmentIndex(segments, undefined)).toBe(-1);
+    expect(activeWorkLogSegmentIndex(segments, "turn-live")).toBe(-1);
+    expect(activeWorkLogSegmentIndex(segments, "turn-old")).toBe(0);
+    expect(subagentActivityStatusForDisplay("running", false, "activity")).toBe("unknown");
+    expect(subagentActivityStatusForDisplay("running", true)).toBe("running");
+    expect(subagentActivityStatusForDisplay("failed", false)).toBe("failed");
+    expect(subagentActivityStatusForDisplay("running", false, "close")).toBe("complete");
+    expect(subagentActivityStatusForDisplay("complete", false)).toBe("complete");
+  });
+
+  it("marks only the latest work log segment in an active turn as live", () => {
+    const segments = groupConversationItems([
+      { id: "user", kind: "user-message", text: "继续", turnId: "turn-live" },
+      {
+        id: "reasoning-before",
+        kind: "reasoning-summary",
+        text: "压缩前",
+        turnId: "turn-live",
+      },
+      {
+        id: "compaction",
+        kind: "tool",
+        operation: "context-compaction",
+        status: "complete",
+        title: "压缩对话上下文",
+        turnId: "turn-live",
+      },
+      {
+        id: "reasoning-after",
+        kind: "reasoning-summary",
+        text: "压缩后",
+        turnId: "turn-live",
+      },
+    ]);
+
+    expect(segments.map((segment) => segment.kind)).toEqual([
+      "content",
+      "work",
+      "compaction",
+      "work",
+    ]);
+    expect(activeWorkLogSegmentIndex(segments, "turn-live")).toBe(3);
+  });
+
+  it("keeps every split work segment from the active turn active for subagent status", () => {
+    const segments = groupConversationItems([
+      {
+        action: "activity",
+        agents: [{ threadId: "agent-live" }],
+        id: "subagent-running",
+        kind: "subagent-activity",
+        status: "running",
+        turnId: "turn-live",
+      },
+      {
+        action: "viewed",
+        attachments: [],
+        id: "image",
+        kind: "image-activity",
+        status: "complete",
+        turnId: "turn-live",
+      },
+      {
+        id: "reasoning-after-image",
+        kind: "reasoning-summary",
+        text: "继续处理",
+        turnId: "turn-live",
+      },
+    ]);
+
+    expect(segments.map((segment) => segment.kind)).toEqual(["work", "content", "work"]);
+    expect(activeWorkLogSegmentIndex(segments, "turn-live")).toBe(2);
+    expect(workLogSegmentBelongsToActiveTurn(segments, 0, "turn-live")).toBe(true);
+    expect(workLogSegmentBelongsToActiveTurn(segments, 2, "turn-live")).toBe(true);
+    expect(
+      subagentActivityStatusForDisplay(
+        "running",
+        workLogSegmentBelongsToActiveTurn(segments, 0, "turn-live"),
+      ),
+    ).toBe("running");
+    expect(workLogSegmentBelongsToActiveTurn(segments, 0, undefined)).toBe(false);
+  });
+
+  it("does not let an undefined turn item bridge two explicit turns into one work segment", () => {
+    const segments = groupConversationItems([
+      {
+        id: "turn-a",
+        kind: "reasoning-summary",
+        text: "A",
+        turnId: "turn-a",
+      },
+      {
+        id: "turn-unknown",
+        kind: "tool",
+        status: "complete",
+        title: "运行命令",
+      },
+      {
+        id: "turn-b",
+        kind: "reasoning-summary",
+        text: "B",
+        turnId: "turn-b",
+      },
+    ]);
+
+    expect(
+      segments.map((segment) =>
+        segment.kind === "work" ? segment.items.map((item) => item.id) : [],
+      ),
+    ).toEqual([["turn-a", "turn-unknown"], ["turn-b"]]);
   });
 
   it("uses authoritative message phases and conservatively treats the last legacy message as final", () => {
@@ -153,8 +333,51 @@ describe("conversation presentation", () => {
     expect(latestReasoningText("__Reviewing changes__")).toBe("Reviewing changes");
     expect(currentLivePhase(items, "turn-live")).toEqual({
       kind: "reasoning",
-      text: "Implementing the final fix",
+      text: "正在思考",
     });
+  });
+
+  it("renders only the latest active reasoning while retaining the complete finished history", () => {
+    const items: ConversationItem[] = [
+      { id: "user-start", kind: "user-message", text: "开始", turnId: "turn-live" },
+      {
+        id: "reasoning-before-steer",
+        kind: "reasoning-summary",
+        text: "Verifying read-only product status",
+        turnId: "turn-live",
+      },
+      { id: "user-steer", kind: "user-message", text: "继续", turnId: "turn-live" },
+      {
+        id: "reasoning-after-steer-1",
+        kind: "reasoning-summary",
+        text: "Inspecting the current state",
+        turnId: "turn-live",
+      },
+      {
+        id: "command",
+        kind: "tool",
+        status: "complete",
+        title: "运行命令",
+        turnId: "turn-live",
+      },
+      {
+        id: "reasoning-after-steer-2",
+        kind: "reasoning-summary",
+        text: "Implementing the current fix",
+        turnId: "turn-live",
+      },
+    ];
+
+    expect(latestActiveReasoning(items, "turn-live")?.id).toBe("reasoning-after-steer-2");
+    expect(conversationContentItems(items, "turn-live").map((item) => item.id)).toEqual([
+      "user-start",
+      "user-steer",
+      "command",
+      "reasoning-after-steer-2",
+    ]);
+    expect(conversationContentItems(items).map((item) => item.id)).toEqual(
+      items.map((item) => item.id),
+    );
   });
 
   it("uses the real running operation instead of claiming that every active turn is thinking", () => {
@@ -225,6 +448,21 @@ describe("conversation presentation", () => {
     expect(
       currentLivePhase([{ id: "waiting", kind: "user-message", text: "已发送" }], "turn-live"),
     ).toBeUndefined();
+    expect(
+      currentLivePhase(
+        [
+          { id: "turn-user", kind: "user-message", text: "开始", turnId: "turn-live" },
+          {
+            id: "stale-same-turn-reasoning",
+            kind: "reasoning-summary",
+            text: "Verifying read-only product status",
+            turnId: "turn-live",
+          },
+          { id: "turn-steer", kind: "user-message", text: "继续", turnId: "turn-live" },
+        ],
+        "turn-live",
+      ),
+    ).toBeUndefined();
   });
 
   it("keeps the complete commentary chain after a turn completes", () => {
@@ -260,9 +498,15 @@ describe("conversation presentation", () => {
     expect(currentLivePhase(items, undefined)).toBeUndefined();
   });
 
-  it("keeps every active commentary update in order while raw reasoning stays ephemeral", () => {
+  it("keeps every commentary update while showing only the latest active reasoning", () => {
     const items: ConversationItem[] = [
       { id: "user", kind: "user-message", text: "开始", turnId: "turn-live" },
+      {
+        id: "reasoning-1",
+        kind: "reasoning-summary",
+        text: "先检查现有状态",
+        turnId: "turn-live",
+      },
       {
         id: "commentary-1",
         kind: "assistant-message",
@@ -278,6 +522,12 @@ describe("conversation presentation", () => {
         turnId: "turn-live",
       },
       {
+        id: "reasoning-2",
+        kind: "reasoning-summary",
+        text: "再实现修复",
+        turnId: "turn-live",
+      },
+      {
         id: "plan",
         kind: "plan-progress",
         steps: [{ status: "inProgress", text: "执行实现" }],
@@ -289,6 +539,14 @@ describe("conversation presentation", () => {
       "user",
       "commentary-1",
       "commentary-2",
+      "reasoning-2",
+    ]);
+    expect(conversationContentItems(items).map((item) => item.id)).toEqual([
+      "user",
+      "reasoning-1",
+      "commentary-1",
+      "commentary-2",
+      "reasoning-2",
     ]);
     expect(latestPlanProgress(items)?.id).toBe("plan");
     expect(currentLivePhase(items, "turn-live")).toBeUndefined();
@@ -310,6 +568,46 @@ describe("conversation presentation", () => {
     expect(
       latestPlanProgress([...items, { id: "plan-cleared", kind: "plan-progress", steps: [] }]),
     ).toBeUndefined();
+  });
+
+  it("keeps answered questions and the formal plan while removing only a duplicate plan envelope", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "question-1",
+        kind: "interaction-record",
+        interaction: "question",
+        status: "answered",
+        title: "Codex 提出了问题",
+        turnId: "turn-plan",
+        questions: [
+          {
+            id: "choice",
+            header: "选择",
+            isSecret: false,
+            question: "采用哪个方案？",
+            answers: ["方案 A"],
+          },
+        ],
+      },
+      {
+        id: "formal-plan",
+        kind: "formal-plan",
+        text: "# 方案 A\n\n1. 验证",
+        turnId: "turn-plan",
+      },
+      {
+        id: "duplicate-envelope",
+        kind: "assistant-message",
+        phase: "final_answer",
+        text: "<proposed_plan>\n# 方案 A\n\n1. 验证\n</proposed_plan>",
+        turnId: "turn-plan",
+      },
+    ];
+
+    expect(conversationContentItems(items).map((item) => item.id)).toEqual([
+      "question-1",
+      "formal-plan",
+    ]);
   });
 
   it("does not repeat a visible commentary message as a live phase", () => {

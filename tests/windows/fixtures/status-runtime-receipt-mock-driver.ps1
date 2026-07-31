@@ -23,6 +23,11 @@ param(
         'listener-replacement',
         'health-id',
         'health-pid',
+        'proof-missing',
+        'proof-digest-mismatch',
+        'proof-runtime-mismatch',
+        'proof-root-mismatch',
+        'proof-unknown-client',
         'runtime-package-drift',
         'runtime-hash-drift',
         'runtime-blocked'
@@ -73,8 +78,10 @@ $upstreamTokenPath = [System.IO.Path]::GetFullPath(
 $startupPath = Join-Path $resolvedDataDir 'startup-last.json'
 $brokerStatePath = Join-Path $resolvedDataDir 'app-server-broker.json'
 $tokenSentinel = 'TOKEN_SENTINEL_SHOULD_NOT_BE_READ_0123456789abcdef'
+$desktopLaunchNonceDigest = 'c' * 64
 
 $null = New-Item -ItemType Directory -Path $resolvedDataDir -Force
+$null = Protect-CodexLocalRemoteDataDirectory -DataDir $resolvedDataDir
 [System.IO.File]::WriteAllText($capabilityTokenPath, $tokenSentinel)
 [System.IO.File]::WriteAllText($upstreamTokenPath, $tokenSentinel)
 
@@ -97,8 +104,8 @@ $task = [pscustomobject]@{
     State = 'Running'
     Actions = @(
         [pscustomobject]@{
-            Execute = $expectedTask.Execute
-            Arguments = $expectedTask.Arguments
+            Execute = $expectedTask.TaskExecute
+            Arguments = $expectedTask.TaskArguments
             WorkingDirectory = $expectedTask.WorkingDirectory
         }
     )
@@ -290,12 +297,21 @@ $processes = @{
         CommandLine = $upstreamCommand
         CreationDate = $upstreamProcessReceipt.CreationDate
     }
+    4500 = [pscustomobject]@{
+        ProcessId = 4500
+        ParentProcessId = 1
+        Name = 'ChatGPT.exe'
+        ExecutablePath = $resolvedCodex
+        CommandLine = (ConvertTo-WindowsCommandLineArgument -Value $resolvedCodex)
+        CreationDate = $baseTime.AddSeconds(4).ToString('O')
+    }
 }
 $startTimes = @{
     4100 = $baseTime
     4200 = $baseTime.AddSeconds(1)
     4300 = $baseTime.AddSeconds(2)
     4400 = $baseTime.AddSeconds(3)
+    4500 = $baseTime.AddSeconds(4)
 }
 
 switch ($Mode) {
@@ -355,6 +371,24 @@ $startupReceipt | ConvertTo-Json -Depth 20 |
     Set-Content -LiteralPath $startupPath -Encoding utf8NoBOM
 $brokerReceipt | ConvertTo-Json -Depth 20 |
     Set-Content -LiteralPath $brokerStatePath -Encoding utf8NoBOM
+
+if ($Mode -cne 'proof-missing') {
+    $null = Write-CodexDesktopOwnerConnectionProof `
+        -DataDir $resolvedDataDir `
+        -RuntimeInvocationId $(if ($Mode -ceq 'proof-runtime-mismatch') {
+            $otherRuntimeId
+        } else {
+            $runtimeId
+        }) `
+        -ProcessId $(if ($Mode -ceq 'proof-root-mismatch') { 4501 } else { 4500 }) `
+        -StartTimeUtcTicks $baseTime.AddSeconds(4).Ticks `
+        -ExecutablePath $resolvedCodex `
+        -LaunchNonceDigest $(if ($Mode -ceq 'proof-digest-mismatch') {
+            'd' * 64
+        } else {
+            $desktopLaunchNonceDigest
+        })
+}
 
 $global:CodexRemoteTokenReadCount = 0
 $global:CodexRemoteStatusReadCount = @{}
@@ -435,6 +469,9 @@ function Get-CimInstance {
     if ($Filter -match '^ProcessId = ([0-9]+)$') {
         return $processes[[int]$Matches[1]]
     }
+    if ($Filter -ceq "Name = 'ChatGPT.exe'") {
+        return $processes[4500]
+    }
     return @()
 }
 
@@ -468,7 +505,7 @@ function Invoke-RestMethod {
             desktopConnected = $true
             sidecarConnected = $true
             degraded = $false
-            unknownCount = 0
+            unknownCount = if ($Mode -ceq 'proof-unknown-client') { 1 } else { 0 }
             runtimeInvocationId = if ($Mode -ceq 'health-id') {
                 $otherRuntimeId
             } else {
@@ -476,6 +513,8 @@ function Invoke-RestMethod {
             }
             brokerProcessId = if ($Mode -ceq 'health-pid') { 4201 } else { 4200 }
             upstreamProcessId = 4400
+            desktopConnectionCount = 1
+            desktopLaunchNonceDigests = @($desktopLaunchNonceDigest)
         }
     }
     if ($Uri -like '*/api/v1/bootstrap') {

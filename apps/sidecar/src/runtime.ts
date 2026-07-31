@@ -13,6 +13,7 @@ import type {
 import type {
   CapabilityState,
   DiagnosticSnapshot,
+  PersistedConversationHistoryIntegrity,
   ProductCapabilities,
 } from "@codex-local-remote/contracts";
 import {
@@ -29,6 +30,10 @@ import { BrowserUploadStore } from "./browser-uploads.js";
 import { createDesktopThreadNotifier } from "./desktop-thread-notifier.js";
 import { DesktopPinnedThreadReader } from "./desktop-global-state.js";
 import { readDesktopRuntimeHealth, type DesktopRuntimeHealth } from "./desktop-runtime-health.js";
+import {
+  DesktopSessionConversationReader,
+  type DesktopSessionConversationReadDiagnostic,
+} from "./desktop-session-conversation.js";
 import { DesktopSessionUsageReader } from "./desktop-session-usage.js";
 import { resolveProjectInputReference } from "./files.js";
 import { createWindowsDpapiPromptProtector } from "./prompt-protector.js";
@@ -39,9 +44,52 @@ import { DurableTurnOutbox } from "./turn-outbox.js";
 import { TurnQueueService } from "./turn-queue.js";
 import { TurnQueueDispatcher } from "./turn-queue-dispatcher.js";
 
-const SIDECAR_VERSION = "0.1.1";
+const SIDECAR_VERSION = "0.1.2";
 const DESKTOP_RECONCILIATION_INTERVAL_MS = 5_000;
 const SHARED_CAPABILITY_PROBE_TIMEOUT_MS = 30_000;
+
+export function persistedConversationHistoryIntegrity(
+  scope: PersistedConversationHistoryIntegrity["scope"],
+  observedCount: number,
+  diagnostic: DesktopSessionConversationReadDiagnostic | undefined,
+): PersistedConversationHistoryIntegrity {
+  if (diagnostic === undefined) {
+    return {
+      observedCount,
+      reason: "diagnostic-unavailable",
+      scope,
+      status: "failed",
+    };
+  }
+  if (diagnostic.status === "failed") {
+    return {
+      observedCount,
+      reason: diagnostic.reason === "unstable-file" ? "unstable-file" : "read-failed",
+      scope,
+      status: "failed",
+    };
+  }
+  if (diagnostic.status === "truncated") {
+    const reason =
+      diagnostic.reason === "invalid-json" ||
+      diagnostic.reason === "overlong-line" ||
+      diagnostic.reason === "unterminated-line"
+        ? diagnostic.reason
+        : "projection-limit";
+    return {
+      observedCount,
+      reason,
+      scope,
+      status: "partial",
+    };
+  }
+  return {
+    observedCount,
+    reason: scope === "complete" ? "verified-complete" : "recent-window",
+    scope,
+    status: scope === "complete" ? "complete" : "partial",
+  };
+}
 
 export interface RunningSidecar {
   app: FastifyInstance;
@@ -71,19 +119,36 @@ export function isSidecarRequestReady(
     snapshot.state === "running" &&
     snapshot.capabilities?.models.state === "available" &&
     snapshot.capabilities.threadList?.state === "available" &&
-    desktopRuntimeCanServeRequests(desktopRuntimeHealth) &&
+    desktopRuntimeCanServeRequests(desktopRuntimeHealth, brokerDesktopHealth) &&
     brokerDesktopCanServeRequests(brokerDesktopHealth)
   );
 }
 
-function desktopRuntimeCanServeRequests(health: DesktopRuntimeHealth): boolean {
+function desktopRuntimeCanServeRequests(
+  health: DesktopRuntimeHealth,
+  brokerHealth: BrokerDesktopHealth,
+): boolean {
+  // The startup receipt describes package/launcher verification, not the live
+  // channel by itself. An exact Broker receipt plus live app-server, Desktop
+  // and Sidecar probes can safely keep the already-running lease usable while
+  // that launcher receipt is temporarily stale or unverifiable.
   return (
-    health.state === "current" || health.state === "starting" || health.state === "update-pending"
+    health.state === "current" ||
+    health.state === "starting" ||
+    health.state === "update-pending" ||
+    (health.state === "runtime-check-blocked" && brokerDesktopCanServeRequests(brokerHealth))
   );
 }
 
-function desktopRuntimeCanReportAvailable(health: DesktopRuntimeHealth): boolean {
-  return health.state === "current" || health.state === "update-pending";
+function desktopRuntimeCanReportAvailable(
+  health: DesktopRuntimeHealth,
+  brokerHealth: BrokerDesktopHealth,
+): boolean {
+  return (
+    health.state === "current" ||
+    health.state === "update-pending" ||
+    (health.state === "runtime-check-blocked" && brokerDesktopCanServeRequests(brokerHealth))
+  );
 }
 
 function brokerDesktopCanServeRequests(health: BrokerDesktopHealth): boolean {
@@ -132,12 +197,16 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     createSharedAppServerSupervisorOptions(config.appServerUrl),
   );
   const desktopPins = new DesktopPinnedThreadReader();
+  const desktopSessionConversation = new DesktopSessionConversationReader();
   const desktopSessionUsage = new DesktopSessionUsageReader();
   const projects = new ProjectRegistry(state.listProjects());
   const notifyManagedThreadCreated = createDesktopThreadNotifier({
     enabled: config.desktopSyncEnabled,
   });
   const domain = new CodexDomainService({
+    archiveIntents: state.listArchiveIntents(),
+    beginArchiveIntent: async (threadId, targetArchived) =>
+      await state.beginArchiveIntent(threadId, targetArchived),
     clearPendingDesktopNotification: async (threadId) => {
       await state.clearPendingDesktopNotification(threadId);
     },
@@ -152,6 +221,44 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     ...(notifyManagedThreadCreated === undefined ? {} : { notifyManagedThreadCreated }),
     pendingDesktopNotificationThreadIds: state.listPendingDesktopNotificationThreadIds(),
     protocolCatalog,
+    readPersistedConversationItems: async (threadId, sessionPath, scope = "recent") => {
+      const codexHome = supervisor.snapshot().codexHome;
+      if (codexHome === undefined) {
+        return {
+          integrity: {
+            observedCount: 0,
+            reason: "diagnostic-unavailable",
+            scope,
+            status: "failed",
+          } satisfies PersistedConversationHistoryIntegrity,
+          items: [],
+        };
+      }
+      const input = {
+        codexHome,
+        ...(sessionPath === undefined ? {} : { sessionPath }),
+        threadId,
+      };
+      const result = await desktopSessionConversation.readWithDiagnostic(input, scope);
+      return {
+        integrity: persistedConversationHistoryIntegrity(
+          scope,
+          result?.items.length ?? 0,
+          result?.diagnostic,
+        ),
+        items: result?.items ?? [],
+      };
+    },
+    readPersistedRuntimeSettings: async (threadId, sessionPath) => {
+      const codexHome = supervisor.snapshot().codexHome;
+      return codexHome === undefined
+        ? undefined
+        : await desktopSessionConversation.readRuntimeSettings({
+            codexHome,
+            ...(sessionPath === undefined ? {} : { sessionPath }),
+            threadId,
+          });
+    },
     readPersistedUsageContext: async (threadId, sessionPath) => {
       const codexHome = supervisor.snapshot().codexHome;
       return codexHome === undefined
@@ -164,6 +271,9 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     },
     persistManagedThread: async (threadId, options) => {
       await state.markManagedThread(threadId, options);
+    },
+    unpersistManagedThread: async (threadId) => {
+      await state.unmarkManagedThread(threadId);
     },
     projects,
     resolveLocalInputReference: async (reference) => {
@@ -187,6 +297,9 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     resolveRegisteredProjectRoot: async (projectId) =>
       await state.authorizeRegisteredProjectRoot(projectId),
     sharedAppServer: true,
+    settleArchiveIntent: async (threadId, observedArchived) => {
+      await state.settleArchiveIntent(threadId, observedArchived);
+    },
   });
   const outbox = await DurableTurnOutbox.open({
     dataDir: config.dataDir,
@@ -370,7 +483,7 @@ export function createDiagnostics(
   },
 ): DiagnosticSnapshot {
   const appServer =
-    desktopRuntimeCanReportAvailable(desktopRuntimeHealth) &&
+    desktopRuntimeCanReportAvailable(desktopRuntimeHealth, brokerDesktopHealth) &&
     brokerDesktopCanServeRequests(brokerDesktopHealth)
       ? appServerCapability(snapshot)
       : "degraded";
@@ -392,9 +505,10 @@ export function createDiagnostics(
       ["thread/compact/start"],
     ),
     desktopSnapshots: capabilityFromProbe(snapshot.capabilities?.threadList, running),
-    fileBrowser: state.listProjects().some((project) => project.source === "registered")
-      ? "available"
-      : "degraded",
+    // The owner file manager is a Sidecar capability. It deliberately follows
+    // the current Windows process identity and does not depend on whether a
+    // task has a registered project.
+    fileBrowser: "available",
     goals: capabilityFromProbeOrMethods(
       snapshot.capabilities?.goals,
       running,

@@ -2,6 +2,8 @@ import type { RemoteEvent } from "@codex-local-remote/contracts";
 import { describe, expect, it } from "vitest";
 import {
   EVENT_SOURCE_CLOSED,
+  EVENT_SOURCE_CONNECTING,
+  EVENT_STREAM_OFFLINE_GRACE_MS,
   EVENT_STREAM_RETRY_DELAYS_MS,
   createFetchEventStreamSource,
   subscribeRemoteEvents,
@@ -23,7 +25,7 @@ class FakeEventStreamSource implements EventStreamSource {
 function reconnectHarness() {
   const sources: FakeEventStreamSource[] = [];
   const urls: string[] = [];
-  const timers = new Map<number, () => void>();
+  const timers = new Map<number, { callback: () => void; delay: number }>();
   const delays: number[] = [];
   let nextTimerId = 1;
 
@@ -40,7 +42,7 @@ function reconnectHarness() {
       },
       schedule: (callback: () => void, delay: number) => {
         const id = nextTimerId++;
-        timers.set(id, callback);
+        timers.set(id, { callback, delay });
         delays.push(delay);
         return id;
       },
@@ -48,12 +50,12 @@ function reconnectHarness() {
         timers.delete(id);
       },
     },
-    runNextTimer() {
-      const next = timers.entries().next().value as [number, () => void] | undefined;
+    runTimer(delay: number) {
+      const next = [...timers.entries()].find(([, timer]) => timer.delay === delay);
       expect(next).toBeDefined();
-      const [id, callback] = next!;
+      const [id, timer] = next!;
       timers.delete(id);
-      callback();
+      timer.callback();
     },
     timerCount() {
       return timers.size;
@@ -62,7 +64,7 @@ function reconnectHarness() {
 }
 
 describe("SSE 断线重连", () => {
-  it("EventSource 进入 CLOSED 后显式重建，并且重复 error 不创建重复连接", () => {
+  it("短暂 CLOSED 会重建连接，但不会立刻把编辑和发送状态切成离线", () => {
     const harness = reconnectHarness();
     const connections: boolean[] = [];
     const unsubscribe = subscribeRemoteEvents(
@@ -74,20 +76,70 @@ describe("SSE 断线重连", () => {
 
     expect(harness.sources).toHaveLength(1);
     const first = harness.sources[0]!;
+    first.onopen?.({} as Event);
     first.readyState = EVENT_SOURCE_CLOSED;
     first.onerror?.({} as Event);
     first.onerror?.({} as Event);
 
-    expect(connections).toEqual([false]);
+    expect(connections).toEqual([true]);
     expect(first.closeCalls).toBe(1);
-    expect(harness.timerCount()).toBe(1);
-    expect(harness.delays).toEqual([EVENT_STREAM_RETRY_DELAYS_MS[0]]);
+    expect(harness.timerCount()).toBe(2);
+    expect(harness.delays).toEqual([
+      EVENT_STREAM_OFFLINE_GRACE_MS,
+      EVENT_STREAM_RETRY_DELAYS_MS[0],
+    ]);
 
-    harness.runNextTimer();
+    harness.runTimer(EVENT_STREAM_RETRY_DELAYS_MS[0]);
     expect(harness.sources).toHaveLength(2);
+    harness.sources[1]!.onopen?.({} as Event);
+    expect(connections).toEqual([true]);
+    expect(harness.timerCount()).toBe(0);
 
     unsubscribe();
     expect(harness.sources[1]!.closeCalls).toBe(1);
+  });
+
+  it("超过宽限时间的真实断线仍会报告离线并禁用远程 mutation", () => {
+    const harness = reconnectHarness();
+    const connections: boolean[] = [];
+    const unsubscribe = subscribeRemoteEvents(
+      "/api/v1/events",
+      () => undefined,
+      (online) => connections.push(online),
+      harness.dependencies,
+    );
+
+    const source = harness.sources[0]!;
+    source.onopen?.({} as Event);
+    source.readyState = EVENT_SOURCE_CLOSED;
+    source.onerror?.({} as Event);
+    harness.runTimer(EVENT_STREAM_OFFLINE_GRACE_MS);
+
+    expect(connections).toEqual([true, false]);
+    unsubscribe();
+  });
+
+  it("原生 EventSource 自动重连期间恢复时不弹出离线状态", () => {
+    const harness = reconnectHarness();
+    const connections: boolean[] = [];
+    const unsubscribe = subscribeRemoteEvents(
+      "/api/v1/events",
+      () => undefined,
+      (online) => connections.push(online),
+      harness.dependencies,
+    );
+
+    const source = harness.sources[0]!;
+    source.onopen?.({} as Event);
+    source.readyState = EVENT_SOURCE_CONNECTING;
+    source.onerror?.({} as Event);
+    expect(harness.sources).toHaveLength(1);
+    expect(harness.timerCount()).toBe(1);
+
+    source.onopen?.({} as Event);
+    expect(connections).toEqual([true]);
+    expect(harness.timerCount()).toBe(0);
+    unsubscribe();
   });
 
   it("退避有上限，连接成功后从最短退避重新开始", () => {
@@ -103,10 +155,12 @@ describe("SSE 断线重连", () => {
       const source = harness.sources.at(-1)!;
       source.readyState = EVENT_SOURCE_CLOSED;
       source.onerror?.({} as Event);
-      harness.runNextTimer();
+      harness.runTimer(
+        EVENT_STREAM_RETRY_DELAYS_MS[Math.min(attempt, EVENT_STREAM_RETRY_DELAYS_MS.length - 1)]!,
+      );
     }
 
-    expect(harness.delays).toEqual([
+    expect(harness.delays.filter((delay) => delay !== EVENT_STREAM_OFFLINE_GRACE_MS)).toEqual([
       ...EVENT_STREAM_RETRY_DELAYS_MS,
       EVENT_STREAM_RETRY_DELAYS_MS.at(-1),
       EVENT_STREAM_RETRY_DELAYS_MS.at(-1),
@@ -160,9 +214,33 @@ describe("SSE 断线重连", () => {
     } as MessageEvent<string>);
     source.readyState = EVENT_SOURCE_CLOSED;
     source.onerror?.({} as Event);
-    harness.runNextTimer();
+    harness.runTimer(EVENT_STREAM_RETRY_DELAYS_MS[0]);
 
     expect(harness.urls).toEqual(["/api/v1/events", "/api/v1/events?cursor=stream-a%3A42"]);
+    unsubscribe();
+  });
+
+  it("首连使用详情快照游标，重连时用最新事件游标精确替换", () => {
+    const harness = reconnectHarness();
+    const unsubscribe = subscribeRemoteEvents(
+      "/api/v1/events?threadId=thread-1&cursor=snapshot%3A7",
+      () => undefined,
+      () => undefined,
+      harness.dependencies,
+    );
+    const source = harness.sources[0]!;
+    source.onmessage?.({
+      data: JSON.stringify({ type: "connection.ready" }),
+      lastEventId: "stream-current:9",
+    } as MessageEvent<string>);
+    source.readyState = EVENT_SOURCE_CLOSED;
+    source.onerror?.({} as Event);
+    harness.runTimer(EVENT_STREAM_RETRY_DELAYS_MS[0]);
+
+    expect(harness.urls).toEqual([
+      "/api/v1/events?threadId=thread-1&cursor=snapshot%3A7",
+      "/api/v1/events?threadId=thread-1&cursor=stream-current%3A9",
+    ]);
     unsubscribe();
   });
 

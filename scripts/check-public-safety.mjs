@@ -189,7 +189,7 @@ function scanWindowsPaths(source, candidate, findings) {
   for (let index = 0; index < 3; index += 1) {
     normalized = normalized.replaceAll("\\\\", "\\");
   }
-  const userPath = /\b[A-Za-z]:\\Users\\([^\\/"'\r\n]+)/giu;
+  const userPath = /\b[A-Za-z]:[\\/]Users[\\/]([^\\/"'\r\n]+)/giu;
   for (const match of normalized.matchAll(userPath)) {
     const user = match[1].replace(/[<>%${}]/gu, "").toLowerCase();
     if (!placeholderWords.has(user)) {
@@ -209,6 +209,27 @@ function scanFunnelHostnames(source, candidate, findings) {
       continue;
     }
     findings.push(`${candidate}:${lineNumberAt(source, match.index)} real Funnel hostname`);
+  }
+}
+
+function scanPublicDocumentationPrivacy(source, candidate, findings) {
+  const normalizedCandidate = candidate.replaceAll("\\", "/");
+  if (!normalizedCandidate.toLowerCase().endsWith(".md")) {
+    return;
+  }
+
+  const conversationIdentifier =
+    /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/giu;
+  for (const match of source.matchAll(conversationIdentifier)) {
+    findings.push(
+      `${candidate}:${lineNumberAt(source, match.index)} conversation identifier in public documentation`,
+    );
+  }
+
+  const ownerLocalPath =
+    /\b[A-Za-z]:[\\/](?:\.agents|PCConfig|PersonalOS|GitHub总索引|Personal|Work)(?:[\\/]|$)/giu;
+  for (const match of source.matchAll(ownerLocalPath)) {
+    findings.push(`${candidate}:${lineNumberAt(source, match.index)} owner-local Windows path`);
   }
 }
 
@@ -252,6 +273,7 @@ for (const candidate of candidates) {
   }
   scanWindowsPaths(source, relative(root, absolute), findings);
   scanFunnelHostnames(source, relative(root, absolute), findings);
+  scanPublicDocumentationPrivacy(source, relative(root, absolute), findings);
 }
 
 if (findings.length > 0) {

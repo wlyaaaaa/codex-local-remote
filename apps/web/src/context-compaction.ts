@@ -60,6 +60,9 @@ export function activeContextCompaction(
   ) {
     return undefined;
   }
+  if (hasTerminalCompactionInSameCycle(thread.items, latestIndex, latest.turnId)) {
+    return undefined;
+  }
   const threadIsActive =
     Boolean(thread.activeTurnId) ||
     thread.state === "running" ||
@@ -73,13 +76,52 @@ export function activeContextCompaction(
 }
 
 export function contextCompactionItemsForDisplay(thread: ThreadDetail): ConversationItem[] {
-  const latest = latestContextCompaction(thread.items);
-  if (latest?.status !== "running" || activeContextCompaction(thread)?.id === latest.id) {
-    return [...thread.items];
+  const activeId = activeContextCompaction(thread)?.id;
+  return thread.items.flatMap((item, index) => {
+    if (
+      item.kind !== "tool" ||
+      item.operation !== "context-compaction" ||
+      item.status !== "running"
+    ) {
+      return [item];
+    }
+    if (hasTerminalCompactionInSameCycle(thread.items, index, item.turnId)) {
+      return [];
+    }
+    return item.id === activeId ? [item] : [{ ...item, status: "complete" as const }];
+  });
+}
+
+function hasTerminalCompactionInSameCycle(
+  items: readonly ConversationItem[],
+  runningIndex: number,
+  runningTurnId: string | undefined,
+): boolean {
+  if (runningTurnId !== undefined) {
+    return items.some(
+      (candidate, index) =>
+        index !== runningIndex &&
+        candidate.kind === "tool" &&
+        candidate.operation === "context-compaction" &&
+        candidate.status !== "running" &&
+        candidate.turnId === runningTurnId,
+    );
   }
-  return thread.items.map((item) =>
-    item.id === latest.id && item.kind === "tool" ? { ...item, status: "complete" as const } : item,
-  );
+  for (let index = runningIndex + 1; index < items.length; index += 1) {
+    const candidate = items[index];
+    if (candidate?.kind === "user-message") {
+      return false;
+    }
+    if (
+      candidate?.kind !== "tool" ||
+      candidate.operation !== "context-compaction" ||
+      candidate.status === "running"
+    ) {
+      continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 export function canRequestContextCompaction(

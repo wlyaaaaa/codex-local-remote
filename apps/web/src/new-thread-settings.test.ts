@@ -5,6 +5,7 @@ import type {
   PermissionProfileOption,
 } from "@codex-local-remote/contracts";
 import {
+  chooseCollaborationMode,
   choosePermissionProfileId,
   chooseServiceTier,
   newThreadRuntimeSettings,
@@ -129,5 +130,18 @@ describe("新建任务运行时设置", () => {
     });
     expect(chooseServiceTier(models[0], undefined)).toBeUndefined();
     expect(chooseServiceTier(models[0], "fast")).toBe("fast");
+  });
+
+  it("新对话默认选择标准协作模式，绝不因列表顺序误入计划模式", () => {
+    const modes: CollaborationModeOption[] = [
+      { id: "plan", displayName: "计划模式", available: true },
+      { id: "Default", displayName: "标准", available: true },
+    ];
+
+    expect(chooseCollaborationMode(modes)).toBe("Default");
+    expect(chooseCollaborationMode(modes, "plan")).toBe("plan");
+    expect(
+      chooseCollaborationMode([{ id: "plan", displayName: "计划模式", available: true }]),
+    ).toBeUndefined();
   });
 });

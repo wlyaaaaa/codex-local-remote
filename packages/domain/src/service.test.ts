@@ -3,8 +3,12 @@ import os from "node:os";
 import path from "node:path";
 
 import type {
+  ConversationItem,
   CreateThreadInput,
   LocalInputReference,
+  PersistedConversationHistoryScope,
+  PersistedConversationReadResult,
+  ThreadSettingsInput,
   UsageSnapshot,
 } from "@codex-local-remote/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -81,6 +85,22 @@ function createService(
   ) => (projectId === "project-1" ? "C:\\workspace\\sample" : undefined),
   notifyManagedThreadCreated?: (threadId: string) => void | Promise<void>,
   options: {
+    archiveCleanupRetryDelaysMs?: number[];
+    archiveIntents?: Iterable<{
+      desktopNotificationPending: boolean;
+      managed: boolean;
+      targetArchived: boolean;
+      threadId: string;
+    }>;
+    beginArchiveIntent?: (
+      threadId: string,
+      targetArchived: boolean,
+    ) => Promise<{
+      desktopNotificationPending: boolean;
+      managed: boolean;
+      targetArchived: boolean;
+      threadId: string;
+    }>;
     events?: RemoteEventBuffer;
     generalConversationRoot?: string;
     listPinnedThreadIds?: () => Promise<readonly string[]>;
@@ -94,6 +114,20 @@ function createService(
       threadId: string,
       sessionPath?: string,
     ) => Promise<NonNullable<UsageSnapshot["context"]> | undefined>;
+    readPersistedConversationItems?: (
+      threadId: string,
+      sessionPath?: string,
+      scope?: PersistedConversationHistoryScope,
+    ) => Promise<ConversationItem[] | PersistedConversationReadResult>;
+    readPersistedRuntimeSettings?: (
+      threadId: string,
+      sessionPath?: string,
+    ) => Promise<ThreadSettingsInput | undefined>;
+    persistManagedThread?: (
+      threadId: string,
+      options: { desktopNotificationPending: boolean },
+    ) => Promise<void>;
+    unpersistManagedThread?: (threadId: string) => Promise<void>;
     resolveLocalInputReference?: (reference: LocalInputReference) => Promise<{
       kind: "file" | "directory";
       name: string;
@@ -101,6 +135,7 @@ function createService(
     }>;
     sharedAppServer?: boolean;
     sharedResumeDelaysMs?: number[];
+    settleArchiveIntent?: (threadId: string, observedArchived: boolean) => Promise<void>;
   } = {},
 ): CodexDomainService {
   // Most pre-pagination fixtures expose their turns on thread/read. Adapt those
@@ -112,6 +147,13 @@ function createService(
     : async <T = unknown>(method: string, params?: unknown): Promise<T> =>
         (await request(method, params)) as T;
   return new CodexDomainService({
+    ...(options.archiveCleanupRetryDelaysMs === undefined
+      ? {}
+      : { archiveCleanupRetryDelaysMs: options.archiveCleanupRetryDelaysMs }),
+    ...(options.archiveIntents === undefined ? {} : { archiveIntents: options.archiveIntents }),
+    ...(options.beginArchiveIntent === undefined
+      ? {}
+      : { beginArchiveIntent: options.beginArchiveIntent }),
     gateway: {
       request: adaptedRequest,
     },
@@ -124,6 +166,9 @@ function createService(
     ...(options.sharedResumeDelaysMs === undefined
       ? {}
       : { sharedResumeDelaysMs: options.sharedResumeDelaysMs }),
+    ...(options.settleArchiveIntent === undefined
+      ? {}
+      : { settleArchiveIntent: options.settleArchiveIntent }),
     ...(options.generalConversationRoot === undefined
       ? {}
       : { generalConversationRoot: options.generalConversationRoot }),
@@ -138,6 +183,18 @@ function createService(
     ...(options.readPersistedUsageContext === undefined
       ? {}
       : { readPersistedUsageContext: options.readPersistedUsageContext }),
+    ...(options.readPersistedConversationItems === undefined
+      ? {}
+      : { readPersistedConversationItems: options.readPersistedConversationItems }),
+    ...(options.readPersistedRuntimeSettings === undefined
+      ? {}
+      : { readPersistedRuntimeSettings: options.readPersistedRuntimeSettings }),
+    ...(options.persistManagedThread === undefined
+      ? {}
+      : { persistManagedThread: options.persistManagedThread }),
+    ...(options.unpersistManagedThread === undefined
+      ? {}
+      : { unpersistManagedThread: options.unpersistManagedThread }),
     ...(options.resolveLocalInputReference === undefined
       ? {}
       : { resolveLocalInputReference: options.resolveLocalInputReference }),
@@ -150,10 +207,12 @@ function createService(
 
 describe("CodexDomainService", () => {
   it("matches registered Windows projects when app-server returns an extended-length cwd", () => {
-    const registry = new ProjectRegistry([{ id: "agents", name: ".agents", root: "E:\\.agents" }]);
+    const registry = new ProjectRegistry([
+      { id: "fixture", name: "Fixture", root: "Q:\\FixtureRoot" },
+    ]);
 
-    expect(registry.findIdByCwd("\\\\?\\E:\\.agents")).toBe("agents");
-    expect(registry.findIdByCwd("\\\\?\\e:\\.AGENTS\\")).toBe("agents");
+    expect(registry.findIdByCwd("\\\\?\\Q:\\FixtureRoot")).toBe("fixture");
+    expect(registry.findIdByCwd("\\\\?\\q:\\FIXTUREROOT\\")).toBe("fixture");
   });
 
   it("treats native Desktop scratch directories as controllable non-project conversations", async () => {
@@ -1022,6 +1081,153 @@ describe("CodexDomainService", () => {
     expect(continued).toEqual({ state: "running", threadId: "thread-new", turnId: "turn-2" });
   });
 
+  it("releases a stopped turn from terminal thread status even when turn/completed is omitted", async () => {
+    const generalConversationRoot = "C:\\CodexLocalRemote\\RemoteConversations";
+    let turnNumber = 0;
+    const service = createService(
+      async (method) => {
+        if (method === "thread/start") {
+          return { thread: { ...threadFixture, cwd: generalConversationRoot } };
+        }
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              cwd: generalConversationRoot,
+              status: { type: "idle" },
+              turns: [],
+            },
+          };
+        }
+        if (method === "turn/start") {
+          turnNumber += 1;
+          return {
+            turn: {
+              id: `turn-${turnNumber}`,
+              items: [],
+              status: "inProgress",
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { generalConversationRoot },
+    );
+
+    await service.createThread({ prompt: "开始任务" });
+    service.handleNotification({
+      method: "thread/status/changed",
+      params: {
+        status: { type: "idle" },
+        threadId: "thread-new",
+      },
+    });
+
+    await expect(service.startTurn("thread-new", { prompt: "停止后继续" })).resolves.toEqual({
+      state: "running",
+      threadId: "thread-new",
+      turnId: "turn-2",
+    });
+  });
+
+  it("releases only the exact active turn on a non-retryable error without turn/completed", async () => {
+    const events = new RemoteEventBuffer();
+    const generalConversationRoot = "C:\\CodexLocalRemote\\RemoteConversations";
+    let turnNumber = 0;
+    const service = createService(
+      async (method) => {
+        if (method === "thread/start") {
+          return { thread: { ...threadFixture, cwd: generalConversationRoot } };
+        }
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              cwd: generalConversationRoot,
+              status: { type: "idle" },
+              turns: [],
+            },
+          };
+        }
+        if (method === "turn/start") {
+          turnNumber += 1;
+          return {
+            turn: {
+              id: `turn-${turnNumber}`,
+              items: [],
+              status: "inProgress",
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { events, generalConversationRoot },
+    );
+
+    await service.createThread({ prompt: "开始任务" });
+    service.handleNotification({
+      method: "error",
+      params: {
+        error: { message: "无关任务失败" },
+        threadId: "thread-new",
+        turnId: "turn-other",
+        willRetry: false,
+      },
+    });
+    await expect(
+      service.startTurn("thread-new", { prompt: "不能越过仍活动的任务" }),
+    ).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    });
+    service.handleNotification({
+      method: "error",
+      params: {
+        error: { message: "将自动重试" },
+        threadId: "thread-new",
+        turnId: "turn-1",
+        willRetry: true,
+      },
+    });
+    await expect(
+      service.startTurn("thread-new", { prompt: "重试错误仍不能清理" }),
+    ).rejects.toMatchObject({
+      code: "TURN_MISMATCH",
+    });
+
+    const beforeTerminalError = events.latestSequence;
+    service.handleNotification({
+      method: "error",
+      params: {
+        error: { message: "最终失败" },
+        threadId: "thread-new",
+        turnId: "turn-1",
+        willRetry: false,
+      },
+    });
+
+    await expect(service.startTurn("thread-new", { prompt: "失败后继续" })).resolves.toEqual({
+      state: "running",
+      threadId: "thread-new",
+      turnId: "turn-2",
+    });
+    expect(
+      events.replayAfter(beforeTerminalError).events.filter((event) => event.type === "turn.state"),
+    ).toEqual([
+      expect.objectContaining({
+        payload: {
+          state: "failed",
+          turn: { id: "turn-1", status: "failed" },
+        },
+        threadId: "thread-new",
+        turnId: "turn-1",
+      }),
+    ]);
+  });
+
   it("forwards a stable queued-message client id and reconciles it from raw history", async () => {
     const generalConversationRoot = "C:\\CodexLocalRemote\\RemoteConversations";
     const calls: Array<{ method: string; params: unknown }> = [];
@@ -1285,7 +1491,17 @@ describe("CodexDomainService", () => {
       throw new Error(`unexpected method ${method}`);
     });
 
-    await service.createThread({ projectId: "project-1", prompt: "极快完成" });
+    const created = await service.createThread({ projectId: "project-1", prompt: "极快完成" });
+
+    expect(created.data).toMatchObject({
+      availableActions: {
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+      state: "complete",
+    });
+    expect(created.data.activeTurnId).toBeUndefined();
 
     await expect(service.startTurn(threadId, { prompt: "继续执行" })).resolves.toMatchObject({
       state: "running",
@@ -1293,6 +1509,74 @@ describe("CodexDomainService", () => {
       turnId: "turn-second",
     });
     expect(turnStarts).toBe(2);
+  });
+
+  it("does not restore a pending turn after terminal thread status arrives before turn/start resolves", async () => {
+    const threadId = "01900000-0000-7000-8000-000000000003";
+    let turnStarts = 0;
+    const service = createService(async (method) => {
+      if (method === "thread/start") {
+        return { thread: { ...threadFixture, id: threadId } };
+      }
+      if (method === "thread/read") {
+        return { thread: { ...threadFixture, id: threadId } };
+      }
+      if (method === "turn/start") {
+        turnStarts += 1;
+        if (turnStarts === 1) {
+          service.handleNotification({
+            method: "turn/started",
+            params: {
+              threadId,
+              turn: { id: "turn-stopped-before-response", status: "inProgress" },
+            },
+          });
+          service.handleNotification({
+            method: "thread/status/changed",
+            params: {
+              status: { type: "idle" },
+              threadId,
+            },
+          });
+          return {
+            turn: {
+              id: "turn-stopped-before-response",
+              items: [],
+              status: "inProgress",
+            },
+          };
+        }
+        return {
+          turn: {
+            id: "turn-after-stop",
+            items: [],
+            status: "inProgress",
+          },
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    const created = await service.createThread({
+      projectId: "project-1",
+      prompt: "启动后立即停止",
+    });
+
+    expect(created.data).toMatchObject({
+      availableActions: {
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+      state: "idle",
+    });
+    expect(created.data.activeTurnId).toBeUndefined();
+
+    await expect(service.startTurn(threadId, { prompt: "停止后下一轮" })).resolves.toEqual({
+      state: "running",
+      threadId,
+      turnId: "turn-after-stop",
+    });
   });
 
   it("does not let an unrelated completion suppress the active turn returned by turn/start", async () => {
@@ -2063,6 +2347,564 @@ describe("CodexDomainService", () => {
         },
       },
     ]);
+  });
+
+  it("merges persisted plan questions and formal plans before the turn final answer", async () => {
+    const sessionPath = "C:\\TestCodexHome\\sessions\\2026\\07\\28\\thread-new.jsonl";
+    const readPersistedConversationItems = vi.fn(async () => [
+      {
+        id: "interaction-question",
+        interaction: "question" as const,
+        kind: "interaction-record" as const,
+        questions: [
+          {
+            answers: ["方案 A"],
+            header: "选择",
+            id: "choice",
+            isSecret: false,
+            question: "采用哪个方案？",
+          },
+        ],
+        status: "answered" as const,
+        title: "Codex 提出了问题",
+        turnId: "turn-plan",
+      },
+      {
+        id: "formal-plan",
+        kind: "formal-plan" as const,
+        text: "# 方案 A",
+        turnId: "turn-plan",
+      },
+    ]);
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              path: sessionPath,
+              turns: [
+                {
+                  completedAt: 1_721_000_020,
+                  id: "turn-plan",
+                  items: [
+                    {
+                      content: [{ text: "先规划", type: "text" }],
+                      id: "user-plan",
+                      type: "userMessage",
+                    },
+                    {
+                      id: "commentary-plan",
+                      phase: "commentary",
+                      text: "我会先提问",
+                      type: "agentMessage",
+                    },
+                    {
+                      id: "final-plan",
+                      phase: "final_answer",
+                      text: "<proposed_plan># 方案 A</proposed_plan>",
+                      type: "agentMessage",
+                    },
+                  ],
+                  startedAt: 1_721_000_010,
+                  status: "completed",
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedConversationItems },
+    );
+
+    await expect(service.getThread(threadFixture.id)).resolves.toMatchObject({
+      items: [
+        { id: "user-plan" },
+        { id: "commentary-plan" },
+        { id: "interaction-question" },
+        { id: "formal-plan" },
+        { id: "final-plan" },
+      ],
+    });
+    expect(readPersistedConversationItems).toHaveBeenCalledWith(
+      threadFixture.id,
+      sessionPath,
+      "recent",
+    );
+  });
+
+  it("reads complete persisted history for a child thread and keeps early items in chronology", async () => {
+    const sessionPath = "C:\\TestCodexHome\\sessions\\2026\\07\\28\\child-thread.jsonl";
+    const readPersistedConversationItems = vi.fn(
+      async (
+        _threadId: string,
+        _sessionPath?: string,
+        scope: PersistedConversationHistoryScope = "recent",
+      ): Promise<PersistedConversationReadResult> => ({
+        integrity: {
+          observedCount: 5,
+          reason: "verified-complete",
+          scope,
+          status: "complete",
+        },
+        items: [
+          {
+            createdAt: "2026-07-28T00:00:00.000Z",
+            id: "child-user-early",
+            kind: "user-message",
+            text: "最早的问题",
+          },
+          {
+            createdAt: "2026-07-28T00:00:01.000Z",
+            id: "child-assistant-early",
+            kind: "assistant-message",
+            phase: "commentary",
+            text: "最早的回复",
+          },
+          {
+            createdAt: "2026-07-28T00:01:00.000Z",
+            id: "child-user-recent",
+            kind: "user-message",
+            text: "持久记录中的最近问题",
+            turnId: "child-turn-recent",
+          },
+          {
+            createdAt: "2026-07-28T00:01:01.000Z",
+            id: "child-persisted-only",
+            kind: "assistant-message",
+            phase: "commentary",
+            text: "app-server 最近页遗漏的中间回复",
+            turnId: "child-turn-recent",
+          },
+          {
+            createdAt: "2026-07-28T00:01:02.000Z",
+            id: "child-assistant-recent",
+            kind: "assistant-message",
+            phase: "final_answer",
+            text: "持久记录中的最近结论",
+            turnId: "child-turn-recent",
+          },
+        ],
+      }),
+    );
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              id: "child-thread",
+              parentThreadId: "root-thread",
+              path: sessionPath,
+              turns: [
+                {
+                  id: "child-turn-recent",
+                  items: [
+                    {
+                      content: [{ text: "协议中的最近问题", type: "text" }],
+                      id: "child-user-recent",
+                      type: "userMessage",
+                    },
+                    {
+                      id: "child-assistant-recent",
+                      phase: "final_answer",
+                      text: "协议中的最近结论",
+                      type: "agentMessage",
+                    },
+                  ],
+                  status: "completed",
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedConversationItems },
+    );
+
+    const result = await service.getThread("child-thread");
+
+    expect(result.items.map((item) => item.id)).toEqual([
+      "child-user-early",
+      "child-assistant-early",
+      "child-user-recent",
+      "child-persisted-only",
+      "child-assistant-recent",
+    ]);
+    expect(result.items.find((item) => item.id === "child-user-recent")).toMatchObject({
+      createdAt: "2026-07-28T00:01:00.000Z",
+      text: "协议中的最近问题",
+    });
+    expect(result.persistedHistoryIntegrity).toEqual({
+      observedCount: 5,
+      reason: "verified-complete",
+      scope: "complete",
+      status: "complete",
+    });
+    expect(readPersistedConversationItems).toHaveBeenCalledWith(
+      "child-thread",
+      sessionPath,
+      "complete",
+    );
+  });
+
+  it("keeps duplicate persisted ids stable while exposing a partial recent root read", async () => {
+    const readPersistedConversationItems = vi.fn(
+      async (): Promise<PersistedConversationReadResult> => ({
+        integrity: {
+          observedCount: 2,
+          reason: "recent-window",
+          scope: "recent",
+          status: "partial",
+        },
+        items: [
+          { id: "root-user", kind: "user-message", text: "持久问题" },
+          { id: "root-user", kind: "user-message", text: "重复项不得出现" },
+        ],
+      }),
+    );
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              turns: [
+                {
+                  id: "root-turn",
+                  items: [
+                    {
+                      content: [{ text: "协议问题", type: "text" }],
+                      id: "root-user",
+                      type: "userMessage",
+                    },
+                  ],
+                  status: "completed",
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedConversationItems },
+    );
+
+    const result = await service.getThread(threadFixture.id);
+
+    expect(result.items).toEqual([expect.objectContaining({ id: "root-user", text: "协议问题" })]);
+    expect(result.persistedHistoryIntegrity).toMatchObject({
+      reason: "recent-window",
+      scope: "recent",
+      status: "partial",
+    });
+  });
+
+  it("deduplicates the same persisted and protocol compaction when their synthetic ids differ", async () => {
+    const readPersistedConversationItems = vi.fn(async () => [
+      {
+        createdAt: "2026-07-29T12:00:01.000Z",
+        id: "persisted-context-compaction-turn-1-1",
+        kind: "tool" as const,
+        operation: "context-compaction" as const,
+        status: "complete" as const,
+        title: "压缩对话上下文",
+        turnId: "turn-1",
+      },
+    ]);
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              turns: [
+                {
+                  completedAt: "2026-07-29T12:00:02.000Z",
+                  id: "turn-1",
+                  items: [
+                    {
+                      id: "protocol-context-compaction",
+                      status: "completed",
+                      type: "contextCompaction",
+                    },
+                  ],
+                  startedAt: "2026-07-29T12:00:00.000Z",
+                  status: "completed",
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedConversationItems },
+    );
+
+    const result = await service.getThread(threadFixture.id);
+
+    expect(
+      result.items.filter(
+        (item) => item.kind === "tool" && item.operation === "context-compaction",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        id: "protocol-context-compaction",
+        status: "complete",
+        turnId: "turn-1",
+      }),
+    ]);
+  });
+
+  it("correlates repeated persisted tools with the fresher protocol items in reverse chronology", async () => {
+    const readPersistedConversationItems = vi.fn(async () => [
+      {
+        createdAt: "2026-07-29T12:00:01.000Z",
+        id: "persisted-command-1",
+        kind: "tool" as const,
+        status: "complete" as const,
+        title: "运行命令",
+        turnId: "turn-tools",
+      },
+      {
+        createdAt: "2026-07-29T12:00:02.000Z",
+        id: "persisted-command-2",
+        kind: "tool" as const,
+        status: "complete" as const,
+        title: "运行命令",
+        turnId: "turn-tools",
+      },
+    ]);
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              turns: [
+                {
+                  completedAt: "2026-07-29T12:00:03.000Z",
+                  id: "turn-tools",
+                  items: [
+                    {
+                      aggregatedOutput: "first result",
+                      command: "first command",
+                      id: "protocol-command-1",
+                      status: "completed",
+                      type: "commandExecution",
+                    },
+                    {
+                      aggregatedOutput: "second result",
+                      command: "second command",
+                      id: "protocol-command-2",
+                      status: "completed",
+                      type: "commandExecution",
+                    },
+                  ],
+                  startedAt: "2026-07-29T12:00:00.000Z",
+                  status: "completed",
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedConversationItems },
+    );
+
+    const result = await service.getThread(threadFixture.id);
+
+    expect(result.items).toMatchObject([
+      {
+        id: "protocol-command-1",
+        kind: "tool",
+        status: "complete",
+        summary: "first command",
+        turnId: "turn-tools",
+      },
+      {
+        id: "protocol-command-2",
+        kind: "tool",
+        status: "complete",
+        summary: "second command",
+        turnId: "turn-tools",
+      },
+    ]);
+  });
+
+  it("preserves protocol order for multiple same-turn user items missing from persisted history", async () => {
+    const sessionPath = "C:\\TestCodexHome\\sessions\\2026\\07\\28\\child-order.jsonl";
+    const readPersistedConversationItems = vi.fn(
+      async (): Promise<PersistedConversationReadResult> => ({
+        integrity: {
+          observedCount: 1,
+          reason: "verified-complete",
+          scope: "complete",
+          status: "complete",
+        },
+        items: [
+          {
+            id: "persisted-assistant",
+            kind: "assistant-message",
+            phase: "final_answer",
+            text: "持久记录中的回答",
+            turnId: "child-turn",
+          },
+        ],
+      }),
+    );
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              id: "child-order",
+              parentThreadId: "root-thread",
+              path: sessionPath,
+              turns: [
+                {
+                  id: "child-turn",
+                  items: [
+                    {
+                      content: [{ text: "第一条协议用户消息", type: "text" }],
+                      id: "protocol-user-1",
+                      type: "userMessage",
+                    },
+                    {
+                      content: [{ text: "第二条协议用户消息", type: "text" }],
+                      id: "protocol-user-2",
+                      type: "userMessage",
+                    },
+                  ],
+                  status: "completed",
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedConversationItems },
+    );
+
+    const result = await service.getThread("child-order");
+
+    expect(result.items.map((item) => item.id)).toEqual([
+      "protocol-user-1",
+      "protocol-user-2",
+      "persisted-assistant",
+    ]);
+  });
+
+  it("exposes failed complete-history integrity when a child persisted reader throws", async () => {
+    const sessionPath = "C:\\TestCodexHome\\sessions\\2026\\07\\28\\child-throw.jsonl";
+    const readPersistedConversationItems = vi.fn(async () => {
+      throw new Error("fixture persisted read failure");
+    });
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              id: "child-throw",
+              parentThreadId: "root-thread",
+              path: sessionPath,
+              turns: [
+                {
+                  id: "child-turn",
+                  items: [
+                    {
+                      content: [{ text: "协议最近页仍保留", type: "text" }],
+                      id: "child-user",
+                      type: "userMessage",
+                    },
+                  ],
+                  status: "completed",
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedConversationItems },
+    );
+
+    const result = await service.getThread("child-throw");
+
+    expect(result.items).toEqual([
+      expect.objectContaining({ id: "child-user", text: "协议最近页仍保留" }),
+    ]);
+    expect(result.persistedHistoryIntegrity).toEqual({
+      observedCount: 0,
+      reason: "read-failed",
+      scope: "complete",
+      status: "failed",
+    });
+    expect(readPersistedConversationItems).toHaveBeenCalledWith(
+      "child-throw",
+      sessionPath,
+      "complete",
+    );
+  });
+
+  it("restores missing runtime parameters from the Desktop session while preserving protocol values", async () => {
+    const sessionPath = "C:\\TestCodexHome\\sessions\\2026\\07\\28\\thread-new.jsonl";
+    const readPersistedRuntimeSettings = vi.fn(async () => ({
+      approvalPolicy: "never",
+      approvalsReviewer: "guardian_subagent",
+      collaborationMode: "default",
+      model: "persisted-model",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    }));
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              model: "protocol-model",
+              path: sessionPath,
+              turns: [],
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { readPersistedRuntimeSettings },
+    );
+
+    await expect(service.getThread(threadFixture.id)).resolves.toMatchObject({
+      approvalPolicy: "never",
+      approvalsReviewer: "guardian_subagent",
+      collaborationMode: "default",
+      model: "protocol-model",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    });
+    expect(readPersistedRuntimeSettings).toHaveBeenCalledWith(threadFixture.id, sessionPath);
   });
 
   it("prefers a bounded recent item page for very long conversations", async () => {
@@ -3035,7 +3877,7 @@ describe("CodexDomainService", () => {
                   ...threadFixture,
                   id: threadId,
                   status: { type: "idle" },
-                  turns: [{ id: "reconnect-turn", items: [], status: "completed" }],
+                  turns: [{ id: "reconnect-turn", items: [], status: "inProgress" }],
                 }
               : {
                   ...threadFixture,
@@ -3068,7 +3910,7 @@ describe("CodexDomainService", () => {
       threadId: "reconnect-root",
       payload: {
         id: "reconnect-root",
-        state: "complete",
+        state: "idle",
       },
     });
   });
@@ -3723,6 +4565,10 @@ describe("CodexDomainService", () => {
     expect(calls.filter((call) => call.method === "thread/read")).toEqual([
       {
         method: "thread/read",
+        params: { includeTurns: false, threadId: "thread-root" },
+      },
+      {
+        method: "thread/read",
         params: { includeTurns: false, threadId: "sub-level-2" },
       },
       {
@@ -3808,6 +4654,184 @@ describe("CodexDomainService", () => {
       { archived: false, cursor: "current-next" },
       { archived: true, cursor: "archived-next" },
     ]);
+  });
+
+  it("marks a short subagent page complete only when paged history and root reads close", async () => {
+    const service = createService(
+      async (method, params) => {
+        const query = params as { archived?: boolean; threadId?: string };
+        if (method === "thread/list") {
+          return query.archived
+            ? { data: [] }
+            : {
+                data: [
+                  {
+                    ...threadFixture,
+                    id: "sub-verified",
+                    parentThreadId: "thread-root",
+                  },
+                ],
+              };
+        }
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              id: query.threadId,
+              parentThreadId:
+                query.threadId === "sub-verified" ? "thread-root" : threadFixture.parentThreadId,
+            },
+          };
+        }
+        if (method === "thread/items/list") {
+          return query.threadId === "thread-root"
+            ? {
+                data: [
+                  {
+                    item: {
+                      agentPath: "/root/verified",
+                      agentThreadId: "sub-verified",
+                      kind: "started",
+                      type: "subAgentActivity",
+                    },
+                    turnId: "turn-root",
+                  },
+                ],
+              }
+            : { data: [] };
+        }
+        if (method === "thread/turns/list") {
+          return {
+            data:
+              query.threadId === "thread-root" ? [{ id: "turn-root", status: "completed" }] : [],
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: {
+          clientMethods: ["thread/items/list", "thread/turns/list"],
+        },
+      },
+    );
+
+    const result = await service.listSubagents("thread-root");
+
+    expect(result.data.map((subagent) => subagent.threadId)).toEqual(["sub-verified"]);
+    expect(result.historyIntegrity).toEqual({
+      observedCount: 1,
+      reason: "verified-exhaustive",
+      status: "complete",
+      streams: {
+        archived: { observedCount: 0, status: "exhausted" },
+        current: { observedCount: 1, status: "exhausted" },
+      },
+    });
+  });
+
+  it("does not call an uncorroborated one-item upstream page complete", async () => {
+    const service = createService(
+      async (method, params) => {
+        const query = params as { archived?: boolean; threadId?: string };
+        if (method === "thread/list") {
+          return query.archived
+            ? { data: [] }
+            : {
+                data: [
+                  {
+                    ...threadFixture,
+                    id: "sub-upstream-only",
+                    parentThreadId: "thread-root",
+                  },
+                ],
+              };
+        }
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              id: query.threadId,
+            },
+          };
+        }
+        if (method === "thread/items/list" || method === "thread/turns/list") {
+          return { data: [] };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: {
+          clientMethods: ["thread/items/list", "thread/turns/list"],
+        },
+      },
+    );
+
+    const result = await service.listSubagents("thread-root");
+
+    expect(result.data.map((subagent) => subagent.threadId)).toEqual(["sub-upstream-only"]);
+    expect(result.historyIntegrity).toMatchObject({
+      observedCount: 1,
+      reason: "upstream-short-page-without-cursor",
+      status: "unknown",
+    });
+  });
+
+  it("preserves a retry cursor and reports an interrupted subagent continuation", async () => {
+    const service = createService(async (method, params) => {
+      const query = params as { archived?: boolean; cursor?: string; threadId?: string };
+      if (method === "thread/list") {
+        if (query.cursor === "current-next") {
+          throw new Error("upstream page interrupted");
+        }
+        return query.archived
+          ? { data: [] }
+          : {
+              data: [
+                {
+                  ...threadFixture,
+                  id: "sub-current",
+                  parentThreadId: "thread-root",
+                },
+              ],
+              nextCursor: "current-next",
+            };
+      }
+      if (method === "thread/read") {
+        return { thread: { ...threadFixture, id: query.threadId } };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    const first = await service.listSubagents("thread-root");
+    expect(first.historyIntegrity).toMatchObject({
+      reason: "pagination-pending",
+      status: "partial",
+    });
+    expect(first.nextCursor).toBeDefined();
+    const retryCursor = first.nextCursor;
+    if (!retryCursor) {
+      throw new Error("expected a retryable subagent cursor");
+    }
+
+    const interrupted = await service.listSubagents("thread-root", {
+      cursor: retryCursor,
+    });
+
+    expect(interrupted.data).toEqual([]);
+    expect(interrupted.historyIntegrity).toEqual({
+      observedCount: 0,
+      reason: "pagination-failed",
+      status: "failed",
+      streams: {
+        archived: { observedCount: 0, status: "not-requested" },
+        current: { observedCount: 0, status: "failed" },
+      },
+    });
+    expect(interrupted.nextCursor).toBe(retryCursor);
   });
 
   it("keeps discovered workspaces read-only and rejects sensitive absolute path segments", async () => {
@@ -4128,6 +5152,952 @@ describe("CodexDomainService", () => {
     });
 
     expect(calls.some((call) => call.method === "thread/read")).toBe(false);
+  });
+
+  it("renames an authorized stored thread without resuming it and publishes the new title", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const events = new RemoteEventBuffer(8);
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: "thread-rename" } };
+        }
+        if (method === "thread/name/set") {
+          return {};
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        events,
+        protocolCatalog: {
+          clientMethods: ["thread/name/set", "thread/turns/list"],
+        },
+      },
+    );
+
+    await service.setThreadName("thread-rename", "新的对话名称");
+
+    expect(calls).toEqual([
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: "thread-rename" },
+      },
+      {
+        method: "thread/name/set",
+        params: { name: "新的对话名称", threadId: "thread-rename" },
+      },
+    ]);
+    expect(events.replayAfter(0).events).toContainEqual(
+      expect.objectContaining({
+        threadId: "thread-rename",
+        type: "thread.updated",
+        payload: { name: "新的对话名称", threadId: "thread-rename" },
+      }),
+    );
+  });
+
+  it("rejects an overlong thread name before reading or mutating the thread", async () => {
+    const request = vi.fn(async () => ({}));
+    const service = createService(request);
+
+    await expect(service.setThreadName("thread-rename", "名".repeat(201))).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+      httpStatus: 400,
+    } satisfies Partial<DomainError>);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("keeps a Desktop-origin renamed title in the shared cache across later lifecycle updates", async () => {
+    const threadId = "thread-desktop-renamed";
+    const events = new RemoteEventBuffer(32);
+    const storedThread = {
+      ...threadFixture,
+      id: threadId,
+      name: "旧名称",
+      preview: "旧预览",
+    };
+    const service = createService(
+      async (method, params) => {
+        if (method === "thread/loaded/list") {
+          return { data: [threadId] };
+        }
+        if (method === "thread/resume" || method === "thread/read") {
+          expect((params as { threadId: string }).threadId).toBe(threadId);
+          return { thread: storedThread };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        events,
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+    await service.resubscribeSharedThreads();
+    const before = events.latestSequence;
+
+    service.handleNotification({
+      method: "thread/name/updated",
+      params: { threadId, threadName: "新名称" },
+    });
+    service.handleNotification({
+      method: "thread/status/changed",
+      params: { status: { type: "idle" }, threadId },
+    });
+
+    const snapshots = events
+      .replayAfter(before)
+      .events.filter((event) => event.type === "thread.snapshot");
+    expect(snapshots.at(-1)).toMatchObject({
+      payload: { id: threadId, title: "新名称" },
+      threadId,
+    });
+  });
+
+  it("archives an authorized idle thread, durably releases management, and publishes convergence", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const events = new RemoteEventBuffer(8);
+    const unpersistManagedThread = vi.fn(async (_threadId: string) => undefined);
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: "thread-archive" } };
+        }
+        if (method === "thread/archive") {
+          return {};
+        }
+        if (method === "thread/unsubscribe") {
+          return { status: "unsubscribed" };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        events,
+        managedThreadIds: ["thread-archive"],
+        protocolCatalog: {
+          clientMethods: [
+            "thread/archive",
+            "thread/name/set",
+            "thread/turns/list",
+            "thread/unarchive",
+            "thread/unsubscribe",
+          ],
+        },
+        unpersistManagedThread,
+      },
+    );
+
+    await service.setThreadArchived("thread-archive", true);
+
+    expect(calls.slice(0, 2)).toEqual([
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: "thread-archive" },
+      },
+      {
+        method: "thread/archive",
+        params: { threadId: "thread-archive" },
+      },
+    ]);
+    expect(unpersistManagedThread).toHaveBeenCalledWith("thread-archive");
+    expect(service.isManagedThread("thread-archive")).toBe(false);
+    expect(events.replayAfter(0).events).toContainEqual(
+      expect.objectContaining({
+        threadId: "thread-archive",
+        type: "thread.updated",
+        payload: { archived: true, threadId: "thread-archive" },
+      }),
+    );
+  });
+
+  it("restores an archived authorized thread and publishes convergence", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const events = new RemoteEventBuffer(8);
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: "thread-restore" } };
+        }
+        if (method === "thread/unarchive") {
+          return { thread: { ...threadFixture, id: "thread-restore" } };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        events,
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+      },
+    );
+
+    await service.setThreadArchived("thread-restore", false);
+
+    expect(calls).toEqual([
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: "thread-restore" },
+      },
+      {
+        method: "thread/unarchive",
+        params: { threadId: "thread-restore" },
+      },
+    ]);
+    expect(events.replayAfter(0).events).toContainEqual(
+      expect.objectContaining({
+        threadId: "thread-restore",
+        type: "thread.updated",
+        payload: { archived: false, threadId: "thread-restore" },
+      }),
+    );
+  });
+
+  it("fails closed before archive mutation when the runtime lacks the official pair", async () => {
+    const request = vi.fn(async () => ({}));
+    const service = createService(request, undefined, undefined, {
+      protocolCatalog: { clientMethods: ["thread/archive", "thread/turns/list"] },
+    });
+
+    await expect(service.setThreadArchived("thread-archive", true)).rejects.toMatchObject({
+      code: "FEATURE_UNAVAILABLE",
+      httpStatus: 409,
+    } satisfies Partial<DomainError>);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("does not archive an active thread", async () => {
+    const calls: string[] = [];
+    const service = createService(
+      async (method) => {
+        calls.push(method);
+        if (method === "thread/read") {
+          return {
+            thread: {
+              ...threadFixture,
+              id: "thread-running",
+              status: { activeFlags: [], type: "active" },
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+      },
+    );
+
+    await expect(service.setThreadArchived("thread-running", true)).rejects.toMatchObject({
+      code: "THREAD_READ_ONLY",
+      httpStatus: 409,
+    } satisfies Partial<DomainError>);
+    expect(calls).toEqual(["thread/read"]);
+  });
+
+  it("does not archive while context compaction is still active", async () => {
+    const threadId = "thread-compacting";
+    const calls: string[] = [];
+    const service = createService(
+      async (method) => {
+        calls.push(method);
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: threadId, status: { type: "idle" } } };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: [threadId],
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+      },
+    );
+    service.handleNotification({
+      method: "item/started",
+      params: {
+        item: { id: "compaction-item", type: "contextCompaction" },
+        threadId,
+        turnId: "turn-compacting",
+      },
+    });
+
+    await expect(service.setThreadArchived(threadId, true)).rejects.toMatchObject({
+      code: "THREAD_READ_ONLY",
+      httpStatus: 409,
+    } satisfies Partial<DomainError>);
+    expect(calls).toEqual(["thread/read"]);
+  });
+
+  it("restores durable management when archive fails after release", async () => {
+    const persistManagedThread = vi.fn(
+      async (_threadId: string, _options: { desktopNotificationPending: boolean }) => undefined,
+    );
+    const unpersistManagedThread = vi.fn(async (_threadId: string) => undefined);
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: "thread-archive-fails" } };
+        }
+        if (method === "thread/archive") {
+          throw new Error("archive failed");
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: ["thread-archive-fails"],
+        persistManagedThread,
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        unpersistManagedThread,
+      },
+    );
+
+    await expect(service.setThreadArchived("thread-archive-fails", true)).rejects.toThrow(
+      "archive failed",
+    );
+    expect(unpersistManagedThread).toHaveBeenCalledWith("thread-archive-fails");
+    expect(persistManagedThread).toHaveBeenCalledWith("thread-archive-fails", {
+      desktopNotificationPending: false,
+    });
+    expect(service.isManagedThread("thread-archive-fails")).toBe(true);
+  });
+
+  it("persists an archive intent before release and settles it only after the RPC succeeds", async () => {
+    const order: string[] = [];
+    const archiveIntent = {
+      desktopNotificationPending: true,
+      managed: true,
+      targetArchived: true,
+      threadId: "thread-durable-archive",
+    };
+    const beginArchiveIntent = vi.fn(async () => {
+      order.push("begin-intent");
+      return archiveIntent;
+    });
+    const unpersistManagedThread = vi.fn(async () => {
+      order.push("release-managed");
+    });
+    const settleArchiveIntent = vi.fn(async (_threadId: string, observedArchived: boolean) => {
+      order.push(`settle-${String(observedArchived)}`);
+    });
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: archiveIntent.threadId } };
+        }
+        if (method === "thread/archive") {
+          order.push("archive-rpc");
+          return {};
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        beginArchiveIntent,
+        managedThreadIds: [archiveIntent.threadId],
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        settleArchiveIntent,
+        unpersistManagedThread,
+      },
+    );
+
+    await service.setThreadArchived(archiveIntent.threadId, true);
+
+    expect(order).toEqual(["begin-intent", "release-managed", "archive-rpc", "settle-true"]);
+    expect(beginArchiveIntent).toHaveBeenCalledWith(archiveIntent.threadId, true);
+    expect(settleArchiveIntent).toHaveBeenCalledWith(archiveIntent.threadId, true);
+    expect(service.isManagedThread(archiveIntent.threadId)).toBe(false);
+  });
+
+  it("preserves the archive failure and a durable recovery intent when compensation persistence fails", async () => {
+    const archiveFailure = new Error("archive failed at app-server");
+    const compensationFailure = new Error("state restore failed");
+    const archiveIntent = {
+      desktopNotificationPending: true,
+      managed: true,
+      targetArchived: true,
+      threadId: "thread-compensation-fails",
+    };
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: archiveIntent.threadId } };
+        }
+        if (method === "thread/archive") {
+          throw archiveFailure;
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        archiveIntents: [],
+        beginArchiveIntent: async () => archiveIntent,
+        managedThreadIds: [archiveIntent.threadId],
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        settleArchiveIntent: async () => {
+          throw compensationFailure;
+        },
+        unpersistManagedThread: async () => undefined,
+      },
+    );
+
+    let failure: unknown;
+    try {
+      await service.setThreadArchived(archiveIntent.threadId, true);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([archiveFailure, compensationFailure]);
+    expect(service.isManagedThread(archiveIntent.threadId)).toBe(true);
+  });
+
+  it.each([
+    { archived: false, expectedManaged: true, stream: "current" },
+    { archived: true, expectedManaged: false, stream: "archived" },
+  ] as const)(
+    "reconciles a restarted archive intent from the authoritative $stream list without replaying the RPC",
+    async ({ archived, expectedManaged }) => {
+      const threadId = `thread-restart-${archived ? "archived" : "current"}`;
+      const archiveIntent = {
+        desktopNotificationPending: true,
+        managed: true,
+        targetArchived: true,
+        threadId,
+      };
+      const calls: Array<{ method: string; params?: unknown }> = [];
+      const settleArchiveIntent = vi.fn(async () => undefined);
+      const service = createService(
+        async (method, params) => {
+          calls.push({ method, params });
+          if (method === "thread/list") {
+            const requestedArchived = (params as { archived?: boolean }).archived === true;
+            return {
+              data: requestedArchived === archived ? [{ ...threadFixture, id: threadId }] : [],
+            };
+          }
+          if (method === "thread/loaded/list") {
+            return { data: [] };
+          }
+          if (method === "thread/resume" || method === "thread/read") {
+            return { thread: { ...threadFixture, id: threadId } };
+          }
+          if (method === "thread/turns/list") {
+            return { data: [] };
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        undefined,
+        undefined,
+        {
+          archiveIntents: [archiveIntent],
+          protocolCatalog: {
+            clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+          },
+          settleArchiveIntent,
+          sharedAppServer: true,
+          sharedResumeDelaysMs: [0],
+        },
+      );
+
+      await service.resubscribeSharedThreads();
+
+      expect(settleArchiveIntent).toHaveBeenCalledWith(threadId, archived);
+      if (expectedManaged) {
+        await expect(service.getThread(threadId)).resolves.toMatchObject({ mode: "managed" });
+      }
+      expect(service.isManagedThread(threadId)).toBe(expectedManaged);
+      expect(calls.some((call) => call.method === "thread/archive")).toBe(false);
+    },
+  );
+
+  it("cleans a stale managed id from an authoritative archived list even if intent creation crashed", async () => {
+    const threadId = "thread-archived-before-intent-write";
+    const settleArchiveIntent = vi.fn(async () => undefined);
+    const service = createService(
+      async (method, params) => {
+        if (method === "thread/list") {
+          return (params as { archived?: boolean }).archived === true
+            ? { data: [{ ...threadFixture, id: threadId }] }
+            : { data: [] };
+        }
+        if (method === "thread/loaded/list") {
+          return { data: [] };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: [threadId],
+        settleArchiveIntent,
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await service.resubscribeSharedThreads();
+
+    expect(settleArchiveIntent).toHaveBeenCalledWith(threadId, true);
+    expect(service.isManagedThread(threadId)).toBe(false);
+  });
+
+  it("retries Desktop-origin archived cleanup within one bounded attempt", async () => {
+    const threadId = "thread-desktop-archived";
+    const archiveIntent = {
+      desktopNotificationPending: false,
+      managed: true,
+      targetArchived: true,
+      threadId,
+    };
+    const beginArchiveIntent = vi.fn(async () => archiveIntent);
+    const unpersistManagedThread = vi
+      .fn<(threadId: string) => Promise<void>>()
+      .mockRejectedValueOnce(new Error("first write failed"))
+      .mockRejectedValueOnce(new Error("second write failed"))
+      .mockResolvedValue(undefined);
+    const settleArchiveIntent = vi.fn(async () => undefined);
+    const service = createService(async () => ({}), undefined, undefined, {
+      archiveCleanupRetryDelaysMs: [0, 0, 0],
+      beginArchiveIntent,
+      managedThreadIds: [threadId],
+      settleArchiveIntent,
+      unpersistManagedThread,
+    });
+
+    service.handleNotification({
+      method: "thread/archived",
+      params: { threadId },
+    });
+
+    await vi.waitFor(() => {
+      expect(unpersistManagedThread).toHaveBeenCalledTimes(3);
+      expect(settleArchiveIntent).toHaveBeenCalledWith(threadId, true);
+    });
+    expect(beginArchiveIntent).toHaveBeenCalledWith(threadId, true);
+    expect(service.isManagedThread(threadId)).toBe(false);
+  });
+
+  it("rejects archiving a subagent thread before any mutation or ownership release", async () => {
+    const beginArchiveIntent = vi.fn();
+    const unpersistManagedThread = vi.fn();
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/read") {
+        return {
+          thread: {
+            ...threadFixture,
+            id: "thread-child-archive",
+            parentThreadId: "thread-root",
+          },
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+    const service = createService(request, undefined, undefined, {
+      beginArchiveIntent,
+      managedThreadIds: ["thread-child-archive"],
+      protocolCatalog: {
+        clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+      },
+      unpersistManagedThread,
+    });
+
+    await expect(service.setThreadArchived("thread-child-archive", true)).rejects.toMatchObject({
+      code: "THREAD_READ_ONLY",
+      httpStatus: 409,
+    } satisfies Partial<DomainError>);
+    expect(beginArchiveIntent).not.toHaveBeenCalled();
+    expect(unpersistManagedThread).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("awaits the complete shared inventory and rejects an unseen active child before archiving its root", async () => {
+    const root = {
+      ...threadFixture,
+      id: "archive-root-with-unseen-active-child",
+      status: { type: "idle" },
+    };
+    const child = {
+      ...threadFixture,
+      id: "unseen-active-child",
+      parentThreadId: root.id,
+      status: { activeFlags: [], type: "active" },
+    };
+    const byId = new Map<string, Record<string, unknown>>([
+      [root.id, root],
+      [child.id, child],
+    ]);
+    const calls: string[] = [];
+    const service = createService(
+      async (method, params) => {
+        calls.push(method);
+        if (method === "thread/loaded/list") {
+          return { data: [child.id] };
+        }
+        if (method === "thread/resume" || method === "thread/read") {
+          const threadId = (params as { threadId: string }).threadId;
+          return { thread: byId.get(threadId) };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await expect(service.setThreadArchived(root.id, true)).rejects.toMatchObject({
+      code: "THREAD_READ_ONLY",
+      httpStatus: 409,
+    } satisfies Partial<DomainError>);
+    expect(calls).toContain("thread/loaded/list");
+    expect(calls).not.toContain("thread/archive");
+  });
+
+  it("fails closed when loaded-thread inventory still has a cursor after the bounded page limit", async () => {
+    const threadId = "archive-root-incomplete-loaded-pages";
+    let loadedCalls = 0;
+    let archiveCalls = 0;
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: threadId } };
+        }
+        if (method === "thread/loaded/list") {
+          loadedCalls += 1;
+          return { data: [], nextCursor: `loaded-page-${loadedCalls}` };
+        }
+        if (method === "thread/archive") {
+          archiveCalls += 1;
+          return {};
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await expect(service.setThreadArchived(threadId, true)).rejects.toMatchObject({
+      code: "THREAD_READ_ONLY",
+      httpStatus: 409,
+    } satisfies Partial<DomainError>);
+    expect(loadedCalls).toBe(20);
+    expect(archiveCalls).toBe(0);
+  });
+
+  it("fails closed when loaded-thread inventory repeats a cursor or a listed thread cannot hydrate", async () => {
+    const rootId = "archive-root-unsafe-inventory";
+    for (const failure of ["repeated-cursor", "hydrate-failed"] as const) {
+      let loadedCalls = 0;
+      let archiveCalls = 0;
+      const service = createService(
+        async (method, params) => {
+          if (method === "thread/read") {
+            const requestedThreadId = (params as { threadId: string }).threadId;
+            if (requestedThreadId === rootId) {
+              return { thread: { ...threadFixture, id: rootId } };
+            }
+            throw new Error("listed child cannot hydrate");
+          }
+          if (method === "thread/loaded/list") {
+            loadedCalls += 1;
+            return failure === "repeated-cursor"
+              ? { data: [], nextCursor: "same-cursor" }
+              : { data: ["unreadable-loaded-child"] };
+          }
+          if (method === "thread/resume") {
+            throw new Error("listed child cannot hydrate");
+          }
+          if (method === "thread/archive") {
+            archiveCalls += 1;
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        undefined,
+        undefined,
+        {
+          protocolCatalog: {
+            clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+          },
+          sharedAppServer: true,
+          sharedResumeDelaysMs: [0],
+        },
+      );
+
+      await expect(service.setThreadArchived(rootId, true)).rejects.toMatchObject({
+        code: "THREAD_READ_ONLY",
+        httpStatus: 409,
+      } satisfies Partial<DomainError>);
+      expect(loadedCalls).toBe(failure === "repeated-cursor" ? 2 : 1);
+      expect(archiveCalls).toBe(0);
+    }
+  });
+
+  it("serializes concurrent archive mutations so a late failure cannot restore a successful archive", async () => {
+    const threadId = "thread-concurrent-archive";
+    const firstArchiveGate = deferred<void>();
+    let archiveCalls = 0;
+    let persistedManaged = true;
+    let persistedIntent:
+      | {
+          desktopNotificationPending: boolean;
+          managed: boolean;
+          targetArchived: boolean;
+          threadId: string;
+        }
+      | undefined;
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: threadId } };
+        }
+        if (method === "thread/archive") {
+          archiveCalls += 1;
+          if (archiveCalls === 1) {
+            await firstArchiveGate.promise;
+            return {};
+          }
+          throw new Error("second archive failed");
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        beginArchiveIntent: async () => {
+          persistedIntent ??= {
+            desktopNotificationPending: false,
+            managed: persistedManaged,
+            targetArchived: true,
+            threadId,
+          };
+          return persistedIntent;
+        },
+        managedThreadIds: [threadId],
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        settleArchiveIntent: async (_threadId, observedArchived) => {
+          if (!observedArchived && persistedIntent?.managed) {
+            persistedManaged = true;
+          }
+          persistedIntent = undefined;
+        },
+        unpersistManagedThread: async () => {
+          persistedManaged = false;
+        },
+      },
+    );
+
+    const first = service.setThreadArchived(threadId, true);
+    const second = service.setThreadArchived(threadId, true);
+    await vi.waitFor(() => {
+      expect(archiveCalls).toBe(1);
+    });
+    firstArchiveGate.resolve();
+
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).rejects.toThrow("second archive failed");
+    expect(archiveCalls).toBe(2);
+    expect(persistedManaged).toBe(false);
+    expect(service.isManagedThread(threadId)).toBe(false);
+  });
+
+  it("lets an authoritative Desktop archive cleanup win over a lost Web archive response", async () => {
+    const threadId = "thread-desktop-archive-response-loss";
+    const archiveResponse = deferred<void>();
+    let persistedManaged = true;
+    let persistedIntent:
+      | {
+          desktopNotificationPending: boolean;
+          managed: boolean;
+          targetArchived: boolean;
+          threadId: string;
+        }
+      | undefined;
+    const settleObservations: boolean[] = [];
+    const service = createService(
+      async (method) => {
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: threadId } };
+        }
+        if (method === "thread/archive") {
+          await archiveResponse.promise;
+          return {};
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        archiveCleanupRetryDelaysMs: [0],
+        beginArchiveIntent: async () => {
+          persistedIntent ??= {
+            desktopNotificationPending: false,
+            managed: persistedManaged,
+            targetArchived: true,
+            threadId,
+          };
+          return persistedIntent;
+        },
+        managedThreadIds: [threadId],
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        settleArchiveIntent: async (_threadId, observedArchived) => {
+          settleObservations.push(observedArchived);
+          persistedManaged = observedArchived ? false : (persistedIntent?.managed ?? false);
+          persistedIntent = undefined;
+        },
+        unpersistManagedThread: async () => {
+          persistedManaged = false;
+        },
+      },
+    );
+
+    const archive = service.setThreadArchived(threadId, true);
+    await vi.waitFor(() => {
+      expect(persistedManaged).toBe(false);
+    });
+    service.handleNotification({
+      method: "thread/archived",
+      params: { threadId },
+    });
+    archiveResponse.reject(new Error("archive response lost"));
+
+    await expect(archive).rejects.toThrow("archive response lost");
+    await vi.waitFor(() => {
+      expect(settleObservations).toEqual([false, true]);
+    });
+    expect(persistedManaged).toBe(false);
+    expect(service.isManagedThread(threadId)).toBe(false);
+  });
+
+  it("does not re-add a pinned thread to current history after Web archives it", async () => {
+    const threadId = "thread-pinned-then-archived";
+    let archived = false;
+    const calls: string[] = [];
+    const archiveIntent = {
+      desktopNotificationPending: false,
+      managed: true,
+      targetArchived: true,
+      threadId,
+    };
+    const service = createService(
+      async (method) => {
+        calls.push(method);
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: threadId } };
+        }
+        if (method === "thread/archive") {
+          archived = true;
+          return {};
+        }
+        if (method === "thread/list") {
+          return { data: archived ? [] : [{ ...threadFixture, id: threadId }] };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        beginArchiveIntent: async () => archiveIntent,
+        listPinnedThreadIds: async () => [threadId],
+        managedThreadIds: [threadId],
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        settleArchiveIntent: async () => undefined,
+        unpersistManagedThread: async () => undefined,
+      },
+    );
+
+    await service.setThreadArchived(threadId, true);
+    const current = await service.listThreads();
+
+    expect(current.data).toEqual([]);
+    expect(calls.filter((method) => method === "thread/read")).toHaveLength(1);
+  });
+
+  it("keeps a Desktop-pinned archived thread out of current history after restart reconciliation", async () => {
+    const threadId = "thread-restarted-pinned-archived";
+    const calls: string[] = [];
+    let archivedListCalls = 0;
+    const service = createService(
+      async (method, params) => {
+        calls.push(method);
+        if (method === "thread/list") {
+          if ((params as { archived?: boolean }).archived === true) {
+            archivedListCalls += 1;
+            return { data: [{ ...threadFixture, id: threadId }] };
+          }
+          return { data: [] };
+        }
+        if (method === "thread/loaded/list") {
+          return { data: [] };
+        }
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, id: threadId } };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        listPinnedThreadIds: async () => [threadId],
+        protocolCatalog: {
+          clientMethods: ["thread/archive", "thread/turns/list", "thread/unarchive"],
+        },
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await service.resubscribeSharedThreads();
+    const current = await service.listThreads();
+
+    expect(current.data).toEqual([]);
+    expect(calls).not.toContain("thread/read");
+    expect(archivedListCalls).toBe(1);
   });
 
   it("keeps archived history on an explicit independent cursor stream", async () => {

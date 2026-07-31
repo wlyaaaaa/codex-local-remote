@@ -1,4 +1,5 @@
 import type {
+  ConversationAttachment,
   ConversationItem,
   RemoteEvent,
   ThreadDetail,
@@ -144,10 +145,17 @@ export function mergeThreadRefresh(
 
   const freshness = compareUpdatedAt(incoming.updatedAt, current.updatedAt);
   const advancesThreadLifecycle = incomingAdvancesThreadLifecycle(current, incoming);
+  const advancesToolLifecycle = incomingAdvancesToolLifecycle(current.items, incoming.items);
+  const preserveCurrentActiveControl =
+    isActiveThreadState(current.state) &&
+    isTerminalThreadState(incoming.state) &&
+    incoming.activeTurnId === undefined &&
+    !advancesToolLifecycle &&
+    !advancesThreadLifecycle;
   const preferIncoming =
     freshness > 0 ||
     incomingHydratesSummaryPlaceholder(current, incoming) ||
-    incomingAdvancesToolLifecycle(current.items, incoming.items) ||
+    advancesToolLifecycle ||
     advancesThreadLifecycle;
   const reconcileTerminalTextAliases =
     isTerminalThreadState(incoming.state) &&
@@ -163,13 +171,20 @@ export function mergeThreadRefresh(
   );
   const items = reconcileCreationSeedFirstUserMessage(mergedItems, incoming, creation);
 
-  if (base === current && sameItemSequence(items, current.items)) {
-    return current;
-  }
-  if (base === incoming && sameItemSequence(items, incoming.items)) {
-    return incoming;
-  }
-  return { ...base, items };
+  const merged =
+    base === current && sameItemSequence(items, current.items)
+      ? current
+      : base === incoming && sameItemSequence(items, incoming.items)
+        ? incoming
+        : { ...base, items };
+  if (!preserveCurrentActiveControl) return merged;
+  const { activeTurnId: _incomingActiveTurnId, ...withoutIncomingActiveTurn } = merged;
+  return {
+    ...withoutIncomingActiveTurn,
+    state: current.state,
+    availableActions: current.availableActions,
+    ...(current.activeTurnId === undefined ? {} : { activeTurnId: current.activeTurnId }),
+  };
 }
 
 export function mergeAuthoritativeThreadControl(
@@ -178,10 +193,35 @@ export function mergeAuthoritativeThreadControl(
   creation?: ThreadCreationMergeContext,
 ): ThreadDetail {
   const merged = mergeThreadRefresh(current, incoming, creation);
-  const { activeTurnId: _staleActiveTurnId, ...withoutActiveTurn } = merged;
+  const {
+    activeTurnId: _staleActiveTurnId,
+    model: _staleModel,
+    reasoningEffort: _staleReasoningEffort,
+    serviceTier: _staleServiceTier,
+    permissionProfileId: _stalePermissionProfileId,
+    approvalPolicy: _staleApprovalPolicy,
+    approvalsReviewer: _staleApprovalsReviewer,
+    collaborationMode: _staleCollaborationMode,
+    ...withoutAuthoritativeControl
+  } = merged;
   return {
-    ...withoutActiveTurn,
+    ...withoutAuthoritativeControl,
     state: incoming.state,
+    ...(incoming.model === undefined ? {} : { model: incoming.model }),
+    ...(incoming.reasoningEffort === undefined
+      ? {}
+      : { reasoningEffort: incoming.reasoningEffort }),
+    ...(incoming.serviceTier === undefined ? {} : { serviceTier: incoming.serviceTier }),
+    ...(incoming.permissionProfileId === undefined
+      ? {}
+      : { permissionProfileId: incoming.permissionProfileId }),
+    ...(incoming.approvalPolicy === undefined ? {} : { approvalPolicy: incoming.approvalPolicy }),
+    ...(incoming.approvalsReviewer === undefined
+      ? {}
+      : { approvalsReviewer: incoming.approvalsReviewer }),
+    ...(incoming.collaborationMode === undefined
+      ? {}
+      : { collaborationMode: incoming.collaborationMode }),
     availableActions: incoming.availableActions,
     ...(incoming.activeTurnId === undefined ? {} : { activeTurnId: incoming.activeTurnId }),
   };
@@ -312,6 +352,10 @@ function mergeConversationItems(
 ): ConversationItem[] {
   const currentById = new Map(currentItems.map((item) => [item.id, item]));
   const contextCompactionAliasIds = findContextCompactionAliasIds(persistedOrder, currentItems);
+  const optimisticSteerAliases = findOptimisticSteerAliases(persistedOrder, currentItems);
+  const terminalTextAliasIds = reconcileTerminalTextAliases
+    ? findTerminalTextAliasIds(persistedOrder, currentItems)
+    : new Set<string>();
   const seen = new Set<string>();
   const merged: ConversationItem[] = [];
 
@@ -320,43 +364,212 @@ function mergeConversationItems(
     merged.push(mergeConversationItem(current, incoming, preferIncoming));
     seen.add(incoming.id);
   }
+  const retainedCurrentOnly = new Set<string>();
   for (const item of currentItems) {
     if (!seen.has(item.id)) {
       if (
         (dropUnpersistedRunningTools && item.kind === "tool" && item.status === "running") ||
         contextCompactionAliasIds.has(item.id) ||
-        isOptimisticSteerAlias(item, persistedOrder) ||
-        (reconcileTerminalTextAliases &&
-          isTextItem(item) &&
-          persistedOrder.some(
-            (persisted) =>
-              isTextItem(persisted) && persisted.kind === item.kind && persisted.text === item.text,
-          )) ||
+        optimisticSteerAliases.has(item.id) ||
+        terminalTextAliasIds.has(item.id) ||
         isCurrentTurnAssistantAlias(item, persistedOrder, currentItems)
       ) {
         continue;
       }
-      merged.push(item);
-      seen.add(item.id);
+      retainedCurrentOnly.add(item.id);
     }
   }
-  return merged;
+  return mergeCurrentOnlyItemsInStableOrder(
+    merged,
+    currentItems,
+    retainedCurrentOnly,
+    optimisticSteerAliases,
+  );
 }
 
-function isOptimisticSteerAlias(
+function mergeCurrentOnlyItemsInStableOrder(
+  persistedItems: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+  retainedCurrentOnly: ReadonlySet<string>,
+  aliasesToPersistedIds: ReadonlyMap<string, string> = new Map(),
+): ConversationItem[] {
+  if (retainedCurrentOnly.size === 0) {
+    return [...persistedItems];
+  }
+
+  const persistedIndexById = new Map(persistedItems.map((item, index) => [item.id, index]));
+  for (const [aliasId, persistedId] of aliasesToPersistedIds) {
+    const persistedIndex = persistedIndexById.get(persistedId);
+    if (persistedIndex !== undefined) persistedIndexById.set(aliasId, persistedIndex);
+  }
+  const gaps: Array<Array<{ currentIndex: number; item: ConversationItem; timestamp?: number }>> =
+    Array.from({ length: persistedItems.length + 1 }, () => []);
+
+  for (let currentIndex = 0; currentIndex < currentItems.length; currentIndex += 1) {
+    const item = currentItems[currentIndex];
+    if (!item || !retainedCurrentOnly.has(item.id)) continue;
+    const temporalGap = temporalInsertionGap(item, persistedItems);
+    const anchoredGap = anchoredInsertionGap(
+      currentIndex,
+      currentItems,
+      persistedIndexById,
+      persistedItems.length,
+    );
+    const gap = temporalGap ?? anchoredGap;
+    const timestamp = conversationItemTimestamp(item);
+    gaps[gap]?.push({
+      currentIndex,
+      item,
+      ...(timestamp === undefined ? {} : { timestamp }),
+    });
+  }
+
+  const result: ConversationItem[] = [];
+  for (let gapIndex = 0; gapIndex < gaps.length; gapIndex += 1) {
+    const gapItems = gaps[gapIndex] ?? [];
+    gapItems.sort((left, right) => {
+      if (
+        left.timestamp !== undefined &&
+        right.timestamp !== undefined &&
+        left.timestamp !== right.timestamp
+      ) {
+        return left.timestamp - right.timestamp;
+      }
+      return left.currentIndex - right.currentIndex;
+    });
+    result.push(...gapItems.map(({ item }) => item));
+    const persisted = persistedItems[gapIndex];
+    if (persisted) result.push(persisted);
+  }
+  return result;
+}
+
+function temporalInsertionGap(
   item: ConversationItem,
+  persistedItems: readonly ConversationItem[],
+): number | undefined {
+  const timestamp = conversationItemTimestamp(item);
+  if (timestamp === undefined) return undefined;
+  for (let index = 0; index < persistedItems.length; index += 1) {
+    const persistedTimestamp = conversationItemTimestamp(persistedItems[index]);
+    if (persistedTimestamp !== undefined && persistedTimestamp > timestamp) {
+      return index;
+    }
+  }
+  return undefined;
+}
+
+function anchoredInsertionGap(
+  currentIndex: number,
+  currentItems: readonly ConversationItem[],
+  persistedIndexById: ReadonlyMap<string, number>,
+  persistedLength: number,
+): number {
+  let previousPersistedIndex: number | undefined;
+  for (let index = currentIndex - 1; index >= 0; index -= 1) {
+    const candidate = currentItems[index];
+    if (!candidate) continue;
+    const persistedIndex = persistedIndexById.get(candidate.id);
+    if (persistedIndex !== undefined) {
+      previousPersistedIndex = persistedIndex;
+      break;
+    }
+  }
+
+  let nextPersistedIndex: number | undefined;
+  for (let index = currentIndex + 1; index < currentItems.length; index += 1) {
+    const candidate = currentItems[index];
+    if (!candidate) continue;
+    const persistedIndex = persistedIndexById.get(candidate.id);
+    if (persistedIndex !== undefined) {
+      nextPersistedIndex = persistedIndex;
+      break;
+    }
+  }
+
+  if (
+    nextPersistedIndex !== undefined &&
+    (previousPersistedIndex === undefined || previousPersistedIndex < nextPersistedIndex)
+  ) {
+    return nextPersistedIndex;
+  }
+  if (previousPersistedIndex !== undefined) {
+    return Math.min(persistedLength, previousPersistedIndex + 1);
+  }
+  return nextPersistedIndex ?? persistedLength;
+}
+
+function conversationItemTimestamp(item: ConversationItem | undefined): number | undefined {
+  if (!item) return undefined;
+  for (const value of [item.createdAt, item.turnStartedAt, item.turnCompletedAt]) {
+    if (!value) continue;
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return undefined;
+}
+
+function findOptimisticSteerAliases(
   persistedOrder: readonly ConversationItem[],
-): boolean {
-  return (
-    item.kind === "user-message" &&
-    item.id.startsWith("pending-steer-") &&
-    persistedOrder.some(
-      (persisted) =>
-        persisted.kind === "user-message" &&
-        persisted.id !== item.id &&
-        persisted.text === item.text,
-    )
+  currentItems: readonly ConversationItem[],
+): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const currentIds = new Set(currentItems.map((item) => item.id));
+  const consumedPersistedIds = new Set<string>();
+  const candidates = persistedOrder.filter(
+    (item): item is Extract<ConversationItem, { kind: "user-message" }> =>
+      item.kind === "user-message" && !currentIds.has(item.id),
   );
+  for (const item of currentItems) {
+    if (item.kind !== "user-message" || !item.id.startsWith("pending-steer-")) continue;
+    const match = candidates.find(
+      (persisted) =>
+        !consumedPersistedIds.has(persisted.id) &&
+        persisted.text === item.text &&
+        conversationItemsMayShareTurn(item, persisted),
+    );
+    if (!match) continue;
+    aliases.set(item.id, match.id);
+    consumedPersistedIds.add(match.id);
+  }
+  return aliases;
+}
+
+function findTerminalTextAliasIds(
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+): Set<string> {
+  const aliases = new Set<string>();
+  const persistedIds = new Set(persistedOrder.map((item) => item.id));
+  const consumedPersistedIds = new Set<string>();
+  const candidates = persistedOrder.filter(isTextItem);
+  for (const item of currentItems) {
+    if (
+      persistedIds.has(item.id) ||
+      !isTextItem(item) ||
+      (item.kind === "user-message" && item.id.startsWith("pending-steer-"))
+    ) {
+      continue;
+    }
+    const match = candidates.find(
+      (persisted) =>
+        !consumedPersistedIds.has(persisted.id) &&
+        persisted.kind === item.kind &&
+        persisted.text === item.text &&
+        conversationItemsMayShareTurn(item, persisted),
+    );
+    if (!match) continue;
+    aliases.add(item.id);
+    consumedPersistedIds.add(match.id);
+  }
+  return aliases;
+}
+
+function conversationItemsMayShareTurn(
+  left: Pick<ConversationItem, "turnId">,
+  right: Pick<ConversationItem, "turnId">,
+): boolean {
+  return left.turnId === undefined || right.turnId === undefined || left.turnId === right.turnId;
 }
 
 function findContextCompactionAliasIds(
@@ -466,7 +679,23 @@ function mergeConversationItem(
     if (isTerminalToolStatus(current.status) && incoming.status === "running") return current;
     if (current.status === "running" && isTerminalToolStatus(incoming.status)) return incoming;
   }
+  if (current.kind === "user-message" && incoming.kind === "user-message") {
+    const selected = preferIncoming ? incoming : current;
+    const attachments = mergeConversationAttachments(current.attachments, incoming.attachments);
+    return attachments === undefined ? selected : { ...selected, attachments };
+  }
   return preferIncoming ? incoming : current;
+}
+
+function mergeConversationAttachments(
+  current: readonly ConversationAttachment[] | undefined,
+  incoming: readonly ConversationAttachment[] | undefined,
+): ConversationAttachment[] | undefined {
+  const merged = new Map<string, ConversationAttachment>();
+  for (const attachment of [...(current ?? []), ...(incoming ?? [])]) {
+    merged.set(`${attachment.kind}\u0000${attachment.path}`, attachment);
+  }
+  return merged.size > 0 ? [...merged.values()] : undefined;
 }
 
 function incomingAdvancesToolLifecycle(
@@ -595,7 +824,14 @@ function isConversationItem(value: unknown): value is ConversationItem {
     item.kind === "assistant-message" ||
     item.kind === "reasoning-summary"
   ) {
-    return typeof item.text === "string";
+    return (
+      typeof item.text === "string" &&
+      (item.kind !== "user-message" ||
+        item.attachments === undefined ||
+        (Array.isArray(item.attachments) &&
+          item.attachments.length <= 32 &&
+          item.attachments.every(isConversationAttachment)))
+    );
   }
   if (item.kind === "tool") {
     return (
@@ -609,7 +845,56 @@ function isConversationItem(value: unknown): value is ConversationItem {
       (item.change === "added" || item.change === "modified" || item.change === "deleted")
     );
   }
+  if (item.kind === "subagent-activity") {
+    return (
+      (item.action === "spawn" ||
+        item.action === "update" ||
+        item.action === "resume" ||
+        item.action === "wait" ||
+        item.action === "close" ||
+        item.action === "activity") &&
+      (item.status === "running" || item.status === "complete" || item.status === "failed") &&
+      Array.isArray(item.agents) &&
+      item.agents.length > 0 &&
+      item.agents.every((agent) => {
+        const candidate = asRecord(agent);
+        return (
+          typeof candidate.threadId === "string" &&
+          (candidate.label === undefined || typeof candidate.label === "string")
+        );
+      })
+    );
+  }
+  if (item.kind === "plan-progress") {
+    return (
+      Array.isArray(item.steps) &&
+      item.steps.length > 0 &&
+      item.steps.every((step) => {
+        const candidate = asRecord(step);
+        return (
+          typeof candidate.text === "string" &&
+          (candidate.status === "pending" ||
+            candidate.status === "inProgress" ||
+            candidate.status === "completed")
+        );
+      }) &&
+      (item.explanation === undefined || typeof item.explanation === "string")
+    );
+  }
   return false;
+}
+
+function isConversationAttachment(value: unknown): value is ConversationAttachment {
+  const attachment = asRecord(value);
+  return (
+    (attachment.kind === "file" || attachment.kind === "image") &&
+    typeof attachment.name === "string" &&
+    attachment.name.length > 0 &&
+    attachment.name.length <= 255 &&
+    typeof attachment.path === "string" &&
+    attachment.path.length > 0 &&
+    attachment.path.length <= 32_768
+  );
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

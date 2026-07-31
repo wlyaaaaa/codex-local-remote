@@ -3,6 +3,7 @@ import {
   ThreadLifecycleArbiter,
   TurnStartConflictError,
   type AuthoritativeThreadState,
+  type ThreadArchiveReservation,
   type TurnStartReservation,
 } from "./thread-lifecycle.js";
 
@@ -35,11 +36,14 @@ export interface BrokerCoordinatorOptions {
 export interface BrokerCoordinatorSnapshot {
   degraded: boolean;
   desktopConnected: boolean;
+  desktopConnectionCount: number;
+  desktopLaunchNonceDigests: string[];
   sidecarConnected: boolean;
   unknownCount: number;
 }
 
 interface AttachPairOptions {
+  desktopLaunchNonceDigest?: string;
   downstream: BrokerWire;
   upstream: BrokerWire;
 }
@@ -106,9 +110,13 @@ const MAX_LOADED_THREAD_CURSOR_LENGTH = 8_192;
 const MAX_LOADED_THREAD_PAGE_LIMIT = 200;
 const MAX_LOADED_THREAD_PAGES = 20;
 const MAX_LOADED_THREADS_PER_CONNECTION = MAX_LOADED_THREAD_PAGE_LIMIT * MAX_LOADED_THREAD_PAGES;
+const MAX_ARCHIVE_STABILITY_ATTEMPTS = 8;
 const MAX_THREAD_TITLE_CODE_POINTS = 80;
+const DESKTOP_LAUNCH_NONCE_DIGEST = /^[0-9a-f]{64}$/u;
 
 export class BrokerCoordinator {
+  readonly #archivedThreadIds = new Set<string>();
+  readonly #archivedThreadTrees = new Map<string, Set<string>>();
   readonly #backfillRetryDelaysMs: number[];
   readonly #backfillInFlight = new Set<number>();
   readonly #connections = new Map<number, BrokerPairConnection>();
@@ -124,6 +132,7 @@ export class BrokerCoordinator {
   readonly #namedThreadIds = new Set<string>();
   readonly #resumeRetryDelaysMs: number[];
   readonly #sleep: (delayMs: number) => Promise<void>;
+  readonly #threadParents = new Map<string, string | undefined>();
   #nextConnectionId = 1;
   #convergenceInFlight: Promise<void> | undefined;
   #convergenceRequested = false;
@@ -165,11 +174,20 @@ export class BrokerCoordinator {
 
   snapshot(): BrokerCoordinatorSnapshot {
     const active = [...this.#connections.values()].filter((connection) => !connection.closed);
+    const desktopConnections = active.filter(
+      (connection) => connection.initialized && connection.role === "desktop",
+    );
     return {
       degraded: this.#degradedBackfills.size > 0,
-      desktopConnected: active.some(
-        (connection) => connection.initialized && connection.role === "desktop",
-      ),
+      desktopConnected: desktopConnections.length > 0,
+      desktopConnectionCount: desktopConnections.length,
+      desktopLaunchNonceDigests: desktopConnections
+        .flatMap((connection) =>
+          connection.desktopLaunchNonceDigest === undefined
+            ? []
+            : [connection.desktopLaunchNonceDigest],
+        )
+        .sort(),
       sidecarConnected: active.some(
         (connection) => connection.initialized && connection.role === "sidecar",
       ),
@@ -192,6 +210,8 @@ export class BrokerCoordinator {
       connection.close();
     }
     this.#connections.clear();
+    this.#archivedThreadIds.clear();
+    this.#archivedThreadTrees.clear();
     this.#backfillInFlight.clear();
     this.#convergenceRequested = false;
     this.#creatorByThread.clear();
@@ -201,6 +221,7 @@ export class BrokerCoordinator {
     this.#loadedRefreshes.clear();
     this.#loadedThreads.clear();
     this.#namedThreadIds.clear();
+    this.#threadParents.clear();
   }
 
   connectionClosed(connection: BrokerPairConnection): void {
@@ -241,13 +262,24 @@ export class BrokerCoordinator {
     threadId: string,
     explicitCreator?: BrokerPairConnection,
     fresh = false,
+    value?: unknown,
   ): void {
+    if (this.#archivedThreadIds.has(threadId) && !fresh) {
+      return;
+    }
+    if (value !== undefined) {
+      this.#rememberThreadLineage(threadId, value);
+    }
+    if (fresh) {
+      this.#archivedThreadIds.delete(threadId);
+    }
     this.#loadedThreads.remember(
       threadId,
       this.#initializedConnections().map((connection) => connection.id),
     );
     if (fresh) {
       this.#lifecycle.observeStatus(threadId, "idle");
+      this.#threadParents.set(threadId, undefined);
     }
     const creator =
       explicitCreator ?? this.#creatorByThread.get(threadId) ?? this.#inferOnlyPendingCreator();
@@ -272,9 +304,23 @@ export class BrokerCoordinator {
     this.#namedThreadIds.add(threadId);
   }
 
-  observeThreadSnapshot(threadId: string, value: unknown): void {
+  captureThreadLifecycleRevision(threadId: string): number {
+    return this.#lifecycle.revision(threadId);
+  }
+
+  observeThreadSnapshot(threadId: string, value: unknown, expectedRevision?: number): void {
+    if (this.#archivedThreadIds.has(threadId)) {
+      return;
+    }
+    this.#rememberThreadLineage(threadId, value);
     const state = extractAuthoritativeThreadState(value);
-    this.#lifecycle.observeStatus(threadId, state);
+    const applied =
+      expectedRevision === undefined
+        ? (this.#lifecycle.observeStatus(threadId, state), true)
+        : this.#lifecycle.observeStatusAtRevision(threadId, state, expectedRevision);
+    if (!applied) {
+      return;
+    }
     if (state === "active") {
       this.#loadedThreads.markInFlight(threadId);
     } else if (state === "idle") {
@@ -282,7 +328,11 @@ export class BrokerCoordinator {
     }
   }
 
-  observeTurnStarted(threadId: string, turnId: string): void {
+  observeTurnStarted(threadId: string, turnId: string, source?: BrokerPairConnection): void {
+    if (this.#archivedThreadIds.has(threadId)) {
+      return;
+    }
+    source?.markSubscribed(threadId);
     this.#lifecycle.observeStarted(threadId, turnId);
     if (this.#lifecycle.snapshot(threadId)?.phase === "active") {
       this.#loadedThreads.markInFlight(threadId);
@@ -291,7 +341,7 @@ export class BrokerCoordinator {
     }
     const creator = this.#creatorByThread.get(threadId);
     for (const connection of this.#initializedConnections()) {
-      if (connection === creator) {
+      if (connection === source || connection === creator) {
         continue;
       }
       void connection
@@ -301,6 +351,9 @@ export class BrokerCoordinator {
   }
 
   observeTurnCompleted(threadId: string, turnId: string): void {
+    if (this.#archivedThreadIds.has(threadId)) {
+      return;
+    }
     this.#lifecycle.complete(threadId, turnId);
     if (this.#lifecycle.snapshot(threadId)?.phase === "active") {
       this.#loadedThreads.markInFlight(threadId);
@@ -310,6 +363,10 @@ export class BrokerCoordinator {
   }
 
   observeThreadStatus(threadId: string, value: unknown): void {
+    if (this.#archivedThreadIds.has(threadId)) {
+      return;
+    }
+    this.#rememberThreadLineage(threadId, value);
     const state = extractAuthoritativeThreadState(value);
     this.#lifecycle.observeStatus(threadId, state);
     if (state === "active") {
@@ -323,13 +380,202 @@ export class BrokerCoordinator {
     source: BrokerPairConnection,
     threadId: string,
   ): Promise<TurnStartReservation> {
-    const reservation = await this.#lifecycle.reserve(
+    await this.#hydrateLineageForArchiveConflict(source, threadId);
+    this.assertTurnStartAllowed(threadId);
+    const reservation = await this.#lifecycle.reserve(threadId, source.id, async () => {
+      const state = await source.inspectThreadState(threadId);
+      this.assertTurnStartAllowed(threadId);
+      return state;
+    });
+    try {
+      await this.#hydrateLineageForArchiveConflict(source, threadId);
+      this.assertTurnStartAllowed(threadId);
+      this.#loadedThreads.markInFlight(threadId);
+      return reservation;
+    } catch (error) {
+      this.#lifecycle.release(reservation);
+      throw error;
+    }
+  }
+
+  assertTurnStartAllowed(threadId: string): void {
+    if (this.#archivedThreadIds.has(threadId)) {
+      throw new TurnStartConflictError("Thread is archived");
+    }
+    this.#lifecycle.assertNotArchiving(threadId);
+    const rootThreadId = this.#knownRootThreadId(threadId);
+    if (rootThreadId !== undefined && rootThreadId !== threadId) {
+      this.#lifecycle.assertNotArchiving(rootThreadId);
+    }
+  }
+
+  async reserveThreadArchive(
+    source: BrokerPairConnection,
+    threadId: string,
+  ): Promise<ThreadArchiveReservation> {
+    const knownRootThreadId = this.#knownRootThreadId(threadId);
+    if (knownRootThreadId !== undefined && knownRootThreadId !== threadId) {
+      throw new TurnStartConflictError("Only top-level threads can be archived");
+    }
+    const reservation = this.#lifecycle.reserveArchive(
       threadId,
+      this.#knownThreadTree(threadId),
       source.id,
-      async () => await source.inspectThreadState(threadId),
     );
-    this.#loadedThreads.markInFlight(threadId);
-    return reservation;
+    const inspected = new Set<string>();
+    const inspectedStates = new Map<string, AuthoritativeThreadState | "no-rollout">();
+    let stabilized = false;
+    try {
+      for (let attempt = 0; attempt < MAX_ARCHIVE_STABILITY_ATTEMPTS; attempt += 1) {
+        const loadedRevision = this.#loadedThreads.revision();
+        const unresolvedLoadedThreadIds = this.#loadedThreads
+          .union()
+          .filter(
+            (candidate) =>
+              !this.#archivedThreadIds.has(candidate) &&
+              !this.#threadParents.has(candidate) &&
+              !inspected.has(candidate),
+          );
+        if (unresolvedLoadedThreadIds.length > MAX_LOADED_THREADS_PER_CONNECTION * 2) {
+          throw new TurnStartConflictError("Loaded thread lineage exceeds the safety limit");
+        }
+        for (
+          let offset = 0;
+          offset < unresolvedLoadedThreadIds.length;
+          offset += this.#maxBackfillConcurrency
+        ) {
+          const batch = unresolvedLoadedThreadIds.slice(
+            offset,
+            offset + this.#maxBackfillConcurrency,
+          );
+          await Promise.all(
+            batch.map(async (candidate) => {
+              try {
+                inspectedStates.set(candidate, await source.inspectThreadState(candidate));
+              } catch (error) {
+                if (!isNoRolloutFoundError(error)) {
+                  throw error;
+                }
+                inspectedStates.set(candidate, "no-rollout");
+              } finally {
+                inspected.add(candidate);
+              }
+            }),
+          );
+        }
+        const tree = this.#knownThreadTree(threadId);
+        this.#lifecycle.extendArchive(reservation, tree);
+        for (const candidate of tree) {
+          const observed = inspectedStates.get(candidate);
+          if (observed === "active" || observed === "unknown") {
+            throw new TurnStartConflictError(
+              observed === "active"
+                ? "Thread already has an active turn"
+                : "Thread idle state could not be confirmed",
+            );
+          }
+        }
+        const candidates = tree.filter((candidate) => {
+          if (inspected.has(candidate)) {
+            return false;
+          }
+          return candidate === threadId || this.#lifecycle.snapshot(candidate)?.phase !== "idle";
+        });
+        if (candidates.length === 0) {
+          const hasNewUnresolvedThread = this.#loadedThreads
+            .union()
+            .some(
+              (candidate) =>
+                !this.#archivedThreadIds.has(candidate) &&
+                !this.#threadParents.has(candidate) &&
+                !inspected.has(candidate),
+            );
+          if (this.#loadedThreads.revision() !== loadedRevision || hasNewUnresolvedThread) {
+            continue;
+          }
+          stabilized = true;
+          break;
+        }
+        for (const candidate of candidates) {
+          let state: AuthoritativeThreadState;
+          try {
+            state = await source.inspectThreadState(candidate);
+          } catch (error) {
+            if (isNoRolloutFoundError(error)) {
+              inspected.add(candidate);
+              inspectedStates.set(candidate, "no-rollout");
+              continue;
+            }
+            throw error;
+          }
+          inspected.add(candidate);
+          inspectedStates.set(candidate, state);
+          if (state !== "idle") {
+            throw new TurnStartConflictError(
+              state === "active"
+                ? "Thread already has an active turn"
+                : "Thread idle state could not be confirmed",
+            );
+          }
+        }
+        const observedRootThreadId = this.#knownRootThreadId(threadId);
+        if (observedRootThreadId !== undefined && observedRootThreadId !== threadId) {
+          throw new TurnStartConflictError("Only top-level threads can be archived");
+        }
+      }
+      if (!stabilized) {
+        throw new TurnStartConflictError("Loaded thread inventory did not stabilize");
+      }
+      if (!this.#lifecycle.ownsArchive(reservation)) {
+        throw new TurnStartConflictError("Thread archive reservation is no longer active");
+      }
+      return reservation;
+    } catch (error) {
+      this.#lifecycle.releaseArchive(reservation);
+      throw error;
+    }
+  }
+
+  releaseThreadArchive(reservation: ThreadArchiveReservation): void {
+    this.#lifecycle.releaseArchive(reservation);
+  }
+
+  observeThreadArchived(rootThreadId: string): void {
+    const threadIds = [
+      ...new Set([
+        ...(this.#archivedThreadTrees.get(rootThreadId) ?? []),
+        ...this.#knownThreadTree(rootThreadId),
+      ]),
+    ];
+    this.#archivedThreadTrees.set(rootThreadId, new Set(threadIds));
+    for (const threadId of threadIds) {
+      this.#archivedThreadIds.add(threadId);
+      this.#creatorByThread.delete(threadId);
+      this.#freshThreadIds.delete(threadId);
+      this.#namedThreadIds.delete(threadId);
+    }
+    this.#loadedThreads.forget(threadIds);
+    this.#lifecycle.forget(threadIds);
+    for (const connection of this.#connections.values()) {
+      connection.forgetThreads(threadIds);
+    }
+    for (const threadId of threadIds) {
+      this.#threadParents.delete(threadId);
+    }
+  }
+
+  observeThreadUnarchived(threadId: string): void {
+    this.#archivedThreadIds.delete(threadId);
+    for (const [rootThreadId, threadIds] of this.#archivedThreadTrees) {
+      threadIds.delete(threadId);
+      if (threadIds.size === 0) {
+        this.#archivedThreadTrees.delete(rootThreadId);
+      }
+    }
+  }
+
+  isThreadArchived(threadId: string): boolean {
+    return this.#archivedThreadIds.has(threadId);
   }
 
   activateTurnStart(reservation: TurnStartReservation, turnId: string): void {
@@ -350,6 +596,58 @@ export class BrokerCoordinator {
 
   markTurnStartUnknown(reservation: TurnStartReservation): void {
     this.#lifecycle.markUnknown(reservation);
+  }
+
+  async #hydrateLineageForArchiveConflict(
+    source: BrokerPairConnection,
+    threadId: string,
+  ): Promise<void> {
+    if (!this.#lifecycle.hasArchiveReservations() || this.#threadParents.has(threadId)) {
+      return;
+    }
+    await source.inspectThreadState(threadId);
+  }
+
+  #knownRootThreadId(threadId: string): string | undefined {
+    let current = threadId;
+    const visited = new Set<string>();
+    for (;;) {
+      if (visited.has(current) || !this.#threadParents.has(current)) {
+        return undefined;
+      }
+      visited.add(current);
+      const parent = this.#threadParents.get(current);
+      if (parent === undefined) {
+        return current;
+      }
+      current = parent;
+    }
+  }
+
+  #knownThreadTree(rootThreadId: string): string[] {
+    const result = new Set<string>([rootThreadId]);
+    for (const threadId of this.#threadParents.keys()) {
+      if (this.#knownRootThreadId(threadId) === rootThreadId) {
+        result.add(threadId);
+      }
+    }
+    return [...result];
+  }
+
+  #rememberThreadLineage(threadId: string, value: unknown): void {
+    const outer = asRecord(value);
+    const nested = asRecord(outer.thread);
+    const thread = Object.keys(nested).length > 0 ? nested : outer;
+    const observedThreadId = extractThreadId(value) ?? threadId;
+    if (!isThreadId(observedThreadId) || !Object.hasOwn(thread, "parentThreadId")) {
+      return;
+    }
+    const parentThreadId = thread.parentThreadId;
+    if (parentThreadId === null) {
+      this.#threadParents.set(observedThreadId, undefined);
+    } else if (isThreadId(parentThreadId) && parentThreadId !== observedThreadId) {
+      this.#threadParents.set(observedThreadId, parentThreadId);
+    }
   }
 
   async listLoadedUnion(): Promise<string[]> {
@@ -512,10 +810,14 @@ export class BrokerCoordinator {
       .collectLoadedThreadIds()
       .then((threadIds) => {
         if (!connection.closed && this.#connections.get(connection.id) === connection) {
-          for (const threadId of threadIds) {
+          const currentThreadIds = threadIds.filter(
+            (threadId) => !this.#archivedThreadIds.has(threadId),
+          );
+          for (const threadId of currentThreadIds) {
             connection.markSubscribed(threadId);
           }
-          this.#loadedThreads.replaceConnection(connection.id, threadIds, refreshGeneration);
+          this.#loadedThreads.replaceConnection(connection.id, currentThreadIds, refreshGeneration);
+          return currentThreadIds;
         }
         return threadIds;
       })
@@ -607,6 +909,11 @@ class BrokerPairConnection implements BrokerPair {
   readonly #inflightResumes = new Map<string, Promise<void>>();
   readonly #maxFrameBytes: number;
   readonly #pendingThreadStartIds = new Set<RpcId>();
+  readonly #pendingThreadResumes = new Map<
+    RpcId,
+    { lifecycleRevision: number; threadId: string }
+  >();
+  readonly #pendingThreadArchives = new Map<RpcId, ThreadArchiveReservation>();
   readonly #pendingTurnStarts = new Map<RpcId, TurnStartReservation>();
   readonly #subscribedThreadIds = new Set<string>();
   readonly #upstream: BrokerWire;
@@ -617,6 +924,7 @@ class BrokerPairConnection implements BrokerPair {
   #initializedNotificationSent = false;
   #roleCandidate: ClientRole | undefined;
   closed = false;
+  readonly desktopLaunchNonceDigest: string | undefined;
   readonly id: number;
   initialized = false;
   role: ClientRole | undefined;
@@ -629,6 +937,10 @@ class BrokerPairConnection implements BrokerPair {
     hiddenRequestTimeoutMs: number,
   ) {
     this.#coordinator = coordinator;
+    this.desktopLaunchNonceDigest =
+      options.desktopLaunchNonceDigest === undefined
+        ? undefined
+        : assertDesktopLaunchNonceDigest(options.desktopLaunchNonceDigest);
     this.id = id;
     this.#downstream = options.downstream;
     this.#upstream = options.upstream;
@@ -705,6 +1017,33 @@ class BrokerPairConnection implements BrokerPair {
     }
 
     if (id !== undefined) {
+      const pendingResume = this.#pendingThreadResumes.get(id);
+      if (pendingResume) {
+        this.#pendingThreadResumes.delete(id);
+        if (!("error" in message)) {
+          this.markSubscribed(pendingResume.threadId);
+          this.#coordinator.observeThreadSnapshot(
+            pendingResume.threadId,
+            message.result,
+            pendingResume.lifecycleRevision,
+          );
+        }
+      }
+    }
+
+    if (id !== undefined) {
+      const archiveReservation = this.#pendingThreadArchives.get(id);
+      if (archiveReservation) {
+        this.#pendingThreadArchives.delete(id);
+        if ("error" in message) {
+          this.#coordinator.releaseThreadArchive(archiveReservation);
+        } else {
+          this.#coordinator.observeThreadArchived(archiveReservation.rootThreadId);
+        }
+      }
+    }
+
+    if (id !== undefined) {
       const reservation = this.#pendingTurnStarts.get(id);
       if (reservation) {
         this.#pendingTurnStarts.delete(id);
@@ -724,26 +1063,40 @@ class BrokerPairConnection implements BrokerPair {
     if (message.method === "thread/started") {
       const threadId = extractThreadId(message.params);
       if (threadId) {
-        this.#coordinator.observeThreadStarted(threadId);
+        this.#coordinator.observeThreadStarted(threadId, undefined, false, message.params);
+      }
+    }
+    if (message.method === "thread/archived") {
+      const threadId = extractThreadId(message.params);
+      if (threadId) {
+        this.#coordinator.observeThreadArchived(threadId);
+      }
+    }
+    if (message.method === "thread/unarchived") {
+      const threadId = extractThreadId(message.params);
+      if (threadId) {
+        this.#coordinator.observeThreadUnarchived(threadId);
       }
     }
     if (message.method === "turn/started") {
       const threadId = extractThreadId(message.params);
       const turnId = extractTurnId(message.params);
       if (threadId && turnId) {
-        this.#coordinator.observeTurnStarted(threadId, turnId);
+        this.#coordinator.observeTurnStarted(threadId, turnId, this);
       }
     }
     if (message.method === "turn/completed") {
       const threadId = extractThreadId(message.params);
       const turnId = extractTurnId(message.params);
       if (threadId && turnId) {
+        this.markSubscribed(threadId);
         this.#coordinator.observeTurnCompleted(threadId, turnId);
       }
     }
     if (message.method === "thread/status/changed") {
       const threadId = extractThreadId(message.params);
       if (threadId) {
+        this.markSubscribed(threadId);
         this.#coordinator.observeThreadStatus(threadId, message.params);
       }
     }
@@ -762,13 +1115,34 @@ class BrokerPairConnection implements BrokerPair {
       pending.reject(error);
     }
     this.#inflightResumes.clear();
+    this.#pendingThreadResumes.clear();
     this.#coordinator.connectionClosed(this);
     safeClose(this.#downstream, 1001, "broker connection closed");
     safeClose(this.#upstream, 1001, "broker connection closed");
   }
 
   markSubscribed(threadId: string): void {
-    this.#subscribedThreadIds.add(threadId);
+    if (!this.#coordinator.isThreadArchived(threadId)) {
+      this.#subscribedThreadIds.add(threadId);
+    }
+  }
+
+  forgetThreads(threadIds: Iterable<string>): void {
+    const forgotten = new Set(threadIds);
+    for (const threadId of forgotten) {
+      this.#inflightResumes.delete(threadId);
+      this.#subscribedThreadIds.delete(threadId);
+    }
+    for (const [id, pending] of this.#pendingThreadResumes) {
+      if (forgotten.has(pending.threadId)) {
+        this.#pendingThreadResumes.delete(id);
+      }
+    }
+    for (const [id, pending] of this.#pendingTurnStarts) {
+      if (forgotten.has(pending.threadId)) {
+        this.#pendingTurnStarts.delete(id);
+      }
+    }
   }
 
   async persistThreadName(threadId: string, name: string): Promise<void> {
@@ -783,6 +1157,9 @@ class BrokerPairConnection implements BrokerPair {
     retryDelaysMs: number[],
     sleepFor: (delayMs: number) => Promise<void>,
   ): Promise<void> {
+    if (this.#coordinator.isThreadArchived(threadId)) {
+      return Promise.resolve();
+    }
     if (this.#subscribedThreadIds.has(threadId)) {
       return Promise.resolve();
     }
@@ -831,12 +1208,13 @@ class BrokerPairConnection implements BrokerPair {
   }
 
   async inspectThreadState(threadId: string): Promise<AuthoritativeThreadState> {
+    const lifecycleRevision = this.#coordinator.captureThreadLifecycleRevision(threadId);
     const result = await this.#sendHidden("thread/read", {
       includeTurns: false,
       threadId,
     });
     const state = extractAuthoritativeThreadState(result);
-    this.#coordinator.observeThreadSnapshot(threadId, result);
+    this.#coordinator.observeThreadSnapshot(threadId, result, lifecycleRevision);
     return state;
   }
 
@@ -880,6 +1258,10 @@ class BrokerPairConnection implements BrokerPair {
       const roleCandidate = classifyClientRole(message.params);
       if (roleCandidate === "unknown") {
         this.#closeProtocol(1008, "unrecognized client is not authorized");
+        return;
+      }
+      if (roleCandidate === "desktop" && this.desktopLaunchNonceDigest === undefined) {
+        this.#closeProtocol(1008, "Codex Desktop launch identity is required");
         return;
       }
       this.#initializeId = id;
@@ -932,8 +1314,9 @@ class BrokerPairConnection implements BrokerPair {
         return;
       }
       try {
+        const lifecycleRevision = this.#coordinator.captureThreadLifecycleRevision(threadId);
         const result = await this.#sendHidden("thread/resume", message.params);
-        this.#coordinator.observeThreadSnapshot(threadId, result);
+        this.#coordinator.observeThreadSnapshot(threadId, result, lifecycleRevision);
         await this.#coordinator.awaitHistoryResumeBarrier(this, threadId);
         this.#send(this.#downstream, JSON.stringify({ id, result }));
       } catch (error) {
@@ -946,12 +1329,54 @@ class BrokerPairConnection implements BrokerPair {
       return;
     }
 
+    if (message.method === "thread/resume" && this.role === "desktop" && id !== undefined) {
+      const threadId = extractThreadId(message.params);
+      if (threadId) {
+        this.#pendingThreadResumes.set(id, {
+          lifecycleRevision: this.#coordinator.captureThreadLifecycleRevision(threadId),
+          threadId,
+        });
+      }
+    }
+
     if (message.method === "thread/name/set") {
       const threadId = extractThreadId(message.params);
       if (threadId) {
         this.#coordinator.observeThreadNamed(threadId);
       }
       this.#send(this.#upstream, frame);
+      return;
+    }
+
+    if (message.method === "thread/archive") {
+      if (id === undefined) {
+        this.#closeProtocol(1002, "thread/archive requires an id");
+        return;
+      }
+      if (!this.initialized || !this.role) {
+        this.#sendError(id, -32_090, "Client is not initialized");
+        return;
+      }
+      const threadId = extractThreadId(message.params);
+      if (!threadId) {
+        this.#sendError(id, -32_602, "thread/archive threadId is required");
+        return;
+      }
+      try {
+        const reservation = await this.#coordinator.reserveThreadArchive(this, threadId);
+        if (!this.closed) {
+          this.#pendingThreadArchives.set(id, reservation);
+          this.#send(this.#upstream, frame);
+        } else {
+          this.#coordinator.releaseThreadArchive(reservation);
+        }
+      } catch (error) {
+        const conflict =
+          error instanceof TurnStartConflictError
+            ? error
+            : new TurnStartConflictError("Thread archive safety check failed");
+        this.#sendError(id, conflict.code, conflict.message);
+      }
       return;
     }
 
@@ -1005,6 +1430,7 @@ class BrokerPairConnection implements BrokerPair {
         return;
       }
       try {
+        this.#coordinator.assertTurnStartAllowed(threadId);
         await this.#coordinator.awaitTurnBarrier(this, threadId, deriveThreadTitle(message.params));
         const reservation = await this.#coordinator.reserveTurnStart(this, threadId);
         if (!this.closed) {
@@ -1051,12 +1477,13 @@ class BrokerPairConnection implements BrokerPair {
         throw new Error("Broker connection closed");
       }
       try {
+        const lifecycleRevision = this.#coordinator.captureThreadLifecycleRevision(threadId);
         const result = await this.#sendHidden("thread/resume", {
           excludeTurns: true,
           threadId,
         });
-        this.#coordinator.observeThreadSnapshot(threadId, result);
-        this.#subscribedThreadIds.add(threadId);
+        this.#coordinator.observeThreadSnapshot(threadId, result, lifecycleRevision);
+        this.markSubscribed(threadId);
         return;
       } catch (error) {
         const retryDelay = retryDelaysMs[attempt];
@@ -1414,6 +1841,13 @@ function assertPositiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new TypeError(`${name} 必须是正整数`);
   }
+}
+
+function assertDesktopLaunchNonceDigest(value: string): string {
+  if (!DESKTOP_LAUNCH_NONCE_DIGEST.test(value)) {
+    throw new TypeError("desktop launch nonce digest must be a lowercase SHA-256 hex value");
+  }
+  return value;
 }
 
 function assertRetryDelays(value: number[], name: string): void {

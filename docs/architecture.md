@@ -43,6 +43,8 @@ React 不得导入 app-server 原始类型。Sidecar 协议适配器将原始通
 
 - 通过 fail-open Windows 启动器按进程注入的
   `CODEX_APP_SERVER_WS_URL` 连接 Broker；
+- 始终由同一用户、同一交互会话的 medium-integrity Explorer primary token
+  创建，不继承安全入口或计划任务的 elevated token；
 - 与 Sidecar 使用同一个 app-server，但保持独立连接和订阅集合；
 - Sidecar 不在线时仍可独立创建和继续任务；
 - Broker 未就绪时，启动器不注入 override，Desktop 仍从原生入口正常启动；
@@ -50,15 +52,21 @@ React 不得导入 app-server 原始类型。Sidecar 协议适配器将原始通
 
 ### Sidecar
 
-- 以当前 Windows 用户身份运行；
+- 在显式 Remote 租约内以当前 Windows 用户的 `Highest` 运行级别运行；
 - 默认监听 `127.0.0.1`，提供认证后的 REST、SSE 和 PWA 静态资源；
 - 作为单独的 WebSocket 客户端连接 Broker，不拥有或终止 app-server；
 - 将 app-server 通知投影为浏览器领域事件；
-- 只为本机注册项目提供文件网关。
+- 提供经过应用认证的所有者文件管理器，以后台受管任务的管理员令牌枚举和
+  管理已检测磁盘。
 
-默认不注册 `LocalSystem` 服务。发行版使用当前用户登录时启动的计划任务，
-先启动 Broker，再启动 Sidecar，从而继承桌面 Codex 的凭据、配置、映射盘
-与 DPAPI 上下文。
+默认不注册 `LocalSystem` 服务。发行版使用当前用户的 `Interactive` /
+`Highest` 按需计划任务；任务没有登录触发器、missed-trigger catch-up 或自动
+重启。普通 vendor 启动、Codex 更新、Windows 重启和睡眠恢复都不会启动
+Remote。显式租约内的 Desktop Owner Coordinator 独占受管 Desktop process
+ownership，先启动 Broker 和 Sidecar，再从同一用户、同一交互会话的 Explorer
+复制 medium-integrity primary token 创建 attached Desktop。这样既保留用户
+凭据、配置、映射盘和 DPAPI 上下文，也让文件管理能力使用后台任务的管理员
+令牌。Desktop 和后台控制面均不使用 `LocalSystem`。
 
 ## 3. 协议分层
 
@@ -86,7 +94,7 @@ React 不得导入 app-server 原始类型。Sidecar 协议适配器将原始通
 - Broker 原始公网传输；
 - thread/shellCommand 和 process/spawn；
 - 任意 config 写入；
-- 通用文件写入、删除或任意根目录；
+- 未经应用认证的裸文件代理；
 - 桌面私有 IPC。
 
 ### 连接与订阅
@@ -136,9 +144,13 @@ Sidecar 为每个宿主维持有界 ring buffer。浏览器携带
 `Last-Event-ID` 重连。SSE 的传输 id 使用
 `<sidecar-instance-id>:<seq>`，其中实例 id 每次 Sidecar 进程启动重新生成；
 实例不匹配或事件已淘汰时，返回重置事件，浏览器重新读取线程快照。任务
-详情同时携带该快照对应的 `snapshotEventSeq`，浏览器只把更高序号的事件
-应用到完整快照。这样页面切换、网络重连和 Sidecar 重启都不会重复拼接旧
-正文，也不会因新进程序号从头开始而漏掉新内容。
+详情响应同时携带绑定该次响应的
+`snapshotEventCursor=<sidecar-instance-id>:<seq>`；收到详情的浏览器把这个
+游标原样用于第一次 thread-scoped SSE，后续断线则改用自己最后收到的
+`Last-Event-ID`。游标不依赖服务端按任务缓存，因此多个浏览器并发读取和其他
+任务驱逐缓存都不能替换旧响应的水位。路由切换时，旧任务迟到的详情回调也
+不能覆盖当前任务已经绑定的游标。这样页面切换、网络重连和 Sidecar 重启都
+不会重复拼接旧正文，也不会漏掉详情请求与订阅之间的新事件。
 
 所有可重试的命令携带 idempotency key 和可选预期 revision。
 
@@ -224,30 +236,39 @@ app-server 没有稳定的桌面 project/list。项目来源按优先级合并�
 3. 可选的桌面状态导入适配器。
 
 后两类来源只用于历史对话归类和展示，不写入项目白名单，也不能成为
-新任务 cwd 或文件网关根。只有第一类来源授予这两项能力并持久化。
+新任务 cwd。只有第一类来源可作为手机新建项目任务的 cwd 并持久化。
 
 移动端不能添加任意路径。添加或扩大根目录只能在本机设置界面完成。
 
 用户也可以创建“不关联项目”的“无项目”对话。此类任务使用安装时配置的
-隔离根作为 cwd，不伪装成已注册项目，也不会授予该目录的浏览、预览或下载
-能力。缺少安全隔离根时，无项目新建请求失败关闭。
+隔离根作为 cwd，不伪装成已注册项目。缺少安全隔离根时，无项目新建请求
+失败关闭。独立的文件管理器不从任务 cwd 推导权限。
 
 ## 8. 文件网关
 
-文件请求携带 project id 和项目内相对路径。服务器：
+文件页启动时并行探测本机盘符，将每个当前可访问的卷规范化为一个不透明
+root id。文件请求携带 root id 和该磁盘内的相对路径。服务器：
 
-1. 拒绝绝对路径、UNC、设备路径和 `..`；
-2. 计算候选路径；
-3. 解析真实路径；
-4. 验证真实路径仍位于注册根；
-5. 检查规范化注册根和目标路径的全部段，拒绝敏感目录与保留名称；
-6. 应用大小、类型和并发限制；
-7. 以安全 Content-Type 与 `nosniff` 返回。
+1. 拒绝客户端提交的绝对、UNC、设备路径、ADS、保留名称和 `..`；
+2. 在选定卷根内计算候选路径，并交给 Windows 以 Sidecar 的当前高完整性
+   进程身份执行；
+3. 不增加项目、隐藏文件、敏感目录、扩展名或 junction denylist；Windows
+   ACL、文件占用和设备状态是唯一权限边界；
+4. 对预览与下载应用类型、大小和并发限制，以安全 Content-Type 与
+   `nosniff` 返回；
+5. 对上传、新建、编辑、重命名、复制、移动和删除统一执行登录、同源、
+   Fetch Metadata、CSRF 与幂等校验；
+6. 同名目标默认返回冲突，覆盖必须显式选择；删除默认调用 Windows 回收站，
+   永久删除必须显式选择并再次确认。
 
-目录列表本身也执行真实路径与 junction/symlink 越界检查。
+任务输出中的绝对文件路径不直接变成公网 URL。Sidecar 在确认文件存在后
+生成当前进程内、短时、不可预测的不透明授权；预览/下载仍要求当前登录会话。
+磁盘移除、网络卷断开或授权过期只让对应操作失败，不拖垮其他卷。
 
-文件 API 只接受来源为 `registered` 的项目 id。历史发现项目和隔离临时
-对话都不能成为文件网关根。
+这是一项单所有者设计：拿到有效 Web 会话就等同拿到当前用户的管理员文件
+操作能力。它不提供多用户 ACL 或浏览器级沙箱，也不把 Broker/app-server
+的原始接口暴露出去。管理员令牌仍不能绕过未解锁 BitLocker、离线卷、未挂载
+网络凭据或另一个 Windows 账号的加密边界。
 
 ## 9. 认证
 
@@ -288,19 +309,49 @@ Sidecar 支持路径前缀，生成的资源、SSE、下载和 Cookie 路径均�
 ## 11. Windows Desktop 兼容层
 
 当前 Windows Desktop 会在启动时读取隐藏的
-`CODEX_APP_SERVER_WS_URL` override。正式入口由 fail-open 启动器动态发现
-当前 Desktop 版本，先检查精确受管的 Broker 与 app-server 基础就绪状态，
-再仅向本次 Desktop 子进程注入回环 endpoint。安装流程不会把该变量写入
-HKCU 或机器环境；Broker 缺席、端口拒绝、身份不匹配、超时或任何启动器异常
-都会清除继承值并直接打开原生 Desktop，因此 Remote 故障不能阻断 Desktop
-启动。共享分支还会在有界时间内等待同一 Broker 运行代确认 Desktop attach；
-若预检后 Broker 瞬间退出，只能回收启动器本次创建且进程身份仍精确一致、
-尚未承载用户工作的 Desktop，并最多一次改走原生启动。既有 Desktop 进程
-永不由启动器关闭。历史版本留下的受管持久值会由升级/卸载流程安全清理。
+`CODEX_APP_SERVER_WS_URL` override。它只能进入由受管 coordinator 创建的单个
+Desktop 子进程；安装流程不会把该变量写入 HKCU 或机器环境。普通 vendor
+Desktop 没有 override，始终使用原生 app-server。
+
+固定在 DataDir 的 control dispatcher 是唯一 Open/Close/Status 实现。它在
+执行前验证 `runtime-current.json`、manifest hash、目标脚本大小/hash 和精确
+计划任务绑定，再把 selected identity 带入同一个全局 operation mutex 内复核。
+dispatcher 不自行派生 `RunAs` 第二进程：可选的个人 AI control skill 对 `Status`
+直接只读，对 `Open`/`Close` 在调用前判断 token，管理员直接执行，非管理员
+通过已启用的 Windows `sudo` 一次执行。因此输出、退出码、mutex 与 intent
+只有一个执行体，提权也不扩大 Desktop 重开授权。
+
+`Open` 的决策顺序固定：
+
+1. Broker、Desktop 和 Sidecar 已在同一精确租约时幂等返回，零重启；
+2. Broker/app-server/Desktop 身份稳定且只有 Sidecar/Web 缺失或存在兼容候选
+   时，执行 Sidecar-only 事务，Broker 和 Desktop 不动；
+3. 没有 Desktop 且按需任务为 `Ready` 时，启动 selected Remote owner；
+4. 只有一个原生 Desktop 且无法热注入时，先返回 `restart-required`；仅
+   `Open -AllowDesktopRestart` 才可关闭精确 PID/start identity、等待 Desktop
+   与独立 stdio 完全排空，再启动任务一次。
+
+计划任务没有任何触发器，`StartWhenAvailable=false`、`RestartCount=0`。
+普通 vendor 启动、Codex 更新、Windows reboot 和 sleep/resume 不写 Remote
+intent，也不会被 coordinator 观察为 takeover cause。Open 失败不会循环：
+若它已经关闭 native Desktop，则有界停止由本次调用启动且尚无安全任务的任务，
+恢复一个原生 Desktop；若期间出现受管活动任务，则保留同一 Broker 并只发布
+一次恢复 intent。结构化失败状态不持久化异常文本、路径、endpoint 或 token。
+
+`Close` 原子写入 Native desired mode 并停止公共 Sidecar，不停止或重开
+Desktop。当前 attached Desktop 与 Broker 可以保持到 Desktop 自然退出；
+supervisor 随后结束 Broker。下一次普通 vendor 启动仍为原生。
+
+注册器保留“Codex Remote（安全启动）”名称作为兼容入口，使用
+MS-SHLLINK `RunAsUser` 标志并指向固定 DataDir dispatcher 的
+`Open -AllowDesktopRestart`。它不是 Desktop 入口，也不指向源码目录或某个
+不可变运行代；日常控制不依赖用户点击它。只有能精确证明为本项目旧入口时
+才事务升级或删除，foreign shortcut 始终失败关闭。
 
 这个 override 不是稳定的公开 Desktop 合约。每次 Desktop 或随附
 `codex.exe` 升级后，都必须在真实 Windows 会话中验证：
 
+- 普通 vendor 启动仍为原生，显式 Open 以零次或至多一次已授权交接建立租约；
 - Desktop 与 Sidecar 均连接同一个 Broker，且没有独立 stdio app-server；
 - 项目对话和无项目对话都立即出现在 Desktop；
 - 两端收到同一轮的实时事件，任务与轮次 id 一致；
@@ -308,16 +359,18 @@ HKCU 或机器环境；Broker 缺席、端口拒绝、身份不匹配、超时�
 - Sidecar 缺席时 Desktop 仍能独立创建并完成任务。
 
 未完成这些检查的版本只能标记为“可用但有限制”，不得凭协议单测推断兼容。
-计划任务不保存 Desktop 版本号或包目录；启动和监督期间均动态发现当前包并
-比较普通文件路径与 SHA-256。热更新复用既有 Broker 时，只有精确 Broker
-身份、Desktop 已连接且活跃二进制与当前发现完全一致，旧回执才会提升为
-current；短暂断连后也会重做同一验证。版本漂移会保留已验证的运行进程，并
-以实时模型/任务能力探针决定是否继续服务：探针通过则带更新待切换提示继续
-可用，探针失败或身份无法验证则拒绝新执行。实现不热换 app-server、不重启
-Desktop，也不回退到 PATH 中的 CLI。
+运行时每次动态发现当前包、随附 app-server 与能力目录并比较普通文件路径和
+SHA-256，不保存 WindowsApps 版本目录，也不回退到 PATH 中的 CLI。
 
-Remote 自身则使用另一条独立的版本边界：构建产物与 Windows 脚本安装到
-内容寻址的不可变 `RuntimeVersions/<sha256>` 目录；计划任务和 fail-open
-快捷方式只指向通过 manifest 回读验证的目录。原子 current/previous 指针
-保存两个 manifest hash，更新和回滚都只改变下一次启动版本，不热替换当前
-Broker/Desktop 运行代。
+Remote 构建产物与 Windows 脚本安装到内容寻址的不可变
+`RuntimeVersions/<sha256>`。原子 current/previous 指针保存 manifest hash；
+受保护 managed config 保存端口、BasePath 和任务名。`-NoStart` 注册把
+dispatcher、快捷方式、任务、pointer 与 desired mode 作为可补偿事务安装，
+但不启停 Desktop、Broker 或 Sidecar。模糊 task/pointer/receipt lineage
+失败关闭。
+
+显式租约内可在严格 compatibility id 相等时执行 Sidecar-only 更新。事务前后
+必须保持 selected root、Broker PID/start、invocation、upstream PID/start、
+Desktop root identity 和连接状态不变，且 `unsafeThreadCount=0`、
+`unknownCount=0`；失败时恢复旧 Sidecar 并复核同一不变量。Broker、app-server
+或不兼容运行代需要一次新的显式 Open 决策，不能伪装成公网层更新。

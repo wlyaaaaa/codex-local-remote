@@ -14,6 +14,7 @@ import {
   reconcileThreadSnapshotLists,
   reconcileNextTurnSettingsDraft,
   synchronizeThreadRemoteEventProjection,
+  threadControlSnapshotIsCurrent,
   threadSummaryFromSnapshotEvent,
   updateNextTurnSettingsDraft,
 } from "./live-thread";
@@ -514,6 +515,55 @@ describe("实时任务事件投影", () => {
     expect(projected.items[0]).toMatchObject({ text: "ABCDE" });
   });
 
+  it("只接受覆盖当前事件水位和连接代际的权威控制壳", () => {
+    const projection = createThreadRemoteEventProjectionState();
+    const generation = projection.generation;
+    const snapshot = {
+      ...detail({ state: "running" }),
+      snapshotEventSeq: 3,
+    };
+    synchronizeThreadRemoteEventProjection(projection, snapshot);
+    applyThreadRemoteEvents(
+      snapshot,
+      [
+        event(4, "turn.state", {
+          state: "complete",
+          turn: { id: "turn-1", status: "completed" },
+        }),
+      ],
+      { projection },
+    );
+
+    expect(
+      threadControlSnapshotIsCurrent(projection, { ...snapshot, snapshotEventSeq: 3 }, generation),
+    ).toBe(false);
+    expect(
+      threadControlSnapshotIsCurrent(projection, { ...snapshot, snapshotEventSeq: 4 }, generation),
+    ).toBe(true);
+
+    applyThreadRemoteEvents(
+      snapshot,
+      [
+        event(
+          4,
+          "connection.reset",
+          { latestSequence: 4, oldestAvailableSequence: 4, reason: "events-expired" },
+          {},
+        ),
+      ],
+      { projection },
+    );
+    expect(
+      threadControlSnapshotIsCurrent(projection, { ...snapshot, snapshotEventSeq: 4 }, generation),
+    ).toBe(false);
+    expect(
+      threadControlSnapshotIsCurrent(projection, {
+        ...snapshot,
+        snapshotEventSeq: 4,
+      }),
+    ).toBe(true);
+  });
+
   it("即时接纳合法 Desktop thread.snapshot，拒绝空壳并保持当前/归档互斥", () => {
     const desktopSnapshotEvent = event(
       7,
@@ -710,9 +760,71 @@ describe("实时任务事件投影", () => {
     });
   });
 
+  it("不可重试错误投影为 failed 后清除活动轮次并恢复下一轮回复", () => {
+    const running = detail({
+      activeTurnId: "turn-1",
+      state: "running",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    });
+
+    const failed = applyThreadRemoteEvents(running, [
+      event(1, "turn.state", {
+        state: "failed",
+        turn: { id: "turn-1", status: "failed" },
+      }),
+    ]);
+
+    expect(failed.activeTurnId).toBeUndefined();
+    expect(failed).toMatchObject({
+      state: "failed",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    });
+  });
+
+  it("迟到的其他轮次失败终态不会清除当前活动轮次", () => {
+    const running = detail({
+      activeTurnId: "turn-current",
+      state: "running",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    });
+
+    const unchanged = applyThreadRemoteEvents(running, [
+      event(1, "turn.state", {
+        state: "failed",
+        turn: { id: "turn-old", status: "failed" },
+      }),
+    ]);
+
+    expect(unchanged).toMatchObject({
+      activeTurnId: "turn-current",
+      state: "running",
+      availableActions: {
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    });
+  });
+
   it("投影任务名称、模型和等待审批状态，但不接管其他任务", () => {
     const projected = applyThreadRemoteEvents(detail(), [
       event(1, "thread.updated", {
+        archived: true,
         name: "手机端真实任务",
         status: { type: "active", activeFlags: ["waitingOnUserInput"] },
         threadSettings: {
@@ -727,6 +839,7 @@ describe("实时任务事件投影", () => {
     ]);
 
     expect(projected).toMatchObject({
+      archived: true,
       title: "手机端真实任务",
       state: "waiting-for-approval",
       model: "gpt-5.6-terra",
@@ -734,6 +847,12 @@ describe("实时任务事件投影", () => {
       serviceTier: "fast",
       permissionProfileId: "workspace-write",
       collaborationMode: "plan",
+      availableActions: {
+        changeModelNextTurn: false,
+        interrupt: false,
+        reply: false,
+        steer: false,
+      },
     });
   });
 
@@ -1058,6 +1177,110 @@ describe("实时任务事件投影", () => {
     expect(projected.items).toEqual(optimistic.items);
   });
 
+  it("连续提交两条引导时按提交顺序一对一消费各自的官方用户事件", () => {
+    const projection = createThreadRemoteEventProjectionState();
+    let projected = detail({
+      activeTurnId: "turn-1",
+      items: [],
+      state: "running",
+    });
+
+    for (const [id, prompt] of [
+      ["pending-steer-a", "先检查 A"],
+      ["pending-steer-b", "再检查 B"],
+    ] as const) {
+      reserveSubmittedTurnUserAlias(projection, projected.id, prompt);
+      projected = {
+        ...projected,
+        items: [...projected.items, { id, kind: "user-message", text: prompt, turnId: "turn-1" }],
+      };
+      rememberSubmittedTurnUserAlias(projection, projected, prompt);
+    }
+
+    projected = applyThreadRemoteEvents(
+      projected,
+      [
+        event(
+          1,
+          "thread.item",
+          {
+            item: [{ id: "canonical-a", kind: "user-message", text: "先检查 A" }],
+          },
+          { threadId: projected.id, turnId: "turn-1" },
+        ),
+        event(
+          2,
+          "thread.item",
+          {
+            item: [{ id: "canonical-b", kind: "user-message", text: "再检查 B" }],
+          },
+          { threadId: projected.id, turnId: "turn-1" },
+        ),
+      ],
+      { projection },
+    );
+
+    expect(projected.items.map((item) => item.id)).toEqual(["pending-steer-a", "pending-steer-b"]);
+  });
+
+  it("连续提交同文引导时也为每次提交保留一条消息", () => {
+    const projection = createThreadRemoteEventProjectionState();
+    const prompt = "继续检查";
+    let projected = detail({
+      activeTurnId: "turn-1",
+      items: [],
+      state: "running",
+    });
+
+    for (const id of ["pending-steer-first", "pending-steer-second"]) {
+      reserveSubmittedTurnUserAlias(projection, projected.id, prompt);
+      projected = {
+        ...projected,
+        items: [...projected.items, { id, kind: "user-message", text: prompt, turnId: "turn-1" }],
+      };
+      rememberSubmittedTurnUserAlias(projection, projected, prompt);
+    }
+    projected = {
+      ...projected,
+      items: [
+        ...projected.items,
+        {
+          id: "reasoning-after-repeated-steers",
+          kind: "reasoning-summary",
+          text: "继续处理",
+          turnId: "turn-1",
+        },
+      ],
+    };
+
+    projected = applyThreadRemoteEvents(
+      projected,
+      [
+        event(
+          1,
+          "thread.item",
+          {
+            item: [{ id: "canonical-first", kind: "user-message", text: prompt }],
+          },
+          { threadId: projected.id, turnId: "turn-1" },
+        ),
+        event(
+          2,
+          "thread.item",
+          {
+            item: [{ id: "canonical-second", kind: "user-message", text: prompt }],
+          },
+          { threadId: projected.id, turnId: "turn-1" },
+        ),
+      ],
+      { projection },
+    );
+
+    expect(
+      projected.items.filter((item) => item.kind === "user-message").map((item) => item.id),
+    ).toEqual(["pending-steer-first", "pending-steer-second"]);
+  });
+
   it("权威快照同步不会过早清除尚未消费的用户消息别名", () => {
     const projection = createThreadRemoteEventProjectionState();
     const prompt = "只保留一条消息";
@@ -1227,6 +1450,85 @@ describe("实时任务事件投影", () => {
       { projection },
     );
     expect(canonical.items).toEqual(immediate.items);
+  });
+
+  it("另一浏览器连续收到两条同文 Sidecar 引导时保留两次真实提交", () => {
+    const projection = createThreadRemoteEventProjectionState();
+    const prompt = "继续检查";
+    const before = detail({
+      activeTurnId: "turn-1",
+      items: [],
+      state: "running",
+    });
+
+    const projected = applyThreadRemoteEvents(
+      before,
+      [
+        event(
+          1,
+          "thread.item",
+          {
+            item: [
+              {
+                id: "pending-steer-broadcast-first",
+                kind: "user-message",
+                text: prompt,
+              },
+            ],
+            localRemoteAlias: "steer",
+          },
+          { threadId: before.id, turnId: "turn-1" },
+        ),
+        event(
+          2,
+          "thread.item",
+          {
+            item: [
+              {
+                id: "pending-steer-broadcast-second",
+                kind: "user-message",
+                text: prompt,
+              },
+            ],
+            localRemoteAlias: "steer",
+          },
+          { threadId: before.id, turnId: "turn-1" },
+        ),
+      ],
+      { projection },
+    );
+
+    expect(projected.items.map((item) => item.id)).toEqual([
+      "pending-steer-broadcast-first",
+      "pending-steer-broadcast-second",
+    ]);
+
+    const canonical = applyThreadRemoteEvents(
+      projected,
+      [
+        event(
+          3,
+          "thread.item",
+          {
+            item: [{ id: "canonical-first", kind: "user-message", text: prompt }],
+          },
+          { threadId: before.id, turnId: "turn-1" },
+        ),
+        event(
+          4,
+          "thread.item",
+          {
+            item: [{ id: "canonical-second", kind: "user-message", text: prompt }],
+          },
+          { threadId: before.id, turnId: "turn-1" },
+        ),
+      ],
+      { projection },
+    );
+    expect(canonical.items.map((item) => item.id)).toEqual([
+      "pending-steer-broadcast-first",
+      "pending-steer-broadcast-second",
+    ]);
   });
 
   it("Sidecar 拒绝引导时会撤下另一浏览器的乐观别名", () => {
@@ -1436,6 +1738,47 @@ describe("实时任务事件投影", () => {
     );
     expect(projected.items).toContainEqual(
       expect.objectContaining({ id: "real-retry", kind: "user-message", text: "重试消息" }),
+    );
+  });
+
+  it("实时 user-message 保留 Desktop 声明的文件与图片附件", () => {
+    const projected = applyThreadRemoteEvents(
+      detail(),
+      [
+        event(1, "thread.item", {
+          item: [
+            {
+              id: "user-with-attachments",
+              kind: "user-message",
+              text: "请查看附件",
+              attachments: [
+                {
+                  kind: "file",
+                  name: "evidence.json",
+                  path: "E:\\PublicFixtures\\BrowserUploads\\upload-id\\evidence.json",
+                },
+                {
+                  kind: "image",
+                  name: "screen.png",
+                  path: "E:\\PublicFixtures\\BrowserUploads\\upload-id\\screen.png",
+                },
+              ],
+            },
+          ],
+        }),
+      ],
+      { projection: createThreadRemoteEventProjectionState() },
+    );
+
+    expect(projected.items).toContainEqual(
+      expect.objectContaining({
+        id: "user-with-attachments",
+        kind: "user-message",
+        attachments: [
+          expect.objectContaining({ kind: "file", name: "evidence.json" }),
+          expect.objectContaining({ kind: "image", name: "screen.png" }),
+        ],
+      }),
     );
   });
 

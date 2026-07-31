@@ -20,6 +20,7 @@ export class LoadedThreadRegistry {
   readonly #pendingDiscovery = new Map<string, PendingDiscovery>();
   readonly #refreshGeneration = new Map<number, number>();
   readonly #transientOrder = new Map<string, true>();
+  #revision = 0;
 
   constructor(options: LoadedThreadRegistryOptions = {}) {
     this.#maxTransientThreads = options.maxTransientThreads ?? DEFAULT_MAX_TRANSIENT_THREADS;
@@ -56,6 +57,7 @@ export class LoadedThreadRegistry {
     }
     this.#byConnection.set(connectionId, normalized);
     this.#lastAppliedRefresh.set(connectionId, refreshGeneration);
+    this.#revision += 1;
 
     for (const [threadId, pending] of this.#pendingDiscovery) {
       const mustRefreshAfter = pending.awaitingRefreshAfter.get(connectionId);
@@ -88,6 +90,7 @@ export class LoadedThreadRegistry {
     }
     this.#pendingDiscovery.set(threadId, { awaitingRefreshAfter });
     this.#touchTransient(threadId);
+    this.#revision += 1;
   }
 
   markInFlight(threadId: string): void {
@@ -96,6 +99,7 @@ export class LoadedThreadRegistry {
     }
     this.#inFlight.add(threadId);
     this.#touchTransient(threadId);
+    this.#revision += 1;
   }
 
   markIdle(threadId: string): void {
@@ -104,6 +108,7 @@ export class LoadedThreadRegistry {
     }
     this.#inFlight.delete(threadId);
     this.#forgetTransientOrderIfUnused(threadId);
+    this.#revision += 1;
   }
 
   markTerminal(threadId: string): void {
@@ -113,6 +118,25 @@ export class LoadedThreadRegistry {
     this.#inFlight.delete(threadId);
     this.#pendingDiscovery.delete(threadId);
     this.#forgetTransientOrderIfUnused(threadId);
+    this.#revision += 1;
+  }
+
+  forget(threadIds: Iterable<string>): void {
+    const forgotten = new Set([...threadIds].filter(isThreadId));
+    if (forgotten.size === 0) {
+      return;
+    }
+    for (const connectionThreads of this.#byConnection.values()) {
+      for (const threadId of forgotten) {
+        connectionThreads.delete(threadId);
+      }
+    }
+    for (const threadId of forgotten) {
+      this.#inFlight.delete(threadId);
+      this.#pendingDiscovery.delete(threadId);
+      this.#transientOrder.delete(threadId);
+    }
+    this.#revision += 1;
   }
 
   removeConnection(connectionId: number): void {
@@ -128,6 +152,7 @@ export class LoadedThreadRegistry {
         this.#forgetTransientOrderIfUnused(threadId);
       }
     }
+    this.#revision += 1;
   }
 
   union(): string[] {
@@ -140,6 +165,10 @@ export class LoadedThreadRegistry {
     return [...result].sort(compareThreadIds);
   }
 
+  revision(): number {
+    return this.#revision;
+  }
+
   clear(): void {
     this.#byConnection.clear();
     this.#inFlight.clear();
@@ -147,6 +176,7 @@ export class LoadedThreadRegistry {
     this.#pendingDiscovery.clear();
     this.#refreshGeneration.clear();
     this.#transientOrder.clear();
+    this.#revision += 1;
   }
 
   #touchTransient(threadId: string): void {

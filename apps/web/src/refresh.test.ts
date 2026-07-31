@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RemoteEvent } from "@codex-local-remote/contracts";
 import {
+  approvalForCurrentThread,
   WORKSPACE_REFRESH_MS,
   canRefreshDocument,
   isTextEntryElement,
@@ -104,5 +105,13 @@ describe("审批刷新竞态", () => {
     expect(reconcileSelectedApproval(approval, [approval])).toBe(approval);
     expect(reconcileSelectedApproval(approval, [])).toBeUndefined();
     expect(reconcileSelectedApproval(undefined, [approval])).toBeUndefined();
+  });
+
+  it("当前任务的新审批自动打开一次，用户关闭后不反复打扰", () => {
+    expect(approvalForCurrentThread(undefined, [approval], "thread-1", new Set())).toBe(approval);
+    expect(
+      approvalForCurrentThread(undefined, [approval], "thread-1", new Set(["approval-1"])),
+    ).toBeUndefined();
+    expect(approvalForCurrentThread(undefined, [approval], "thread-2", new Set())).toBeUndefined();
   });
 });

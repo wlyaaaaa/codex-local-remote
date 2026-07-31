@@ -1,4 +1,5 @@
 import type {
+  ConversationAttachment,
   ConversationItem,
   ModelOption,
   ReasoningEffort,
@@ -27,17 +28,17 @@ export type ThreadRemoteEventProjectionState = {
   authoritativeSnapshotByThread: Set<string>;
   accumulatedDeltaByItem: Map<string, string>;
   replayBaselineByItem: Map<string, string>;
-  submittedTurnUserAliasByThread: Map<
-    string,
-    {
-      itemId: string;
-      text: string;
-      turnId?: string;
-      pending?: boolean;
-      canonicalConsumed?: boolean;
-    }
-  >;
+  submittedTurnUserAliasByThread: Map<string, SubmittedTurnUserAlias[]>;
   consumedLiveUserAliasIds: Set<string>;
+};
+
+type SubmittedTurnUserAlias = {
+  itemId: string;
+  text: string;
+  turnId?: string;
+  pending?: boolean;
+  canonicalConsumed?: boolean;
+  remoteAlias?: boolean;
 };
 
 const runStates = new Set<RunState>([
@@ -150,21 +151,39 @@ export function rememberSubmittedTurnUserAlias(
   response: ThreadDetail,
   prompt: string,
 ): void {
-  const reservation = projection.submittedTurnUserAliasByThread.get(response.id);
-  if (reservation?.pending !== true || reservation.text !== prompt) return;
+  const aliases = projection.submittedTurnUserAliasByThread.get(response.id) ?? [];
+  const reservationIndex = aliases.findLastIndex(
+    (alias) => alias.pending === true && alias.text === prompt,
+  );
+  const reservation = aliases[reservationIndex];
+  if (reservation === undefined) return;
+  const claimedItemIds = new Set(
+    aliases.flatMap((alias, index) =>
+      index === reservationIndex || alias.itemId.length === 0 ? [] : [alias.itemId],
+    ),
+  );
   const item = response.items.findLast(
-    (candidate) => candidate.kind === "user-message" && candidate.text === prompt,
+    (candidate) =>
+      candidate.kind === "user-message" &&
+      candidate.text === prompt &&
+      !claimedItemIds.has(candidate.id),
   );
   if (!item || item.kind !== "user-message") {
-    projection.submittedTurnUserAliasByThread.delete(response.id);
+    replaceSubmittedTurnUserAliases(
+      projection,
+      response.id,
+      aliases.filter((_, index) => index !== reservationIndex),
+    );
     return;
   }
   const turnId = item.turnId ?? response.activeTurnId;
-  projection.submittedTurnUserAliasByThread.set(response.id, {
+  const next = [...aliases];
+  next[reservationIndex] = {
     itemId: item.id,
     text: item.text,
     ...(turnId ? { turnId } : {}),
-  });
+  };
+  replaceSubmittedTurnUserAliases(projection, response.id, next);
 }
 
 export function reserveSubmittedTurnUserAlias(
@@ -172,11 +191,15 @@ export function reserveSubmittedTurnUserAlias(
   threadId: string,
   prompt: string,
 ): void {
-  projection.submittedTurnUserAliasByThread.set(threadId, {
-    itemId: "",
-    pending: true,
-    text: prompt,
-  });
+  const aliases = projection.submittedTurnUserAliasByThread.get(threadId) ?? [];
+  replaceSubmittedTurnUserAliases(projection, threadId, [
+    ...aliases,
+    {
+      itemId: "",
+      pending: true,
+      text: prompt,
+    },
+  ]);
 }
 
 export function cancelSubmittedTurnUserAlias(
@@ -184,10 +207,42 @@ export function cancelSubmittedTurnUserAlias(
   threadId: string,
   prompt: string,
 ): void {
-  const reservation = projection.submittedTurnUserAliasByThread.get(threadId);
-  if (reservation?.pending === true && reservation.text === prompt) {
+  const aliases = projection.submittedTurnUserAliasByThread.get(threadId) ?? [];
+  const reservationIndex = aliases.findLastIndex(
+    (alias) => alias.pending === true && alias.text === prompt,
+  );
+  if (reservationIndex < 0) return;
+  replaceSubmittedTurnUserAliases(
+    projection,
+    threadId,
+    aliases.filter((_, index) => index !== reservationIndex),
+  );
+}
+
+function replaceSubmittedTurnUserAliases(
+  projection: ThreadRemoteEventProjectionState,
+  threadId: string,
+  aliases: SubmittedTurnUserAlias[],
+): void {
+  if (aliases.length === 0) {
     projection.submittedTurnUserAliasByThread.delete(threadId);
+  } else {
+    projection.submittedTurnUserAliasByThread.set(threadId, aliases);
   }
+}
+
+function submittedAliasIndexForItem(
+  aliases: readonly SubmittedTurnUserAlias[],
+  item: Extract<ConversationItem, { kind: "user-message" }>,
+  incomingIsRemoteAlias: boolean,
+): number {
+  return aliases.findIndex(
+    (alias) =>
+      alias.itemId !== item.id &&
+      (!incomingIsRemoteAlias || alias.remoteAlias !== true) &&
+      alias.text === item.text &&
+      (alias.turnId === undefined || item.turnId === undefined || alias.turnId === item.turnId),
+  );
 }
 
 export function synchronizeThreadRemoteEventProjection(
@@ -206,6 +261,20 @@ export function synchronizeThreadRemoteEventProjection(
   projection.authoritativeSnapshotByThread.add(snapshot.id);
   clearReplayDeltaState(projection, snapshot.id);
   return true;
+}
+
+export function threadControlSnapshotIsCurrent(
+  projection: Pick<ThreadRemoteEventProjectionState, "generation" | "sequenceFloorByThread">,
+  snapshot: Pick<ThreadDetail, "id" | "snapshotEventSeq">,
+  expectedGeneration: number = projection.generation,
+): boolean {
+  if (projection.generation !== expectedGeneration) return false;
+  const snapshotSequence = asUnsignedInteger(snapshot.snapshotEventSeq);
+  const projectedSequence = projection.sequenceFloorByThread.get(snapshot.id);
+  if (snapshotSequence === undefined) {
+    return projectedSequence === undefined;
+  }
+  return projectedSequence === undefined || snapshotSequence >= projectedSequence;
 }
 
 export function applyThreadRemoteEvents(
@@ -412,6 +481,15 @@ function applyTurnState(thread: ThreadDetail, event: RemoteEvent): ThreadDetail 
               : item,
           ),
         };
+  const terminal = state !== "running" && state !== "waiting-for-approval";
+  if (
+    terminal &&
+    turnId !== undefined &&
+    thread.activeTurnId !== undefined &&
+    turnId !== thread.activeTurnId
+  ) {
+    return timedThread;
+  }
   return withRunState(timedThread, state, event.emittedAt, turnId);
 }
 
@@ -508,10 +586,12 @@ function applyThreadItem(
       incoming.filter((item) => item.kind === "user-message").map((item) => item.id),
     );
     if (cancelledIds.size === 0) return thread;
-    const submittedAlias = projection.submittedTurnUserAliasByThread.get(thread.id);
-    if (submittedAlias && cancelledIds.has(submittedAlias.itemId)) {
-      projection.submittedTurnUserAliasByThread.delete(thread.id);
-    }
+    const submittedAliases = projection.submittedTurnUserAliasByThread.get(thread.id) ?? [];
+    replaceSubmittedTurnUserAliases(
+      projection,
+      thread.id,
+      submittedAliases.filter((alias) => !cancelledIds.has(alias.itemId)),
+    );
     return {
       ...thread,
       items: thread.items.filter((item) => !cancelledIds.has(item.id)),
@@ -524,50 +604,43 @@ function applyThreadItem(
     if (projection.consumedLiveUserAliasIds.has(liveAliasKey)) {
       continue;
     }
-    const submittedAlias = projection.submittedTurnUserAliasByThread.get(thread.id);
-    const matchesSubmittedAlias =
-      item.kind === "user-message" &&
-      submittedAlias !== undefined &&
-      submittedAlias.itemId !== item.id &&
-      submittedAlias.text === item.text &&
-      (submittedAlias.turnId === undefined ||
-        item.turnId === undefined ||
-        submittedAlias.turnId === item.turnId);
     const isLocalRemoteSteerAlias =
       item.kind === "user-message" && payload.localRemoteAlias === "steer";
+    const submittedAliases = projection.submittedTurnUserAliasByThread.get(thread.id) ?? [];
+    const submittedAliasIndex =
+      item.kind === "user-message"
+        ? submittedAliasIndexForItem(submittedAliases, item, isLocalRemoteSteerAlias)
+        : -1;
+    const submittedAlias =
+      submittedAliasIndex < 0 ? undefined : submittedAliases[submittedAliasIndex];
+    const matchesSubmittedAlias = submittedAlias !== undefined;
     if (isLocalRemoteSteerAlias && matchesSubmittedAlias) {
       projection.consumedLiveUserAliasIds.add(liveAliasKey);
       continue;
     }
     if (isLocalRemoteSteerAlias && item.kind === "user-message") {
-      const existingAlias = items.find(
-        (candidate) =>
-          candidate.kind === "user-message" &&
-          candidate.text === item.text &&
-          (candidate.turnId === undefined ||
-            item.turnId === undefined ||
-            candidate.turnId === item.turnId),
-      );
-      if (existingAlias) {
-        projection.consumedLiveUserAliasIds.add(liveAliasKey);
-        continue;
-      }
-      projection.submittedTurnUserAliasByThread.set(thread.id, {
-        itemId: item.id,
-        text: item.text,
-        ...(item.turnId === undefined ? {} : { turnId: item.turnId }),
-      });
+      replaceSubmittedTurnUserAliases(projection, thread.id, [
+        ...submittedAliases,
+        {
+          itemId: item.id,
+          remoteAlias: true,
+          text: item.text,
+          ...(item.turnId === undefined ? {} : { turnId: item.turnId }),
+        },
+      ]);
     } else if (matchesSubmittedAlias && submittedAlias !== undefined) {
+      const nextAliases = [...submittedAliases];
       if (submittedAlias.pending === true) {
-        projection.submittedTurnUserAliasByThread.set(thread.id, {
+        nextAliases[submittedAliasIndex] = {
           ...submittedAlias,
           canonicalConsumed: true,
           itemId: item.id,
           ...(item.turnId === undefined ? {} : { turnId: item.turnId }),
-        });
+        };
       } else {
-        projection.submittedTurnUserAliasByThread.delete(thread.id);
+        nextAliases.splice(submittedAliasIndex, 1);
       }
+      replaceSubmittedTurnUserAliases(projection, thread.id, nextAliases);
       projection.consumedLiveUserAliasIds.add(liveAliasKey);
       continue;
     }
@@ -575,7 +648,8 @@ function applyThreadItem(
     if (
       item.kind === "user-message" &&
       lastItem?.kind === "user-message" &&
-      lastItem.text === item.text
+      lastItem.text === item.text &&
+      !(isLocalRemoteSteerAlias && lastItem.id.startsWith("pending-steer-"))
     ) {
       // A turn/start response (or the optimistic steer row) already contains
       // the user text, while app-server lifecycle notifications use a
@@ -632,6 +706,27 @@ function applyThreadUpdate(thread: ThreadDetail, event: RemoteEvent): ThreadDeta
     ...(title === undefined ? {} : { title }),
     ...(model === undefined ? {} : { model }),
   };
+  if (Object.hasOwn(payload, "archived")) {
+    if (payload.archived === true) {
+      const { activeTurnId: _activeTurnId, ...withoutActiveTurn } = next;
+      next = {
+        ...withoutActiveTurn,
+        archived: true,
+        availableActions: {
+          ...next.availableActions,
+          changeModelNextTurn: false,
+          compact: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+          updateSettings: false,
+        },
+      };
+    } else {
+      const { archived: _archived, ...withoutArchived } = next;
+      next = withoutArchived;
+    }
+  }
   if (hasEffort) {
     if (rawEffort === null) {
       const { reasoningEffort: _reasoningEffort, ...withoutEffort } = next;
@@ -798,10 +893,13 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
     (kind === "user-message" || kind === "assistant-message" || kind === "reasoning-summary") &&
     typeof item.text === "string"
   ) {
+    const attachments =
+      kind === "user-message" ? asConversationAttachments(item.attachments) : undefined;
     return {
       id,
       kind,
       text: item.text,
+      ...(attachments === undefined ? {} : { attachments }),
       ...(kind === "assistant-message" &&
       (item.phase === "commentary" || item.phase === "final_answer")
         ? { phase: item.phase }
@@ -975,6 +1073,22 @@ function asConversationItem(value: unknown): ConversationItem | undefined {
     };
   }
   return undefined;
+}
+
+function asConversationAttachments(value: unknown): ConversationAttachment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const attachments = value
+    .slice(0, 32)
+    .map((candidate): ConversationAttachment | undefined => {
+      const attachment = asRecord(candidate);
+      const kind =
+        attachment.kind === "file" || attachment.kind === "image" ? attachment.kind : undefined;
+      const name = productString(attachment.name, 255);
+      const path = productString(attachment.path, 32_768);
+      return kind && name && path ? { kind, name, path } : undefined;
+    })
+    .filter((attachment): attachment is ConversationAttachment => attachment !== undefined);
+  return attachments.length > 0 ? attachments : undefined;
 }
 
 function projectUsageWindows(payload: Record<string, unknown>): UsageWindow[] {

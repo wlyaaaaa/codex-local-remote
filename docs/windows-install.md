@@ -46,9 +46,9 @@ node apps/sidecar/dist/cli.js serve
 ```
 
 上面的直接 `serve` 仅适合首次设置和诊断。要让 Desktop 与手机连接同一个
-运行时，日常 Remote 基础设施必须使用下文的 Windows 计划任务；它会先启动
-共享 Broker，再启动 Sidecar。Desktop 则从受管 fail-open 快捷方式打开。
-不要同时保留另一个手工启动的 `codex app-server`。
+运行时，Remote 基础设施使用下文的 Windows 按需计划任务，并由同一
+coordinator 管理显式 Remote 租约。普通 Desktop 启动不会触发该任务。不要
+同时保留另一个手工启动的 `codex app-server`。
 
 也可以先启动服务，再从电脑本机浏览器打开
 `http://127.0.0.1:18790/codex-remote/` 完成首次设置。首次设置接口只接受
@@ -62,10 +62,29 @@ loopback 请求。
 node apps/sidecar/dist/cli.js register-project --id my-project --name "我的项目" --root "C:\Projects\my-project"
 ```
 
-设置完成后注册“当前用户登录时启动”的计划任务；脚本不会申请
-`LocalSystem` 或管理员运行级别。任务带有项目签名，并固定 PowerShell
-bootstrap、Node、参数和工作目录；Codex Desktop 与随附 `codex.exe` 每次
-动态发现，不固定版本或 WindowsApps 路径。bootstrap 严格按以下次序运行：
+设置完成后，从管理员 PowerShell（或 Windows `sudo` / UAC）注册当前用户的
+按需计划任务。任务不设置登录触发器，也不允许 missed-trigger catch-up；
+普通登录、启动、Codex 更新、Windows reboot 和 sleep/resume 都不会自动打开
+Remote。任务仍绑定当前交互用户，不使用 `LocalSystem`，但 Broker、Sidecar 与
+它拥有的 app-server 采用 `Highest` run level，从而让“电脑文件”与本机 AI
+具有一致的管理员文件能力。
+
+`Interactive` / `Highest` 任务中的 Desktop Owner Coordinator 是显式 Remote
+租约内唯一受管 Desktop process owner；它使用同一用户、同一交互会话的
+medium-integrity Explorer primary token 打开 ChatGPT / Codex Desktop，不能让
+Desktop 继承管理员令牌。稳定 DataDir dispatcher 是受支持的控制入口，只接受
+`Open`、`Close` 和 `Status`。`Open` 需要 Desktop 交接时，generation-bound
+调用必须携带完整且实时匹配的 selected version/root；任何缺失、非法或 mismatch
+都失败关闭。进程判断使用会抛错的严格 CIM 枚举，无法枚举时不能按“没有
+Desktop”继续。
+
+`Open` 幂等，先尝试零 Desktop 重启的恢复路径；只有明确返回需要重开且获得
+`-AllowDesktopRestart` 授权时，才允许至多一次受控交接。`Close` 清除公网
+intent 并停止 Sidecar，不重开 Desktop；已连接 owner 自然退出，下一次普通
+启动回到原生。`Status` 只读。
+Codex Desktop
+包、随附 app-server 与能力目录每次动态发现，不固定版本或 WindowsApps 路径。
+bootstrap 严格按以下次序运行：
 
 1. 阻断任何作用域中的 `CODEX_APP_SERVER_FORCE_CLI=1`，避免 Desktop
    静默创建第二个 owner；
@@ -74,40 +93,68 @@ bootstrap、Node、参数和工作目录；Codex Desktop 与随附 `codex.exe` �
 3. 验证或启动 18791 Broker Proxy；启动参数只传 token 文件路径，Proxy 再
    独占经过认证的 18792 app-server；
 4. 写入不含对话、endpoint token 和凭据的 Broker Proxy PID owner state；
-5. 把 `127.0.0.1:18790` Sidecar 作为受监控子进程启动。Broker 或
-   app-server 退出/失去精确 owner/健康状态时，bootstrap 只停止自己启动的
-   Sidecar 并非零退出，使计划任务的三次重启策略真正生效。
+5. 把 `127.0.0.1:18790` Sidecar 作为受监控子进程启动；
+6. 只在同一 owner mutex 下消费显式 `Open` 发布的 fresh
+   generation-bound intent；普通 vendor 根进程不会成为自动接管原因。若已明确
+   授权 Desktop 重开，则从 Explorer medium token 执行最多一次受管交接。
+   用户主动退出且没有新的显式 cause 时不自动重拉。Broker 或
+   app-server 退出、失去精确 owner 或失去健康状态时，bootstrap 清除本次
+   Remote intent、停止自己启动的 Sidecar 并失败关闭；计划任务
+   `RestartCount=0`，不能自动重建 Broker/app-server。
 
 冷启动握手分成两层：Sidecar 只要已经以受管身份连接同一 Broker，transport
 层就完成并保持进程存活；在 Desktop 尚未接入时，请求级 `/ready` 仍保持
-degraded，所有执行入口继续禁用。fail-open 启动器据此先确认稳定基础设施，
-再向本次 Desktop 子进程注入 endpoint。不能反过来要求请求级 `/ready`
+degraded，所有执行入口继续禁用。显式 `Open` 的控制器据此先确认稳定基础
+设施，再向本次 Desktop 子进程注入 endpoint。不能反过来要求请求级 `/ready`
 先通过，否则会形成“等 Desktop 才 Ready、等 Ready 才启动 Desktop”的
 循环等待。
 
-任务所有权还会核对当前用户 SID、`Interactive`/`Limited` principal、唯一且
-启用的同 SID 登录触发器，以及电池、执行时限、单实例、重启、可用性、按需
-启动、空闲和网络等完整 settings。缺字段或 SID 无法解析都视为不匹配。任务
+任务所有权还会核对当前用户 SID、`Interactive`/`Highest` principal、禁用的
+触发器、`StartWhenAvailable=false`、`RestartCount=0`，以及电池、执行时限、单实例、
+按需启动、空闲和网络等完整 settings。缺字段或 SID 无法解析都视为不匹配。任务
 不存在时注册器不使用 `-Force`，因此同名创建竞态会失败而不会覆盖；精确 V2
-重复注册返回 `already-registered`，精确 V1 必须改用
-`Migrate-CodexLocalRemoteSharedOwner.ps1`。
+到 V4 的旧受管定义只在可证明 lineage 下升级为 V5，运行中的旧定义要求
+`-NoStart`，不能请求第二个任务实例；精确 V5 重复注册返回
+`already-registered`。精确 V1 必须改用
+`Migrate-CodexLocalRemoteSharedOwner.ps1`，外来同名任务始终拒绝覆盖。
 
 Windows 任务对象的任务级 ACL/安全描述符会受目标机器、域和 Task Scheduler
 服务规范化影响，不能在不同机器间作稳定的逐字节精确验证。本产品因此把同一
 Windows 用户、`SYSTEM`、内置管理员和 Windows Task Scheduler 服务共同列入
 本地可信边界；任务定义指纹用于防止误认和无意覆盖，不声称隔离这些主体。
 
-注册脚本不会设置用户或机器级 `CODEX_APP_SERVER_WS_URL`。正式共享入口是
-`Launch-CodexWithRemote.ps1` 及注册器创建的受管快捷方式：启动器每次动态
-解析当前 Desktop，在受管 Broker 基础就绪时只向本次 Desktop 子进程注入
-带高熵能力路径的 loopback endpoint；任何检查失败、超时或 Remote 未运行
-都会清除继承值并打开无 override 的原生 Desktop。重复安装会验证并复用
-同一个 token。启动器使用 `ProcessStartInfo` 和
-`UseShellExecute=false` 直接创建 Desktop 子进程，不依赖可能让打包应用脱离
-调用者环境的 ShellExecute；父进程环境保持不变。冷启动会给动态版本发现、
+注册脚本不会设置用户或机器级 `CODEX_APP_SERVER_WS_URL`。正式控制入口是
+DataDir 下的稳定 dispatcher；计划任务中的 Desktop Owner Coordinator 只消费
+显式 `Open` 发布的受管请求，不观察普通 vendor 启动来自动接管。coordinator
+每次动态解析当前 Desktop，在受管 Broker 基础就绪时只向本次 Desktop
+子进程注入带高熵能力路径和单次启动 nonce 的 loopback endpoint。Broker
+只保留 nonce 的 SHA-256 摘要；启动器要求全部已初始化 Desktop 连接都属于
+本次启动，并再次核对唯一根进程、运行代与启动回执后，才写入绑定 runtime、
+精确 root identity 与 nonce digest 的 owner proof 并报告远程已连接。任何
+检查失败、超时、旧连接、并发连接或 Remote 未运行都会清除继承值并保留
+无 override 的原生 Desktop。重复安装会验证并复用同一个 token。显式控制
+入口的 PowerShell 可以是 elevated，但 Desktop 创建必须由 coordinator 复制
+同一用户、同一交互会话中 `explorer.exe` 的非 elevated medium-integrity
+primary token；找不到唯一合格 token 时失败关闭，不能让 Desktop 继承 UAC
+后的管理员 token。启动器从该 token 创建显式环境块，移除所有继承的
+`CODEX_APP_SERVER_WS_URL`，再按本次结果加入一次性 endpoint；环境块用后清零，
+父进程环境保持不变。冷启动会给动态版本发现、
 Broker 与 Sidecar 最多 30 秒完成
 基础握手，避免在服务仍正常启动时过早回退。历史安装若留下本项目可证明的持久 override，升级时只做一次
 精确恢复/清理；第三方值或无法证明的状态绝不覆盖。
+
+Broker 接受 Desktop 身份时还要求本次受管启动的 nonce；没有 nonce 的
+Desktop-class 初始化以 WebSocket 1008 失败关闭。单独看到一个原生 Desktop
+连接或施工期临时 bridge，不能将其提升为 owner proof 或正式 Ready。
+
+按需计划任务与 dispatcher 调用的 PowerShell 都以隐藏窗口运行，不应留下
+长期可见的终端。显式 `Open` 的严格结果以
+`desktop-launch/v2` 白名单字段持久化到 `desktop-launch-last.json`，只包含
+状态、失败阶段/代码、关联 id 与反馈状态，不保存异常正文、命令行、本机路径
+或凭据。requester 的原始结构化失败阶段/代码必须贯穿受限原生补偿和最终
+回执，不能被归一成 `unexpected/unexpected`。远程失败显示警告色“远程启动
+失败”，不能用成功状态掩盖降级。状态页读取该回执，但历史回执不能冒充当前
+就绪状态。
 
 在任何 token、环境备份、运行状态或递归 ACL 写入前，脚本必须先证明
 `<DataDir>` 归本项目所有。首次安全创建/接管会以 `CreateNew` 临时文件和
@@ -119,7 +166,7 @@ marker，以及 marker 自身是 reparse point、hard link 或异常大文件时
 
 不存在的目录和不位于 Git 仓库/系统广义目录的空自定义目录可以首次 claim。
 非空自定义目录没有 marker 时默认拒绝。只有精确的默认
-`%LOCALAPPDATA%\CodexLocalRemote` 可以自动接管旧安装，而且根目录只接受
+`%LOCALAPPDATA%\CodexLocalRemote` 可以迁移认领旧安装，而且根目录只接受
 已知状态/token 文件、`RemoteConversations`、`funnel-backups` 和源码真实
 产生的精确临时文件名；未知项、类型错误或任意后代 reparse point 都会在
 marker/ACL 变化前拒绝。
@@ -132,52 +179,117 @@ marker/ACL 变化前拒绝。
 均零写；有效 marker 且整棵 ACL 已合规则返回 `already-protected`。
 
 ```powershell
-.\scripts\windows\Register-CodexLocalRemoteStartup.ps1
+# 在管理员 PowerShell 中执行。
+.\scripts\windows\Register-CodexLocalRemoteStartup.ps1 -NoStart
 ```
 
 注册器不会让计划任务直接执行 Git 工作树。它先把 `package.json`、Broker/
 Sidecar 独立 bundle、Web `dist` 和 Windows 脚本复制到
 `%LOCALAPPDATA%\CodexLocalRemote\RuntimeVersions\<content-sha256>`，写入并
 回读 `runtime-manifest.json`。manifest 记录源码 commit、dirty 状态以及每个
-文件的大小和 SHA-256；任务与安全启动快捷方式只在验证通过后指向该不可变目录。
+文件的大小和 SHA-256；任务与稳定 dispatcher 只在验证通过后指向该不可变目录。
 `runtime-current.json` 原子保留当前和上一版的目录与 manifest hash。
 
-如果 Codex Desktop 当前仍开着，首次迁移仍需等当前工作结束后再进入一次
-受控关闭/打开门禁，避免短暂出现两个 app-server owner：
+登记只安装并选择候选，不会启动 Remote，也不会启停 Desktop、Broker 或
+Sidecar。通过稳定 dispatcher 显式查看或打开：
 
 ```powershell
-.\scripts\windows\Register-CodexLocalRemoteStartup.ps1 -NoStart
-# 现在由用户完全退出 Codex Desktop（包括托盘/后台进程）
-Start-ScheduledTask -TaskName 'Codex Local Remote'
-# BrokerReady 后通过受管 fail-open 快捷方式重新打开 Codex Desktop
+$control = Join-Path $env:LOCALAPPDATA `
+  'CodexLocalRemote\control\CodexLocalRemote.Control.ps1'
+& $control -Operation Status
+& $control -Operation Open
 ```
 
-上面的“退出再打开 Desktop”仅适用于从 V1 单 owner 迁入共享 Broker。不要对
-已经运行共享 Broker 的 pinned V2 任务再次使用
-`Migrate-CodexLocalRemoteSharedOwner.ps1`；该迁移器会按 V1 合约停止并重新
-启动 Desktop。
+`Open` 已健康时幂等零重启返回；符合兼容门的 Web/Sidecar 缺失或候选更新
+优先只滚动公网层，Broker、app-server 与 Desktop 保持不动。只有它明确返回
+`restart-required`，并且本次另有 Desktop 重开授权时，才可再次调用
+`Open -AllowDesktopRestart`。若上一已验证运行代正在服务活动 turn，该调用返回
+`restart-deferred` 并只登记一个隐藏 worker；产品继续在线，待所有 Broker 观测
+任务空闲后，worker 经固定 dispatcher 重验 selected runtime 与原始 intent，再
+完成至多一次受控交接。只有 intent、运行代、路径和存活进程声明全部一致时才复用
+现有 worker；`Close` 或更新 intent 会让旧 worker 主动取消并释放单例，下一次
+`Open` 不会被旧等待任务吞掉。V1 单 owner
+的历史迁移器只用于明确的旧安装迁移，不是日常打开或更新入口。
 
-最终构建完成后的普通更新只登记下一次启动版本，无需退出或重启 Codex
-Desktop，也不得停止 Broker：
+注册器仍维护名为“Codex Remote（安全启动）”的受管快捷方式，但它只是兼容
+既有使用习惯的可选显式 `Open -AllowDesktopRestart` 别名：目标是上述固定
+DataDir dispatcher，不是 Desktop、源码目录或某个不可变运行代。普通 vendor
+快捷方式始终原生；远程能力不依赖用户点击受管快捷方式。
+
+可选的全局 AI 控制 skill 不让 dispatcher 自行派生第二个 `RunAs` 进程：`Status`
+始终直接只读；`Open` / `Close` 在调用前检查当前 Windows token，已经提权就
+直接同步执行，否则通过本机已启用的 Windows `sudo` 只执行一次同一 dispatcher。
+这保留结构化结果、退出码、mutex 与 intent 的单一边界；提权不会扩大 Desktop
+重开授权。
+
+最终构建完成后的普通更新只登记待切换版本，无需立刻退出或重启 Codex
+Desktop，也不得在登记阶段停止 Broker：
 
 ```powershell
 # 构建、验证并把任务定义切到新的不可变目录；当前运行代保持不动。
 pnpm build
+# 在管理员 PowerShell 中执行注册。
 .\scripts\windows\Register-CodexLocalRemoteStartup.ps1 -NoStart
 ```
 
-当前正在运行的 bootstrap/Broker/Desktop/Sidecar 不会因“登记更新”被替换；
-下一次注销、重启或自然受控的运行代切换才执行新版。需要撤回下一次启动版本时：
+当前正在运行的 bootstrap/Broker/Desktop/Sidecar 不会因“登记更新”被替换。
+普通 vendor 入口、Codex 更新、Windows 重启和睡眠恢复始终保持原生，也不会
+采用 selected 运行代。采用必须来自显式 `Open`；如果只需兼容的 Web/Sidecar
+滚动更新，不得把它升级成 Broker/app-server/Desktop 重启。需要撤回待采用
+版本时：
 
 ```powershell
 .\scripts\windows\Rollback-CodexLocalRemoteRuntime.ps1
 ```
 
+如需等待现有 Desktop 自然退出后无人值守采用 selected 运行代，可在确认任务
+空闲后运行：
+
+```powershell
+.\scripts\windows\Complete-CodexLocalRemoteDeferredHandoff.ps1 `
+  -WaitForNaturalDesktopExit
+```
+
+该模式不会关闭 Desktop，也不会在等待时停止当前运行链。它必须连续观察到
+严格 CIM Desktop 根进程为 0 与 Broker 已断开，才执行一次接管；超时、Broker
+不可达、unsafe task 或进程枚举异常均失败关闭。自然退出 worker 使用按规范化
+DataDir 派生的专用 mutex 保证单例；启动时固定 expected runtime version/root，
+等待结束及启动前再次核对。最终只接受 expected Broker root，且
+launcher 返回的 IntentId 会成为 exact expected CorrelationId；
+`desktop-launch/v2` 必须精确匹配该 IntentId，记录时间晚于本次启动开始；另一
+worker 或无关启动写入的“新鲜”回执不能通过验收。
+
+登记运行代切换时，`runtime-current.json` 会在有界、原子写入中保存旧任务的
+完整 XML 前像及 SHA-256，并严格绑定旧运行代、任务名和路径；同时把当前
+selected 任务的完整导出 XML 哈希绑定到 selected 运行代和路径。普通状态读取
+只返回前像/绑定是否存在及摘要，不回显 XML。受管启动器会在停止任何旧进程前
+逐项验证 selected 绑定；只要 forward Start 已经发出，即使计划任务状态或新
+回执尚未可见，也会先有界反复取消该任务并清理 selected 运行代 owner，随后才
+恢复并复核旧任务前像和 current 指针，避免延迟启动后效应或任务/指针混合状态。
+首次注册、同运行代任务升级和 current 指针修复也进入同一事务：计划任务或
+指针写入即使“已生效后抛错”，也必须通过实时 selected task/pointer/binding
+联合审计才算成功；否则恢复并复核登记前捕获的精确基线，既有 current 任务不会
+因 binding 持久写入失败而被停止或注销。
+
+若现场已经有 selected 不可变运行代但尚未成为 active，新的登记会在任何
+任务、指针、dispatcher 或运行目录写入前失败关闭，避免覆盖 rollback 祖先。
+只有显式 pending-runtime 修复才会依据严格的活动 Broker 证据事务重建原
+任务/指针对；证据缺失、冲突或不唯一时保持零写入。切换停止旧任务后，
+Sidecar 应当断开，因此 post-stop 屏障要求 `sidecarConnected=false`，同时
+继续复核 Desktop、selected/active root、invocation、Broker/upstream 与
+readiness。所选 Sidecar、Broker 或启动流程失败时，补偿路径恢复并验证旧
+任务和旧指针，再有界启动精确旧运行代。
+
 回滚同样只更新任务定义和 current/previous 指针，不终止当前 Desktop。切换后
 用 `Get-CodexLocalRemoteStatus.ps1 -Json` 验证 `ImmutableRuntimeReady=true`、
 `RuntimeVersionId`、`RuntimeRoot` 和 `PreviousRuntimeVersionId`。
 
-V3 bootstrap 复用旧 Broker 时不会只凭旧版本号放行。它先核对精确 Broker
+注册器同时把实际 `SidecarPort`、`BrokerPort`、`BrokerUpstreamPort`、
+`BasePath` 和任务名写入受保护的 `managed-config.json`。启动、状态、停止、
+回滚和卸载在没有显式参数时都读取这份配置，因此现场使用 18795 等非默认
+upstream 端口时不需要重复输入，也不会误回退到文档示例的 18792。
+
+V5 bootstrap 复用旧 Broker 时不会只凭旧版本号放行。它先核对精确 Broker
 和 upstream 身份，再要求 Desktop 已连接，并将活跃 app-server 的规范路径与
 新鲜 SHA-256 和当前动态发现结果逐项比较；完全一致才把旧回执提升为 current。
 如果 Desktop 在切换瞬间短暂断开，bootstrap 保持 degraded 并在监督循环中
@@ -195,15 +307,17 @@ V3 bootstrap 复用旧 Broker 时不会只凭旧版本号放行。它先核对�
 任一条件失败时不会先停止任务、Sidecar 或 Broker。随后它会校验任务
 签名、名称、Action、命令和工作目录；只会依据 PID state 停止路径、命令行
 和 loopback listener 都精确匹配的 Broker。即使 Broker 已强制退出或 state
-缺失，也只检查固定 18792 端口，并仅停止命令、Codex 路径、官方认证参数和
-固定 upstream token 文件都精确匹配的 orphan。它绝不停止 Desktop 的独立
-stdio 进程、18789、其他 Codex 进程或其他 Funnel。随后删除受管 fail-open
-快捷方式与固定 `broker-capability.token`。新安装没有持久 Desktop 环境
+缺失，也只检查 managed config 中记录的实际 upstream 端口，并仅停止命令、
+Codex 路径、官方认证参数和固定 upstream token 文件都精确匹配的 orphan。
+它绝不停止 Desktop 的独立
+stdio 进程、18789、其他 Codex 进程或其他 Funnel。随后删除本项目受管的
+legacy 快捷方式、dispatcher 与固定 `broker-capability.token`。新安装没有持久 Desktop 环境
 需要恢复；对于历史安装，仅当环境备份、当前值与受管 endpoint 能形成完整
 证明链时才精确恢复。若用户变量已被其他程序改写，卸载会拒绝覆盖新值并
 报告冲突。
 
-如果注册时使用了非默认参数，卸载时要传入完全相同的参数：
+新版本会自动读取注册时保存的非默认参数；只有显式覆盖或恢复旧安装时才需要
+再次传入完全相同的参数：
 
 ```powershell
 .\scripts\windows\Unregister-CodexLocalRemoteStartup.ps1
@@ -275,8 +389,8 @@ PowerShell 的格式化文本误当成对象：
 
 关键字段：
 
-- `TaskOwned`：计划任务是否精确匹配动态 V3 签名、PowerShell bootstrap action、
-  参数、工作目录，以及当前用户 SID、`Interactive` logon type 和 `Limited`
+- `TaskOwned`：计划任务是否精确匹配动态 V5 签名、PowerShell bootstrap action、
+  参数、工作目录，以及当前用户 SID、`Interactive` logon type 和 `Highest`
   run level；
 - `TaskRunning`：计划任务的当前 `TaskState` 是否为 `Running`；
 - `TaskReady`：`TaskOwned` 与 `TaskRunning` 是否同时成立。`LastTaskResult`
@@ -296,14 +410,20 @@ PowerShell 的格式化文本误当成对象：
   完整命令行、监听器 owner 与 `/ready` 回显；旧回执或两次启动的混合状态
   不能拼成健康结果；
 - `CapabilityTokenReady`：固定 token 文件是否存在且格式有效；
-- `LauncherScriptReady` / `LauncherShortcutReady`：fail-open 启动脚本与
-  “Codex Remote（安全启动）”入口是否存在且精确匹配当前安装；
-- `LauncherConfigured` / `LaunchMode`：聚合入口是否可用，正式模式必须为
-  `process-scoped-fail-open`；
+- 稳定 DataDir dispatcher 在每次分派前独立验证自身所有权和所选不可变
+  运行代；这是 `Open`、`Close`、`Status` 的受支持入口，不能用历史 launcher
+  字段替代这道验证；
+- `LauncherScriptReady` / `LauncherShortcutReady`、`LauncherConfigured` /
+  `LaunchMode`：仅用于识别和迁移历史 fail-open 安装，不参与当前受支持入口的
+  Ready 判定；
 - `DesktopLaunchReceiptReady` / `DesktopLaunchStatus` /
-  `DesktopLaunchRemoteEnabled` / `DesktopLaunchDecision`：最近一次安全启动
-  是否留下了严格、无 token 的结果回执，以及当次是远程接入、原生降级还是
+  `DesktopLaunchRemoteEnabled` / `DesktopLaunchDecision`：最近一次显式 `Open`
+  是否留下了严格、无 token 的结果回执，以及当次是远程接入、原生补偿还是
   无有效回执；历史回执只解释最近一次启动，不冒充当前 `Ready`；
+- `DesktopOwnerProofReady`：当前 active runtime、精确 Desktop root identity
+  与 Broker launch nonce digest 是否匹配稳定 attach 后持久化的 owner proof；
+  单独的 `DesktopConnected=true`、任意旧原生 root 或无 nonce 临时 bridge
+  都不能提升为正式 Ready；
 - `LegacyPersistentOverrideBlocked` / `LegacyEnvironmentState`：任何持久
   `CODEX_APP_SERVER_WS_URL` 都会阻断 Ready；旧受管状态必须精确退休为
   `none`，不能让 Desktop 启动依赖本地端口；
@@ -323,7 +443,7 @@ PowerShell 的格式化文本误当成对象：
   Desktop 一致；`update-pending` 表示 Codex 已更新，但现有共享任务仍由
   启动时验证过的旧进程承载；`blocked` 表示无法安全解析新运行时；
 - `Ready`：计划任务 `TaskReady`、精确 Sidecar listener/进程 owner gate、
-  Funnel、Broker、认证 upstream、Desktop、Sidecar、安全 fail-open 入口和
+  Funnel、Broker、认证 upstream、Desktop、Sidecar、稳定 dispatcher 和
   Desktop 单 owner 边界是否同时通过且未降级。
 
 例行状态查询会复用启动时已经通过完整二进制 hash 校验的运行时回执，只读取
@@ -348,18 +468,64 @@ generation 和二进制 hash；发现漂移后把 `startup-last.json` 写为
 `Ready=false`，表示新安装代尚未完成严格切换验收。只要旧的已验证运行进程
 仍在、Desktop/Broker 身份一致，并且模型和任务协议的实时能力探针继续通过，
 Sidecar 仍可服务请求并在 Web 显示更新待切换提示；不会仅因版本/hash 改变
-就让手机端停摆。下一次受管栈启动会自动采用新运行时。解析或校验失败则报告
-`blocked` 并停止新执行。若新 Desktop 不再接受
+就让手机端停摆。启动任何新 Desktop 前，owner 会把活动 Broker/app-server
+receipt 的 package path/hash/generation 与当前发现结果精确比较。Desktop
+只有新的显式 `Open` 会在同一 V5 事务中核验并采用新基础栈；普通 vendor
+入口只保持原生，不发布 intent、不调度 worker，也不接管。受控交接 worker
+使用 nonce+PID/start 原子认领，只 compare-delete 自己的 IntentId；失败
+suppression、受限补偿、通知/回执与任务补偿均一次性收敛。解析或校验失败则
+报告 `blocked` 并停止新执行。若新 Desktop 不再接受
 `CODEX_APP_SERVER_WS_URL`，或协议
 能力探测失败，远程端必须显示兼容性降级并拒绝新执行，而不是建立第二个
 手机专属 owner。此隐藏入口本身不是官方稳定合约，因此“自动发现”不能
 等价为“保证未来每个版本都兼容”。
 
-Sidecar 另以 5 秒周期读取有界普通文件形式的 V3 启动/Broker 回执，并向
+显式 `Open` 的 package refresh worker 在停止精确原生 Desktop 根前执行三次
+安全观测，最后一次
+紧贴 destructive stop。每次都要求严格 CIM 根身份不变、
+`unsafeThreadCount=0`、Broker/runtime invocation 不变且 generation 为
+`current`；任一观测未知、unsafe 恢复、连接恢复、根身份或运行代漂移都保持零
+停止、零重启。
+
+只有显式 `Open` 获得必要授权后的受管运行代采用才可使用 runtime restart；
+它不是 Web/Sidecar 公网层恢复手段。该路径使用更晚的 post-task-stop barrier：先
+`Stop-ScheduledTask` 并等待任务确实停止，再在 Sidecar/Broker stop 前重新执行
+完整严格 CIM、selected/active root、runtime invocation、Broker/upstream PID、
+`unsafeThreadCount=0` 与 `unknownCount=0` 联合检查。若此时状态改变，Sidecar 与
+Broker stop 调用均保持 0，并启动精确 V5 任务补偿；不能因为计划任务已经停止就
+继续使用过期的 pre-stop 结论。
+
+## 睡眠与半开连接恢复
+
+Broker 对每个配对连接的 Desktop 与 upstream 两腿分别执行 ping/pong heartbeat。
+默认每 30 秒探测、每次 deadline 30 秒；必须连续两次 miss 才移除整个 half-open
+pair，因此正常计时下最坏约 90 秒完成清理。Sidecar Supervisor 观察到共享
+WebSocket 退出后按有界退避重连，并在新 session 重新绑定通知转发。
+
+Windows 睡眠会造成 Node timer 长间隔。heartbeat sweep 发现超出容差的 timer gap
+时不会沿用睡眠前 miss，也不会在唤醒瞬间立即关闭连接；它会清零两腿状态并马上
+发起 fresh probe。唤醒本身不创建 Remote intent，也不授权停止或重开 Desktop、
+Broker 或 app-server。只有既有显式租约中的 Web/Sidecar 满足约 3 秒连续兼容门，
+才可滚动公网层；任何 reconnect、unsafe、Broker/app-server 丢失或运行代漂移
+都失败关闭，并等待新的显式 `Open`。
+
+上述行为已有定向自动化；发布证明仍必须绑定同一不可变候选，不能以源码测试替代
+真实冷启动、公网、Desktop 同步或真实 Windows 睡眠/唤醒门。
+
+独立终审已关闭 bound expected 与 post-task-stop barrier 两项 P1；主任务新鲜
+定向 3 文件 98/98、reviewer 独立 2 文件 56/56 通过，最新终审为 PASS 且无剩余
+P0/P1。最终 diff 复核补获并关闭 bound pointer 不可验证时的原生 fallback P1，
+随后主任务 4 文件 118/118、reviewer 独立 1 文件 20/20 通过。这些是源码差异
+证据；完整检查已单独通过，但两者都不代表上述真实运行态门已经通过。
+
+Sidecar 另以 5 秒周期读取有界普通文件形式的 V5 启动/Broker 回执，并向
 Broker 的回环 `/ready` 复核运行代号、Broker/upstream PID、
-`DesktopConnected`、`SidecarConnected` 和未知客户端数。任何不一致或
-Desktop 断线都会把 app-server 能力设为 degraded、触发 Web 实时刷新并暂停
-新执行；启动回执缺失也不会被当作 Ready。
+`DesktopConnected`、`SidecarConnected` 和未知客户端数。Desktop 包/启动回执
+暂时无法验证时，只要精确 Broker 回执、实时三端连接与核心能力探针全部通过，
+既有租约仍可发送；任何 Broker 身份不一致、真实 Desktop/Sidecar 断线、核心
+探针失败或启动回执缺失/无效仍会把 app-server 设为 degraded 并暂停新执行。
+Windows 监督器的包检查周期使用单调时钟，系统时间回拨不会把下一次复核卡在
+未来。
 
 ## 浏览器
 

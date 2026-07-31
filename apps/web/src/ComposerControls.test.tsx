@@ -11,6 +11,7 @@ import {
   ComposerSettingsSheet,
   ComposerToolsSheet,
   DeliveryModeSwitch,
+  GoalSheet,
   InlineDecisionStack,
   PlanProgressControl,
   QueueShelf,
@@ -193,6 +194,8 @@ describe("composer 组件结构", () => {
     expect(html).toContain("1/3 步已完成");
     expect(html).toContain("读取需求");
     expect(html).toContain("验证交互");
+    expect(html).toContain('aria-label="关闭任务进度"');
+    expect(html).toContain('data-testid="composer-plan-progress-close"');
   });
 
   it("工具抽屉只渲染运行时确认支持的入口", () => {
@@ -226,6 +229,26 @@ describe("composer 组件结构", () => {
     expect(html).toContain("任务目标");
     expect(html).not.toContain("计划模式");
     expect(html).not.toContain("压缩上下文");
+  });
+
+  it("已有目标只提供运行时真实支持的修改和删除，不伪造暂停能力", () => {
+    const html = renderToStaticMarkup(
+      <GoalSheet
+        busy={false}
+        hasGoal
+        onChange={() => undefined}
+        onClear={() => undefined}
+        onClose={() => undefined}
+        onSave={() => undefined}
+        open
+        value="完成候选版本"
+      />,
+    );
+
+    expect(html).toContain("保存修改");
+    expect(html).toContain("删除目标");
+    expect(html).not.toContain("暂停目标");
+    expect(html).not.toContain("继续目标");
   });
 
   it("当前线程的结构化问题固定显示在对话内", () => {

@@ -14,11 +14,12 @@ import {
 
 import type { RegisteredProject } from "@codex-local-remote/domain";
 
-const STATE_SCHEMA_VERSION = 3;
+const STATE_SCHEMA_VERSION = 5;
 const ABSOLUTE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const IDLE_SESSION_TTL_MS = 24 * 60 * 60 * 1_000;
 const SESSION_PERSIST_INTERVAL_MS = 60_000;
 const MAX_CSRF_GENERATIONS = 8;
+const MAX_MUTATION_RECEIPTS = 1_000;
 
 interface StoredSession extends SessionRecord {
   csrfDigests: string[];
@@ -37,8 +38,22 @@ interface PersistedRegisteredProject {
   source: "registered";
 }
 
+interface PersistedMutationReceipt {
+  state: "completed" | "started";
+  updatedAtMs: number;
+}
+
+export interface PersistedArchiveIntent {
+  desktopNotificationPending: boolean;
+  managed: boolean;
+  targetArchived: boolean;
+  threadId: string;
+}
+
 interface PersistedState {
+  archiveIntents: PersistedArchiveIntent[];
   managedThreadIds: string[];
+  mutationReceipts: Record<string, PersistedMutationReceipt>;
   pendingDesktopNotificationThreadIds: string[];
   schemaVersion: typeof STATE_SCHEMA_VERSION;
   passwordHash?: string;
@@ -105,18 +120,73 @@ export class SidecarStateStore {
     return [...this.#state.pendingDesktopNotificationThreadIds];
   }
 
+  listArchiveIntents(): PersistedArchiveIntent[] {
+    return this.#state.archiveIntents.map((intent) => ({ ...intent }));
+  }
+
   async verifyPassword(password: string): Promise<boolean> {
     const encodedHash = this.#state.passwordHash;
     return encodedHash ? await verifyPassword(password, encodedHash) : false;
   }
 
   async setPasswordHash(encodedHash: string): Promise<void> {
-    this.#state = {
-      ...this.#state,
+    await this.#commitState((current) => ({
+      ...current,
+      mutationReceipts: {},
       passwordHash: encodedHash,
       sessions: {},
-    };
-    await this.#persist();
+    }));
+    this.#lastSessionPersistedAt.clear();
+  }
+
+  async reserveMutation(scope: string, now: number): Promise<"completed" | "reserved" | "started"> {
+    requireMutationReceiptInput(scope, now);
+    let result: "completed" | "reserved" | "started" = "reserved";
+    await this.#commitState((current) => {
+      const existing = current.mutationReceipts[scope];
+      if (existing) {
+        result = existing.state;
+        return current;
+      }
+      const mutationReceipts = {
+        ...current.mutationReceipts,
+        [scope]: { state: "started" as const, updatedAtMs: now },
+      };
+      return {
+        ...current,
+        mutationReceipts: pruneMutationReceipts(mutationReceipts),
+      };
+    });
+    return result;
+  }
+
+  async completeMutation(scope: string, now: number): Promise<void> {
+    requireMutationReceiptInput(scope, now);
+    await this.#commitState((current) => {
+      const existing = current.mutationReceipts[scope];
+      if (!existing || (existing.state === "completed" && existing.updatedAtMs === now)) {
+        return current;
+      }
+      return {
+        ...current,
+        mutationReceipts: {
+          ...current.mutationReceipts,
+          [scope]: { state: "completed", updatedAtMs: now },
+        },
+      };
+    });
+  }
+
+  async releaseMutation(scope: string): Promise<void> {
+    requireMutationScope(scope);
+    await this.#commitState((current) => {
+      if (current.mutationReceipts[scope]?.state !== "started") {
+        return current;
+      }
+      const mutationReceipts = { ...current.mutationReceipts };
+      delete mutationReceipts[scope];
+      return { ...current, mutationReceipts };
+    });
   }
 
   async registerProject(project: RegisteredProject): Promise<void> {
@@ -144,21 +214,22 @@ export class SidecarStateStore {
     if (!normalizedProject.id || !normalizedProject.name) {
       throw new Error("项目配置无效");
     }
-    const existing = this.#state.projects.findIndex((item) => item.id === normalizedProject.id);
-    if (
-      existing >= 0 &&
-      JSON.stringify(this.#state.projects[existing]) === JSON.stringify(normalizedProject)
-    ) {
-      return;
-    }
-    const projects = this.#state.projects.map((item) => ({ ...item }));
-    if (existing >= 0) {
-      projects[existing] = normalizedProject;
-    } else {
-      projects.push(normalizedProject);
-    }
-    this.#state = { ...this.#state, projects };
-    await this.#persist();
+    await this.#commitState((current) => {
+      const existing = current.projects.findIndex((item) => item.id === normalizedProject.id);
+      if (
+        existing >= 0 &&
+        JSON.stringify(current.projects[existing]) === JSON.stringify(normalizedProject)
+      ) {
+        return current;
+      }
+      const projects = current.projects.map((item) => ({ ...item }));
+      if (existing >= 0) {
+        projects[existing] = normalizedProject;
+      } else {
+        projects.push(normalizedProject);
+      }
+      return { ...current, projects };
+    });
   }
 
   async authorizeRegisteredProjectRoot(projectId: string): Promise<string | undefined> {
@@ -190,39 +261,127 @@ export class SidecarStateStore {
     threadId: string,
     options: { desktopNotificationPending?: boolean } = {},
   ): Promise<void> {
-    const normalized = threadId.trim();
-    if (!normalized || normalized.length > 512) {
-      throw new Error("对话标识无效");
+    const normalized = requireManagedThreadId(threadId);
+    await this.#commitState((current) => {
+      const managed = current.managedThreadIds.includes(normalized);
+      const pending = current.pendingDesktopNotificationThreadIds.includes(normalized);
+      if (managed && (options.desktopNotificationPending !== true || pending)) {
+        return current;
+      }
+      return {
+        ...current,
+        managedThreadIds: managed
+          ? current.managedThreadIds
+          : [...current.managedThreadIds, normalized],
+        pendingDesktopNotificationThreadIds:
+          options.desktopNotificationPending === true && !pending
+            ? [...current.pendingDesktopNotificationThreadIds, normalized]
+            : current.pendingDesktopNotificationThreadIds,
+      };
+    });
+  }
+
+  async unmarkManagedThread(threadId: string): Promise<void> {
+    const normalized = requireManagedThreadId(threadId);
+    await this.#commitState((current) => {
+      const managed = current.managedThreadIds.includes(normalized);
+      const pending = current.pendingDesktopNotificationThreadIds.includes(normalized);
+      if (!managed && !pending) {
+        return current;
+      }
+      return {
+        ...current,
+        managedThreadIds: current.managedThreadIds.filter((candidate) => candidate !== normalized),
+        pendingDesktopNotificationThreadIds: current.pendingDesktopNotificationThreadIds.filter(
+          (candidate) => candidate !== normalized,
+        ),
+      };
+    });
+  }
+
+  async beginArchiveIntent(
+    threadId: string,
+    targetArchived: boolean,
+  ): Promise<PersistedArchiveIntent> {
+    const normalized = requireManagedThreadId(threadId);
+    let resolved: PersistedArchiveIntent | undefined;
+    await this.#commitState((current) => {
+      const existing = current.archiveIntents.find((intent) => intent.threadId === normalized);
+      if (existing !== undefined) {
+        if (existing.targetArchived !== targetArchived) {
+          throw new Error("对话已有相反的归档恢复意图");
+        }
+        resolved = { ...existing };
+        return current;
+      }
+      const intent: PersistedArchiveIntent = {
+        desktopNotificationPending:
+          current.pendingDesktopNotificationThreadIds.includes(normalized),
+        managed: current.managedThreadIds.includes(normalized),
+        targetArchived,
+        threadId: normalized,
+      };
+      resolved = intent;
+      return {
+        ...current,
+        archiveIntents: [...current.archiveIntents, intent],
+      };
+    });
+    if (resolved === undefined) {
+      throw new Error("归档意图无法持久化");
     }
-    const managed = this.#state.managedThreadIds.includes(normalized);
-    const pending = this.#state.pendingDesktopNotificationThreadIds.includes(normalized);
-    if (managed && (options.desktopNotificationPending !== true || pending)) {
-      return;
-    }
-    this.#state = {
-      ...this.#state,
-      managedThreadIds: managed
-        ? this.#state.managedThreadIds
-        : [...this.#state.managedThreadIds, normalized],
-      pendingDesktopNotificationThreadIds:
-        options.desktopNotificationPending === true && !pending
-          ? [...this.#state.pendingDesktopNotificationThreadIds, normalized]
-          : this.#state.pendingDesktopNotificationThreadIds,
-    };
-    await this.#persist();
+    return { ...resolved };
+  }
+
+  async settleArchiveIntent(threadId: string, observedArchived: boolean): Promise<void> {
+    const normalized = requireManagedThreadId(threadId);
+    await this.#commitState((current) => {
+      const intent = current.archiveIntents.find((candidate) => candidate.threadId === normalized);
+      if (intent === undefined && !observedArchived) {
+        return current;
+      }
+      const managedThreadIds = new Set(current.managedThreadIds);
+      const pendingDesktopNotificationThreadIds = new Set(
+        current.pendingDesktopNotificationThreadIds,
+      );
+      if (observedArchived) {
+        managedThreadIds.delete(normalized);
+        pendingDesktopNotificationThreadIds.delete(normalized);
+      } else if (intent !== undefined) {
+        if (intent.managed) {
+          managedThreadIds.add(normalized);
+        } else {
+          managedThreadIds.delete(normalized);
+        }
+        if (intent.managed && intent.desktopNotificationPending) {
+          pendingDesktopNotificationThreadIds.add(normalized);
+        } else {
+          pendingDesktopNotificationThreadIds.delete(normalized);
+        }
+      }
+      return {
+        ...current,
+        archiveIntents: current.archiveIntents.filter(
+          (candidate) => candidate.threadId !== normalized,
+        ),
+        managedThreadIds: [...managedThreadIds],
+        pendingDesktopNotificationThreadIds: [...pendingDesktopNotificationThreadIds],
+      };
+    });
   }
 
   async clearPendingDesktopNotification(threadId: string): Promise<void> {
-    if (!this.#state.pendingDesktopNotificationThreadIds.includes(threadId)) {
-      return;
-    }
-    this.#state = {
-      ...this.#state,
-      pendingDesktopNotificationThreadIds: this.#state.pendingDesktopNotificationThreadIds.filter(
-        (candidate) => candidate !== threadId,
-      ),
-    };
-    await this.#persist();
+    await this.#commitState((current) => {
+      if (!current.pendingDesktopNotificationThreadIds.includes(threadId)) {
+        return current;
+      }
+      return {
+        ...current,
+        pendingDesktopNotificationThreadIds: current.pendingDesktopNotificationThreadIds.filter(
+          (candidate) => candidate !== threadId,
+        ),
+      };
+    });
   }
 
   async createSession(
@@ -234,12 +393,17 @@ export class SidecarStateStore {
       idleTtlMs: IDLE_SESSION_TTL_MS,
       now,
     });
-    this.#state.sessions[session.record.tokenDigest] = {
-      ...session.record,
-      csrfDigests: [csrfDigest],
-    };
+    await this.#commitState((current) => ({
+      ...current,
+      sessions: {
+        ...current.sessions,
+        [session.record.tokenDigest]: {
+          ...session.record,
+          csrfDigests: [csrfDigest],
+        },
+      },
+    }));
     this.#lastSessionPersistedAt.set(session.record.tokenDigest, session.record.lastSeenAtMs);
-    await this.#persist();
     return session;
   }
 
@@ -273,25 +437,37 @@ export class SidecarStateStore {
   }
 
   async touchSession(token: string, now: number): Promise<SessionLookup> {
+    await this.#writeChain;
     const digest = digestSessionToken(token);
     const stored = this.#state.sessions[digest];
     if (!stored || !validateSession(token, stored, now).valid) {
       return { valid: false };
     }
     const touched = touchSession(stored, now, IDLE_SESSION_TTL_MS);
-    this.#state.sessions[digest] = {
-      ...touched,
-      csrfDigests: [...stored.csrfDigests],
-    };
     const lastPersisted = this.#lastSessionPersistedAt.get(digest) ?? stored.lastSeenAtMs;
     if (now - lastPersisted >= SESSION_PERSIST_INTERVAL_MS) {
+      await this.#commitState((current) => ({
+        ...current,
+        sessions: {
+          ...current.sessions,
+          [digest]: {
+            ...touched,
+            csrfDigests: [...stored.csrfDigests],
+          },
+        },
+      }));
       this.#lastSessionPersistedAt.set(digest, now);
-      try {
-        await this.#persist();
-      } catch (error) {
-        this.#lastSessionPersistedAt.set(digest, lastPersisted);
-        throw error;
-      }
+    } else {
+      this.#state = {
+        ...this.#state,
+        sessions: {
+          ...this.#state.sessions,
+          [digest]: {
+            ...touched,
+            csrfDigests: [...stored.csrfDigests],
+          },
+        },
+      };
     }
     return {
       csrfDigest: stored.csrfDigests.at(-1) ?? "",
@@ -302,6 +478,7 @@ export class SidecarStateStore {
   }
 
   async rotateCsrf(token: string, csrfDigest: string, now: number): Promise<SessionLookup> {
+    await this.#writeChain;
     const digest = digestSessionToken(token);
     const stored = this.#state.sessions[digest];
     if (!stored || !validateSession(token, stored, now).valid) {
@@ -312,28 +489,47 @@ export class SidecarStateStore {
       ...stored.csrfDigests.filter((candidate) => candidate !== csrfDigest),
       csrfDigest,
     ].slice(-MAX_CSRF_GENERATIONS);
-    this.#state.sessions[digest] = { ...touched, csrfDigests };
+    await this.#commitState((current) => ({
+      ...current,
+      sessions: {
+        ...current.sessions,
+        [digest]: { ...touched, csrfDigests },
+      },
+    }));
     this.#lastSessionPersistedAt.set(digest, now);
-    await this.#persist();
     return { csrfDigest, csrfDigests, record: touched, valid: true };
   }
 
   async deleteSession(token: string): Promise<void> {
     const digest = digestSessionToken(token);
-    delete this.#state.sessions[digest];
+    await this.#commitState((current) => {
+      if (current.sessions[digest] === undefined) {
+        return current;
+      }
+      const sessions = { ...current.sessions };
+      delete sessions[digest];
+      return { ...current, sessions };
+    });
     this.#lastSessionPersistedAt.delete(digest);
-    await this.#persist();
   }
 
-  async #persist(): Promise<void> {
-    const snapshot = JSON.stringify(this.#state, null, 2);
+  async #commitState(update: (current: PersistedState) => PersistedState): Promise<void> {
     const operation = this.#writeChain.then(async () => {
+      const current = this.#state;
+      const next = update(current);
+      if (next === current) {
+        return;
+      }
       const temporaryPath = path.join(
         this.#dataDir,
         `.state-${process.pid}-${randomBytes(6).toString("hex")}.tmp`,
       );
-      await writeFile(temporaryPath, snapshot, { encoding: "utf8", mode: 0o600 });
+      await writeFile(temporaryPath, JSON.stringify(next, null, 2), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
       await rename(temporaryPath, this.#statePath);
+      this.#state = next;
     });
     this.#writeChain = operation.then(
       () => undefined,
@@ -345,7 +541,9 @@ export class SidecarStateStore {
 
 function emptyState(): PersistedState {
   return {
+    archiveIntents: [],
     managedThreadIds: [],
+    mutationReceipts: {},
     pendingDesktopNotificationThreadIds: [],
     projects: [],
     schemaVersion: STATE_SCHEMA_VERSION,
@@ -359,6 +557,8 @@ function parseState(serialized: string): PersistedState {
     !isRecord(value) ||
     (value.schemaVersion !== 1 &&
       value.schemaVersion !== 2 &&
+      value.schemaVersion !== 3 &&
+      value.schemaVersion !== 4 &&
       value.schemaVersion !== STATE_SCHEMA_VERSION)
   ) {
     throw new Error("unsupported state");
@@ -373,9 +573,15 @@ function parseState(serialized: string): PersistedState {
   const managedThreadIds = Array.isArray(value.managedThreadIds)
     ? [...new Set(value.managedThreadIds.filter(isManagedThreadId))]
     : [];
+  const archiveIntents =
+    value.schemaVersion === STATE_SCHEMA_VERSION && Array.isArray(value.archiveIntents)
+      ? deduplicateArchiveIntents(value.archiveIntents.filter(isPersistedArchiveIntent))
+      : [];
   const managedThreadIdSet = new Set(managedThreadIds);
   const pendingDesktopNotificationThreadIds =
-    value.schemaVersion === STATE_SCHEMA_VERSION &&
+    (value.schemaVersion === 3 ||
+      value.schemaVersion === 4 ||
+      value.schemaVersion === STATE_SCHEMA_VERSION) &&
     Array.isArray(value.pendingDesktopNotificationThreadIds)
       ? [
           ...new Set(
@@ -385,6 +591,22 @@ function parseState(serialized: string): PersistedState {
           ),
         ]
       : [];
+  const mutationReceipts: Record<string, PersistedMutationReceipt> = {};
+  if (
+    (value.schemaVersion === 4 || value.schemaVersion === STATE_SCHEMA_VERSION) &&
+    isRecord(value.mutationReceipts)
+  ) {
+    const valid = Object.entries(value.mutationReceipts)
+      .filter(
+        (entry): entry is [string, PersistedMutationReceipt] =>
+          isMutationScope(entry[0]) && isPersistedMutationReceipt(entry[1]),
+      )
+      .sort((left, right) => left[1].updatedAtMs - right[1].updatedAtMs)
+      .slice(-MAX_MUTATION_RECEIPTS);
+    for (const [scope, receipt] of valid) {
+      mutationReceipts[scope] = receipt;
+    }
+  }
   const sessions: Record<string, StoredSession> = {};
   if (isRecord(value.sessions)) {
     for (const [digest, candidate] of Object.entries(value.sessions)) {
@@ -395,13 +617,44 @@ function parseState(serialized: string): PersistedState {
     }
   }
   return {
+    archiveIntents,
     managedThreadIds,
+    mutationReceipts,
     pendingDesktopNotificationThreadIds,
     projects,
     schemaVersion: STATE_SCHEMA_VERSION,
     sessions,
     ...(typeof value.passwordHash === "string" ? { passwordHash: value.passwordHash } : {}),
   };
+}
+
+function requireManagedThreadId(threadId: string): string {
+  const normalized = threadId.trim();
+  if (!isManagedThreadId(normalized)) {
+    throw new Error("对话标识无效");
+  }
+  return normalized;
+}
+
+function isPersistedArchiveIntent(value: unknown): value is PersistedArchiveIntent {
+  return (
+    isRecord(value) &&
+    isManagedThreadId(value.threadId) &&
+    typeof value.managed === "boolean" &&
+    typeof value.desktopNotificationPending === "boolean" &&
+    typeof value.targetArchived === "boolean" &&
+    (!value.desktopNotificationPending || value.managed)
+  );
+}
+
+function deduplicateArchiveIntents(intents: PersistedArchiveIntent[]): PersistedArchiveIntent[] {
+  const deduplicated = new Map<string, PersistedArchiveIntent>();
+  for (const intent of intents) {
+    if (!deduplicated.has(intent.threadId)) {
+      deduplicated.set(intent.threadId, { ...intent });
+    }
+  }
+  return [...deduplicated.values()];
 }
 
 function normalizeStoredSession(value: unknown): StoredSession | undefined {
@@ -429,6 +682,51 @@ function normalizeStoredSession(value: unknown): StoredSession | undefined {
 function isManagedThreadId(value: unknown): value is string {
   return (
     typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 512
+  );
+}
+
+function requireMutationReceiptInput(scope: string, now: number): void {
+  requireMutationScope(scope);
+  if (!Number.isSafeInteger(now) || now < 0) {
+    throw new TypeError("操作回执时间无效");
+  }
+}
+
+function requireMutationScope(scope: string): void {
+  if (!isMutationScope(scope)) {
+    throw new TypeError("操作回执范围无效");
+  }
+}
+
+function isMutationScope(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim() === value &&
+    value.length >= 8 &&
+    value.length <= 4_096
+  );
+}
+
+function isPersistedMutationReceipt(value: unknown): value is PersistedMutationReceipt {
+  return (
+    isRecord(value) &&
+    (value.state === "completed" || value.state === "started") &&
+    Number.isSafeInteger(value.updatedAtMs) &&
+    (value.updatedAtMs as number) >= 0
+  );
+}
+
+function pruneMutationReceipts(
+  receipts: Record<string, PersistedMutationReceipt>,
+): Record<string, PersistedMutationReceipt> {
+  const entries = Object.entries(receipts);
+  if (entries.length <= MAX_MUTATION_RECEIPTS) {
+    return receipts;
+  }
+  return Object.fromEntries(
+    entries
+      .sort((left, right) => left[1].updatedAtMs - right[1].updatedAtMs)
+      .slice(-MAX_MUTATION_RECEIPTS),
   );
 }
 

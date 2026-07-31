@@ -1,8 +1,41 @@
 import { expect, test } from "@playwright/test";
 
 import { expectNoHorizontalOverflow, expectPrimaryTouchTargets, login } from "./helpers.js";
+import { openSharedThread, SharedRuntime } from "./shared-runtime.js";
 
 test.describe("六视口布局契约", () => {
+  test("长工作记录在六视口均可紧凑展开且不丢最终回答", async ({ page }) => {
+    const runtime = new SharedRuntime({ longWorkLog: true });
+    await runtime.attach(page.context());
+
+    try {
+      await openSharedThread(page);
+      const workLog = page.locator("section.work-log");
+      const toggle = workLog.getByRole("button", { name: /工作记录/u }).first();
+
+      await expect(toggle).toHaveAttribute("aria-expanded", "false");
+      await expect(page.getByText("完整工作记录之后的最终回答。", { exact: true })).toBeVisible();
+      await expectNoHorizontalOverflow(page);
+      expect((await toggle.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
+
+      await toggle.click();
+      await expect(toggle).toHaveAttribute("aria-expanded", "true");
+      await expect(page.getByText("先确认真实历史基线", { exact: true })).toBeVisible();
+      await expectNoHorizontalOverflow(page);
+
+      if ((page.viewportSize()?.width ?? 0) <= 700) {
+        const activity = workLog.locator("details.activity-record");
+        const subagent = workLog.getByRole("button", { name: "历史完整性检查" });
+        expect(
+          (await activity.locator("summary").boundingBox())?.height ?? 0,
+        ).toBeGreaterThanOrEqual(44);
+        expect((await subagent.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+
   test("首页没有横向溢出且主要触控目标至少 44px", async ({ page }) => {
     await login(page);
     await expectNoHorizontalOverflow(page);
@@ -109,7 +142,7 @@ test.describe("六视口布局契约", () => {
   test("搜索输入与文件路径按钮保持至少 44px 的触控高度", async ({ page }) => {
     await login(page);
     await page.goto("./?demo=1#/threads");
-    const conversationSearch = page.getByLabel("搜索任务");
+    const conversationSearch = page.getByLabel("搜索当前任务");
     await expect(conversationSearch).toBeVisible();
     expect((await conversationSearch.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
 
@@ -125,6 +158,60 @@ test.describe("六视口布局契约", () => {
         (await breadcrumbButtons.nth(index).boundingBox())?.height ?? 0,
       ).toBeGreaterThanOrEqual(44);
     }
+  });
+
+  test("文件页四个主要动作在手机端保持两列且文字不竖排", async ({ page }) => {
+    await login(page);
+    await page.goto("./?demo=1#/files");
+    const actions = page.locator(".file-manager-actions");
+    await expect(actions).toBeVisible();
+    await expect(actions.getByRole("button")).toHaveCount(4);
+    const { geometry, mobileLayout } = await actions.evaluate((element) => ({
+      geometry: Array.from(element.querySelectorAll<HTMLElement>("button")).map((button) => ({
+        height: button.getBoundingClientRect().height,
+        width: button.getBoundingClientRect().width,
+        text: button.textContent?.trim() ?? "",
+        whiteSpace: window.getComputedStyle(button).whiteSpace,
+      })),
+      mobileLayout: window.matchMedia("(max-width: 700px)").matches,
+    }));
+    for (const action of geometry) {
+      expect(action.height).toBeGreaterThanOrEqual(44);
+      expect(action.width).toBeGreaterThanOrEqual(44);
+      if (action.text && mobileLayout) {
+        expect(action.width).toBeGreaterThanOrEqual(120);
+        expect(action.whiteSpace).toBe("nowrap");
+      }
+    }
+    await expectNoHorizontalOverflow(page);
+  });
+
+  test("文件页可预览、复制、下载并打开完整管理动作", async ({ page }) => {
+    await login(page);
+    await page.goto("./?demo=1#/files");
+
+    const readme = page.locator("button.file-entry-main").filter({ hasText: "README.md" });
+    await expect(readme).toBeVisible();
+    await readme.click();
+
+    const preview = page.locator(".file-preview");
+    await expect(preview).toBeVisible();
+    await expect(preview.getByRole("heading", { name: "Local Remote" })).toBeVisible();
+    await expect(preview.getByRole("link", { name: "下载文件" })).toHaveAttribute(
+      "download",
+      "README.md",
+    );
+    await preview.getByRole("button", { name: "复制完整内容" }).click();
+    await expect(preview.getByRole("button", { name: "已复制", exact: true })).toBeVisible();
+    await preview.getByRole("button", { name: "关闭预览" }).click();
+
+    await page.getByRole("button", { name: "管理 README.md" }).click();
+    const manager = page.getByRole("dialog").filter({ hasText: "README.md" });
+    await expect(manager).toBeVisible();
+    for (const action of ["预览", "重命名", "复制到…", "移动到…", "删除…"]) {
+      await expect(manager.getByRole("button", { name: action, exact: true })).toBeVisible();
+    }
+    await expectNoHorizontalOverflow(page);
   });
 
   test("200% 字体放大后仍无页面级横向滚动", async ({ page }) => {

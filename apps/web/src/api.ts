@@ -8,6 +8,7 @@ import type {
   CreateThreadInput,
   DiagnosticSnapshot,
   FileListing,
+  FileRoot,
   LocalInputReference,
   ResolvedFileEntry,
   EditQueuedTurnInput,
@@ -24,6 +25,7 @@ import type {
   SetThreadGoalInput,
   SteerQueuedTurnInput,
   SteerTurnInput,
+  SubagentHistoryIntegrity,
   SubagentSummary,
   ThreadDetail,
   ThreadGoal,
@@ -63,6 +65,56 @@ export class ApiRequestError extends Error {
   }
 }
 
+export type SubagentCursorPage = CursorPage<SubagentSummary> & {
+  historyIntegrity?: SubagentHistoryIntegrity;
+};
+
+const subagentIntegrityStatuses = new Set(["complete", "partial", "unknown", "failed"]);
+const subagentIntegrityReasons = new Set([
+  "verified-exhaustive",
+  "pagination-pending",
+  "pagination-failed",
+  "read-failed",
+  "read-truncated",
+  "upstream-short-page-without-cursor",
+  "verification-mismatch",
+  "continuation-unverified",
+]);
+const subagentStreamStatuses = new Set(["exhausted", "more-available", "failed", "not-requested"]);
+
+export function subagentHistoryIntegrityFrom(
+  headers: Headers,
+): SubagentHistoryIntegrity | undefined {
+  const raw = headers.get("X-Subagent-History-Integrity")?.trim();
+  if (!raw) return undefined;
+  try {
+    const value = JSON.parse(decodeURIComponent(raw)) as Partial<SubagentHistoryIntegrity>;
+    const current = value.streams?.current;
+    const archived = value.streams?.archived;
+    if (
+      typeof value.status !== "string" ||
+      !subagentIntegrityStatuses.has(value.status) ||
+      typeof value.reason !== "string" ||
+      !subagentIntegrityReasons.has(value.reason) ||
+      !Number.isSafeInteger(value.observedCount) ||
+      (value.observedCount ?? -1) < 0 ||
+      typeof current?.status !== "string" ||
+      !subagentStreamStatuses.has(current.status) ||
+      !Number.isSafeInteger(current.observedCount) ||
+      current.observedCount < 0 ||
+      typeof archived?.status !== "string" ||
+      !subagentStreamStatuses.has(archived.status) ||
+      !Number.isSafeInteger(archived.observedCount) ||
+      archived.observedCount < 0
+    ) {
+      return undefined;
+    }
+    return value as SubagentHistoryIntegrity;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ApiClient {
   readonly demo: boolean;
   bootstrap(): Promise<PublicBootstrap>;
@@ -85,6 +137,8 @@ export interface ApiClient {
   createThread(input: CreateThreadInput): Promise<ThreadDetail>;
   resumeThread(threadId: string, idempotencyKey: string): Promise<ThreadDetail>;
   compact(threadId: string, idempotencyKey: string): Promise<void>;
+  setThreadName(threadId: string, name: string): Promise<void>;
+  setThreadArchived(threadId: string, archived: boolean): Promise<void>;
   queue(threadId: string): Promise<TurnQueueSnapshot>;
   enqueue(threadId: string, input: QueueTurnInput): Promise<TurnQueueSnapshot>;
   updateQueued(
@@ -115,12 +169,31 @@ export interface ApiClient {
   sendTurn(threadId: string, input: SendTurnInput): Promise<ThreadDetail>;
   steer(threadId: string, turnId: string, input: SteerTurnInput): Promise<void>;
   interrupt(threadId: string, turnId: string): Promise<void>;
-  subagents(threadId: string, cursor?: string): Promise<CursorPage<SubagentSummary>>;
+  subagents(threadId: string, cursor?: string): Promise<SubagentCursorPage>;
   usage(threadId?: string): Promise<UsageSnapshot>;
   approvals(): Promise<ApprovalRequest[]>;
   resolveApproval(id: string, input: ApprovalResolutionInput): Promise<void>;
   upload(file: File, relativePath?: string): Promise<LocalInputReference>;
+  fileRoots(): Promise<FileRoot[]>;
   files(projectId: string, path: string): Promise<FileListing>;
+  createFolder(projectId: string, path: string): Promise<void>;
+  writeHostFile(projectId: string, path: string, file: File, overwrite?: boolean): Promise<void>;
+  renameHostFile(projectId: string, path: string, name: string): Promise<void>;
+  copyHostFile(input: {
+    sourceProjectId: string;
+    sourcePath: string;
+    targetProjectId: string;
+    targetPath: string;
+    overwrite?: boolean;
+  }): Promise<void>;
+  moveHostFile(input: {
+    sourceProjectId: string;
+    sourcePath: string;
+    targetProjectId: string;
+    targetPath: string;
+    overwrite?: boolean;
+  }): Promise<void>;
+  deleteHostFile(projectId: string, path: string, permanent?: boolean): Promise<void>;
   resolveFile(projectId: string | undefined, path: string): Promise<ResolvedFileEntry>;
   preview(projectId: string, path: string): Promise<{ contentType: string; blob: Blob }>;
   downloadUrl(projectId: string, path: string): string;
@@ -128,13 +201,14 @@ export interface ApiClient {
   subscribe(
     onEvent: (event: RemoteEvent) => void,
     onConnection: (online: boolean) => void,
-    options?: { threadId?: string },
+    options?: { cursor?: string; threadId?: string },
   ): () => void;
 }
 
 export const EVENT_SOURCE_CLOSED = 2;
 export const EVENT_SOURCE_CONNECTING = 0;
 export const EVENT_SOURCE_OPEN = 1;
+export const EVENT_STREAM_OFFLINE_GRACE_MS = 3_000;
 export const EVENT_STREAM_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000] as const;
 
 export interface EventStreamSource {
@@ -271,8 +345,14 @@ function createBrowserEventStreamSource(url: string): EventStreamSource {
 
 function eventStreamUrl(url: string, cursor: string): string {
   if (!cursor) return url;
-  const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}cursor=${encodeURIComponent(cursor)}`;
+  const hashIndex = url.indexOf("#");
+  const hash = hashIndex < 0 ? "" : url.slice(hashIndex);
+  const withoutHash = hashIndex < 0 ? url : url.slice(0, hashIndex);
+  const queryIndex = withoutHash.indexOf("?");
+  const path = queryIndex < 0 ? withoutHash : withoutHash.slice(0, queryIndex);
+  const query = new URLSearchParams(queryIndex < 0 ? "" : withoutHash.slice(queryIndex + 1));
+  query.set("cursor", cursor);
+  return `${path}?${query.toString()}${hash}`;
 }
 
 export function subscribeRemoteEvents(
@@ -286,6 +366,7 @@ export function subscribeRemoteEvents(
   },
 ): () => void {
   let currentSource: EventStreamSource | undefined;
+  let offlineTimer: number | undefined;
   let retryTimer: number | undefined;
   let retryAttempt = 0;
   let disposed = false;
@@ -302,6 +383,20 @@ export function subscribeRemoteEvents(
     if (retryTimer === undefined) return;
     dependencies.cancel(retryTimer);
     retryTimer = undefined;
+  };
+
+  const clearOffline = () => {
+    if (offlineTimer === undefined) return;
+    dependencies.cancel(offlineTimer);
+    offlineTimer = undefined;
+  };
+
+  const scheduleOffline = () => {
+    if (disposed || offlineTimer !== undefined || lastConnectionState === false) return;
+    offlineTimer = dependencies.schedule(() => {
+      offlineTimer = undefined;
+      if (!disposed) reportConnection(false);
+    }, EVENT_STREAM_OFFLINE_GRACE_MS);
   };
 
   const scheduleReconnect = () => {
@@ -323,7 +418,7 @@ export function subscribeRemoteEvents(
     try {
       source = dependencies.createSource(eventStreamUrl(url, lastEventId));
     } catch {
-      reportConnection(false);
+      scheduleOffline();
       scheduleReconnect();
       return;
     }
@@ -332,11 +427,12 @@ export function subscribeRemoteEvents(
       if (disposed || currentSource !== source) return;
       retryAttempt = 0;
       clearRetry();
+      clearOffline();
       reportConnection(true);
     };
     source.onerror = () => {
       if (disposed || currentSource !== source) return;
-      reportConnection(false);
+      scheduleOffline();
       if (source.readyState !== EVENT_SOURCE_CLOSED) return;
       source.close();
       currentSource = undefined;
@@ -356,6 +452,7 @@ export function subscribeRemoteEvents(
   connect();
   return () => {
     disposed = true;
+    clearOffline();
     clearRetry();
     const source = currentSource;
     currentSource = undefined;
@@ -388,11 +485,35 @@ async function apiErrorPayload(response: Response): Promise<ApiErrorPayload> {
   }
 }
 
+async function logicalIntentStorageKey(fingerprint: string): Promise<string | undefined> {
+  try {
+    if (!crypto.subtle) {
+      return undefined;
+    }
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(fingerprint));
+    const hex = Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+    return `codex-remote:idempotency:${hex}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function sessionStorageIfAvailable(): Storage | undefined {
+  try {
+    return typeof sessionStorage === "undefined" ? undefined : sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
+
 export class HttpApiClient implements ApiClient {
   readonly demo = false;
   private apiRoot: string;
   private csrfToken: string | undefined;
   private readonly fetcher: typeof fetch;
+  private readonly pendingIdempotencyKeys = new Map<string, string>();
 
   constructor(apiRoot = initialApiRoot(), fetcher: typeof fetch = fetch) {
     this.apiRoot = apiRoot;
@@ -412,13 +533,19 @@ export class HttpApiClient implements ApiClient {
       idempotencyKey?: string;
     } = {},
   ): Promise<T> {
+    const logicalIntent =
+      options.idempotent && options.idempotencyKey === undefined
+        ? await this.acquireLogicalIdempotencyKey(path, options)
+        : undefined;
     const idempotencyKey = options.idempotent
-      ? (options.idempotencyKey ?? crypto.randomUUID())
+      ? (options.idempotencyKey ?? logicalIntent?.key)
       : undefined;
     const execute = async () => {
       const headers = new Headers(options.headers);
       headers.set("Accept", "application/json");
-      if (options.body !== undefined) headers.set("Content-Type", "application/json");
+      if (options.body !== undefined && !headers.has("Content-Type")) {
+        headers.set("Content-Type", "application/json");
+      }
       if (options.mutation && this.csrfToken) headers.set("X-CSRF-Token", this.csrfToken);
       if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey);
       return await this.fetcher(`${this.apiRoot}${path}`, {
@@ -448,16 +575,74 @@ export class HttpApiClient implements ApiClient {
           throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
         }
       } else {
+        if (firstFailure.code === "IDEMPOTENCY_REPLAY_REQUIRES_REFRESH") {
+          this.retireLogicalIdempotencyKey(logicalIntent);
+        }
         throw new ApiRequestError(firstFailure.message, response.status, firstFailure.code);
       }
     }
     if (!response.ok) {
       const failure = await apiErrorPayload(response);
+      if (failure.code === "IDEMPOTENCY_REPLAY_REQUIRES_REFRESH") {
+        this.retireLogicalIdempotencyKey(logicalIntent);
+      }
       throw new ApiRequestError(failure.message, response.status, failure.code);
     }
-    if (response.status === 204) return undefined as T;
+    if (response.status === 204) {
+      this.retireLogicalIdempotencyKey(logicalIntent);
+      return undefined as T;
+    }
     const body = await response.text();
-    return body.length === 0 ? (undefined as T) : (JSON.parse(body) as T);
+    const result = body.length === 0 ? (undefined as T) : (JSON.parse(body) as T);
+    this.retireLogicalIdempotencyKey(logicalIntent);
+    return result;
+  }
+
+  private async acquireLogicalIdempotencyKey(
+    path: string,
+    options: RequestInit,
+  ): Promise<{ fingerprint: string; key: string; storageKey?: string }> {
+    const method = (options.method ?? "GET").toUpperCase();
+    const body = typeof options.body === "string" ? options.body : "";
+    const fingerprint = `${method}\u0000${this.apiRoot}${path}\u0000${body}`;
+    const inMemory = this.pendingIdempotencyKeys.get(fingerprint);
+    if (inMemory) {
+      return { fingerprint, key: inMemory };
+    }
+
+    const storageKey = await logicalIntentStorageKey(fingerprint);
+    const storage = sessionStorageIfAvailable();
+    const persisted = storageKey ? storage?.getItem(storageKey) : undefined;
+    const key =
+      persisted && /^[A-Za-z0-9._:-]{8,200}$/u.test(persisted) ? persisted : crypto.randomUUID();
+    this.pendingIdempotencyKeys.set(fingerprint, key);
+    if (storageKey) {
+      try {
+        storage?.setItem(storageKey, key);
+      } catch {
+        // Private browsing or a full storage quota must not block the request.
+      }
+    }
+    return { fingerprint, key, ...(storageKey ? { storageKey } : {}) };
+  }
+
+  private retireLogicalIdempotencyKey(
+    intent: { fingerprint: string; key: string; storageKey?: string } | undefined,
+  ): void {
+    if (!intent || this.pendingIdempotencyKeys.get(intent.fingerprint) !== intent.key) {
+      return;
+    }
+    this.pendingIdempotencyKeys.delete(intent.fingerprint);
+    if (intent.storageKey) {
+      try {
+        const storage = sessionStorageIfAvailable();
+        if (storage?.getItem(intent.storageKey) === intent.key) {
+          storage.removeItem(intent.storageKey);
+        }
+      } catch {
+        // The in-memory lifecycle remains authoritative for this page.
+      }
+    }
   }
 
   private async refreshCsrfToken(): Promise<boolean> {
@@ -483,7 +668,9 @@ export class HttpApiClient implements ApiClient {
     }
   }
 
-  private async requestPage<T>(path: string): Promise<CursorPage<T>> {
+  private async requestPage<T>(
+    path: string,
+  ): Promise<CursorPage<T> & { historyIntegrity?: SubagentHistoryIntegrity }> {
     const response = await fetch(`${this.apiRoot}${path}`, {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
@@ -507,7 +694,12 @@ export class HttpApiClient implements ApiClient {
     }
     const items = (await response.json()) as T[];
     const nextCursor = nextCursorFrom(response.headers);
-    return { items, ...(nextCursor ? { nextCursor } : {}) };
+    const historyIntegrity = subagentHistoryIntegrityFrom(response.headers);
+    return {
+      items,
+      ...(nextCursor ? { nextCursor } : {}),
+      ...(historyIntegrity ? { historyIntegrity } : {}),
+    };
   }
 
   async bootstrap() {
@@ -617,6 +809,24 @@ export class HttpApiClient implements ApiClient {
       idempotent: true,
       idempotencyKey,
       method: "POST",
+      mutation: true,
+    });
+  }
+
+  setThreadName(threadId: string, name: string) {
+    return this.request<void>(`/threads/${encodeURIComponent(threadId)}/name`, {
+      body: JSON.stringify({ name }),
+      idempotent: true,
+      method: "PUT",
+      mutation: true,
+    });
+  }
+
+  setThreadArchived(threadId: string, archived: boolean) {
+    return this.request<void>(`/threads/${encodeURIComponent(threadId)}/archive`, {
+      body: JSON.stringify({ archived }),
+      idempotent: true,
+      method: "PUT",
       mutation: true,
     });
   }
@@ -822,6 +1032,78 @@ export class HttpApiClient implements ApiClient {
     return this.request<FileListing>(`/files?${query.toString()}`);
   }
 
+  fileRoots() {
+    return this.request<FileRoot[]>("/file-roots");
+  }
+
+  createFolder(projectId: string, path: string) {
+    return this.request<void>("/files/folders", {
+      body: JSON.stringify({ path, projectId }),
+      idempotent: true,
+      method: "POST",
+      mutation: true,
+    });
+  }
+
+  writeHostFile(projectId: string, path: string, file: File, overwrite = false) {
+    const query = new URLSearchParams({ overwrite: String(overwrite), path, projectId });
+    return this.request<void>(`/files/content?${query.toString()}`, {
+      body: file,
+      headers: { "Content-Type": "application/octet-stream" },
+      idempotent: true,
+      method: "PUT",
+      mutation: true,
+    });
+  }
+
+  renameHostFile(projectId: string, path: string, name: string) {
+    return this.request<void>("/files/rename", {
+      body: JSON.stringify({ name, path, projectId }),
+      idempotent: true,
+      method: "POST",
+      mutation: true,
+    });
+  }
+
+  copyHostFile(input: {
+    sourceProjectId: string;
+    sourcePath: string;
+    targetProjectId: string;
+    targetPath: string;
+    overwrite?: boolean;
+  }) {
+    return this.request<void>("/files/copy", {
+      body: JSON.stringify(input),
+      idempotent: true,
+      method: "POST",
+      mutation: true,
+    });
+  }
+
+  moveHostFile(input: {
+    sourceProjectId: string;
+    sourcePath: string;
+    targetProjectId: string;
+    targetPath: string;
+    overwrite?: boolean;
+  }) {
+    return this.request<void>("/files/move", {
+      body: JSON.stringify(input),
+      idempotent: true,
+      method: "POST",
+      mutation: true,
+    });
+  }
+
+  deleteHostFile(projectId: string, path: string, permanent = false) {
+    return this.request<void>("/files", {
+      body: JSON.stringify({ path, permanent, projectId }),
+      idempotent: true,
+      method: "DELETE",
+      mutation: true,
+    });
+  }
+
   resolveFile(projectId: string | undefined, path: string) {
     const query = new URLSearchParams({ path });
     if (projectId) query.set("projectId", projectId);
@@ -858,11 +1140,12 @@ export class HttpApiClient implements ApiClient {
   subscribe(
     onEvent: (event: RemoteEvent) => void,
     onConnection: (online: boolean) => void,
-    options: { threadId?: string } = {},
+    options: { cursor?: string; threadId?: string } = {},
   ) {
-    const query = options.threadId
-      ? `?${new URLSearchParams({ threadId: options.threadId }).toString()}`
-      : "";
+    const parameters = new URLSearchParams();
+    if (options.threadId) parameters.set("threadId", options.threadId);
+    if (options.cursor) parameters.set("cursor", options.cursor);
+    const query = parameters.size > 0 ? `?${parameters.toString()}` : "";
     return subscribeRemoteEvents(`${this.apiRoot}/events${query}`, onEvent, onConnection);
   }
 }
@@ -870,6 +1153,7 @@ export class HttpApiClient implements ApiClient {
 class DemoApiClient implements ApiClient {
   readonly demo = true;
   private detail: ThreadDetail = structuredClone(demoThreadDetail);
+  private threadSummaries: ThreadSummary[] = structuredClone(demoThreads);
   private createdSubagents: SubagentSummary[] = [];
   private readonly queuedByThread = new Map<string, TurnQueueSnapshot>();
   private readonly goalsByThread = new Map<string, ThreadGoal>();
@@ -909,11 +1193,7 @@ class DemoApiClient implements ApiClient {
   }
 
   approvalReviewers() {
-    return this.later<ApprovalReviewerOption[]>([
-      { id: "user" },
-      { id: "auto_review" },
-      { id: "guardian_subagent" },
-    ]);
+    return this.later<ApprovalReviewerOption[]>([{ id: "user" }, { id: "auto_review" }]);
   }
 
   approvalPolicies() {
@@ -952,7 +1232,9 @@ class DemoApiClient implements ApiClient {
     options: { archived?: boolean; cursor?: string } = {},
   ): Promise<CursorPage<ThreadSummary>> {
     return this.later({
-      items: demoThreads.filter((thread) => Boolean(thread.archived) === Boolean(options.archived)),
+      items: this.threadSummaries.filter(
+        (thread) => Boolean(thread.archived) === Boolean(options.archived),
+      ),
     });
   }
 
@@ -976,6 +1258,11 @@ class DemoApiClient implements ApiClient {
         reasoningEffort: "high",
         items: [
           {
+            id: `${id}-request`,
+            kind: "user-message",
+            text: "只检查分配给你的模块，并把可验证结论返回父对话。",
+          },
+          {
             id: `${id}-summary`,
             kind: "reasoning-summary",
             text: "我正在处理分配给这个子智能体的有界任务，并将结果汇总给父对话。",
@@ -993,6 +1280,16 @@ class DemoApiClient implements ApiClient {
             summary: "只查看与当前子任务相关的文件",
             occurrences: 3,
           },
+          {
+            id: `${id}-verification`,
+            kind: "reasoning-summary",
+            text: "相关文件和边界已经核对完成，正在整理可以回读的验证结果。",
+          },
+          {
+            id: `${id}-answer`,
+            kind: "assistant-message",
+            text: "子任务已完成：检查记录、工具活动和最终结论都保留在这个子智能体对话中。",
+          },
         ],
         availableActions: {
           changeModelNextTurn: false,
@@ -1003,7 +1300,7 @@ class DemoApiClient implements ApiClient {
       };
       return this.later(subagentDetail);
     }
-    const summary = demoThreads.find((thread) => thread.id === id) ?? demoThreads[0]!;
+    const summary = this.threadSummaries.find((thread) => thread.id === id) ?? demoThreads[0]!;
     const items: ThreadDetail["items"] =
       summary.mode === "desktop-snapshot"
         ? [
@@ -1168,6 +1465,29 @@ class DemoApiClient implements ApiClient {
       };
     }, 650);
     await this.later(undefined);
+  }
+
+  async setThreadName(threadId: string, name: string) {
+    this.threadSummaries = this.threadSummaries.map((thread) =>
+      thread.id === threadId ? { ...thread, title: name } : thread,
+    );
+    if (this.detail.id === threadId) {
+      this.detail = { ...this.detail, title: name };
+    }
+    return this.later(undefined);
+  }
+
+  async setThreadArchived(threadId: string, archived: boolean) {
+    this.threadSummaries = this.threadSummaries.map((thread) => {
+      if (thread.id !== threadId) return thread;
+      const { archived: _archived, pinnedRank: _pinnedRank, ...rest } = thread;
+      return archived ? { ...rest, archived: true } : rest;
+    });
+    if (this.detail.id === threadId) {
+      const { archived: _archived, pinnedRank: _pinnedRank, ...rest } = this.detail;
+      this.detail = archived ? { ...rest, archived: true } : rest;
+    }
+    return this.later(undefined);
   }
 
   queue(threadId: string) {
@@ -1393,7 +1713,7 @@ class DemoApiClient implements ApiClient {
     await this.later(undefined);
   }
 
-  subagents(threadId: string, _cursor?: string): Promise<CursorPage<SubagentSummary>> {
+  subagents(threadId: string, _cursor?: string): Promise<SubagentCursorPage> {
     if (threadId === "thread-active") return this.later({ items: demoSubagents });
     return this.later({
       items: [...demoSubagents, ...this.createdSubagents].filter(
@@ -1442,6 +1762,59 @@ class DemoApiClient implements ApiClient {
     return this.later({ ...listing, projectId });
   }
 
+  fileRoots() {
+    return this.later<FileRoot[]>([
+      {
+        id: "host-root:C",
+        kind: "host",
+        name: "C:",
+        rootLabel: "C:\\",
+      },
+      {
+        id: "host-root:V",
+        kind: "host",
+        name: "V:",
+        rootLabel: "V:\\",
+      },
+    ]);
+  }
+
+  createFolder(_projectId: string, _path: string) {
+    return this.later(undefined);
+  }
+
+  writeHostFile(_projectId: string, _path: string, _file: File, _overwrite = false) {
+    return this.later(undefined);
+  }
+
+  renameHostFile(_projectId: string, _path: string, _name: string) {
+    return this.later(undefined);
+  }
+
+  copyHostFile(_input: {
+    sourceProjectId: string;
+    sourcePath: string;
+    targetProjectId: string;
+    targetPath: string;
+    overwrite?: boolean;
+  }) {
+    return this.later(undefined);
+  }
+
+  moveHostFile(_input: {
+    sourceProjectId: string;
+    sourcePath: string;
+    targetProjectId: string;
+    targetPath: string;
+    overwrite?: boolean;
+  }) {
+    return this.later(undefined);
+  }
+
+  deleteHostFile(_projectId: string, _path: string, _permanent = false) {
+    return this.later(undefined);
+  }
+
   async resolveFile(projectId: string | undefined, path: string): Promise<ResolvedFileEntry> {
     const resolvedProjectId = projectId ?? demoProjects[0]?.id ?? "project-console";
     const normalized = path.replaceAll("\\", "/").replace(/^\.\/+/u, "");
@@ -1480,7 +1853,7 @@ class DemoApiClient implements ApiClient {
   subscribe(
     _onEvent: (event: RemoteEvent) => void,
     onConnection: (online: boolean) => void,
-    _options: { threadId?: string } = {},
+    _options: { cursor?: string; threadId?: string } = {},
   ) {
     onConnection(true);
     return () => undefined;

@@ -56,6 +56,36 @@ describe("SidecarStateStore", () => {
     });
   });
 
+  it("persists mutation reservations so a process restart cannot execute the same intent twice", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    const scope = "session-digest:POST:/threads/:threadId/turns:threadId=thread-1:intent-1";
+
+    await expect(store.reserveMutation(scope, 1_000)).resolves.toBe("reserved");
+    await store.completeMutation(scope, 1_001);
+
+    const reopened = await SidecarStateStore.open(directory);
+    await expect(reopened.reserveMutation(scope, 1_002)).resolves.toBe("completed");
+  });
+
+  it("releases a failed mutation reservation while retaining an unknown crash reservation", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+
+    await expect(store.reserveMutation("failed-intent", 1_000)).resolves.toBe("reserved");
+    await store.releaseMutation("failed-intent");
+    await expect(store.reserveMutation("failed-intent", 1_001)).resolves.toBe("reserved");
+
+    const reopened = await SidecarStateStore.open(directory);
+    await expect(reopened.reserveMutation("failed-intent", 1_002)).resolves.toBe("started");
+  });
+
   it("checks a bound session digest synchronously without extending its idle lifetime", async () => {
     const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
       path.join(os.tmpdir(), "codex-local-remote-state-"),
@@ -104,6 +134,181 @@ describe("SidecarStateStore", () => {
     expect(delivered.listPendingDesktopNotificationThreadIds()).toEqual([]);
   });
 
+  it("atomically releases managed ownership and any pending Desktop notification", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    await store.markManagedThread("thread-being-archived", {
+      desktopNotificationPending: true,
+    });
+
+    await store.unmarkManagedThread("thread-being-archived");
+    await store.unmarkManagedThread("thread-being-archived");
+
+    const reopened = await SidecarStateStore.open(directory);
+    expect(reopened.listManagedThreadIds()).toEqual([]);
+    expect(reopened.listPendingDesktopNotificationThreadIds()).toEqual([]);
+  });
+
+  it("rolls back an in-memory managed mark after persistence fails and allows an exact retry", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    const statePath = path.join(directory, "state.json");
+    await mkdir(statePath);
+
+    await expect(
+      store.markManagedThread("thread-mark-retry", { desktopNotificationPending: true }),
+    ).rejects.toThrow();
+    expect(store.listManagedThreadIds()).toEqual([]);
+    expect(store.listPendingDesktopNotificationThreadIds()).toEqual([]);
+
+    await rm(statePath, { force: true, recursive: true });
+    await expect(
+      store.markManagedThread("thread-mark-retry", { desktopNotificationPending: true }),
+    ).resolves.toBeUndefined();
+    expect(store.listManagedThreadIds()).toEqual(["thread-mark-retry"]);
+    expect(store.listPendingDesktopNotificationThreadIds()).toEqual(["thread-mark-retry"]);
+  });
+
+  it("rolls back an in-memory managed release after persistence fails and allows an exact retry", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    const statePath = path.join(directory, "state.json");
+    await store.markManagedThread("thread-unmark-retry", {
+      desktopNotificationPending: true,
+    });
+    await rm(statePath);
+    await mkdir(statePath);
+
+    await expect(store.unmarkManagedThread("thread-unmark-retry")).rejects.toThrow();
+    expect(store.listManagedThreadIds()).toEqual(["thread-unmark-retry"]);
+    expect(store.listPendingDesktopNotificationThreadIds()).toEqual(["thread-unmark-retry"]);
+
+    await rm(statePath, { force: true, recursive: true });
+    await expect(store.unmarkManagedThread("thread-unmark-retry")).resolves.toBeUndefined();
+    expect(store.listManagedThreadIds()).toEqual([]);
+    expect(store.listPendingDesktopNotificationThreadIds()).toEqual([]);
+  });
+
+  it("recovers a crash-before-archive-RPC intent by restoring its exact prior ownership", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    await store.markManagedThread("thread-crash-before-rpc", {
+      desktopNotificationPending: true,
+    });
+
+    await expect(store.beginArchiveIntent("thread-crash-before-rpc", true)).resolves.toMatchObject({
+      desktopNotificationPending: true,
+      managed: true,
+      targetArchived: true,
+      threadId: "thread-crash-before-rpc",
+    });
+    await store.unmarkManagedThread("thread-crash-before-rpc");
+
+    const restarted = await SidecarStateStore.open(directory);
+    expect(restarted.listManagedThreadIds()).toEqual([]);
+    expect(restarted.listArchiveIntents()).toEqual([
+      {
+        desktopNotificationPending: true,
+        managed: true,
+        targetArchived: true,
+        threadId: "thread-crash-before-rpc",
+      },
+    ]);
+
+    await restarted.settleArchiveIntent("thread-crash-before-rpc", false);
+    const recovered = await SidecarStateStore.open(directory);
+    expect(recovered.listManagedThreadIds()).toEqual(["thread-crash-before-rpc"]);
+    expect(recovered.listPendingDesktopNotificationThreadIds()).toEqual([
+      "thread-crash-before-rpc",
+    ]);
+    expect(recovered.listArchiveIntents()).toEqual([]);
+  });
+
+  it("recovers a success-before-cleanup intent by completing the durable managed release", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    await store.markManagedThread("thread-success-before-cleanup", {
+      desktopNotificationPending: true,
+    });
+    await store.beginArchiveIntent("thread-success-before-cleanup", true);
+    await store.unmarkManagedThread("thread-success-before-cleanup");
+
+    const restarted = await SidecarStateStore.open(directory);
+    await restarted.settleArchiveIntent("thread-success-before-cleanup", true);
+
+    const recovered = await SidecarStateStore.open(directory);
+    expect(recovered.listManagedThreadIds()).toEqual([]);
+    expect(recovered.listPendingDesktopNotificationThreadIds()).toEqual([]);
+    expect(recovered.listArchiveIntents()).toEqual([]);
+  });
+
+  it("retains an unsettled archive intent after one cleanup write failure and retries exactly", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    const statePath = path.join(directory, "state.json");
+    await store.markManagedThread("thread-settle-retry", {
+      desktopNotificationPending: true,
+    });
+    await store.beginArchiveIntent("thread-settle-retry", true);
+    await store.unmarkManagedThread("thread-settle-retry");
+    await rm(statePath);
+    await mkdir(statePath);
+
+    await expect(store.settleArchiveIntent("thread-settle-retry", true)).rejects.toThrow();
+    expect(store.listManagedThreadIds()).toEqual([]);
+    expect(store.listArchiveIntents()).toHaveLength(1);
+
+    await rm(statePath, { force: true, recursive: true });
+    await expect(store.settleArchiveIntent("thread-settle-retry", true)).resolves.toBeUndefined();
+    const recovered = await SidecarStateStore.open(directory);
+    expect(recovered.listManagedThreadIds()).toEqual([]);
+    expect(recovered.listArchiveIntents()).toEqual([]);
+  });
+
+  it("serializes archive state with concurrent session and mutation-receipt persistence", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = await SidecarStateStore.open(directory);
+    await store.markManagedThread("thread-concurrent-archive");
+
+    const [, session] = await Promise.all([
+      store.beginArchiveIntent("thread-concurrent-archive", true),
+      store.createSession(1_000, "csrf-concurrent"),
+    ]);
+    await Promise.all([
+      store.unmarkManagedThread("thread-concurrent-archive"),
+      store.reserveMutation("concurrent-archive-receipt", 1_001),
+    ]);
+
+    const restarted = await SidecarStateStore.open(directory);
+    expect(restarted.listManagedThreadIds()).toEqual([]);
+    expect(restarted.listArchiveIntents()).toHaveLength(1);
+    expect(restarted.findSession(session.token, 1_002)).toMatchObject({ valid: true });
+    await expect(restarted.reserveMutation("concurrent-archive-receipt", 1_003)).resolves.toBe(
+      "started",
+    );
+  });
+
   it.each([1, 2])(
     "migrates schema v%s without treating historical managed threads as pending",
     async (schemaVersion) => {
@@ -130,7 +335,7 @@ describe("SidecarStateStore", () => {
     },
   );
 
-  it("keeps only managed pending ids from the current schema", async () => {
+  it("keeps only managed pending ids from the notification-capable schema", async () => {
     const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
       path.join(os.tmpdir(), "codex-local-remote-state-"),
     );
@@ -150,6 +355,34 @@ describe("SidecarStateStore", () => {
     const restored = await SidecarStateStore.open(directory);
 
     expect(restored.listPendingDesktopNotificationThreadIds()).toEqual(["managed-pending-thread"]);
+  });
+
+  it("migrates schema v4 mutation receipts without inventing archive intents", async () => {
+    const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
+      path.join(os.tmpdir(), "codex-local-remote-state-"),
+    );
+    temporaryDirectories.push(directory);
+    await writeFile(
+      path.join(directory, "state.json"),
+      JSON.stringify({
+        managedThreadIds: [],
+        mutationReceipts: {
+          "completed-schema-v4-receipt": { state: "completed", updatedAtMs: 1_000 },
+        },
+        pendingDesktopNotificationThreadIds: [],
+        projects: [],
+        schemaVersion: 4,
+        sessions: {},
+      }),
+      "utf8",
+    );
+
+    const migrated = await SidecarStateStore.open(directory);
+
+    expect(migrated.listArchiveIntents()).toEqual([]);
+    await expect(migrated.reserveMutation("completed-schema-v4-receipt", 1_001)).resolves.toBe(
+      "completed",
+    );
   });
 
   it("binds a registered root to its directory identity across restarts", async () => {
@@ -175,7 +408,7 @@ describe("SidecarStateStore", () => {
       projects: Array<{ rootIdentity?: { dev?: string; ino?: string } }>;
       schemaVersion: number;
     };
-    expect(persisted.schemaVersion).toBe(3);
+    expect(persisted.schemaVersion).toBe(5);
     expect(persisted.projects[0]?.rootIdentity?.dev).toMatch(/^\d+$/u);
     expect(persisted.projects[0]?.rootIdentity?.ino).toMatch(/^\d+$/u);
     await expect(store.authorizeRegisteredProjectRoot("project-1")).resolves.toBeDefined();

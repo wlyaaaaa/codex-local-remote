@@ -865,12 +865,25 @@ export class DurableTurnOutbox {
       .map((item) => this.#summary(item));
   }
 
+  async reconcilableItems(): Promise<QueuedTurnSummary[]> {
+    await this.#mutationChain;
+    return this.#state.items
+      .filter((item) => item.state === "dispatching" || item.state === "started")
+      .map((item) => this.#summary(item));
+  }
+
   async pendingThreadIds(): Promise<string[]> {
     await this.#mutationChain;
     return [
       ...new Set(
         this.#state.items
-          .filter((item) => item.state === "queued" || item.state === "dispatching")
+          .filter(
+            (item) =>
+              item.state === "queued" ||
+              item.state === "dispatching" ||
+              item.state === "ambiguous" ||
+              item.state === "started",
+          )
           .map((item) => item.threadId),
       ),
     ];

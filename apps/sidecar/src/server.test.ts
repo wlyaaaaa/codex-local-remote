@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -23,6 +23,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setupPassword } from "./auth.js";
 import { BrowserUploadStore } from "./browser-uploads.js";
+import { HostFileStore } from "./host-files.js";
 import {
   createSidecarServer,
   eventMatchesSubscription,
@@ -175,9 +176,10 @@ async function createFixture(
       degradations: [],
     })),
     listProjects,
-    listSubagents: vi.fn(async () => ({ data: [] })),
+    listSubagents: vi.fn<SidecarDomainApi["listSubagents"]>(async () => ({ data: [] })),
     listThreads,
     resumeThread,
+    setThreadArchived: vi.fn(async () => undefined),
     setThreadGoal: vi.fn(async () => undefined),
     setThreadName: vi.fn(async () => undefined),
     startTurn,
@@ -212,33 +214,46 @@ async function createFixture(
     await mkdir(path.dirname(absolutePath), { recursive: true });
     await writeFile(absolutePath, content, "utf8");
   }
-  const app = await createSidecarServer({
-    approvals: new ApprovalCoordinator(events),
-    config: {
-      appServerUrl: "ws://127.0.0.1:18791/",
-      basePath: "/codex-remote",
-      dataDir: directory,
-      desktopSyncEnabled: true,
-      host: "127.0.0.1",
-      port: 18_790,
-      webDir,
+  const hostRoot = path.join(directory, "host-root");
+  await mkdir(hostRoot, { recursive: true });
+  const hostFiles = await HostFileStore.open({
+    recycle: async (absolutePath, isDirectory) => {
+      await rm(absolutePath, { force: true, recursive: isDirectory });
     },
-    diagnostics: () => diagnostics,
-    domain,
-    events,
-    requestReady: requestReady ?? (() => diagnostics.capabilities.appServer === "available"),
-    ...(queue === undefined ? {} : { queue }),
-    state,
+    roots: [{ id: "host-root:test", name: "测试磁盘", path: hostRoot }],
   });
+  const createApp = async (stateOverride: SidecarStateStore = state) =>
+    await createSidecarServer({
+      approvals: new ApprovalCoordinator(events),
+      config: {
+        appServerUrl: "ws://127.0.0.1:18791/",
+        basePath: "/codex-remote",
+        dataDir: directory,
+        desktopSyncEnabled: true,
+        host: "127.0.0.1",
+        port: 18_790,
+        webDir,
+      },
+      diagnostics: () => diagnostics,
+      domain,
+      events,
+      hostFiles,
+      requestReady: requestReady ?? (() => diagnostics.capabilities.appServer === "available"),
+      ...(queue === undefined ? {} : { queue }),
+      state: stateOverride,
+    });
+  const app = await createApp();
   return {
     app,
     compactThread,
+    createApp,
     createThread,
     diagnostics,
     directory,
     domain,
     events,
     getThread,
+    hostRoot,
     listProjects,
     listThreads,
     password,
@@ -274,6 +289,7 @@ async function readEventHandshake(
   cookie: string,
   lastEventId?: string,
   queryCursor?: string,
+  threadId?: string,
 ): Promise<SseFrame[]> {
   if (!fixture.app.server.listening) {
     await fixture.app.listen({ host: "127.0.0.1", port: 0 });
@@ -293,6 +309,9 @@ async function readEventHandshake(
         reject(new Error("Timed out waiting for SSE ready frame"));
       }
     }, 3_000);
+    const query = new URLSearchParams();
+    if (queryCursor !== undefined) query.set("cursor", queryCursor);
+    if (threadId !== undefined) query.set("threadId", threadId);
     const request = httpRequest({
       headers: {
         cookie,
@@ -300,9 +319,7 @@ async function readEventHandshake(
       },
       host: "127.0.0.1",
       method: "GET",
-      path:
-        "/codex-remote/api/v1/events" +
-        (queryCursor === undefined ? "" : `?cursor=${encodeURIComponent(queryCursor)}`),
+      path: `/codex-remote/api/v1/events${query.size === 0 ? "" : `?${query.toString()}`}`,
       port,
     });
     request.on("response", (response) => {
@@ -529,6 +546,162 @@ describe("sidecar REST surface", () => {
     const uploads = await BrowserUploadStore.open(fixture.directory);
     const resolved = await uploads.resolve(reference);
     expect(await readFile(resolved.path, "utf8")).toBe("uploaded from phone");
+
+    const history = await fixture.app.inject({
+      method: "GET",
+      url: `/codex-remote/api/v1/files/resolve?${new URLSearchParams({
+        path: resolved.path,
+      }).toString()}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(history.statusCode).toBe(200);
+    const historyEntry = history.json<{
+      name: string;
+      projectId: string;
+      relativePath: string;
+    }>();
+    expect(historyEntry).toMatchObject({
+      name: "phone-note.txt",
+      projectId: `browser-upload:${reference.uploadId}`,
+      relativePath: "notes/phone-note.txt",
+    });
+
+    const historyQuery = new URLSearchParams({
+      path: historyEntry.relativePath,
+      projectId: historyEntry.projectId,
+    }).toString();
+    const preview = await fixture.app.inject({
+      method: "GET",
+      url: `/codex-remote/api/v1/files/preview?${historyQuery}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.headers["content-type"]).toContain("text/plain");
+    expect(preview.body).toBe("uploaded from phone");
+
+    const download = await fixture.app.inject({
+      method: "GET",
+      url: `/codex-remote/api/v1/files/download?${historyQuery}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.body).toBe("uploaded from phone");
+    await fixture.app.close();
+  });
+
+  it("exposes authenticated full-host file browsing and mutations through the running Windows identity", async () => {
+    const fixture = await createFixture();
+    const session = await login(fixture);
+    await writeFile(path.join(fixture.hostRoot, ".env"), "FULL_HOST_ACCESS=1", "utf8");
+
+    const roots = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/file-roots",
+      headers: { cookie: session.cookie },
+    });
+    expect(roots.statusCode).toBe(200);
+    expect(roots.json()).toEqual([
+      {
+        id: "host-root:test",
+        kind: "host",
+        name: "测试磁盘",
+        rootLabel: fixture.hostRoot,
+      },
+    ]);
+
+    const listing = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/files?projectId=host-root%3Atest&path=",
+      headers: { cookie: session.cookie },
+    });
+    expect(listing.statusCode).toBe(200);
+    expect(listing.json<{ entries: Array<{ name: string }> }>().entries).toContainEqual(
+      expect.objectContaining({ name: ".env" }),
+    );
+
+    const resolved = await fixture.app.inject({
+      method: "GET",
+      url: `/codex-remote/api/v1/files/resolve?${new URLSearchParams({
+        path: path.join(fixture.hostRoot, ".env"),
+      }).toString()}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(resolved.statusCode).toBe(200);
+    const resolvedEntry = resolved.json<{ projectId: string; relativePath: string }>();
+    expect(resolvedEntry.projectId).toMatch(/^host-file:/u);
+    expect(JSON.stringify(resolvedEntry)).not.toContain(fixture.hostRoot);
+
+    const preview = await fixture.app.inject({
+      method: "GET",
+      url: `/codex-remote/api/v1/files/preview?${new URLSearchParams({
+        path: resolvedEntry.relativePath,
+        projectId: resolvedEntry.projectId,
+      }).toString()}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.body).toBe("FULL_HOST_ACCESS=1");
+
+    const mutationHeaders = (idempotencyKey: string) => ({
+      cookie: session.cookie,
+      host: "127.0.0.1:18790",
+      "idempotency-key": idempotencyKey,
+      origin: "http://127.0.0.1:18790",
+      "sec-fetch-site": "same-origin",
+      "x-csrf-token": session.csrfToken,
+    });
+    const folder = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/api/v1/files/folders",
+      headers: mutationHeaders("host-create-folder"),
+      payload: { path: "notes", projectId: "host-root:test" },
+    });
+    expect(folder.statusCode).toBe(204);
+
+    const upload = await fixture.app.inject({
+      method: "PUT",
+      url: `/codex-remote/api/v1/files/content?${new URLSearchParams({
+        path: "notes/one.txt",
+        projectId: "host-root:test",
+      }).toString()}`,
+      headers: {
+        ...mutationHeaders("host-write-file"),
+        "content-type": "application/octet-stream",
+      },
+      payload: Buffer.from("one", "utf8"),
+    });
+    expect(upload.statusCode).toBe(204);
+
+    const renamed = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/api/v1/files/rename",
+      headers: mutationHeaders("host-rename-file"),
+      payload: {
+        name: "renamed.txt",
+        path: "notes/one.txt",
+        projectId: "host-root:test",
+      },
+    });
+    expect(renamed.statusCode).toBe(204);
+    await expect(
+      readFile(path.join(fixture.hostRoot, "notes", "renamed.txt"), "utf8"),
+    ).resolves.toBe("one");
+
+    const deleted = await fixture.app.inject({
+      method: "DELETE",
+      url: "/codex-remote/api/v1/files",
+      headers: mutationHeaders("host-delete-file"),
+      payload: {
+        path: "notes/renamed.txt",
+        permanent: false,
+        projectId: "host-root:test",
+      },
+    });
+    expect(deleted.statusCode).toBe(204);
+    await expect(stat(path.join(fixture.hostRoot, "notes", "renamed.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await fixture.app.close();
   });
 
   it("keeps the full proxy prefix and redirects the bare base path", async () => {
@@ -694,6 +867,52 @@ describe("sidecar REST surface", () => {
     await fixture.app.close();
   });
 
+  it("keeps the subagent array response while exposing truthful history integrity metadata", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    fixture.domain.listSubagents.mockResolvedValue({
+      data: [
+        {
+          threadId: "agent-1",
+          parentThreadId: "thread-1",
+          title: "只读核验",
+          depth: 1,
+          state: "complete",
+          updatedAt: "2026-07-27T00:00:00.000Z",
+          isDirectlyControllable: false,
+        },
+      ],
+      historyIntegrity: {
+        status: "partial",
+        reason: "pagination-pending",
+        observedCount: 1,
+        streams: {
+          current: { status: "more-available", observedCount: 1 },
+          archived: { status: "not-requested", observedCount: 0 },
+        },
+      },
+      nextCursor: "next-agent-page",
+    });
+
+    const response = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-1/subagents",
+      headers: { cookie: authenticated.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toHaveLength(1);
+    expect(response.headers["x-next-cursor"]).toBe("next-agent-page");
+    expect(
+      JSON.parse(decodeURIComponent(String(response.headers["x-subagent-history-integrity"]))),
+    ).toMatchObject({
+      status: "partial",
+      reason: "pagination-pending",
+      observedCount: 1,
+    });
+    await fixture.app.close();
+  });
+
   it("returns dynamic permission profiles for the selected thread without exposing its cwd", async () => {
     const fixture = await createFixture();
     const authenticated = await login(fixture);
@@ -806,6 +1025,379 @@ describe("sidecar REST surface", () => {
     });
     expect(fixture.domain.getThread).toHaveBeenNthCalledWith(1, "thread-recent-cache");
     expect(fixture.domain.getThread).toHaveBeenCalledTimes(1);
+    await fixture.app.close();
+  });
+
+  it("replays the gap after a cached detail watermark to a fresh thread-scoped client exactly once", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    const recentDetail: ThreadDetail = {
+      id: "thread-fresh-mobile",
+      title: "跨端任务",
+      mode: "managed",
+      state: "running",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+      items: [
+        {
+          id: "assistant-old",
+          kind: "assistant-message",
+          text: "旧快照",
+        },
+      ],
+      activeTurnId: "turn-1",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    };
+    fixture.events.append("diagnostic", { message: "快照前事件" });
+    fixture.domain.getThread.mockResolvedValue(recentDetail);
+
+    const cached = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-fresh-mobile",
+      headers: { cookie: authenticated.cookie },
+    });
+    fixture.events.append(
+      "thread.item",
+      {
+        item: [
+          {
+            id: "assistant-new",
+            kind: "assistant-message",
+            text: "手机必须看到的新消息",
+          },
+        ],
+        lifecycle: "completed",
+      },
+      { threadId: "thread-fresh-mobile", turnId: "turn-1" },
+    );
+    fixture.events.append(
+      "thread.item",
+      {
+        item: [
+          {
+            id: "assistant-other",
+            kind: "assistant-message",
+            text: "其他任务消息",
+          },
+        ],
+        lifecycle: "completed",
+      },
+      { threadId: "thread-other", turnId: "turn-other" },
+    );
+
+    const frames = await readEventHandshake(
+      fixture,
+      authenticated.cookie,
+      undefined,
+      undefined,
+      "thread-fresh-mobile",
+    );
+    const refreshed = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-fresh-mobile",
+      headers: { cookie: authenticated.cookie },
+    });
+
+    expect(cached.json()).toMatchObject({
+      items: [{ id: "assistant-old", text: "旧快照" }],
+      snapshotEventSeq: 1,
+    });
+    expect(refreshed.json()).toMatchObject({
+      items: [{ id: "assistant-old", text: "旧快照" }],
+      snapshotEventSeq: 1,
+    });
+    expect(frames.map((frame) => frame.event.type)).toEqual(["thread.item", "connection.ready"]);
+    expect(
+      frames.filter(
+        (frame) =>
+          frame.event.type === "thread.item" &&
+          frame.event.threadId === "thread-fresh-mobile" &&
+          JSON.stringify(frame.event.payload).includes("手机必须看到的新消息"),
+      ),
+    ).toHaveLength(1);
+    expect(JSON.stringify(frames)).not.toContain("其他任务消息");
+    expect(fixture.domain.getThread).toHaveBeenCalledTimes(1);
+    await fixture.app.close();
+  });
+
+  it("registers the detail watermark before its read completes so a concurrent fresh stream cannot miss the gap", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    let markThreadReadStarted: (() => void) | undefined;
+    let releaseThreadRead: ((detail: ThreadDetail) => void) | undefined;
+    const threadReadStarted = new Promise<void>((resolve) => {
+      markThreadReadStarted = resolve;
+    });
+    const pendingThreadRead = new Promise<ThreadDetail>((resolve) => {
+      releaseThreadRead = resolve;
+    });
+    fixture.domain.getThread.mockImplementation(async () => {
+      markThreadReadStarted?.();
+      return await pendingThreadRead;
+    });
+
+    const detailRequest = fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-concurrent-mobile",
+      headers: { cookie: authenticated.cookie },
+    });
+    await threadReadStarted;
+    fixture.events.append(
+      "thread.item",
+      {
+        item: [
+          {
+            id: "assistant-between-detail-and-stream",
+            kind: "assistant-message",
+            text: "并发窗口中的消息",
+          },
+        ],
+        lifecycle: "completed",
+      },
+      { threadId: "thread-concurrent-mobile", turnId: "turn-concurrent" },
+    );
+
+    const frames = await readEventHandshake(
+      fixture,
+      authenticated.cookie,
+      undefined,
+      undefined,
+      "thread-concurrent-mobile",
+    );
+    releaseThreadRead?.({
+      id: "thread-concurrent-mobile",
+      title: "并发任务",
+      mode: "managed",
+      state: "running",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+      items: [],
+      activeTurnId: "turn-concurrent",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    });
+    const detail = await detailRequest;
+
+    expect(detail.json()).toMatchObject({
+      id: "thread-concurrent-mobile",
+      items: [],
+      snapshotEventSeq: 0,
+    });
+    expect(
+      frames.filter(
+        (frame) =>
+          frame.event.type === "thread.item" &&
+          frame.event.threadId === "thread-concurrent-mobile" &&
+          JSON.stringify(frame.event.payload).includes("并发窗口中的消息"),
+      ),
+    ).toHaveLength(1);
+    await fixture.app.close();
+  });
+
+  it("keeps the earliest in-flight detail watermark when a newer concurrent snapshot finishes last", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    const readResolvers: Array<(detail: ThreadDetail) => void> = [];
+    const readStartedResolvers: Array<() => void> = [];
+    const readStarted = [0, 1].map(
+      (index) =>
+        new Promise<void>((resolve) => {
+          readStartedResolvers[index] = resolve;
+        }),
+    );
+    fixture.domain.getThread.mockImplementation(
+      async () =>
+        await new Promise<ThreadDetail>((resolve) => {
+          const index = readResolvers.length;
+          readResolvers.push(resolve);
+          readStartedResolvers[index]?.();
+        }),
+    );
+
+    const olderRequest = fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-two-readers",
+      headers: { cookie: authenticated.cookie },
+    });
+    await readStarted[0];
+    fixture.events.append(
+      "thread.item",
+      {
+        item: [
+          {
+            id: "assistant-between-two-reads",
+            kind: "assistant-message",
+            text: "两个详情读取之间的消息",
+          },
+        ],
+        lifecycle: "completed",
+      },
+      { threadId: "thread-two-readers", turnId: "turn-two-readers" },
+    );
+    const newerRequest = fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-two-readers",
+      headers: { cookie: authenticated.cookie },
+    });
+    await readStarted[1];
+
+    const actions = {
+      changeModelNextTurn: true,
+      interrupt: true,
+      reply: false,
+      steer: true,
+    };
+    readResolvers[0]?.({
+      id: "thread-two-readers",
+      title: "旧快照客户端",
+      mode: "managed",
+      state: "running",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+      items: [],
+      activeTurnId: "turn-two-readers",
+      availableActions: actions,
+    });
+    const olderResponse = await olderRequest;
+    readResolvers[1]?.({
+      id: "thread-two-readers",
+      title: "新快照客户端",
+      mode: "managed",
+      state: "running",
+      updatedAt: "2026-07-27T00:00:01.000Z",
+      items: [
+        {
+          id: "assistant-between-two-reads",
+          kind: "assistant-message",
+          text: "两个详情读取之间的消息",
+          turnId: "turn-two-readers",
+        },
+      ],
+      activeTurnId: "turn-two-readers",
+      availableActions: actions,
+    });
+    const newerResponse = await newerRequest;
+    const olderSnapshot = olderResponse.json<ThreadDetail>();
+    const newerSnapshot = newerResponse.json<ThreadDetail>();
+
+    fixture.domain.getThread.mockImplementation(async (otherThreadId: string) => ({
+      id: otherThreadId,
+      title: `驱逐任务 ${otherThreadId}`,
+      mode: "managed",
+      state: "idle",
+      updatedAt: "2026-07-27T00:00:02.000Z",
+      items: [],
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+    }));
+    for (let index = 0; index < 8; index += 1) {
+      const evicted = await fixture.app.inject({
+        method: "GET",
+        url: `/codex-remote/api/v1/threads/thread-eviction-${index}`,
+        headers: { cookie: authenticated.cookie },
+      });
+      expect(evicted.statusCode).toBe(200);
+    }
+
+    const frames = await readEventHandshake(
+      fixture,
+      authenticated.cookie,
+      undefined,
+      olderSnapshot.snapshotEventCursor,
+      "thread-two-readers",
+    );
+
+    expect(olderSnapshot).toMatchObject({
+      items: [],
+      snapshotEventSeq: 0,
+    });
+    expect(olderSnapshot.snapshotEventCursor).toMatch(/^[0-9a-f-]{36}:0$/u);
+    expect(newerSnapshot).toMatchObject({
+      items: [{ id: "assistant-between-two-reads" }],
+      snapshotEventSeq: 1,
+    });
+    expect(
+      frames.filter(
+        (frame) =>
+          frame.event.type === "thread.item" &&
+          JSON.stringify(frame.event.payload).includes("两个详情读取之间的消息"),
+      ),
+    ).toHaveLength(1);
+    await fixture.app.close();
+  });
+
+  it("advances an expired provisional watermark instead of forcing every later fresh stream to reset", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    const detail: ThreadDetail = {
+      id: "thread-watermark-advance",
+      title: "水位更新",
+      mode: "managed",
+      state: "running",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+      items: [],
+      activeTurnId: "turn-watermark",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    };
+    fixture.domain.getThread.mockResolvedValue(detail);
+
+    await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-watermark-advance",
+      headers: { cookie: authenticated.cookie },
+    });
+    for (let index = 0; index < 9; index += 1) {
+      fixture.events.append("diagnostic", { message: `填充事件 ${index}` });
+    }
+    const refreshed = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/threads/thread-watermark-advance",
+      headers: { cookie: authenticated.cookie },
+    });
+    fixture.events.append(
+      "thread.item",
+      {
+        item: [
+          {
+            id: "assistant-after-watermark-advance",
+            kind: "assistant-message",
+            text: "更新水位后的消息",
+          },
+        ],
+        lifecycle: "completed",
+      },
+      { threadId: "thread-watermark-advance", turnId: "turn-watermark" },
+    );
+
+    const frames = await readEventHandshake(
+      fixture,
+      authenticated.cookie,
+      undefined,
+      undefined,
+      "thread-watermark-advance",
+    );
+
+    expect(refreshed.json()).toMatchObject({
+      id: "thread-watermark-advance",
+      snapshotEventSeq: 9,
+    });
+    expect(frames.map((frame) => frame.event.type)).toEqual(["thread.item", "connection.ready"]);
+    expect(JSON.stringify(frames)).toContain("更新水位后的消息");
     await fixture.app.close();
   });
 
@@ -965,6 +1557,41 @@ describe("sidecar REST surface", () => {
       /^pending-steer-/u,
     );
     await fixture.app.close();
+  });
+
+  it("does not execute a completed mutation again after the Sidecar process restarts", async () => {
+    const fixture = await createFixture();
+    const authenticated = await login(fixture);
+    const request = {
+      method: "POST" as const,
+      url: "/codex-remote/api/v1/threads/thread-new/compact",
+      headers: {
+        cookie: authenticated.cookie,
+        host: "127.0.0.1:18790",
+        origin: "http://127.0.0.1:18790",
+        "sec-fetch-site": "same-origin",
+        "x-csrf-token": authenticated.csrfToken,
+        "idempotency-key": "compact-survives-restart-1",
+      },
+    };
+
+    const first = await fixture.app.inject(request);
+    expect(first.statusCode).toBe(202);
+    expect(fixture.domain.compactThread).toHaveBeenCalledTimes(1);
+    await fixture.app.close();
+
+    const reopenedState = await SidecarStateStore.open(fixture.directory);
+    const restartedApp = await fixture.createApp(reopenedState);
+    const retry = await restartedApp.inject(request);
+
+    expect(retry.statusCode).toBe(409);
+    expect(retry.json()).toMatchObject({
+      error: {
+        code: "IDEMPOTENCY_REPLAY_REQUIRES_REFRESH",
+      },
+    });
+    expect(fixture.domain.compactThread).toHaveBeenCalledTimes(1);
+    await restartedApp.close();
   });
 
   it("withdraws the cross-Web steer alias when Desktop rejects the steer", async () => {
@@ -1159,8 +1786,11 @@ describe("sidecar REST surface", () => {
       headers: { ...mutationHeaders, "idempotency-key": "watermark-turn" },
       payload: { prompt: "继续" },
     });
-    expect(turned.json()).toMatchObject({ id: "thread-watermark", snapshotEventSeq: 2 });
+    expect(turned.json()).toMatchObject({ id: "thread-watermark", snapshotEventSeq: 3 });
     expect(fixture.startTurn).toHaveBeenCalledWith("thread-watermark", { prompt: "继续" });
+    expect(fixture.getThread).toHaveBeenCalledWith("thread-watermark", {
+      includeTurns: false,
+    });
     await fixture.app.close();
   });
 
@@ -1725,6 +2355,76 @@ describe("sidecar REST surface", () => {
     expect(retried.body).toBe("");
     expect(fixture.compactThread).toHaveBeenCalledOnce();
     expect(fixture.compactThread).toHaveBeenCalledWith("thread-new");
+    await fixture.app.close();
+  });
+
+  it("routes rename and archive state through protected idempotent mutations", async () => {
+    const fixture = await createFixture();
+    const origin = "https://phone.example.test";
+    const forwardedHeaders = {
+      host: "127.0.0.1:18790",
+      origin,
+      "sec-fetch-site": "same-origin",
+      "x-forwarded-host": "phone.example.test",
+      "x-forwarded-proto": "https",
+    };
+    const login = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/api/v1/auth/login",
+      remoteAddress: "127.0.0.1",
+      headers: forwardedHeaders,
+      payload: { password: fixture.password },
+    });
+    const session = login.json<{ csrfToken: string }>();
+    const mutationHeaders = (idempotencyKey: string) => ({
+      ...forwardedHeaders,
+      cookie: cookieFrom(login),
+      "idempotency-key": idempotencyKey,
+      "x-csrf-token": session.csrfToken,
+    });
+
+    const renamed = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/name",
+      headers: mutationHeaders("thread-rename-0001"),
+      payload: { name: "新的任务名称" },
+    });
+    const renameRetry = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/name",
+      headers: mutationHeaders("thread-rename-0001"),
+      payload: { name: "新的任务名称" },
+    });
+    expect(renamed.statusCode).toBe(204);
+    expect(renameRetry.statusCode).toBe(204);
+    expect(fixture.domain.setThreadName).toHaveBeenCalledOnce();
+    expect(fixture.domain.setThreadName).toHaveBeenCalledWith("thread-new", "新的任务名称");
+
+    const archived = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/archive",
+      headers: mutationHeaders("thread-archive-001"),
+      payload: { archived: true },
+    });
+    const archiveRetry = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/archive",
+      headers: mutationHeaders("thread-archive-001"),
+      payload: { archived: true },
+    });
+    expect(archived.statusCode).toBe(204);
+    expect(archiveRetry.statusCode).toBe(204);
+    expect(fixture.domain.setThreadArchived).toHaveBeenCalledOnce();
+    expect(fixture.domain.setThreadArchived).toHaveBeenCalledWith("thread-new", true);
+
+    const invalid = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/archive",
+      headers: mutationHeaders("thread-archive-002"),
+      payload: { archived: "yes" },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(fixture.domain.setThreadArchived).toHaveBeenCalledOnce();
     await fixture.app.close();
   });
 

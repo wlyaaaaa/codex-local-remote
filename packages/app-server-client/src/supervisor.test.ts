@@ -9,6 +9,7 @@ import {
   JsonlRpcConnection,
   RpcConnectionClosedError,
   RpcRequestError,
+  type RpcNotification,
 } from "./jsonl-connection.js";
 import {
   AppServerSupervisor,
@@ -69,8 +70,9 @@ function createChildSession(
 
 function createSession(
   request = vi.fn(async (_method: string, _params?: unknown) => ({ ok: true })),
-): AppServerSession & { exit(): void } {
+): AppServerSession & { exit(): void; notification(notification: RpcNotification): void } {
   const exitListeners = new Set<(error?: Error) => void>();
+  const notificationListeners = new Set<(notification: RpcNotification) => void>();
   return {
     capabilities: {
       account: available(),
@@ -92,6 +94,11 @@ function createSession(
         listener(new Error("fixture exit"));
       }
     },
+    notification(notification) {
+      for (const listener of notificationListeners) {
+        listener(notification);
+      }
+    },
     notify: vi.fn(async () => undefined),
     onExit(listener) {
       exitListeners.add(listener);
@@ -99,8 +106,11 @@ function createSession(
         exitListeners.delete(listener);
       };
     },
-    onNotification() {
-      return () => undefined;
+    onNotification(listener) {
+      notificationListeners.add(listener);
+      return () => {
+        notificationListeners.delete(listener);
+      };
     },
     onServerRequest() {
       return () => undefined;
@@ -341,6 +351,39 @@ describe("AppServerSupervisor", () => {
     }
   });
 
+  it("serializes an overlapping stop and start so the old stop cannot overwrite the new session", async () => {
+    const stopGate = Promise.withResolvers<void>();
+    const firstSession = createSession();
+    const firstStop = vi.fn(async () => {
+      await stopGate.promise;
+    });
+    firstSession.stop = firstStop;
+    const secondSession = createSession();
+    const secondStop = vi.fn(async () => undefined);
+    secondSession.stop = secondStop;
+    const sessions = [firstSession, secondSession];
+    const supervisor = new AppServerSupervisor({
+      mode: "shared-websocket",
+      endpoint: "ws://127.0.0.1:4747",
+      connectSharedSession: vi.fn(async () => sessions.shift() ?? createSession()),
+    });
+
+    await supervisor.start();
+    const stopping = supervisor.stop();
+    await vi.waitFor(() => {
+      expect(firstStop).toHaveBeenCalledTimes(1);
+    });
+    const starting = supervisor.start();
+    stopGate.resolve();
+
+    await Promise.all([stopping, starting]);
+
+    expect(supervisor.snapshot().state).toBe("running");
+    await expect(supervisor.request("model/list", {})).resolves.toEqual({ ok: true });
+    expect(secondStop).not.toHaveBeenCalled();
+    await supervisor.stop();
+  });
+
   it("degrades and retries when executable discovery itself fails", async () => {
     vi.useFakeTimers();
     try {
@@ -373,13 +416,17 @@ describe("AppServerSupervisor", () => {
     }
   });
 
-  it("uses only the explicit shared connector, then degrades and reconnects after disconnect", async () => {
+  it("uses only the shared connector, then reconnects and re-subscribes event forwarding", async () => {
     vi.useFakeTimers();
     try {
       const candidateProvider = vi.fn(async () => ({ candidates: [], diagnostics: [] }));
       const launchCandidate = vi.fn(async () => createSession());
       const firstSession = createSession();
-      const secondSession = createSession();
+      const secondRequest = vi.fn(async (_method: string, _params?: unknown) => ({
+        ok: true,
+        session: "second",
+      }));
+      const secondSession = createSession(secondRequest);
       const sessions = [firstSession, secondSession];
       const connectSharedSession = vi.fn(async () => sessions.shift() ?? createSession());
       const supervisor = new AppServerSupervisor({
@@ -390,6 +437,10 @@ describe("AppServerSupervisor", () => {
         launchCandidate,
         restartDelaysMs: [10],
       });
+      const notifications: string[] = [];
+      supervisor.on("notification", (notification) => {
+        notifications.push(notification.method);
+      });
 
       await supervisor.start();
       expect(supervisor.snapshot()).toMatchObject({
@@ -399,15 +450,34 @@ describe("AppServerSupervisor", () => {
       });
       expect(candidateProvider).not.toHaveBeenCalled();
       expect(launchCandidate).not.toHaveBeenCalled();
+      firstSession.notification({ method: "fixture/first-session" });
 
       firstSession.exit();
-      expect(supervisor.snapshot().state).toBe("degraded");
-      await vi.advanceTimersByTimeAsync(10);
+      firstSession.notification({ method: "fixture/stale-session" });
+      expect(supervisor.snapshot()).toMatchObject({
+        restartAttempt: 1,
+        state: "degraded",
+      });
+      await vi.advanceTimersByTimeAsync(9);
+      expect(connectSharedSession).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
 
       expect(connectSharedSession).toHaveBeenCalledTimes(2);
-      expect(supervisor.snapshot().state).toBe("running");
+      expect(supervisor.snapshot()).toMatchObject({
+        restartAttempt: 0,
+        state: "running",
+      });
+      secondSession.notification({ method: "fixture/second-session" });
+      expect(notifications).toEqual(["fixture/first-session", "fixture/second-session"]);
+      await expect(supervisor.request("model/list", {})).resolves.toEqual({
+        ok: true,
+        session: "second",
+      });
+      expect(secondRequest).toHaveBeenCalledTimes(1);
       await supervisor.stop();
       expect((secondSession.stop as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(connectSharedSession).toHaveBeenCalledTimes(2);
       expect(candidateProvider).not.toHaveBeenCalled();
       expect(launchCandidate).not.toHaveBeenCalled();
     } finally {
@@ -456,6 +526,13 @@ class SharedSessionFakeWebSocket extends EventTarget implements WebSocketLike {
     this.dispatchEvent(new MessageEvent("message", { data }));
   }
 
+  remoteClose(code = 1006): void {
+    this.readyState = 3;
+    const event = new Event("close");
+    Object.defineProperty(event, "code", { value: code });
+    this.dispatchEvent(event);
+  }
+
   send(data: string): void {
     this.sent.push(data);
     const request = JSON.parse(data) as {
@@ -483,6 +560,70 @@ class SharedSessionFakeWebSocket extends EventTarget implements WebSocketLike {
     });
   }
 }
+
+describe("AppServerSupervisor shared transport liveness", () => {
+  it("reconnects a real shared session after transport close and reattaches notifications", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = new SharedSessionFakeWebSocket();
+      const second = new SharedSessionFakeWebSocket();
+      const sockets = [first, second];
+      const webSocketFactory = vi.fn(() => {
+        const socket = sockets.shift();
+        if (!socket) {
+          throw new Error("unexpected third shared WebSocket");
+        }
+        queueMicrotask(() => {
+          socket.open();
+        });
+        return socket;
+      });
+      const candidateProvider = vi.fn(async () => ({ candidates: [], diagnostics: [] }));
+      const launchCandidate = vi.fn(async () => createSession());
+      const supervisor = new AppServerSupervisor({
+        candidateProvider,
+        endpoint: "ws://127.0.0.1:4747",
+        launchCandidate,
+        mode: "shared-websocket",
+        restartDelaysMs: [10],
+        webSocketFactory,
+      });
+      const notifications: string[] = [];
+      supervisor.on("notification", (notification) => {
+        notifications.push(notification.method);
+      });
+
+      await supervisor.start();
+      expect(webSocketFactory).toHaveBeenCalledTimes(1);
+      first.remoteClose();
+      expect(supervisor.snapshot()).toMatchObject({
+        restartAttempt: 1,
+        state: "degraded",
+      });
+
+      await vi.advanceTimersByTimeAsync(9);
+      expect(webSocketFactory).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(webSocketFactory).toHaveBeenCalledTimes(2);
+      expect(supervisor.snapshot()).toMatchObject({
+        restartAttempt: 0,
+        state: "running",
+      });
+
+      second.receive(JSON.stringify({ method: "fixture/reconnected-notification" }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(notifications).toEqual(["fixture/reconnected-notification"]);
+
+      await supervisor.stop();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(webSocketFactory).toHaveBeenCalledTimes(2);
+      expect(candidateProvider).not.toHaveBeenCalled();
+      expect(launchCandidate).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("connectSharedAppServerSession", () => {
   it("connects, initializes, probes capabilities, and stop never owns the broker", async () => {

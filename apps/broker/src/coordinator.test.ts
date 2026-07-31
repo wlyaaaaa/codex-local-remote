@@ -27,6 +27,8 @@ interface PairFixture {
   upstream: RecordingWire;
 }
 
+const TEST_DESKTOP_LAUNCH_NONCE_DIGEST = "c".repeat(64);
+
 describe("normalizeThreadTitle", () => {
   it("turns Markdown and percent-encoded URL fragments into readable titles", () => {
     expect(normalizeThreadTitle("https://**steamcommunity.com**/market")).toBe(
@@ -40,12 +42,22 @@ describe("normalizeThreadTitle", () => {
   });
 });
 
-function attach(coordinator: BrokerCoordinator): PairFixture {
+function attach(
+  coordinator: BrokerCoordinator,
+  desktopLaunchNonceDigest: string | null = TEST_DESKTOP_LAUNCH_NONCE_DIGEST,
+): PairFixture {
   const downstream = new RecordingWire();
   const upstream = new RecordingWire();
+  const options: Parameters<BrokerCoordinator["attach"]>[0] & {
+    desktopLaunchNonceDigest?: string;
+  } = {
+    downstream,
+    upstream,
+    ...(desktopLaunchNonceDigest === null ? {} : { desktopLaunchNonceDigest }),
+  };
   return {
     downstream,
-    pair: coordinator.attach({ downstream, upstream }),
+    pair: coordinator.attach(options),
     upstream,
   };
 }
@@ -101,6 +113,47 @@ async function initializeWithClientInfo(
   );
 }
 
+async function initializeWithLoadedThreads(
+  fixture: PairFixture,
+  role: "desktop" | "sidecar",
+  threadIds: string[],
+): Promise<void> {
+  const initializeId = `${role}-initialize-loaded`;
+  await fixture.pair.receiveDownstream(
+    JSON.stringify({
+      id: initializeId,
+      method: "initialize",
+      params: {
+        clientInfo:
+          role === "sidecar"
+            ? { name: "codex-local-remote", version: "fixture" }
+            : {
+                name: "codex-desktop-internal",
+                title: "Codex Desktop",
+                version: "fixture",
+              },
+      },
+    }),
+  );
+  await fixture.pair.receiveUpstream(
+    JSON.stringify({
+      id: initializeId,
+      result: { userAgent: "codex-cli/fixture" },
+    }),
+  );
+  await fixture.pair.receiveDownstream(JSON.stringify({ method: "initialized" }));
+  const loaded = await nextHiddenRequest(fixture, "thread/loaded/list");
+  await fixture.pair.receiveUpstream(
+    JSON.stringify({
+      id: loaded.id,
+      result: { data: threadIds, nextCursor: null },
+    }),
+  );
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 async function nextHiddenRequest(
   fixture: PairFixture,
   method: string,
@@ -132,6 +185,46 @@ function parseRecord(frame: string): Record<string, unknown> {
 
 function methodFrames(fixture: PairFixture, method: string): Record<string, unknown>[] {
   return fixture.upstream.sent.map(parseRecord).filter((message) => message.method === method);
+}
+
+function asTestThreadId(message: Record<string, unknown>): string {
+  const params = message.params as Record<string, unknown> | undefined;
+  if (typeof params?.threadId !== "string") {
+    throw new Error("fixture request has no threadId");
+  }
+  return params.threadId;
+}
+
+async function resumeHistoryThread(
+  source: PairFixture,
+  peer: PairFixture,
+  thread: Record<string, unknown>,
+): Promise<void> {
+  const threadId = String(thread.id);
+  const sourceBefore = source.upstream.sent.length;
+  const peerBefore = peer.upstream.sent.length;
+  const resumed = source.pair.receiveDownstream(
+    JSON.stringify({
+      id: `resume-${threadId}`,
+      method: "thread/resume",
+      params: { excludeTurns: true, threadId },
+    }),
+  );
+  const sourceResume = await nextHiddenRequest(source, "thread/resume", sourceBefore);
+  await source.pair.receiveUpstream(
+    JSON.stringify({
+      id: sourceResume.id,
+      result: { thread },
+    }),
+  );
+  const peerResume = await nextHiddenRequest(peer, "thread/resume", peerBefore);
+  await peer.pair.receiveUpstream(
+    JSON.stringify({
+      id: peerResume.id,
+      result: { thread },
+    }),
+  );
+  await resumed;
 }
 
 describe("BrokerCoordinator subscription barrier", () => {
@@ -671,6 +764,493 @@ describe("BrokerCoordinator subscription barrier", () => {
     expect(methodFrames(desktop, "turn/start")).toHaveLength(1);
   });
 
+  it("atomically blocks a Desktop turn while Sidecar archive is pending and releases after failure", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    await resumeHistoryThread(sidecar, desktop, {
+      id: "thread-archive-race",
+      parentThreadId: null,
+      status: { type: "idle" },
+    });
+    const archiveBefore = sidecar.upstream.sent.length;
+    const archive = sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-race",
+        method: "thread/archive",
+        params: { threadId: "thread-archive-race" },
+      }),
+    );
+    const archiveInspect = await nextHiddenRequest(sidecar, "thread/read", archiveBefore);
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: archiveInspect.id,
+        result: {
+          thread: {
+            id: "thread-archive-race",
+            parentThreadId: null,
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    await archive;
+    expect(methodFrames(sidecar, "thread/archive")).toHaveLength(1);
+
+    await desktop.pair.receiveDownstream(
+      JSON.stringify({
+        id: "desktop-turn-during-archive",
+        method: "turn/start",
+        params: { input: [], threadId: "thread-archive-race" },
+      }),
+    );
+    expect(methodFrames(desktop, "turn/start")).toHaveLength(0);
+    expect(desktop.downstream.sent.map(parseRecord)).toContainEqual({
+      error: { code: -32_094, message: "Thread is being archived" },
+      id: "desktop-turn-during-archive",
+    });
+
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        error: { code: -32_000, message: "fixture archive failed" },
+        id: "archive-race",
+      }),
+    );
+    await desktop.pair.receiveDownstream(
+      JSON.stringify({
+        id: "desktop-turn-after-archive-failure",
+        method: "turn/start",
+        params: { input: [], threadId: "thread-archive-race" },
+      }),
+    );
+    expect(methodFrames(desktop, "turn/start")).toHaveLength(1);
+  });
+
+  it("blocks archive when a turn start has already been reserved", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    await resumeHistoryThread(sidecar, desktop, {
+      id: "thread-turn-first",
+      parentThreadId: null,
+      status: { type: "idle" },
+    });
+
+    await desktop.pair.receiveDownstream(
+      JSON.stringify({
+        id: "desktop-turn-first",
+        method: "turn/start",
+        params: { input: [], threadId: "thread-turn-first" },
+      }),
+    );
+    expect(methodFrames(desktop, "turn/start")).toHaveLength(1);
+
+    await sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-after-turn-reserved",
+        method: "thread/archive",
+        params: { threadId: "thread-turn-first" },
+      }),
+    );
+    expect(methodFrames(sidecar, "thread/archive")).toHaveLength(0);
+    expect(sidecar.downstream.sent.map(parseRecord)).toContainEqual({
+      error: { code: -32_094, message: "Thread has a pending turn" },
+      id: "archive-after-turn-reserved",
+    });
+  });
+
+  it("rejects archive after an authoritative inspection finds an active child", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    coordinator.observeThreadSnapshot("thread-root-active-child", {
+      thread: {
+        id: "thread-root-active-child",
+        parentThreadId: null,
+        status: { type: "idle" },
+      },
+    });
+    coordinator.observeThreadSnapshot("thread-active-child", {
+      thread: {
+        id: "thread-active-child",
+        parentThreadId: "thread-root-active-child",
+        status: { type: "active" },
+      },
+    });
+    const beforeArchive = sidecar.upstream.sent.length;
+    const archive = sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-active-child",
+        method: "thread/archive",
+        params: { threadId: "thread-root-active-child" },
+      }),
+    );
+    const rootInspect = await nextHiddenRequest(sidecar, "thread/read", beforeArchive);
+    const afterRootInspect = sidecar.upstream.sent.length;
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: rootInspect.id,
+        result: {
+          thread: {
+            id: "thread-root-active-child",
+            parentThreadId: null,
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    const childInspect = await nextHiddenRequest(sidecar, "thread/read", afterRootInspect);
+    expect(childInspect.params).toEqual({
+      includeTurns: false,
+      threadId: "thread-active-child",
+    });
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: childInspect.id,
+        result: {
+          thread: {
+            id: "thread-active-child",
+            parentThreadId: "thread-root-active-child",
+            status: { type: "active" },
+          },
+        },
+      }),
+    );
+    await archive;
+
+    expect(methodFrames(sidecar, "thread/archive")).toHaveLength(0);
+    expect(sidecar.downstream.sent.map(parseRecord)).toContainEqual({
+      error: { code: -32_094, message: "Thread already has an active turn" },
+      id: "archive-active-child",
+    });
+  });
+
+  it("hydrates unknown loaded lineage after Broker restart and rejects an active child", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initializeWithLoadedThreads(desktop, "desktop", ["restart-root", "restart-active-child"]);
+    await initializeWithLoadedThreads(sidecar, "sidecar", ["restart-root", "restart-active-child"]);
+    const beforeArchive = sidecar.upstream.sent.length;
+    const archive = sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-after-restart",
+        method: "thread/archive",
+        params: { threadId: "restart-root" },
+      }),
+    );
+
+    let restartReads: Array<Record<string, unknown> & { id: string }> = [];
+    await vi.waitFor(() => {
+      restartReads = sidecar.upstream.sent
+        .slice(beforeArchive)
+        .map(parseRecord)
+        .filter(
+          (message): message is Record<string, unknown> & { id: string } =>
+            message.method === "thread/read" && typeof message.id === "string",
+        );
+      expect(restartReads).toHaveLength(2);
+    });
+    for (const read of restartReads) {
+      const readThreadId = asTestThreadId(read);
+      await sidecar.pair.receiveUpstream(
+        JSON.stringify({
+          id: read.id,
+          result: {
+            thread:
+              readThreadId === "restart-active-child"
+                ? {
+                    id: readThreadId,
+                    parentThreadId: "restart-root",
+                    status: { type: "active" },
+                  }
+                : {
+                    id: readThreadId,
+                    parentThreadId: null,
+                    status: { type: "idle" },
+                  },
+          },
+        }),
+      );
+    }
+    await archive;
+
+    expect(new Set(restartReads.map(asTestThreadId))).toEqual(
+      new Set(["restart-root", "restart-active-child"]),
+    );
+    expect(methodFrames(sidecar, "thread/archive")).toHaveLength(0);
+    expect(sidecar.downstream.sent.map(parseRecord)).toContainEqual({
+      error: { code: -32_094, message: "Thread already has an active turn" },
+      id: "archive-after-restart",
+    });
+  });
+
+  it("rechecks the loaded generation when an unknown active child appears during archive inspection", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initializeWithLoadedThreads(desktop, "desktop", ["generation-root"]);
+    await initializeWithLoadedThreads(sidecar, "sidecar", ["generation-root"]);
+    const beforeArchive = sidecar.upstream.sent.length;
+    const archive = sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-generation-race",
+        method: "thread/archive",
+        params: { threadId: "generation-root" },
+      }),
+    );
+    const rootRead = await nextHiddenRequest(sidecar, "thread/read", beforeArchive);
+
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "generation-active-child",
+          turn: { id: "generation-child-turn" },
+        },
+      }),
+    );
+    const afterRootRead = sidecar.upstream.sent.length;
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: rootRead.id,
+        result: {
+          thread: {
+            id: "generation-root",
+            parentThreadId: null,
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    const childRead = await nextHiddenRequest(sidecar, "thread/read", afterRootRead);
+    expect(childRead.params).toEqual({
+      includeTurns: false,
+      threadId: "generation-active-child",
+    });
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: childRead.id,
+        result: {
+          thread: {
+            id: "generation-active-child",
+            parentThreadId: "generation-root",
+            status: { type: "active" },
+          },
+        },
+      }),
+    );
+    await archive;
+
+    expect(methodFrames(sidecar, "thread/archive")).toHaveLength(0);
+    expect(sidecar.downstream.sent.map(parseRecord)).toContainEqual({
+      error: { code: -32_094, message: "Thread already has an active turn" },
+      id: "archive-generation-race",
+    });
+  });
+
+  it("forgets archived loaded and subscription state even when upstream snapshots stay stale", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    await resumeHistoryThread(sidecar, desktop, {
+      id: "forget-archived-root",
+      parentThreadId: null,
+      status: { type: "idle" },
+    });
+    const archiveBefore = sidecar.upstream.sent.length;
+    const archive = sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-forget-state",
+        method: "thread/archive",
+        params: { threadId: "forget-archived-root" },
+      }),
+    );
+    const archiveInspect = await nextHiddenRequest(sidecar, "thread/read", archiveBefore);
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: archiveInspect.id,
+        result: {
+          thread: {
+            id: "forget-archived-root",
+            parentThreadId: null,
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    await archive;
+    await sidecar.pair.receiveUpstream(JSON.stringify({ id: "archive-forget-state", result: {} }));
+
+    const desktopBeforeList = desktop.upstream.sent.length;
+    const sidecarBeforeList = sidecar.upstream.sent.length;
+    const loadedUnion = coordinator.listLoadedUnion();
+    const desktopList = await nextHiddenRequest(desktop, "thread/loaded/list", desktopBeforeList);
+    const sidecarList = await nextHiddenRequest(sidecar, "thread/loaded/list", sidecarBeforeList);
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        id: desktopList.id,
+        result: { data: ["forget-archived-root"], nextCursor: null },
+      }),
+    );
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: sidecarList.id,
+        result: { data: ["forget-archived-root"], nextCursor: null },
+      }),
+    );
+
+    await expect(loadedUnion).resolves.toEqual([]);
+    expect(coordinator.unsafeThreadCount()).toBe(0);
+  });
+
+  it("unarchives only the notified rollout and keeps archived descendants blocked", () => {
+    const coordinator = new BrokerCoordinator();
+    coordinator.observeThreadSnapshot("unarchive-root", {
+      thread: {
+        id: "unarchive-root",
+        parentThreadId: null,
+        status: { type: "idle" },
+      },
+    });
+    coordinator.observeThreadSnapshot("unarchive-child", {
+      thread: {
+        id: "unarchive-child",
+        parentThreadId: "unarchive-root",
+        status: { type: "idle" },
+      },
+    });
+
+    coordinator.observeThreadArchived("unarchive-root");
+    coordinator.observeThreadUnarchived("unarchive-root");
+
+    expect(() => coordinator.assertTurnStartAllowed("unarchive-root")).not.toThrow();
+    expect(() => coordinator.assertTurnStartAllowed("unarchive-child")).toThrow(
+      "Thread is archived",
+    );
+
+    coordinator.observeThreadUnarchived("unarchive-child");
+    expect(() => coordinator.assertTurnStartAllowed("unarchive-child")).not.toThrow();
+  });
+
+  it("keeps archive protocol-transparent for an empty shell with no rollout", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    const beforeArchive = sidecar.upstream.sent.length;
+    const archive = sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-empty-shell",
+        method: "thread/archive",
+        params: { threadId: "empty-shell" },
+      }),
+    );
+    const inspect = await nextHiddenRequest(sidecar, "thread/read", beforeArchive);
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        error: { code: -32_000, message: "no rollout found for thread empty-shell" },
+        id: inspect.id,
+      }),
+    );
+    await archive;
+
+    expect(methodFrames(sidecar, "thread/archive")).toEqual([
+      {
+        id: "archive-empty-shell",
+        method: "thread/archive",
+        params: { threadId: "empty-shell" },
+      },
+    ]);
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        error: { code: -32_123, message: "official archive error" },
+        id: "archive-empty-shell",
+      }),
+    );
+    expect(sidecar.downstream.sent.map(parseRecord)).toContainEqual({
+      error: { code: -32_123, message: "official archive error" },
+      id: "archive-empty-shell",
+    });
+  });
+
+  it("extends a pending root archive lock to a child discovered by Desktop", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    await resumeHistoryThread(sidecar, desktop, {
+      id: "thread-root-archive",
+      parentThreadId: null,
+      status: { type: "idle" },
+    });
+    const archiveBefore = sidecar.upstream.sent.length;
+    const archive = sidecar.pair.receiveDownstream(
+      JSON.stringify({
+        id: "archive-root",
+        method: "thread/archive",
+        params: { threadId: "thread-root-archive" },
+      }),
+    );
+    const archiveInspect = await nextHiddenRequest(sidecar, "thread/read", archiveBefore);
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: archiveInspect.id,
+        result: {
+          thread: {
+            id: "thread-root-archive",
+            parentThreadId: null,
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    await archive;
+
+    await desktop.pair.receiveDownstream(
+      JSON.stringify({
+        id: "desktop-resume-late-child",
+        method: "thread/resume",
+        params: { excludeTurns: true, threadId: "thread-late-child" },
+      }),
+    );
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        id: "desktop-resume-late-child",
+        result: {
+          thread: {
+            id: "thread-late-child",
+            parentThreadId: "thread-root-archive",
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    await desktop.pair.receiveDownstream(
+      JSON.stringify({
+        id: "desktop-turn-late-child",
+        method: "turn/start",
+        params: { input: [], threadId: "thread-late-child" },
+      }),
+    );
+
+    expect(methodFrames(desktop, "turn/start")).toHaveLength(0);
+    expect(desktop.downstream.sent.map(parseRecord)).toContainEqual({
+      error: { code: -32_094, message: "Thread is being archived" },
+      id: "desktop-turn-late-child",
+    });
+  });
+
   it("accepts loaded subscriptions after a desktop reconnect without resuming its own threads", async () => {
     const coordinator = new BrokerCoordinator();
     const firstDesktop = attach(coordinator);
@@ -709,6 +1289,8 @@ describe("BrokerCoordinator subscription barrier", () => {
       expect(coordinator.snapshot()).toEqual({
         degraded: false,
         desktopConnected: true,
+        desktopConnectionCount: 1,
+        desktopLaunchNonceDigests: [TEST_DESKTOP_LAUNCH_NONCE_DIGEST],
         sidecarConnected: false,
         unknownCount: 0,
       });
@@ -718,9 +1300,251 @@ describe("BrokerCoordinator subscription barrier", () => {
       reconnected.downstream.sent.some((frame) => frame.includes(BROKER_HIDDEN_ID_PREFIX)),
     ).toBe(false);
   });
+
+  it("never resumes the same connection that delivered turn/started", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    const desktopOffset = desktop.upstream.sent.length;
+    const sidecarOffset = sidecar.upstream.sent.length;
+
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "thread-source-subscribed",
+          turn: { id: "turn-source-subscribed" },
+        },
+      }),
+    );
+
+    const peerResume = await nextHiddenRequest(sidecar, "thread/resume", sidecarOffset);
+    expect(peerResume.params).toEqual({
+      excludeTurns: true,
+      threadId: "thread-source-subscribed",
+    });
+    expect(
+      desktop.upstream.sent
+        .slice(desktopOffset)
+        .map(parseRecord)
+        .filter((message) => message.method === "thread/resume"),
+    ).toEqual([]);
+    coordinator.stop();
+  });
+
+  it("remembers a successful Desktop history resume before a peer starts the next turn", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    const desktopResumeOffset = desktop.upstream.sent.length;
+
+    await desktop.pair.receiveDownstream(
+      JSON.stringify({
+        id: "desktop-history-resume",
+        method: "thread/resume",
+        params: { threadId: "thread-history-subscribed" },
+      }),
+    );
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        id: "desktop-history-resume",
+        result: {
+          thread: {
+            id: "thread-history-subscribed",
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    const desktopAfterResume = desktop.upstream.sent.length;
+
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "thread-history-subscribed",
+          turn: { id: "turn-from-peer" },
+        },
+      }),
+    );
+
+    expect(
+      desktop.upstream.sent
+        .slice(desktopAfterResume)
+        .map(parseRecord)
+        .filter((message) => message.method === "thread/resume"),
+    ).toEqual([]);
+    expect(
+      desktop.upstream.sent
+        .slice(desktopResumeOffset)
+        .map(parseRecord)
+        .filter(
+          (message) =>
+            message.method === "thread/resume" && message.id === "desktop-history-resume",
+        ),
+    ).toHaveLength(1);
+    coordinator.stop();
+  });
+
+  it("does not let a delayed subscription snapshot resurrect a completed turn", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    const sidecar = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await initialize(sidecar, "sidecar");
+    const sidecarOffset = sidecar.upstream.sent.length;
+
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "thread-delayed-snapshot",
+          turn: { id: "turn-delayed-snapshot" },
+        },
+      }),
+    );
+    const delayedResume = await nextHiddenRequest(sidecar, "thread/resume", sidecarOffset);
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/completed",
+        params: {
+          threadId: "thread-delayed-snapshot",
+          turn: { id: "turn-delayed-snapshot" },
+        },
+      }),
+    );
+    expect(coordinator.unsafeThreadCount()).toBe(0);
+
+    await sidecar.pair.receiveUpstream(
+      JSON.stringify({
+        id: delayedResume.id,
+        result: {
+          thread: {
+            id: "thread-delayed-snapshot",
+            status: { type: "active" },
+          },
+        },
+      }),
+    );
+    const unsafeAfterDelayedResume = coordinator.unsafeThreadCount();
+    coordinator.stop();
+
+    expect(unsafeAfterDelayedResume).toBe(0);
+  });
 });
 
 describe("BrokerCoordinator client identity and readiness", () => {
+  it("rejects non-SHA-256 launch identity metadata before creating a connection", () => {
+    const coordinator = new BrokerCoordinator();
+
+    expect(() => attach(coordinator, "not-a-digest")).toThrow("desktop launch nonce digest");
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
+      unknownCount: 0,
+    });
+  });
+
+  it("rejects a legacy Desktop without a launch nonce while allowing a nonce-free Sidecar", async () => {
+    const coordinator = new BrokerCoordinator();
+    const legacyDesktop = attach(coordinator, null);
+
+    await legacyDesktop.pair.receiveDownstream(
+      JSON.stringify({
+        id: "legacy-desktop-initialize",
+        method: "initialize",
+        params: {
+          clientInfo: {
+            name: "codex-desktop-internal",
+            title: "Codex Desktop",
+            version: "fixture",
+          },
+        },
+      }),
+    );
+
+    expect(legacyDesktop.upstream.sent).toEqual([]);
+    expect(legacyDesktop.downstream.closes).toEqual([
+      { code: 1008, reason: "Codex Desktop launch identity is required" },
+    ]);
+    expect(legacyDesktop.upstream.closes).toEqual([
+      { code: 1008, reason: "Codex Desktop launch identity is required" },
+    ]);
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnected: false,
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
+      sidecarConnected: false,
+      unknownCount: 0,
+    });
+
+    const sidecar = attach(coordinator, null);
+    await initialize(sidecar, "sidecar");
+
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnected: false,
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
+      sidecarConnected: true,
+      unknownCount: 0,
+    });
+  });
+
+  it("attributes only initialized Desktop connections and removes exact launch digests on close", async () => {
+    const ownDigest = "a".repeat(64);
+    const foreignDigest = "b".repeat(64);
+    const coordinator = new BrokerCoordinator();
+    const firstOwn = attach(coordinator, ownDigest);
+    const secondOwn = attach(coordinator, ownDigest);
+    const foreign = attach(coordinator, foreignDigest);
+    const thirdOwn = attach(coordinator, ownDigest);
+    const sidecar = attach(coordinator, foreignDigest);
+
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
+      unknownCount: 5,
+    });
+
+    await initialize(firstOwn, "desktop");
+    await initialize(secondOwn, "desktop");
+    await initialize(foreign, "desktop");
+    await initialize(thirdOwn, "desktop");
+    await initialize(sidecar, "sidecar");
+
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnected: true,
+      desktopConnectionCount: 4,
+      desktopLaunchNonceDigests: [ownDigest, ownDigest, ownDigest, foreignDigest],
+      sidecarConnected: true,
+      unknownCount: 0,
+    });
+
+    foreign.pair.close();
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnectionCount: 3,
+      desktopLaunchNonceDigests: [ownDigest, ownDigest, ownDigest],
+    });
+
+    thirdOwn.pair.close();
+    firstOwn.pair.close();
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnectionCount: 1,
+      desktopLaunchNonceDigests: [ownDigest],
+    });
+
+    secondOwn.pair.close();
+    expect(coordinator.snapshot()).toMatchObject({
+      desktopConnected: false,
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
+    });
+  });
+
   it("activates Codex Desktop after initialize succeeds without an initialized notification", async () => {
     const coordinator = new BrokerCoordinator();
     const desktop = attach(coordinator);
@@ -754,6 +1578,8 @@ describe("BrokerCoordinator client identity and readiness", () => {
       expect(coordinator.snapshot()).toEqual({
         degraded: false,
         desktopConnected: true,
+        desktopConnectionCount: 1,
+        desktopLaunchNonceDigests: [TEST_DESKTOP_LAUNCH_NONCE_DIGEST],
         sidecarConnected: false,
         unknownCount: 0,
       });
@@ -780,6 +1606,8 @@ describe("BrokerCoordinator client identity and readiness", () => {
     expect(coordinator.snapshot()).toEqual({
       degraded: false,
       desktopConnected: false,
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
       sidecarConnected: false,
       unknownCount: 0,
     });
@@ -810,6 +1638,8 @@ describe("BrokerCoordinator client identity and readiness", () => {
     expect(coordinator.snapshot()).toEqual({
       degraded: false,
       desktopConnected: false,
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
       sidecarConnected: true,
       unknownCount: 0,
     });
@@ -837,6 +1667,8 @@ describe("BrokerCoordinator client identity and readiness", () => {
     expect(coordinator.snapshot()).toEqual({
       degraded: false,
       desktopConnected: false,
+      desktopConnectionCount: 0,
+      desktopLaunchNonceDigests: [],
       sidecarConnected: false,
       unknownCount: 0,
     });
@@ -938,6 +1770,8 @@ describe("BrokerCoordinator client identity and readiness", () => {
       expect(coordinator.snapshot()).toEqual({
         degraded: false,
         desktopConnected: true,
+        desktopConnectionCount: 1,
+        desktopLaunchNonceDigests: [TEST_DESKTOP_LAUNCH_NONCE_DIGEST],
         sidecarConnected: true,
         unknownCount: 0,
       });
@@ -996,6 +1830,8 @@ describe("BrokerCoordinator client identity and readiness", () => {
       expect(coordinator.snapshot()).toEqual({
         degraded: false,
         desktopConnected: true,
+        desktopConnectionCount: 1,
+        desktopLaunchNonceDigests: [TEST_DESKTOP_LAUNCH_NONCE_DIGEST],
         sidecarConnected: false,
         unknownCount: 0,
       });

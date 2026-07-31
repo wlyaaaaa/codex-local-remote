@@ -445,10 +445,10 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
   #diagnostics: CodexDiscoveryDiagnostic[] = [];
   #detachSessionListeners: Array<() => void> = [];
   #intendedRunning = false;
+  #lifecycleChain: Promise<void> = Promise.resolve();
   #restartAttempt = 0;
   #restartTimer: NodeJS.Timeout | undefined;
   #session: AppServerSession | undefined;
-  #startPromise: Promise<void> | undefined;
   #state: AppServerSupervisorSnapshot["state"] = "stopped";
 
   constructor(options: AppServerSupervisorOptions = {}) {
@@ -507,19 +507,12 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
 
   async start(): Promise<void> {
     this.#intendedRunning = true;
-    if (this.#session) {
-      return;
-    }
-    if (this.#startPromise) {
-      return await this.#startPromise;
-    }
-
-    this.#startPromise = this.#startNow();
-    try {
-      await this.#startPromise;
-    } finally {
-      this.#startPromise = undefined;
-    }
+    await this.#enqueueLifecycle(async () => {
+      if (!this.#intendedRunning || this.#session) {
+        return;
+      }
+      await this.#startNow();
+    });
   }
 
   async stop(): Promise<void> {
@@ -528,14 +521,16 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
       clearTimeout(this.#restartTimer);
       this.#restartTimer = undefined;
     }
-    this.#detachActiveSession();
-    const session = this.#session;
-    this.#session = undefined;
-    if (session) {
-      await session.stop();
-    }
-    this.#restartAttempt = 0;
-    this.#setState("stopped");
+    await this.#enqueueLifecycle(async () => {
+      this.#detachActiveSession();
+      const session = this.#session;
+      this.#session = undefined;
+      if (session) {
+        await session.stop();
+      }
+      this.#restartAttempt = 0;
+      this.#setState("stopped");
+    });
   }
 
   async request<T = unknown>(
@@ -583,6 +578,15 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
           }
         : {}),
     };
+  }
+
+  #enqueueLifecycle(operation: () => Promise<void>): Promise<void> {
+    const result = this.#lifecycleChain.then(operation, operation);
+    this.#lifecycleChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   async #startNow(): Promise<void> {

@@ -93,4 +93,31 @@ describe("LoadedThreadRegistry", () => {
 
     expect(registry.union()).toEqual(["valid"]);
   });
+
+  it("forgets archived threads from every connection and transient source", () => {
+    const registry = new LoadedThreadRegistry();
+    registry.replaceConnection(1, ["archived-root", "archived-child", "keep"]);
+    registry.replaceConnection(2, ["archived-root", "other"]);
+    registry.remember("archived-child", [1, 2]);
+    registry.markInFlight("archived-root");
+
+    registry.forget(["archived-root", "archived-child"]);
+
+    expect(registry.union()).toEqual(["keep", "other"]);
+  });
+
+  it("increments its revision for every applied union mutation", () => {
+    const registry = new LoadedThreadRegistry();
+    const initial = registry.revision();
+
+    registry.replaceConnection(1, ["thread-a"]);
+    const afterSnapshot = registry.revision();
+    registry.markInFlight("thread-b");
+    const afterInFlight = registry.revision();
+    registry.forget(["thread-a"]);
+
+    expect(afterSnapshot).toBeGreaterThan(initial);
+    expect(afterInFlight).toBeGreaterThan(afterSnapshot);
+    expect(registry.revision()).toBeGreaterThan(afterInFlight);
+  });
 });

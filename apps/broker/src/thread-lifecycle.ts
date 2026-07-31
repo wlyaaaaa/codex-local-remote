@@ -6,6 +6,12 @@ export interface TurnStartReservation {
   token: number;
 }
 
+export interface ThreadArchiveReservation {
+  ownerConnectionId: number;
+  rootThreadId: string;
+  token: number;
+}
+
 export interface ThreadLifecycleSnapshot {
   ownerConnectionId?: number;
   phase: "active" | "checking" | "idle" | "reserved" | "unknown";
@@ -14,6 +20,7 @@ export interface ThreadLifecycleSnapshot {
 }
 
 type LifecycleEntry = ThreadLifecycleSnapshot;
+type ArchiveEntry = ThreadArchiveReservation;
 
 export class TurnStartConflictError extends Error {
   readonly code = -32_094;
@@ -32,8 +39,10 @@ export class TurnStartConflictError extends Error {
  * client request may be forwarded.
  */
 export class ThreadLifecycleArbiter {
+  readonly #archiveEntries = new Map<string, ArchiveEntry>();
   readonly #completedTurnIds = new Map<string, string[]>();
   readonly #entries = new Map<string, LifecycleEntry>();
+  readonly #revisions = new Map<string, number>();
   #nextToken = 1;
 
   async reserve(
@@ -42,6 +51,7 @@ export class ThreadLifecycleArbiter {
     inspect: () => Promise<AuthoritativeThreadState>,
   ): Promise<TurnStartReservation> {
     const normalized = requireThreadId(threadId);
+    this.assertNotArchiving(normalized);
     const current = this.#entries.get(normalized);
     if (current?.phase === "checking" || current?.phase === "reserved") {
       throw new TurnStartConflictError();
@@ -54,7 +64,7 @@ export class ThreadLifecycleArbiter {
       token,
     };
     if (current?.phase === "idle") {
-      this.#entries.set(normalized, {
+      this.#set(normalized, {
         ownerConnectionId,
         phase: "reserved",
         token,
@@ -62,7 +72,7 @@ export class ThreadLifecycleArbiter {
       return reservation;
     }
 
-    this.#entries.set(normalized, {
+    this.#set(normalized, {
       ownerConnectionId,
       phase: "checking",
       token,
@@ -72,7 +82,7 @@ export class ThreadLifecycleArbiter {
       observed = await inspect();
     } catch (error) {
       if (this.#matches(reservation, "checking")) {
-        this.#entries.set(normalized, { phase: "unknown" });
+        this.#set(normalized, { phase: "unknown" });
       }
       throw error;
     }
@@ -80,7 +90,7 @@ export class ThreadLifecycleArbiter {
       throw new TurnStartConflictError("Thread lifecycle changed during the idle check");
     }
     if (observed !== "idle") {
-      this.#entries.set(
+      this.#set(
         normalized,
         observed === "active"
           ? {
@@ -99,12 +109,81 @@ export class ThreadLifecycleArbiter {
           : "Thread idle state could not be confirmed",
       );
     }
-    this.#entries.set(normalized, {
+    this.#set(normalized, {
       ownerConnectionId,
       phase: "reserved",
       token,
     });
     return reservation;
+  }
+
+  reserveArchive(
+    rootThreadId: string,
+    descendantThreadIds: Iterable<string>,
+    ownerConnectionId: number,
+  ): ThreadArchiveReservation {
+    const normalizedRoot = requireThreadId(rootThreadId);
+    const threadIds = new Set<string>([
+      normalizedRoot,
+      ...[...descendantThreadIds].map(requireThreadId),
+    ]);
+    const reservation: ThreadArchiveReservation = {
+      ownerConnectionId,
+      rootThreadId: normalizedRoot,
+      token: this.#nextToken++,
+    };
+    this.#assertArchiveExtensionSafe(reservation, threadIds);
+    for (const threadId of threadIds) {
+      this.#archiveEntries.set(threadId, reservation);
+    }
+    return reservation;
+  }
+
+  extendArchive(
+    reservation: ThreadArchiveReservation,
+    descendantThreadIds: Iterable<string>,
+  ): void {
+    if (!this.ownsArchive(reservation)) {
+      throw new TurnStartConflictError("Thread archive reservation is no longer active");
+    }
+    const threadIds = new Set([...descendantThreadIds].map(requireThreadId));
+    this.#assertArchiveExtensionSafe(reservation, threadIds);
+    for (const threadId of threadIds) {
+      this.#archiveEntries.set(threadId, reservation);
+    }
+  }
+
+  releaseArchive(reservation: ThreadArchiveReservation): void {
+    for (const [threadId, entry] of this.#archiveEntries) {
+      if (sameArchiveReservation(entry, reservation)) {
+        this.#archiveEntries.delete(threadId);
+      }
+    }
+  }
+
+  ownsArchive(reservation: ThreadArchiveReservation): boolean {
+    const rootEntry = this.#archiveEntries.get(reservation.rootThreadId);
+    return rootEntry !== undefined && sameArchiveReservation(rootEntry, reservation);
+  }
+
+  assertNotArchiving(threadId: string): void {
+    if (this.#archiveEntries.has(requireThreadId(threadId))) {
+      throw new TurnStartConflictError("Thread is being archived");
+    }
+  }
+
+  hasArchiveReservations(): boolean {
+    return this.#archiveEntries.size > 0;
+  }
+
+  forget(threadIds: Iterable<string>): void {
+    for (const rawThreadId of threadIds) {
+      const threadId = requireThreadId(rawThreadId);
+      this.#archiveEntries.delete(threadId);
+      this.#completedTurnIds.delete(threadId);
+      this.#entries.delete(threadId);
+      this.#revisions.delete(threadId);
+    }
   }
 
   activate(reservation: TurnStartReservation, turnId: string): void {
@@ -113,10 +192,10 @@ export class ThreadLifecycleArbiter {
       return;
     }
     if (this.#completedTurnIds.get(reservation.threadId)?.includes(normalizedTurnId)) {
-      this.#entries.set(reservation.threadId, { phase: "idle" });
+      this.#set(reservation.threadId, { phase: "idle" });
       return;
     }
-    this.#entries.set(reservation.threadId, {
+    this.#set(reservation.threadId, {
       ownerConnectionId: reservation.ownerConnectionId,
       phase: "active",
       token: reservation.token,
@@ -126,13 +205,13 @@ export class ThreadLifecycleArbiter {
 
   release(reservation: TurnStartReservation): void {
     if (this.#matches(reservation, "checking", "reserved")) {
-      this.#entries.set(reservation.threadId, { phase: "idle" });
+      this.#set(reservation.threadId, { phase: "idle" });
     }
   }
 
   markUnknown(reservation: TurnStartReservation): void {
     if (this.#matches(reservation, "checking", "reserved", "active")) {
-      this.#entries.set(reservation.threadId, { phase: "unknown" });
+      this.#set(reservation.threadId, { phase: "unknown" });
     }
   }
 
@@ -143,7 +222,7 @@ export class ThreadLifecycleArbiter {
       return;
     }
     const current = this.#entries.get(normalized);
-    this.#entries.set(normalized, {
+    this.#set(normalized, {
       ...(current?.ownerConnectionId === undefined
         ? {}
         : { ownerConnectionId: current.ownerConnectionId }),
@@ -168,8 +247,12 @@ export class ThreadLifecycleArbiter {
       current?.phase === "active" &&
       (current.turnId === undefined || current.turnId === normalizedTurnId)
     ) {
-      this.#entries.set(normalized, { phase: "idle" });
+      this.#set(normalized, { phase: "idle" });
     }
+  }
+
+  revision(threadId: string): number {
+    return this.#revisions.get(requireThreadId(threadId)) ?? 0;
   }
 
   observeStatus(threadId: string, status: AuthoritativeThreadState): void {
@@ -179,14 +262,14 @@ export class ThreadLifecycleArbiter {
       if (current?.phase === "checking" || current?.phase === "reserved") {
         return;
       }
-      this.#entries.set(normalized, { phase: "idle" });
+      this.#set(normalized, { phase: "idle" });
       return;
     }
     if (status === "active") {
       if (current?.phase === "checking" || current?.phase === "reserved") {
         return;
       }
-      this.#entries.set(normalized, {
+      this.#set(normalized, {
         ...(current?.ownerConnectionId === undefined
           ? {}
           : { ownerConnectionId: current.ownerConnectionId }),
@@ -197,17 +280,35 @@ export class ThreadLifecycleArbiter {
       return;
     }
     if (!current) {
-      this.#entries.set(normalized, { phase: "unknown" });
+      this.#set(normalized, { phase: "unknown" });
     }
   }
 
+  observeStatusAtRevision(
+    threadId: string,
+    status: AuthoritativeThreadState,
+    expectedRevision: number,
+  ): boolean {
+    const normalized = requireThreadId(threadId);
+    if (this.revision(normalized) !== expectedRevision) {
+      return false;
+    }
+    this.observeStatus(normalized, status);
+    return true;
+  }
+
   connectionClosed(connectionId: number): void {
+    for (const [threadId, entry] of this.#archiveEntries) {
+      if (entry.ownerConnectionId === connectionId) {
+        this.#archiveEntries.delete(threadId);
+      }
+    }
     for (const [threadId, entry] of this.#entries) {
       if (
         entry.ownerConnectionId === connectionId &&
         (entry.phase === "checking" || entry.phase === "reserved" || entry.phase === "active")
       ) {
-        this.#entries.set(threadId, { phase: "unknown" });
+        this.#set(threadId, { phase: "unknown" });
       }
     }
   }
@@ -218,16 +319,34 @@ export class ThreadLifecycleArbiter {
   }
 
   unsafeThreadCount(): number {
-    let count = 0;
-    for (const entry of this.#entries.values()) {
-      if (entry.phase !== "idle") count += 1;
+    const unsafeThreadIds = new Set(this.#archiveEntries.keys());
+    for (const [threadId, entry] of this.#entries) {
+      if (entry.phase !== "idle") unsafeThreadIds.add(threadId);
     }
-    return count;
+    return unsafeThreadIds.size;
   }
 
   clear(): void {
+    this.#archiveEntries.clear();
     this.#completedTurnIds.clear();
     this.#entries.clear();
+    this.#revisions.clear();
+  }
+
+  #assertArchiveExtensionSafe(
+    reservation: ThreadArchiveReservation,
+    threadIds: Iterable<string>,
+  ): void {
+    for (const threadId of threadIds) {
+      const archive = this.#archiveEntries.get(threadId);
+      if (archive !== undefined && !sameArchiveReservation(archive, reservation)) {
+        throw new TurnStartConflictError("Thread is already being archived");
+      }
+      const lifecycle = this.#entries.get(threadId);
+      if (lifecycle?.phase === "checking" || lifecycle?.phase === "reserved") {
+        throw new TurnStartConflictError("Thread has a pending turn");
+      }
+    }
   }
 
   #matches(reservation: TurnStartReservation, ...phases: LifecycleEntry["phase"][]): boolean {
@@ -239,6 +358,22 @@ export class ThreadLifecycleArbiter {
       current.token === reservation.token
     );
   }
+
+  #set(threadId: string, entry: LifecycleEntry): void {
+    this.#entries.set(threadId, entry);
+    this.#revisions.set(threadId, (this.#revisions.get(threadId) ?? 0) + 1);
+  }
+}
+
+function sameArchiveReservation(
+  left: ThreadArchiveReservation,
+  right: ThreadArchiveReservation,
+): boolean {
+  return (
+    left.ownerConnectionId === right.ownerConnectionId &&
+    left.rootThreadId === right.rootThreadId &&
+    left.token === right.token
+  );
 }
 
 function requireThreadId(value: string): string {

@@ -231,8 +231,8 @@ export class TurnQueueDispatcher {
   }
 
   async reconcileAfterRestart(): Promise<void> {
-    const dispatching = await this.#outbox.dispatchingItems();
-    for (const item of dispatching) {
+    const reconcilable = await this.#outbox.reconcilableItems();
+    for (const item of reconcilable) {
       try {
         const result = await this.#gateway.reconcileClientUserMessage(
           item.threadId,
@@ -250,14 +250,32 @@ export class TurnQueueDispatcher {
               status: "failed",
               ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
             });
-          } else {
+          } else if (result.lifecycle === "active" || item.state === "dispatching") {
             await this.#outbox.markStarted(item.id, result.turnId);
+          } else {
+            await this.#outbox.reconcileAcceptedTerminal(item.id, {
+              issue: "PREVIOUS_TURN_RESULT_UNKNOWN_AFTER_RESTART",
+              status: "failed",
+              ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
+            });
           }
+        } else if (item.state === "started") {
+          await this.#outbox.reconcileAcceptedTerminal(item.id, {
+            issue: "PREVIOUS_TURN_RESULT_UNKNOWN_AFTER_RESTART",
+            status: "failed",
+          });
         } else {
           await this.#outbox.markAmbiguous(item.id);
         }
       } catch {
-        await this.#outbox.markAmbiguous(item.id);
+        if (item.state === "started") {
+          await this.#outbox.reconcileAcceptedTerminal(item.id, {
+            issue: "PREVIOUS_TURN_RESULT_UNKNOWN_AFTER_RESTART",
+            status: "failed",
+          });
+        } else {
+          await this.#outbox.markAmbiguous(item.id);
+        }
       }
     }
     const safeThreadIds = await this.#outbox.reconcilePendingAfterRestart();

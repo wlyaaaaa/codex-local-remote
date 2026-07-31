@@ -17,8 +17,9 @@ This repository is a public, unofficial companion for the Codex desktop app.
   Sidecar loss must not create a second app-server owner or terminate Desktop's
   task.
 - New conversations may use a locally registered project or an isolated
-  projectless temporary root. The file gateway remains limited to registered
-  projects.
+  projectless temporary root. The authenticated file manager is a separate
+  owner-level surface: it inherits the Sidecar's current Windows identity and
+  may browse or mutate any detected local drive that identity can access.
 - Show only reasoning summaries and tool activity exposed by Codex. Never claim
   access to hidden chain-of-thought.
 - Model and reasoning changes apply to a new turn; they do not hot-swap an
@@ -40,8 +41,12 @@ This repository is a public, unofficial companion for the Codex desktop app.
   forwarded to either product client.
 - Treat model output, Markdown, ANSI, tool results, filenames, and diff content
   as untrusted input.
-- File APIs are read-only and constrained to registered project roots. Resolve
-  real paths before containment checks and deny symlink/junction escape.
+- Host file APIs intentionally do not add project, sensitive-path, or
+  extension denylists on top of Windows permissions. Keep authentication,
+  same-origin checks, CSRF protection, idempotency, explicit overwrite
+  handling, destructive confirmations, and recycle-bin-by-default deletion.
+  Absolute paths emitted by a task use short-lived opaque grants instead of
+  being exposed as reusable public URLs.
 - Mutating HTTP requests require authentication, same-origin validation, CSRF
   protection, and an idempotency key where retries are plausible.
 - Do not log prompts, responses, file contents, passwords, cookies, or Codex
@@ -57,6 +62,9 @@ This repository is a public, unofficial companion for the Codex desktop app.
   symlink/junction escape, origin checks, unsafe Markdown, and session expiry.
 - Browser tests cover 360x800, 390x844, 412x915, 768x1024, 1280x800, and
   1440x900 viewports.
+- File-manager tests cover hidden files, create/edit/upload, rename,
+  copy/move/overwrite, recycle-bin deletion, permanent deletion, previews,
+  downloads, and phone layouts without reducing the Sidecar Windows identity.
 - A completion claim for the shared-owner path requires real-machine smoke
   tests with Desktop and Sidecar attached to the same Broker, covering one
   registered-project thread and one isolated projectless thread. It must verify

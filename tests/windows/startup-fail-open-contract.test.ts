@@ -10,6 +10,17 @@ function windowsScript(name: string) {
 }
 
 describe("Windows fail-open startup contract", () => {
+  it("loads the persisted non-default listener configuration unless the caller overrides it", () => {
+    const start = windowsScript("Start-CodexLocalRemote.ps1");
+    const launcher = windowsScript("Launch-CodexWithRemote.ps1");
+
+    for (const source of [start, launcher]) {
+      expect(source).toContain("Get-CodexLocalRemoteManagedConfiguration");
+      expect(source).toContain("PSBoundParameters.ContainsKey('BrokerUpstreamPort')");
+      expect(source).toContain("$managedConfiguration.BrokerUpstreamPort");
+    }
+  });
+
   it("never depends on a persistent Desktop WebSocket override", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
 
@@ -37,17 +48,50 @@ describe("Windows fail-open startup contract", () => {
     );
   });
 
-  it("never stops an existing Desktop and delegates automatic recovery to the fail-open launcher", () => {
+  it("keeps the startup task as the sole Desktop owner coordinator", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
 
     expect(start).not.toMatch(/Start-Process[\s\S]{0,160}\$resolvedCodex/u);
     expect(start).not.toMatch(/Stop-Process[\s\S]{0,160}(?:ChatGPT|Desktop)/u);
-    expect(start).toContain("Codex Desktop still owns an independent stdio app-server");
     expect(start).toContain("[switch]$NoDesktopLaunch");
+    expect(start).toContain("[switch]$DesktopOwnerCoordinator");
     expect(start).toContain("function Invoke-ManagedDesktopLaunch");
     expect(start).toContain("Launch-CodexWithRemote.ps1");
-    expect(start).toContain("$initialDesktopLaunch = Invoke-ManagedDesktopLaunch");
-    expect(start).toContain("$desktopRecoveryLaunch = Invoke-ManagedDesktopLaunch");
+    expect(start).toMatch(/\$initialDesktopLaunch\s*=\s*Invoke-WithCodexDesktopOwnerMutex/u);
+    expect(start).toMatch(/\$desktopRecoveryLaunch\s*=\s*Invoke-ManagedDesktopLaunch/u);
+    expect(start).toContain("-DesktopOwnerExecution");
+  });
+
+  it("turns the managed shortcut into a generation-bound launch request", () => {
+    const launcher = windowsScript("Launch-CodexWithRemote.ps1");
+    const start = windowsScript("Start-CodexLocalRemote.ps1");
+    const registration = windowsScript("Register-CodexLocalRemoteStartup.ps1");
+    const module = windowsScript("CodexLocalRemote.Windows.psm1");
+
+    expect(launcher).toContain("[switch]$RequestDesktopLaunch");
+    expect(launcher).toContain("[switch]$DesktopOwnerExecution");
+    expect(launcher).toContain("New-CodexDesktopOwnerIntent");
+    expect(launcher).toContain("Status = 'desktop-owner-requested'");
+    expect(registration).toContain("'-RequestDesktopLaunch'");
+    expect(module).toContain("$legacySuffix = ' -TakeOverExistingNativeDesktop'");
+    expect(module).toContain("$legacySuffix = ' -NoDesktopLaunch'");
+    expect(start).toContain("Get-CodexDesktopOwnerDecision");
+    expect(start).toContain("Complete-CodexDesktopOwnerIntent");
+  });
+
+  it("attempts each native Desktop root identity at most once and never relaunches after user close", () => {
+    const start = windowsScript("Start-CodexLocalRemote.ps1");
+
+    expect(start).toContain("function Get-UniqueCodexDesktopRootIdentityKey");
+    expect(start).toContain("Get-CodexDesktopOwnerRootIdentityKey");
+    expect(start).toContain("-StartTimeUtcTicks ([long]$identityHandle.StartTimeUtcTicks)");
+    expect(start).toContain("-ExecutablePath ([string]$root.ExecutablePath)");
+    expect(start).toContain("LastAttemptedRootIdentityKey = $null");
+    expect(start).toContain("-LastAttemptedRootIdentityKey");
+    expect(start).toContain("$desktopOwnerState.LastAttemptedRootIdentityKey =");
+    expect(start).not.toMatch(
+      /Get-RunningCodexDesktopRootProcesses\)\.Count\s+-eq\s+0[\s\S]{0,500}Invoke-ManagedDesktopLaunch/u,
+    );
   });
 
   it("lets the cold shared runtime finish discovery before falling back to native Desktop", () => {

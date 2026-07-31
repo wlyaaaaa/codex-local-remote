@@ -2,9 +2,8 @@ import type { ConversationItem } from "@codex-local-remote/contracts";
 
 export type ConversationSegment =
   | { kind: "content"; item: ConversationItem }
-  | { kind: "activity"; items: ConversationItem[] }
-  | { kind: "compaction"; item: Extract<ConversationItem, { kind: "tool" }> }
-  | { kind: "subagents"; items: ConversationItem[] };
+  | { kind: "work"; items: ConversationItem[] }
+  | { kind: "compaction"; item: Extract<ConversationItem, { kind: "tool" }> };
 
 export function groupConversationItems(items: readonly ConversationItem[]): ConversationSegment[] {
   const segments: ConversationSegment[] = [];
@@ -13,24 +12,28 @@ export function groupConversationItems(items: readonly ConversationItem[]): Conv
       segments.push({ kind: "compaction", item });
       continue;
     }
-    const segmentKind =
-      item.kind === "tool" || item.kind === "file-change"
-        ? "activity"
-        : item.kind === "subagent-activity"
-          ? "subagents"
-          : "content";
-    if (segmentKind === "content") {
+    if (!isWorkLogItem(item)) {
       segments.push({ kind: "content", item });
       continue;
     }
     const previous = segments.at(-1);
-    if (previous?.kind === segmentKind && sameTurn(previous.items.at(-1), item)) {
+    if (previous?.kind === "work" && workSegmentAcceptsItem(previous.items, item)) {
       previous.items.push(item);
       continue;
     }
-    segments.push({ kind: segmentKind, items: [item] });
+    segments.push({ kind: "work", items: [item] });
   }
   return segments;
+}
+
+function isWorkLogItem(item: ConversationItem): boolean {
+  return (
+    item.kind === "reasoning-summary" ||
+    (item.kind === "assistant-message" && item.phase === "commentary") ||
+    item.kind === "tool" ||
+    item.kind === "file-change" ||
+    item.kind === "subagent-activity"
+  );
 }
 
 export function activitySummary(items: readonly ConversationItem[]): string {
@@ -57,6 +60,93 @@ export function activitySummary(items: readonly ConversationItem[]): string {
   return parts.length ? parts.join(" · ") : "工作记录";
 }
 
+export function workLogSummary(items: readonly ConversationItem[]): string {
+  let thoughts = 0;
+  let operations = 0;
+  const agentIds = new Set<string>();
+  for (const item of items) {
+    if (
+      item.kind === "reasoning-summary" ||
+      (item.kind === "assistant-message" && item.phase === "commentary")
+    ) {
+      thoughts += 1;
+    } else if (item.kind === "tool") {
+      operations += item.occurrences ?? 1;
+    } else if (item.kind === "file-change") {
+      operations += 1;
+    } else if (item.kind === "subagent-activity") {
+      for (const agent of item.agents) agentIds.add(agent.threadId);
+    }
+  }
+  const parts: string[] = [];
+  if (thoughts) parts.push(`${thoughts} 条思考`);
+  if (operations) parts.push(`${operations} 项操作`);
+  if (agentIds.size) parts.push(`${agentIds.size} 个子智能体`);
+  return parts.length ? parts.join(" · ") : "工作记录";
+}
+
+export function workLogHeadline(items: readonly ConversationItem[]): string | undefined {
+  const latestThought = items.findLast(
+    (item) =>
+      item.kind === "reasoning-summary" ||
+      (item.kind === "assistant-message" && item.phase === "commentary"),
+  );
+  if (latestThought?.kind !== "reasoning-summary" && latestThought?.kind !== "assistant-message") {
+    return undefined;
+  }
+  const text = latestReasoningText(latestThought.text);
+  if (text === undefined) return undefined;
+  return text.length <= 120 ? text : `${text.slice(0, 119).trimEnd()}…`;
+}
+
+export function activeWorkLogSegmentIndex(
+  segments: readonly ConversationSegment[],
+  activeTurnId: string | undefined,
+): number {
+  if (activeTurnId === undefined) return -1;
+  const exactIndex = segments.findLastIndex(
+    (segment) =>
+      segment.kind === "work" && segment.items.some((item) => item.turnId === activeTurnId),
+  );
+  if (exactIndex >= 0) return exactIndex;
+  const latestUserIndex = segments.findLastIndex(
+    (segment) => segment.kind === "content" && segment.item.kind === "user-message",
+  );
+  if (latestUserIndex < 0) return -1;
+  return segments.findLastIndex(
+    (segment, index) => index > latestUserIndex && segment.kind === "work",
+  );
+}
+
+export function workLogSegmentBelongsToActiveTurn(
+  segments: readonly ConversationSegment[],
+  segmentIndex: number,
+  activeTurnId: string | undefined,
+): boolean {
+  if (activeTurnId === undefined) return false;
+  const segment = segments[segmentIndex];
+  if (segment?.kind !== "work") return false;
+  const explicitTurnIds = segment.items.flatMap((item) =>
+    item.turnId === undefined ? [] : [item.turnId],
+  );
+  if (explicitTurnIds.includes(activeTurnId)) return true;
+  if (explicitTurnIds.length > 0) return false;
+  const latestUserIndex = segments.findLastIndex(
+    (candidate) => candidate.kind === "content" && candidate.item.kind === "user-message",
+  );
+  return latestUserIndex >= 0 && segmentIndex > latestUserIndex;
+}
+
+export function subagentActivityStatusForDisplay(
+  status: Extract<ConversationItem, { kind: "subagent-activity" }>["status"],
+  active: boolean,
+  action?: Extract<ConversationItem, { kind: "subagent-activity" }>["action"],
+): Extract<ConversationItem, { kind: "subagent-activity" }>["status"] | "unknown" {
+  if (status === "failed") return "failed";
+  if (status === "complete" || action === "close") return "complete";
+  return active ? "running" : "unknown";
+}
+
 export function assistantPhaseForDisplay(
   item: ConversationItem,
   items: readonly ConversationItem[],
@@ -73,9 +163,34 @@ export function assistantPhaseForDisplay(
 
 export function conversationContentItems(
   items: readonly ConversationItem[],
-  _activeTurnId?: string,
+  activeTurnId?: string,
 ): ConversationItem[] {
-  return items.filter((item) => item.kind !== "reasoning-summary" && item.kind !== "plan-progress");
+  const latestUserIndex = latestUserMessageIndex(items);
+  const activeReasoningId = latestActiveReasoning(items, activeTurnId)?.id;
+  return items.filter((item, index) => {
+    if (item.kind === "plan-progress") {
+      return false;
+    }
+    if (
+      item.kind === "reasoning-summary" &&
+      activeTurnId !== undefined &&
+      (item.turnId === activeTurnId ||
+        (item.turnId === undefined && latestUserIndex >= 0 && index > latestUserIndex))
+    ) {
+      return item.id === activeReasoningId;
+    }
+    if (item.kind !== "assistant-message") {
+      return true;
+    }
+    const formalPlan = items.find(
+      (candidate): candidate is Extract<ConversationItem, { kind: "formal-plan" }> =>
+        candidate.kind === "formal-plan" && candidate.turnId === item.turnId,
+    );
+    return (
+      formalPlan === undefined ||
+      normalizePlanText(extractProposedPlan(item.text)) !== normalizePlanText(formalPlan.text)
+    );
+  });
 }
 
 export function latestPlanProgress(
@@ -97,26 +212,14 @@ export function latestActiveReasoning(
   if (activeTurnId === undefined) {
     return undefined;
   }
-  for (let index = items.length - 1; index >= 0; index -= 1) {
+  const latestUserIndex = latestUserMessageIndex(items);
+  const oldestCandidateIndex = latestUserIndex < 0 ? 0 : latestUserIndex + 1;
+  for (let index = items.length - 1; index >= oldestCandidateIndex; index -= 1) {
     const item = items[index];
-    if (item?.kind === "reasoning-summary" && item.turnId === activeTurnId) {
-      return { id: item.id, text: item.text };
-    }
-  }
-
-  let latestUserIndex = -1;
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (items[index]?.kind === "user-message") {
-      latestUserIndex = index;
-      break;
-    }
-  }
-  if (latestUserIndex < 0) {
-    return undefined;
-  }
-  for (let index = items.length - 1; index > latestUserIndex; index -= 1) {
-    const item = items[index];
-    if (item?.kind === "reasoning-summary" && item.turnId === undefined) {
+    if (
+      item?.kind === "reasoning-summary" &&
+      (item.turnId === activeTurnId || (item.turnId === undefined && latestUserIndex >= 0))
+    ) {
       return { id: item.id, text: item.text };
     }
   }
@@ -148,13 +251,7 @@ export function currentLivePhase(
   if (activeTurnId === undefined) {
     return undefined;
   }
-  let latestUserIndex = -1;
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (items[index]?.kind === "user-message") {
-      latestUserIndex = index;
-      break;
-    }
-  }
+  const latestUserIndex = latestUserMessageIndex(items);
   const belongsToActiveTurn = (item: ConversationItem, index: number) =>
     item.turnId === activeTurnId ||
     (item.turnId === undefined && latestUserIndex >= 0 && index > latestUserIndex);
@@ -192,10 +289,13 @@ export function currentLivePhase(
     if (item === undefined || !belongsToActiveTurn(item, index)) {
       continue;
     }
+    if (latestUserIndex >= 0 && index <= latestUserIndex) {
+      return undefined;
+    }
     if (item.kind === "reasoning-summary") {
       return {
         kind: "reasoning",
-        text: latestReasoningText(item.text) ?? "正在思考",
+        text: "正在思考",
       };
     }
     if (item.kind === "assistant-message") {
@@ -211,6 +311,10 @@ export function currentLivePhase(
     }
   }
   return undefined;
+}
+
+function latestUserMessageIndex(items: readonly ConversationItem[]): number {
+  return items.findLastIndex((item) => item.kind === "user-message");
 }
 
 function runningToolLabel(
@@ -239,8 +343,21 @@ function runningToolLabel(
   return normalized.length > 0 ? `正在${normalized}` : "正在执行操作";
 }
 
-function sameTurn(left: ConversationItem | undefined, right: ConversationItem): boolean {
-  if (!left) return false;
-  if (left.turnId === undefined || right.turnId === undefined) return true;
-  return left.turnId === right.turnId;
+function workSegmentAcceptsItem(
+  segmentItems: readonly ConversationItem[],
+  item: ConversationItem,
+): boolean {
+  if (segmentItems.length === 0) return false;
+  if (item.turnId === undefined) return true;
+  const explicitTurnId = segmentItems.find((candidate) => candidate.turnId !== undefined)?.turnId;
+  return explicitTurnId === undefined || explicitTurnId === item.turnId;
+}
+
+function extractProposedPlan(text: string): string {
+  const match = /<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/iu.exec(text);
+  return match?.[1] ?? text;
+}
+
+function normalizePlanText(text: string): string {
+  return text.replace(/\r\n?/gu, "\n").replace(/\s+/gu, " ").trim();
 }

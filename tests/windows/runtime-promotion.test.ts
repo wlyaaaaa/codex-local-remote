@@ -66,17 +66,18 @@ windowsOnly("legacy active runtime promotion", () => {
       join(repositoryRoot, "scripts", "windows", "Start-CodexLocalRemote.ps1"),
       "utf8",
     );
-    const supervisionStart = start.indexOf(
-      "if ([DateTime]::UtcNow -ge $nextDesktopRuntimeCheckAt)",
-    );
+    const supervisionStart = start.indexOf("if ($desktopRuntimeCheckClock.ElapsedMilliseconds -ge");
     const supervisionEnd = start.indexOf(
-      "$nextDesktopRuntimeCheckAt = [DateTime]::UtcNow.AddSeconds",
+      "$nextDesktopRuntimeCheckElapsedMilliseconds =",
       supervisionStart,
     );
     const supervision = start.slice(supervisionStart, supervisionEnd);
 
     expect(supervision).toContain("Get-VerifiedBrokerRuntimeSnapshot");
-    expect(supervision).toContain("$currentBrokerRuntimeSnapshot.Readiness.desktopConnected");
+    expect(supervision).toContain("Read-CodexDesktopOwnerConnectionProof");
+    expect(supervision).toContain("Test-CodexDesktopOwnerConnectionProof");
+    expect(supervision).toContain("-ExpectedRuntimeInvocationId $runtimeInvocationId");
+    expect(supervision).toContain("-RootIdentityKey $currentDesktopRootIdentityKey");
     expect(supervision).toContain("Test-ActiveCodexRuntimeMatchesCurrentDiscovery");
     expect(supervision).toContain("$runtimeDiscovery = $currentDesktopRuntime");
     expect(supervision).toContain("elseif (-not $desktopConnected)");

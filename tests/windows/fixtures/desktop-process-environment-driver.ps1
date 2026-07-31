@@ -31,7 +31,8 @@ function Invoke-EnvironmentCapture {
             '-Command',
             $captureScript
         ) `
-        -RedirectStandardOutput
+        -RedirectStandardOutput `
+        -TestElevatedAction { $false }
     try {
         $captured = $process.StandardOutput.ReadToEnd()
         $process.WaitForExit()

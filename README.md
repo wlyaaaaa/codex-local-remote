@@ -15,7 +15,7 @@
 **[Install with AI](docs/ai-install-prompt.md)** ·
 **[中文介绍](#中文介绍)** ·
 **[Latest release](https://github.com/wlyaaaaa/codex-local-remote/releases/latest)** ·
-**[v0.1.1 notes](docs/release-notes-v0.1.1.md)**
+**[v0.1.2 notes](docs/release-notes-v0.1.2.md)**
 
 ## Install with AI — one prompt
 
@@ -25,8 +25,12 @@ Open this repository in ChatGPT / Codex Desktop, or paste this directly into a n
 Install or upgrade https://github.com/wlyaaaaa/codex-local-remote on this Windows PC.
 Read AGENTS.md and docs/ai-install-prompt.md first. Inspect the existing Desktop runtime, ports,
 Broker, Sidecar, scheduled task and Tailscale before changing anything. Use only the Codex runtime
-bundled with Desktop, keep native Desktop fail-open, never persist CODEX_APP_SERVER_WS_URL, run the
-targeted checks, and verify that Desktop and the browser see the same task.
+bundled with Desktop, keep the scheduled task as the single Desktop owner coordinator, use the
+stable DataDir control dispatcher for explicit Open, Close and Status operations, keep normal
+Desktop startup, updates, Windows restart and sleep/resume native, launch Desktop from the
+same-session medium-integrity Explorer token only when an authorized Open requires one bounded
+handoff, never persist CODEX_APP_SERVER_WS_URL, run the targeted checks, and verify that Desktop
+and the browser see the same task.
 ```
 
 The full bilingual prompt tells the AI exactly when it must stop for your password, project,
@@ -80,9 +84,12 @@ Funnel approval or a real Desktop restart:
 - Start project or no-project tasks with the models your current Desktop actually exposes.
 - Steer, queue or stop a running turn; answer approvals and structured questions remotely.
 - Follow tool calls, file diffs, subagents, context usage and account limits in real time.
-- Preview and download files only from explicitly registered projects.
+- Keep the latest reasoning and active Work Log expanded while a turn is running, then expand the
+  reversible completed log for the full progress, tool, file and child-agent timeline.
+- Browse, upload, create, edit, rename, copy, move, download and delete files
+  across every detected drive available to the Sidecar's Windows identity.
 - Use any modern Android or desktop browser through your HTTPS reverse proxy or Tailscale Funnel.
-- Keep native Desktop usable: the managed launcher fails open when Remote is unavailable.
+- Keep native Desktop as the default: Remote starts only through an explicit control operation.
 
 This is not remote desktop software and it does not publish raw app-server JSON-RPC. It is a
 mobile-first client for the same task protocol that Desktop is using on your own Windows PC.
@@ -113,8 +120,14 @@ JSON-RPC 日志原样铺进网页。
 - 从手机选择已注册的桌面项目，或创建不关联任何项目的隔离对话；
 - 查看全部已持久化历史，按 Desktop 的手工顺序只读镜像“置顶 / 最近”
   分组；首页合并 Desktop/Sidecar 的全部运行任务，不截断前三条；
-- 在共享对话中实时查看当前回复、思考摘要、工具活动、文件变更、审批请求
+- 从顶层对话的行操作菜单重命名、复制对话 ID、归档或恢复；归档前必须先
+  停止仍在运行或等待审批的任务；提交后权威回读当前与归档列表，回读失败
+  只重试读取并明确提示，不重复已提交的操作；
+- 在共享对话中实时查看当前回复、最新思考摘要、工具活动、文件变更、审批请求
   和结构化提问；只有运行时为本次请求明确提供的审批选项才会显示并可提交；
+- 进行中的最新 WorkLog 默认展开且只显示最新官方思考摘要；任务完成后，长工作段
+  默认显示紧凑摘要，展开可按原顺序恢复完整进度、命令与有界输出、文件 diff、
+  图片和子智能体状态，最终回答仍独立显示；
 - 在运行中追加引导、停止任务，或把消息加入可编辑、排序和恢复的下一轮
   队列；
 - 从运行时目录选择下一轮模型、思考等级、速度、权限、审批路由和计划模式，
@@ -126,11 +139,15 @@ JSON-RPC 日志原样铺进网页。
   UTC+8 重置时间；
 - 显示 Codex 自动或手动触发的上下文压缩状态；空闲共享对话还可手动发起，
   并按真实事件区分“已受理”和“已完成”；
-- 浏览、预览和下载已注册项目内的文件；
+- 在独立“电脑文件”页以同一 Windows 登录用户的管理员运行级别浏览全部已检测
+  磁盘，并上传、
+  新建、编辑、重命名、复制、移动、下载或删除文件；删除默认进入回收站，
+  永久删除和覆盖都要求明确确认；
 - 在手机和 Desktop 之间实时续接同一个任务，保持一致的任务与轮次标识；
 - 使用一个本地设置的密码登录，手机无需安装应用、扩展或 Tailscale；
 - 在断线或页面重载后恢复事件流、新建任务提示词、项目/非项目选择、现有
-  对话草稿、滚动位置和子智能体导航状态；
+  对话草稿、滚动位置和子智能体导航状态；短暂 SSE 抖动有 3 秒恢复宽限，真实
+  断线时草稿仍可继续编辑，只暂停发送、停止和审批等远程动作；
 - 长对话按最近内容渐进渲染，可逐段展开全部历史；输入框更新不会重新解析
   已经显示过的整段 Markdown；完整历史快照只作低频兜底，正在输入时会
   延后。
@@ -142,13 +159,13 @@ JSON-RPC 日志原样铺进网页。
 - 不能在同一轮生成中热切换模型或思考等级；
 - 不能显示模型隐藏的完整思维链；
 - 不能保证所有中国大陆网络都能稳定访问某一个公网入口；
-- 无项目对话不授予文件浏览或下载能力；
 - Web 只镜像 Desktop 的任务置顶状态，不直接修改 Desktop 私有置顶配置；
 - app-server 不提供 Desktop 原生未发送队列接口；Web 队列只会在真正派发后
   出现在 Desktop，不伪装成已同步的 Desktop 草稿；
 - app-server 若没有为某条审批请求提供可提交选项，Web 只能显示阻塞原因，
   不能猜造“允许一次 / 拒绝”等按钮；
-- 不提供任意磁盘、任意命令或 app-server 原始接口的公网代理。
+- 不提供任意命令或 app-server 原始接口的公网代理；“电脑文件”是经过登录、
+  同源、CSRF 和操作确认保护的所有者文件管理器，不是匿名裸文件代理。
 
 ## 架构
 
@@ -162,7 +179,7 @@ Tailscale Serve / Funnel
 本机 Sidecar ─────┐
       │            │
       ├─ 单密码登录、会话、限速、Origin/CSRF
-      ├─ 项目白名单、文件只读网关
+      ├─ 全磁盘所有者文件管理器（同一用户，管理员运行级别）
       ├─ 领域事件投影与重连
       └─ 最小化审计元数据
                    │ loopback WebSocket
@@ -180,34 +197,55 @@ Broker 只使用当前 Codex Desktop 安装中动态发现的 `codex.exe`，不�
 失败。Broker 与 app-server 的原始 WebSocket 都只绑定回环地址，公网浏览器
 只能到达经过认证和授权的 Sidecar API。
 
-计划任务不固定 Codex 版本号或 WindowsApps 路径。Sidecar 会持续核对受管
-启动回执、请求级 `/ready` 和 Broker 的无敏感状态。包路径或二进制哈希
-漂移时，已验证的旧运行链只要实时模型/任务能力探针仍通过就继续可用并提示
-待切换；Desktop 断开、回执无法验证或协议探针失败时才暂停新执行，不显示
-假在线。
+`Interactive` / `Highest` 计划任务中的 Desktop Owner Coordinator 是显式
+Remote 租约内唯一受管 Desktop 进程 owner，同时监督 Broker、app-server、
+Sidecar 和文件权限。注册器会安装一个稳定的 DataDir
+`control-dispatcher/v1`，仅提供 `Open`、`Close` 和 `Status`：dispatcher
+先验证 `runtime-current.json`、所选不可变运行目录、manifest、文件大小与
+SHA-256，再调用该运行代中的控制脚本，不直接执行可变 Git 工作树。
 
-Windows 兼容层通过 fail-open 启动器，在单次 Desktop 子进程范围内使用当前
-隐藏的 `CODEX_APP_SERVER_WS_URL` override。项目不会把该值持久写入用户或
-系统环境：只有精确受管的 Broker 与 app-server 已通过就绪检查时才注入；
-Remote 未启动、端口不可达、身份不匹配或检查超时时，启动器会去掉 override
-并照常打开原生 Desktop。启动器使用 `UseShellExecute=false` 直接创建
-Desktop 进程，避免 Windows 打包应用经 ShellExecute 跳转后丢失仅属于本次
-子进程的 endpoint；父进程环境不会被临时改写。每次启动还会写入不含 token
-或 endpoint 的结果回执，状态命令可明确报告远程接入、原生降级或无有效回执。
-冷启动最多等待 30 秒，让动态 Desktop 版本发现、
-Broker 和 Sidecar 先完成传输握手，再启动并等待 Desktop 接入；在 Desktop
-尚未接入时进程保持存活但执行 API 明确禁用，避免启动器与 Sidecar 互相等待。
+普通 ChatGPT / Codex vendor 入口、Codex 更新、Windows 重启和睡眠恢复都保持
+原生，不会自动启动或接管 Remote。`Open` 是幂等操作：租约已经健康时零重启
+返回；可补齐的公网组件优先在不重启 Desktop 的情况下恢复；只有原生 Desktop
+无法安全接入时，才可在明确授权后执行至多一次受控重开。`Close` 清除公网
+intent 并停止 Sidecar，不重开 Desktop；已连接的 Broker/app-server/Desktop
+owner 保持到 Desktop 自然退出，下一次普通启动回到原生。`Status` 只读。
+可选的本机全局 AI control skill 会把自然语言“打开远程 / 关闭远程 / 远程状态”
+路由到同一 dispatcher，并在 Open/Close 前一次性适配当前 Windows token。
+受管“安全启动”快捷方式只是固定 dispatcher 的可选
+`Open -AllowDesktopRestart` 兼容别名，不是另一套启动链；它会显示短暂结果，
+但日常使用不要求用户点击它。
+
+显式租约内，普通 Sidecar 崩溃可以由受管 supervisor 在保持
+Broker/app-server/Desktop 不动时安全恢复。Broker 或 app-server 丢失会失败
+关闭，并等待新的显式 `Open` 判断，不能伪装成普通公网重启。这类恢复不等同于
+Codex 更新、Windows 睡眠/唤醒或新运行代采用；后三者都不产生隐式 Desktop
+重启授权。包路径或二进制哈希漂移时，不显示假在线，也不把普通 vendor 启动
+变成接管入口。
+
+Windows 兼容层只在显式 `Open` 的一次受管 Desktop 子进程范围内使用当前隐藏的
+`CODEX_APP_SERVER_WS_URL` override。需要特权协调时，提升只用于控制面；
+ChatGPT / Codex Desktop 本身必须由 coordinator 从同一用户、同一交互会话的
+medium-integrity Explorer primary token 创建，不能继承管理员令牌。启动器从
+该 token 构造显式进程环境，并只为本次子进程加入 endpoint；项目不会把该值
+持久写入用户或系统环境。只有精确受管的 Broker 与 app-server 已通过就绪检查
+时才注入。父进程环境不会被临时改写。每次受管启动还会写入不含 token 或
+endpoint 的结果回执；正式 Ready 还必须匹配绑定运行代、精确根进程和启动
+nonce 摘要的 owner proof，不能只凭 `desktopConnected=true`。
 最坏结果只能是“远程离线”。这个隐藏入口不是稳定的公开 Desktop 接口；升级
 Codex Desktop 或随附 Codex 后，仍必须重新进行 Desktop、Sidecar、Broker
 同实例的实机验收，不能只凭单元测试宣称兼容。
 
 Remote 自身更新也遵循同一条桌面优先边界：注册器把构建安装到
 `RuntimeVersions/<content-sha256>`，manifest 记录源码 commit 和逐文件
-SHA-256；计划任务与安全启动快捷方式不直接执行可变 Git 工作树。
-`runtime-current.json` 保留当前/上一版本，支持只切换下一次启动版本的回滚。
+SHA-256；计划任务与稳定 dispatcher 不直接执行可变 Git 工作树。
+`runtime-current.json` 保留当前/上一版本，`managed-config.json` 保存实际受管
+端口、路径和任务名；状态、显式控制、回滚和卸载不会再猜测默认端口。
 只要 Desktop 或任何远程任务仍依赖当前 Broker，停止脚本就会拒绝终止它；
-新运行代只在自然的受控启动窗口切换，不能为了“让更新立即生效”打断桌面登录
-或正在运行的任务。
+登记更新不会自动切换、接管或重启 Desktop。采用新运行代必须通过显式 `Open`；
+能保持 Desktop 的路径优先，确需受控重开时必须另有明确授权。符合当前 Broker
+兼容门的 Web/Sidecar 修复可以在现有显式租约内有界采用，Broker、app-server
+与 Desktop 均不重启。
 
 ## 当前状态
 
@@ -234,8 +272,9 @@ SHA-256；计划任务与安全启动快捷方式不直接执行可变 Git 工�
 - 浏览器使用 `Secure`、`HttpOnly`、`SameSite=Strict` 会话 Cookie；
 - 登录失败会限速和临时锁定；
 - 项目授权绑定注册时的 canonical path 与目录身份；根被移动、替换或改成
-  junction 后，文件访问和新任务都会拒绝，直到电脑本机重新登记；
-- 无项目对话使用独立的有界目录，但该目录不进入文件网关；
+  junction 后，只拒绝在该根启动新任务，直到电脑本机重新登记；
+- 无项目对话使用独立的有界目录；独立“电脑文件”页按当前 Windows 管理员
+  身份枚举磁盘，不以任务项目、隐藏属性或扩展名对文件能力降权；
 - Desktop 置顶适配器以 2 MiB 上限只读解析 `codexHome` 下的全局状态，
   只提取并返回最多 100 个 `pinned-thread-ids`，不写入该文件，也不记录或
   返回其他键；

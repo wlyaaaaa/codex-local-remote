@@ -31,8 +31,9 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(start).toContain("Get-SharedRuntimeDecision");
     expect(start).toContain("-Phase RuntimeTransition");
     expect(start).toContain("Stop-ProcessIdentityHandle");
-    expect(registration).toContain("-RestartCount 3");
-    expect(registration).toContain("-RestartInterval (New-TimeSpan -Minutes 1)");
+    expect(registration).not.toContain("-RestartCount");
+    expect(registration).not.toContain("-RestartInterval");
+    expect(windowsScript("CodexLocalRemote.Windows.psm1")).toContain("RestartInterval = ''");
   });
 
   it("leaves the Broker running while an exact Sidecar hot reload is recovered", () => {
@@ -116,8 +117,9 @@ describe("Windows capability and lifecycle safety contract", () => {
   it("periodically reports Desktop package drift without terminating the live stack", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
     expect(start).toContain("[int]$DesktopRuntimeCheckIntervalSeconds");
-    expect(start).toContain("$nextDesktopRuntimeCheckAt");
-    const driftCheckStart = start.indexOf("if ([DateTime]::UtcNow -ge $nextDesktopRuntimeCheckAt)");
+    expect(start).toContain("$desktopRuntimeCheckClock = [Diagnostics.Stopwatch]::StartNew()");
+    expect(start).toContain("$nextDesktopRuntimeCheckElapsedMilliseconds");
+    const driftCheckStart = start.indexOf("if ($desktopRuntimeCheckClock.ElapsedMilliseconds -ge");
     const driftCheckEnd = start.indexOf("Start-Sleep -Seconds 1", driftCheckStart);
     expect(driftCheckStart).toBeGreaterThan(-1);
     expect(driftCheckEnd).toBeGreaterThan(driftCheckStart);
@@ -126,6 +128,10 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(driftCheck).toContain("Test-DesktopRuntimeIdentityCurrent");
     expect(driftCheck).toContain("$startupStage = 'update-pending'");
     expect(driftCheck).toContain("-Status 'degraded'");
+    expect(driftCheck).toContain(
+      "$nextDesktopRuntimeCheckElapsedMilliseconds =\n                $desktopRuntimeCheckClock.ElapsedMilliseconds +",
+    );
+    expect(driftCheck).not.toContain("$nextDesktopRuntimeCheckAt");
     expect(driftCheck).not.toContain("Stop-ProcessIdentityHandle");
     expect(driftCheck).not.toMatch(/\bexit\b/u);
   });
@@ -177,16 +183,96 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(start).not.toMatch(/Write-StartupStatus[\s\S]{0,160}\$webSocketUrl/u);
   });
 
-  it("protects the data directory before the first startup status write", () => {
+  it("uses a bounded root protection gate before the first startup status write", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
-    const protection = start.indexOf(
-      "Protect-CodexLocalRemoteDataDirectory -DataDir $resolvedDataDir",
-    );
+    const protection = start.indexOf("Assert-CodexLocalRemoteDataDirectoryStartupProtection");
     const firstStatusWrite = start.indexOf("Write-StartupStatus -Status 'starting'");
     expect(protection).toBeGreaterThan(-1);
     expect(firstStatusWrite).toBeGreaterThan(-1);
     expect(start.slice(0, protection)).not.toContain("New-Item");
     expect(protection).toBeLessThan(firstStatusWrite);
+    expect(start.slice(0, firstStatusWrite)).not.toContain(
+      "Protect-CodexLocalRemoteDataDirectory -DataDir $resolvedDataDir",
+    );
+  });
+
+  it("keeps startup protection bounded while registration retains the full tree repair", () => {
+    const module = windowsScript("CodexLocalRemote.Windows.psm1");
+    const start = windowsScript("Start-CodexLocalRemote.ps1");
+    const registration = windowsScript("Register-CodexLocalRemoteStartup.ps1");
+    const gateStart = module.indexOf(
+      "function Assert-CodexLocalRemoteDataDirectoryStartupProtection",
+    );
+    const gateEnd = module.indexOf(
+      "\nfunction New-CodexLocalRemoteDataDirectoryOwnerMarker",
+      gateStart,
+    );
+    const gate = module.slice(gateStart, gateEnd);
+    const writerStart = module.indexOf("function Write-AtomicJsonFile");
+    const writerEnd = module.indexOf(
+      "\nfunction Get-CodexLocalRemoteManagedConfiguration",
+      writerStart,
+    );
+    const writer = module.slice(writerStart, writerEnd);
+
+    expect(gateStart).toBeGreaterThan(-1);
+    expect(gate).toContain("Assert-CodexLocalRemoteDataDirectoryOwnerMarker");
+    expect(gate).toContain("Test-CodexLocalRemoteDataAcl");
+    expect(gate).toContain("Get-ChildItem -LiteralPath $resolvedDataDir -Force");
+    expect(gate).not.toContain("Get-CodexLocalRemoteDataDirectoryItems");
+    expect(gate).not.toContain("Test-CodexLocalRemoteDataAclTree");
+    expect(writer).toContain("Assert-CodexLocalRemoteDataDirectoryStartupProtection");
+    expect(start).toContain("Assert-CodexLocalRemoteDataDirectoryStartupProtection");
+    expect(registration).toContain(
+      "Protect-CodexLocalRemoteDataDirectory -DataDir $expected.DataDir",
+    );
+  });
+
+  it("ignores disappearing managed atomic-write files without weakening reparse checks", () => {
+    const module = windowsScript("CodexLocalRemote.Windows.psm1");
+    const enumerationStart = module.indexOf("function Get-CodexLocalRemoteDataDirectoryItems");
+    const enumerationEnd = module.indexOf(
+      "\nfunction Test-CodexLocalRemoteBroadKnownFolder",
+      enumerationStart,
+    );
+    const enumeration = module.slice(enumerationStart, enumerationEnd);
+    const reparseGuard = enumeration.indexOf(
+      "$item.Attributes -band [System.IO.FileAttributes]::ReparsePoint",
+    );
+    const ephemeralSkip = enumeration.indexOf(
+      "Test-CodexLocalRemoteManagedEphemeralFileName -Name $item.Name",
+    );
+
+    expect(module).toContain("function Test-CodexLocalRemoteManagedEphemeralFileName");
+    expect(module).toContain("function Get-CodexLocalRemoteManagedDataItemAcl");
+    expect(module).toContain("'^\\..+\\.[0-9a-f]{32}\\.tmp$'");
+    expect(module).toContain("'^\\.(?:state|turn-outbox)-[1-9][0-9]*-[0-9a-f]{12}\\.tmp$'");
+    expect(reparseGuard).toBeGreaterThan(-1);
+    expect(ephemeralSkip).toBeGreaterThan(reparseGuard);
+    expect(module).toContain("} catch [System.Management.Automation.ItemNotFoundException] {");
+    expect(module).toContain("} catch [System.IO.FileNotFoundException] {");
+  });
+
+  it("serializes atomic JSON writers for the same managed path across processes", () => {
+    const module = windowsScript("CodexLocalRemote.Windows.psm1");
+    const writeStart = module.indexOf("function Write-AtomicJsonFile");
+    const writeEnd = module.indexOf(
+      "\nfunction Get-CodexLocalRemoteManagedConfiguration",
+      writeStart,
+    );
+    const write = module.slice(writeStart, writeEnd);
+    const wait = write.indexOf("$writeMutex.WaitOne(");
+    const protect = write.indexOf("Assert-CodexLocalRemoteDataDirectoryStartupProtection");
+
+    expect(module).toContain("function Get-CodexLocalRemoteAtomicWriteMutexName");
+    expect(write).toContain("Get-CodexLocalRemoteAtomicWriteMutexName -Path $resolvedPath");
+    expect(write).toContain("[TimeSpan]::FromSeconds(15)");
+    expect(write).toContain("[System.Threading.AbandonedMutexException]");
+    expect(write).toContain("[System.IO.File]::Move($temporary, $resolvedPath, $true)");
+    expect(wait).toBeGreaterThan(-1);
+    expect(protect).toBeGreaterThan(wait);
+    expect(write).toContain("$writeMutex.ReleaseMutex()");
+    expect(write).toContain("$writeMutex.Dispose()");
   });
 
   it("rejects a filesystem root in the pure ownership plan before any mutation", () => {
@@ -218,15 +304,21 @@ describe("Windows capability and lifecycle safety contract", () => {
     }
   });
 
-  it("never installs a persistent Desktop override and rolls back only newly created ancillary state", () => {
+  it("never installs a persistent Desktop override and rolls back only verified ancillary state", () => {
     const registration = windowsScript("Register-CodexLocalRemoteStartup.ps1");
     expect(registration).not.toContain("Install-BrokerUserEnvironment");
     expect(registration).toContain("Restore-BrokerUserEnvironment");
     expect(registration).toContain("Remove-LegacyPersistentOverride");
     expect(registration).toContain("Install-ManagedLauncherShortcut");
+    expect(registration).toContain("Install-CodexLocalRemoteManagedDesktopIcon");
+    expect(registration).toContain("$shortcut.IconLocation");
     expect(registration).toContain("0x5B89, 0x5168, 0x542F, 0x52A8");
     expect(registration).toContain("$null -ne $token -and $token.Status -ceq 'created'");
-    expect(registration).toContain("$launcher.Status -ceq 'created'");
+    expect(registration).toContain("Complete-ManagedLauncherShortcutTransaction");
+    expect(registration).toContain("Undo-ManagedLauncherShortcutTransaction");
+    expect(registration).toContain("Remove-ManagedLauncherShortcutReceiptFile");
+    expect(registration).not.toContain("$launcher.Status -ceq 'created'");
+    expect(registration).toContain("$launcherIcon.Status -ceq 'created'");
     expect(registration).toContain("Remove-BrokerCapabilityToken -DataDir $expected.DataDir");
     expect(registration).not.toMatch(/Set-UserEnvironmentValue\s+`?\s*[\s\S]*?-Exists\s+\$true/u);
   });
@@ -338,6 +430,7 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(status).toContain("DesktopConnected = $desktopConnected");
     expect(status).toContain("SidecarConnected = $sidecarConnected");
     expect(status).toContain("LauncherConfigured = $launcherConfigured");
+    expect(status).toContain("LauncherIconReady = $launcherIconReady");
     expect(status).toContain("LegacyPersistentOverrideBlocked = $legacyPersistentOverrideBlocked");
     expect(status).toContain("LaunchMode = $launchMode");
     expect(status).not.toContain("DesktopEnvironmentConfigured =");

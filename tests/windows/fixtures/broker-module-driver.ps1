@@ -9,6 +9,7 @@ param(
         'add-everyone-rule',
         'validate-url',
         'classify-process',
+        'classify-bootstrap-contract',
         'classify-sidecar',
         'classify-desktop',
         'assert-force-cli',
@@ -102,6 +103,21 @@ switch ($Operation) {
             -ExpectedCodexPath $PwshPath `
             -DataDir $DataDir `
             -CapabilityTokenFilePath $WebSocketUrl |
+            ConvertTo-Json -Compress -Depth 20
+    }
+    'classify-bootstrap-contract' {
+        Get-ManagedBootstrapProcessContract `
+            -CommandLine $CommandLine `
+            -ExecutablePath $ExecutablePath `
+            -TaskName 'Codex Local Remote' `
+            -NodePath $NodePath `
+            -PwshPath $PwshPath `
+            -InstallRoot $InstallRoot `
+            -DataDir $DataDir `
+            -Port 18790 `
+            -BrokerPort 18791 `
+            -BrokerUpstreamPort 18792 `
+            -BasePath '/codex-remote' |
             ConvertTo-Json -Compress -Depth 20
     }
     'classify-sidecar' {

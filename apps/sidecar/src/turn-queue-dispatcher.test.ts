@@ -321,6 +321,77 @@ describe("TurnQueueDispatcher", () => {
     });
   });
 
+  it("reconciles a persisted started turn after restart and releases the next message", async () => {
+    const current = await fixture("idle");
+    await current.outbox.enqueue({
+      idempotencyScope: "started-before-restart",
+      input: { prompt: "已经被 Codex 接受的上一轮" },
+      threadId: "thread-started",
+    });
+    await current.dispatcher.wake("thread-started");
+    await current.outbox.enqueue({
+      idempotencyScope: "next-after-started",
+      input: { prompt: "离线完成后应继续发送" },
+      threadId: "thread-started",
+    });
+    current.reconcileClientUserMessage.mockResolvedValueOnce({
+      lifecycle: "completed",
+      state: "accepted",
+      turnId: "turn-dispatched",
+    });
+
+    await current.dispatcher.reconcileAfterRestart();
+
+    expect(current.reconcileClientUserMessage).toHaveBeenCalledWith(
+      "thread-started",
+      expect.any(String),
+    );
+    expect(current.startTurn).toHaveBeenCalledTimes(2);
+    expect(current.startTurn).toHaveBeenLastCalledWith(
+      "thread-started",
+      expect.objectContaining({ prompt: "离线完成后应继续发送" }),
+    );
+    await expect(current.outbox.snapshot("thread-started")).resolves.toMatchObject({
+      items: [
+        {
+          state: "started",
+          turnId: "turn-dispatched",
+        },
+      ],
+    });
+  });
+
+  it("removes an unresolved started tombstone and pauses later messages instead of wedging", async () => {
+    const current = await fixture("idle");
+    await current.outbox.enqueue({
+      idempotencyScope: "unknown-started-before-restart",
+      input: { prompt: "已经开始但终态未知" },
+      threadId: "thread-started-unknown",
+    });
+    await current.dispatcher.wake("thread-started-unknown");
+    await current.outbox.enqueue({
+      idempotencyScope: "next-after-unknown-started",
+      input: { prompt: "不能越过未知上一轮" },
+      threadId: "thread-started-unknown",
+    });
+    current.reconcileClientUserMessage.mockResolvedValueOnce({
+      state: "absent-idle",
+    });
+
+    await current.dispatcher.reconcileAfterRestart();
+
+    expect(current.startTurn).toHaveBeenCalledTimes(1);
+    await expect(current.outbox.snapshot("thread-started-unknown")).resolves.toMatchObject({
+      items: [
+        {
+          issue: "PREVIOUS_TURN_RESULT_UNKNOWN_AFTER_RESTART",
+          prompt: "不能越过未知上一轮",
+          state: "paused",
+        },
+      ],
+    });
+  });
+
   it("pauses an unknown previous lifecycle after restart instead of dispatching from idle alone", async () => {
     const beforeRestart = await fixture("active");
     await beforeRestart.outbox.enqueue({

@@ -20,8 +20,28 @@ interface RuntimePackageResult {
   PreviousVersionId: string;
   FirstPointerPrevious: null;
   SecondPointerPrevious: string;
+  PointerHasTaskPreImage: boolean;
+  PointerTaskPreImageSha256: string;
+  PointerTaskPreImageTaskName: string;
+  PointerTaskPreImageRuntimeVersionId: string;
+  PointerTaskPreImageRuntimeRoot: string;
+  PointerHasCurrentTaskDefinition: boolean;
+  PointerCurrentTaskDefinitionSha256: string;
+  PointerCurrentTaskDefinitionTaskName: string;
+  PointerCurrentTaskDefinitionRuntimeVersionId: string;
+  PointerCurrentTaskDefinitionRuntimeRoot: string;
+  StoredCurrentTaskDefinitionExact: boolean;
+  StoredCurrentTaskDefinitionHasXml: boolean;
+  OrdinaryPointerExposesTaskXml: boolean;
+  StoredTaskPreImageExact: boolean;
+  StrictTaskPreImageExact: boolean;
+  TamperedTaskPreImageRejected: boolean;
   RollbackCurrent: string;
   RollbackPrevious: string;
+  RepairedStatus: string;
+  RepairedCurrent: string;
+  RepairedPrevious: string;
+  AlreadyCurrentStatus: string;
   StagingValid: boolean;
   StrictStagingValid: boolean;
   StrictStagingReason: string;
@@ -71,13 +91,37 @@ windowsOnly("immutable runtime version package", () => {
       PreviousVersionId: runtime.FirstVersionId,
       FirstPointerPrevious: null,
       SecondPointerPrevious: runtime.FirstVersionId,
+      PointerHasTaskPreImage: true,
+      PointerTaskPreImageTaskName: "Codex Local Remote",
+      PointerTaskPreImageRuntimeVersionId: runtime.FirstVersionId,
+      PointerHasCurrentTaskDefinition: true,
+      PointerCurrentTaskDefinitionTaskName: "Codex Local Remote",
+      PointerCurrentTaskDefinitionRuntimeVersionId: runtime.SecondVersionId,
+      StoredCurrentTaskDefinitionExact: true,
+      StoredCurrentTaskDefinitionHasXml: false,
+      OrdinaryPointerExposesTaskXml: false,
+      StoredTaskPreImageExact: true,
+      StrictTaskPreImageExact: true,
+      TamperedTaskPreImageRejected: true,
       RollbackCurrent: runtime.FirstVersionId,
       RollbackPrevious: runtime.SecondVersionId,
+      RepairedStatus: "repaired",
+      RepairedCurrent: runtime.SecondVersionId,
+      RepairedPrevious: runtime.FirstVersionId,
+      AlreadyCurrentStatus: "already-current",
       StagingValid: true,
       StrictStagingValid: false,
       TamperedValid: false,
     });
     expect(runtime.StrictStagingReason).toMatch(/directory name/u);
     expect(runtime.TamperedReason).toMatch(/(?:hash|size)/u);
+    expect(runtime.PointerTaskPreImageSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(runtime.PointerCurrentTaskDefinitionSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(resolve(runtime.PointerTaskPreImageRuntimeRoot)).toBe(
+      resolve(sandbox, "data", "RuntimeVersions", runtime.FirstVersionId),
+    );
+    expect(resolve(runtime.PointerCurrentTaskDefinitionRuntimeRoot)).toBe(
+      resolve(sandbox, "data", "RuntimeVersions", runtime.SecondVersionId),
+    );
   }, 30_000);
 });

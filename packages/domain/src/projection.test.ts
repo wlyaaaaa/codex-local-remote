@@ -55,6 +55,78 @@ const rawThread = {
 };
 
 describe("thread projection", () => {
+  it("keeps browser uploads and project files attached to the user message history", () => {
+    expect(
+      projectThreadItem({
+        id: "user-with-files",
+        type: "userMessage",
+        content: [
+          { type: "text", text: "请查看这些文件" },
+          {
+            type: "localImage",
+            path: "E:\\PublicFixtures\\CodexLocalRemote\\BrowserUploads\\upload\\screen.png",
+          },
+          {
+            type: "mention",
+            name: "notes.json",
+            path: "Q:\\FixtureProjects\\sample\\notes.json",
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        attachments: [
+          {
+            kind: "image",
+            name: "screen.png",
+            path: "E:\\PublicFixtures\\CodexLocalRemote\\BrowserUploads\\upload\\screen.png",
+          },
+          {
+            kind: "file",
+            name: "notes.json",
+            path: "Q:\\FixtureProjects\\sample\\notes.json",
+          },
+        ],
+        id: "user-with-files",
+        kind: "user-message",
+        text: "请查看这些文件",
+      },
+    ]);
+  });
+
+  it("keeps an attachment-only user message instead of dropping it", () => {
+    expect(
+      projectThreadItem({
+        id: "user-image-only",
+        type: "userMessage",
+        content: [{ type: "localImage", path: "C:\\uploads\\proof.jpg" }],
+      }),
+    ).toEqual([
+      {
+        attachments: [{ kind: "image", name: "proof.jpg", path: "C:\\uploads\\proof.jpg" }],
+        id: "user-image-only",
+        kind: "user-message",
+        text: "",
+      },
+    ]);
+  });
+
+  it("keeps formal plans distinct from transient reasoning", () => {
+    expect(
+      projectThreadItem({
+        id: "plan-1",
+        type: "plan",
+        text: "# 实施计划\n\n1. 先验证\n2. 再执行",
+      }),
+    ).toEqual([
+      {
+        id: "plan-1",
+        kind: "formal-plan",
+        text: "# 实施计划\n\n1. 先验证\n2. 再执行",
+      },
+    ]);
+  });
+
   it("renders legacy percent-encoded Markdown titles as readable text", () => {
     expect(
       projectThreadSummary(
@@ -151,6 +223,34 @@ describe("thread projection", () => {
         interrupt: true,
         reply: false,
         steer: true,
+      },
+    });
+  });
+
+  it("treats an explicit idle thread status as terminal when its last turn record still lags", () => {
+    const detail = projectThreadDetail(
+      {
+        ...rawThread,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn-stopped",
+            status: "inProgress",
+            startedAt: 1_721_000_030,
+            items: [],
+          },
+        ],
+      },
+      { managed: true },
+    );
+
+    expect(detail.activeTurnId).toBeUndefined();
+    expect(detail).toMatchObject({
+      state: "idle",
+      availableActions: {
+        interrupt: false,
+        reply: true,
+        steer: false,
       },
     });
   });
@@ -573,6 +673,33 @@ describe("thread projection", () => {
         status: "inProgress",
         type: "imageGeneration",
       }),
+      ...projectThreadItem({
+        id: "image-2",
+        result: "data:image/png;base64,secret-generated-image",
+        revisedPrompt: "一张已经完成的测试图",
+        savedPath: "C:\\generated\\finished.png",
+        status: "completed",
+        type: "imageGeneration",
+      }),
+      ...projectThreadItem({
+        id: "image-3",
+        result: "data:image/png;base64,secret-generated-image-snake",
+        revised_prompt: "来自真实会话事件的图片",
+        saved_path: "C:\\generated\\session-shape.png",
+        status: "completed",
+        type: "imageGeneration",
+      }),
+      ...projectThreadItem({
+        id: "image-view-1",
+        images: [
+          { path: "C:\\screenshots\\first.png" },
+          { saved_path: "C:\\screenshots\\second.jpg" },
+          { path: "data:image/png;base64,secret-viewed-image" },
+        ],
+        local_images: ["C:\\screenshots\\third.webp"],
+        paths: ["C:\\screenshots\\first.png"],
+        type: "imageView",
+      }),
     ];
 
     expect(items).toEqual(
@@ -603,14 +730,112 @@ describe("thread projection", () => {
           status: "running",
           summary: "一张测试图",
         }),
+        {
+          action: "generated",
+          attachments: [
+            {
+              kind: "image",
+              name: "finished.png",
+              path: "C:\\generated\\finished.png",
+            },
+          ],
+          id: "image-2",
+          kind: "image-activity",
+          status: "complete",
+          summary: "一张已经完成的测试图",
+        },
+        {
+          action: "generated",
+          attachments: [
+            {
+              kind: "image",
+              name: "session-shape.png",
+              path: "C:\\generated\\session-shape.png",
+            },
+          ],
+          id: "image-3",
+          kind: "image-activity",
+          status: "complete",
+          summary: "来自真实会话事件的图片",
+        },
+        {
+          action: "viewed",
+          attachments: [
+            {
+              kind: "image",
+              name: "first.png",
+              path: "C:\\screenshots\\first.png",
+            },
+            {
+              kind: "image",
+              name: "third.webp",
+              path: "C:\\screenshots\\third.webp",
+            },
+            {
+              kind: "image",
+              name: "second.jpg",
+              path: "C:\\screenshots\\second.jpg",
+            },
+          ],
+          id: "image-view-1",
+          kind: "image-activity",
+          status: "complete",
+          summary: "已查看 3 张图像",
+        },
       ]),
     );
     expect(JSON.stringify(items)).not.toContain("base64,secret");
+    expect(JSON.stringify(items)).not.toContain("secret-generated-image");
+    expect(JSON.stringify(items)).not.toContain("secret-generated-image-snake");
+    expect(JSON.stringify(items)).not.toContain("secret-viewed-image");
     expect(JSON.stringify(items)).not.toContain("\\u0000");
   });
 });
 
 describe("notification projection", () => {
+  it("projects official rename and archive lifecycle fields into workspace refresh events", () => {
+    expect(
+      projectAppServerNotification({
+        method: "thread/name/updated",
+        params: { threadId: "thread-1", threadName: "新的名称" },
+      }),
+    ).toEqual([
+      {
+        threadId: "thread-1",
+        type: "thread.updated",
+        payload: {
+          name: "新的名称",
+          threadId: "thread-1",
+          threadName: "新的名称",
+        },
+      },
+    ]);
+    expect(
+      projectAppServerNotification({
+        method: "thread/archived",
+        params: { threadId: "thread-1" },
+      }),
+    ).toEqual([
+      {
+        threadId: "thread-1",
+        type: "thread.updated",
+        payload: { archived: true, threadId: "thread-1" },
+      },
+    ]);
+    expect(
+      projectAppServerNotification({
+        method: "thread/unarchived",
+        params: { threadId: "thread-1" },
+      }),
+    ).toEqual([
+      {
+        threadId: "thread-1",
+        type: "thread.updated",
+        payload: { archived: false, threadId: "thread-1" },
+      },
+    ]);
+  });
+
   it("projects a complete thread/started notification as a bounded read-only upsert snapshot", () => {
     const projected = projectAppServerNotification({
       method: "thread/started",
@@ -848,6 +1073,56 @@ describe("notification projection", () => {
       },
     ]);
     expect(JSON.stringify(warning)).not.toContain("config.toml");
+  });
+
+  it("projects a non-retryable turn error as one failed terminal state plus its diagnostic", () => {
+    expect(
+      projectAppServerNotification({
+        method: "error",
+        params: {
+          error: {
+            message: "模型请求失败",
+          },
+          threadId: "thread-1",
+          turnId: "turn-1",
+          willRetry: false,
+        },
+      }),
+    ).toEqual([
+      {
+        payload: {
+          category: "error",
+          message: "模型请求失败",
+        },
+        threadId: "thread-1",
+        turnId: "turn-1",
+        type: "diagnostic",
+      },
+      {
+        payload: {
+          state: "failed",
+          turn: {
+            id: "turn-1",
+            status: "failed",
+          },
+        },
+        threadId: "thread-1",
+        turnId: "turn-1",
+        type: "turn.state",
+      },
+    ]);
+
+    expect(
+      projectAppServerNotification({
+        method: "error",
+        params: {
+          error: { message: "稍后自动重试" },
+          threadId: "thread-1",
+          turnId: "turn-1",
+          willRetry: true,
+        },
+      }).map((event) => event.type),
+    ).toEqual(["diagnostic"]);
   });
 
   it("projects model reroutes as a settings refresh and a safe diagnostic", () => {

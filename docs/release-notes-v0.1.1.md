@@ -1,100 +1,114 @@
 # ChatGPT / Codex Local Remote v0.1.1
 
-`v0.1.1` is a repair release for the Windows lifecycle, long-task reader, and
-remote-control regressions found after `v0.1.0`. The `v0.1.0` tag remains
-unchanged.
+> **Superseded — do not install for new deployments.** Upgrade to `v0.1.2` or
+> later. The `v0.1.1` tag remains immutable so the original release can still be
+> audited and rolled back precisely.
+>
+> 简体中文：`v0.1.1` 已被 `v0.1.2` 取代，不建议新安装。源码自动化曾通过，
+> 但发布后的真实运行态复审发现运行代接管与长期恢复阻断；旧标签不会移动。
 
-## What changed
+`v0.1.1` was a repair release for regressions found after `v0.1.0`. It
+substantially improved queue recovery, long-task pagination, login throttling,
+Desktop fail-open launch and immutable runtime packaging. A later live audit
+showed that its update lifecycle was not yet release-safe.
 
-- Keeps **Stop** independently visible while the message composer is collapsed.
-- Isolates drafts and browser uploads when switching between tasks.
-- Recovers a queued next turn after a crash without turning an already completed
-  Desktop turn back into a permanently active turn.
-- Recovers from an individual state-file write failure without poisoning later
-  saves.
-- Reads long tasks only through bounded item/turn pagination. If the installed
-  Desktop runtime does not expose a bounded reader, the Web UI reports the
-  capability as unavailable instead of attempting an unbounded `thread/read`.
-- Uses the physical data-directory identity for the single Broker lease and
-  rejects sensitive paths after resolving filesystem aliases.
-- Reserves login-attempt capacity before asynchronous password verification, so
-  concurrent requests cannot bypass the configured limits.
-- Performs every uninstall safety check before the first mutation.
-- Starts the exact Desktop child with `UseShellExecute=false`, preserving the
-  process-scoped Broker endpoint that packaged-app ShellExecute could silently
-  drop. Native fallback explicitly removes any inherited stale endpoint.
-- Writes a strict, token-free `desktop-launch-last.json` receipt so diagnostics
-  can distinguish a remote launch, native fallback, and missing or invalid
-  evidence without exposing the capability URL.
-- Installs each runtime into a content-addressed, immutable
-  `RuntimeVersions/<sha256>` directory. The scheduled task and the managed
-  shortcut point to the selected version; one previous validated version is
-  retained for bounded rollback.
+## What shipped
 
-## Windows lifecycle
+- Kept **Stop** independently visible when the mobile composer was collapsed.
+- Isolated drafts and browser uploads when switching between tasks.
+- Reconciled crash-after-complete queue entries without reviving a terminal
+  Desktop turn or poisoning later state saves.
+- Replaced unbounded long-task reads with bounded item/turn pagination and an
+  explicit unavailable state when the installed runtime lacked that capability.
+- Hardened the single-Broker lease, alias-resolved file boundaries, login
+  throttling and uninstall preflight checks.
+- Launched the exact Desktop child with a process-scoped Broker endpoint while
+  preserving native Desktop as the fail-open path.
+- Installed content-addressed immutable runtimes with current/previous pointers
+  and bounded rollback.
 
-Normal use remains:
+## Post-release finding
 
-1. Open the managed **ChatGPT Remote** shortcut.
-2. The hidden scheduled task starts the selected Broker and Sidecar runtime.
-3. ChatGPT / Codex Desktop starts with the process-scoped Broker endpoint only
-   when that endpoint is ready.
-4. If Remote cannot start, the launcher opens native Desktop without a persistent
-   app-server override.
+The release assumed that registering a new immutable runtime with `-NoStart`
+would make it active on the next natural Desktop launch. That assumption was
+incomplete when the old scheduled-task generation was already running: Desktop
+could reopen while the old Broker generation remained active, leaving the new
+selected runtime unapplied.
 
-An already-running native Desktop cannot be hot-switched onto the shared Broker.
-Installing this update is non-disruptive: the selected immutable version applies
-at the next natural Desktop start.
+The later audit also found durable retry and lifecycle races that required a
+new release: persisted `started` queue reconciliation, logical-intent
+idempotency across restarts, serialized Supervisor start/stop, authoritative
+terminal control state, and transactional selected-versus-active runtime
+handoff.
 
-Use `scripts/windows/Rollback-CodexLocalRemoteRuntime.ps1` to select the previous
-validated runtime for the next start. Rollback does not kill a running Desktop
-session.
+Accordingly:
 
-## Compatibility receipt
+- the frozen `v0.1.1` source checks remain valid historical evidence;
+- the original live shared-owner conclusion is **BLOCK**, not PASS or DEGRADED;
+- `v0.1.1` is retained for audit and rollback only.
 
-- Windows: Windows 11 x64
-- Desktop package: `OpenAI.Codex_26.721.4979.0_x64__2p2nqsd0c76g0`
-- Product version: `0.1.1`
-- Runtime selection: dynamic package/runtime discovery; no pinned WindowsApps
-  version directory
-- Persistent `CODEX_APP_SERVER_WS_URL`: not used
+## Upgrade
 
-This receipt proves the version tested for this release only. Future ChatGPT /
-Codex Desktop builds are discovered dynamically, but cannot be promised
-compatible before they exist. An incompatible build must leave native Desktop
-usable and report Remote as unavailable.
+Prefer the published `v0.1.2` tag or a later release. From a clean checkout of
+that tag:
 
-## Verification
+```powershell
+pnpm install --frozen-lockfile
+pnpm check
+.\scripts\windows\Register-CodexLocalRemoteStartup.ps1 -NoStart
+```
 
-The frozen tree passed formatting, lint, and type checking; all 83 test files
-passed with 981/981 tests; production builds completed; and the public-safety
-scan accepted 271 files.
+Registration is non-disruptive. Do not stop an active Desktop task merely to
+apply an update. Registration does not open Remote and does not change the
+normal vendor Desktop entry. After installing `v0.1.2` or later, use its stable
+DataDir dispatcher for an explicit `Status` or `Open`; if `Open` reports that a
+Desktop handoff is required, grant that one restart separately. Do not use the
+ordinary Desktop launch as an adoption signal. In v0.1.2 and later, the exact
+managed shortcut is only an optional alias for the same explicit `Open`
+dispatcher; old runtime-bound shortcut definitions are migrated rather than
+trusted as current.
+See [`windows-install.md`](windows-install.md).
 
-The six supported browser viewports passed the stop/steer/compaction journey.
-Windows tests launch a real child process and prove that the capability endpoint
-reaches only the remote child, native fallback receives no endpoint, and the
-parent environment is unchanged. Immutable-version tests cover two installs,
-current/previous switching, and tamper rejection.
+## Rollback and native recovery
 
-The final candidate is installed with `-NoStart`, so the running Desktop, Broker,
-and Sidecar are not restarted or interrupted. A live packaged-Desktop cold start
-is intentionally deferred to the next natural launch; the exact child-process
-test is the non-disruptive release substitute, not a claim that the
-already-running native Desktop was hot-switched.
+To withdraw a selected update without terminating the currently running
+Desktop:
 
-Release acceptance is therefore **PASS for the frozen repository candidate**
-and explicitly **DEGRADED for the live shared-owner smoke test**: the currently
-open Desktop remains on its native app-server until the next natural start.
+```powershell
+.\scripts\windows\Rollback-CodexLocalRemoteRuntime.ps1
+```
 
-GitHub CI is useful follow-up evidence but is not used as a substitute for these
-local functional checks.
+Rollback changes the selected runtime and task definition for a later explicit
+adoption; it does not restart Broker, app-server or Desktop. To remove the
+managed control path entirely, first satisfy the uninstall preflight and then
+use:
 
-## Known boundaries
+```powershell
+.\scripts\windows\Unregister-CodexLocalRemoteStartup.ps1
+```
 
+Neither operation authorizes killing an unrelated Desktop or app-server
+process.
+
+## Compatibility and boundaries
+
+- Windows 11 x64.
+- ChatGPT / Codex Desktop is discovered dynamically; no WindowsApps version
+  directory is pinned.
+- `CODEX_APP_SERVER_WS_URL` is process-scoped and is not persisted.
+- An incompatible Desktop build must fail open to native Desktop and report
+  Remote unavailable.
+- Broker and raw app-server listeners stay loopback-only. Public HTTPS exposes
+  only the authenticated Sidecar route.
 - This is an unofficial self-hosted companion, not an OpenAI product.
-- The app-server is loopback-only. Public HTTPS exposure is limited to the Web
-  Sidecar route and still requires its password/session protections.
-- A historical task can be much larger than a browser frame. The UI loads its
-  newest bounded page first and fetches older pages only when requested.
-- A Desktop approval can be answered remotely only when the current runtime
-  provides an explicit response schema. Unknown approval shapes fail closed.
+
+## Historical verification
+
+The `v0.1.1` frozen tree passed formatting, lint, type checking, 981 automated
+tests, production builds and its public-safety scan. Six supported browser
+viewports passed the targeted stop/steer/compaction journey.
+
+Those checks did not include a successful packaged-Desktop cold start on the
+same immutable generation. Repository automation is therefore preserved as
+historical source evidence and must not be cited as proof that the `v0.1.1`
+live runtime takeover passed.

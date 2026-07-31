@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { DesktopSessionUsageReader } from "./desktop-session-usage.js";
 
-const THREAD_ID = "019f99ea-c6de-7002-9f9c-03eeb3e9f37b";
+const THREAD_ID = "00000000-0000-0000-0000-000000000001";
 
 describe("DesktopSessionUsageReader", () => {
   const sandboxes: string[] = [];
@@ -40,9 +40,9 @@ describe("DesktopSessionUsageReader", () => {
           payload: {
             type: "token_count",
             info: {
-              last_token_usage: { total_tokens: 102_000 },
-              model_context_window: 258_000,
-              total_token_usage: { total_tokens: 900_000_000 },
+              last_token_usage: { total_tokens: 100_000 },
+              model_context_window: 260_000,
+              total_token_usage: { total_tokens: 900_000 },
             },
           },
         }),
@@ -52,9 +52,9 @@ describe("DesktopSessionUsageReader", () => {
           payload: {
             type: "token_count",
             info: {
-              last_token_usage: { total_tokens: 238_814 },
-              model_context_window: 258_400,
-              total_token_usage: { total_tokens: 1_017_917_889 },
+              last_token_usage: { total_tokens: 240_000 },
+              model_context_window: 260_000,
+              total_token_usage: { total_tokens: 1_000_000 },
             },
           },
         }),
@@ -65,9 +65,9 @@ describe("DesktopSessionUsageReader", () => {
 
     const reader = new DesktopSessionUsageReader();
     await expect(reader.read({ codexHome, sessionPath, threadId: THREAD_ID })).resolves.toEqual({
-      limitTokens: 258_400,
-      usedPercent: 92.42,
-      usedTokens: 238_814,
+      limitTokens: 260_000,
+      usedPercent: 92.31,
+      usedTokens: 240_000,
     });
   });
 

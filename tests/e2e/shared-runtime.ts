@@ -6,13 +6,16 @@ import {
   type ProductCapabilities,
   type QueuedTurnItem,
   type RemoteEvent,
+  type SetThreadGoalInput,
   type ThreadDetail,
+  type ThreadGoal,
   type TurnQueueSnapshot,
 } from "../../packages/contracts/src/index.js";
 import type { BrowserContext, Page, Route } from "@playwright/test";
 
 type EventSourceHarness = Window & {
   __codexRemoteE2eDispatch?: (event: RemoteEvent) => void;
+  __codexRemoteE2eSetOnline?: (online: boolean) => void;
 };
 
 const now = () => new Date().toISOString();
@@ -52,6 +55,9 @@ export const runtimePermissionProfiles: PermissionProfileOption[] = [
   },
 ];
 
+const runtimeApprovalPolicies = [{ id: "on-request" }, { id: "never" }];
+const runtimeApprovalReviewers = [{ id: "auto_review" }, { id: "guardian_subagent" }];
+
 const runtimeCollaborationModes: CollaborationModeOption[] = [
   {
     id: "runtime-auto-next",
@@ -63,6 +69,8 @@ const runtimeCollaborationModes: CollaborationModeOption[] = [
 
 const capabilities: ProductCapabilities = {
   appServer: "available",
+  approvalPolicies: "available",
+  approvalReviewers: "available",
   collaborationModes: "available",
   compact: "available",
   desktopSnapshots: "available",
@@ -123,14 +131,19 @@ function approval(id: string, title: string, choiceSuffix: string): ApprovalRequ
 }
 
 export class SharedRuntime {
+  readonly goalUpdates: Array<SetThreadGoalInput | null> = [];
   readonly settingsUpdates: Array<Record<string, string | null | undefined>> = [];
   private readonly contexts = new Set<BrowserContext>();
   private sequence = 0;
   private approvals: ApprovalRequest[];
+  private goal: ThreadGoal | null = null;
   private queueSnapshot: TurnQueueSnapshot;
   private thread: ThreadDetail;
 
-  constructor({ complexState = false }: { complexState?: boolean } = {}) {
+  constructor({
+    complexState = false,
+    longWorkLog = false,
+  }: { complexState?: boolean; longWorkLog?: boolean } = {}) {
     this.thread = {
       id: "shared-running-thread",
       title: "双客户端实时同步自动验收",
@@ -143,6 +156,8 @@ export class SharedRuntime {
       reasoningEffort: runtimeModels[0]!.defaultReasoningEffort,
       serviceTier: runtimeModels[0]!.defaultServiceTier,
       permissionProfileId: runtimePermissionProfiles[0]!.id,
+      approvalPolicy: runtimeApprovalPolicies[0]!.id,
+      approvalsReviewer: runtimeApprovalReviewers[0]!.id,
       collaborationMode: runtimeCollaborationModes[0]!.id,
       activeTurnId: "shared-running-turn",
       items: [
@@ -150,6 +165,18 @@ export class SharedRuntime {
           id: "shared-user-message",
           kind: "user-message",
           text: "验证两个独立 Web 客户端能否看到同一运行任务。",
+          attachments: [
+            {
+              kind: "file",
+              name: "mobile-evidence.json",
+              path: "Q:/PublicFixtures/reports/mobile-evidence.json",
+            },
+            {
+              kind: "image",
+              name: "mobile-evidence.svg",
+              path: "Q:/PublicFixtures/reports/mobile-evidence.svg",
+            },
+          ],
           createdAt: now(),
         },
         {
@@ -158,6 +185,13 @@ export class SharedRuntime {
           title: "运行共享状态验收",
           status: "running",
           summary: "自动 UI 证据，不代表 Desktop 实机三端证据",
+          createdAt: now(),
+        },
+        {
+          id: "shared-local-file-link",
+          kind: "assistant-message",
+          phase: "final_answer",
+          text: "查看 [fresh-task (line 87)](Q:/PublicFixtures/reports/review-evidence.json:87)。",
           createdAt: now(),
         },
       ],
@@ -170,6 +204,169 @@ export class SharedRuntime {
         updateSettings: true,
       },
     };
+    if (complexState) {
+      this.thread.items.push(
+        {
+          id: "shared-plan-question",
+          kind: "interaction-record",
+          interaction: "question",
+          status: "answered",
+          title: "已回答 1 个计划问题",
+          questions: [
+            {
+              id: "delivery-priority",
+              header: "优先级",
+              question: "这次移动端验收优先保证什么？",
+              isSecret: false,
+              options: [
+                {
+                  label: "稳定闭环",
+                  description: "先保证真实任务、审批与下一轮都可完成。",
+                },
+                {
+                  label: "视觉微调",
+                  description: "先调整字号、间距与颜色。",
+                },
+              ],
+              answers: ["稳定闭环"],
+            },
+          ],
+          turnId: "shared-running-turn",
+          createdAt: now(),
+        },
+        {
+          id: "shared-formal-plan",
+          kind: "formal-plan",
+          text: "## 移动端验收计划\n\n1. 验证动态审批与计划提问。\n2. 验证命令、输出和文件均可查看、滚动与复制。",
+          turnId: "shared-running-turn",
+          createdAt: now(),
+        },
+        {
+          id: "shared-long-command",
+          kind: "tool",
+          title: "运行命令",
+          status: "completed",
+          summary: `pwsh -NoProfile -Command "${Array.from(
+            { length: 80 },
+            (_, index) => `Write-Output 'COMMAND-${index + 1}-ABCDEFGHIJKLMNOPQRSTUVWXYZ'`,
+          ).join("\n")}"`,
+          detail: Array.from(
+            { length: 80 },
+            (_, index) =>
+              `OUTPUT-${String(index + 1).padStart(2, "0")}: ${"0123456789abcdefghijklmnopqrstuvwxyz".repeat(5)}`,
+          ).join("\n"),
+          createdAt: now(),
+        },
+      );
+    }
+    if (longWorkLog) {
+      const createdAt = now();
+      this.thread.state = "complete";
+      delete this.thread.activeTurnId;
+      this.thread.availableActions = {
+        steer: false,
+        interrupt: false,
+        reply: true,
+        changeModelNextTurn: true,
+        compact: true,
+        updateSettings: true,
+      };
+      this.thread.items = [
+        {
+          id: "long-work-user",
+          kind: "user-message",
+          text: "请完整检查长对话，不能丢失任何工作记录。",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-reasoning-a",
+          kind: "reasoning-summary",
+          text: "先确认真实历史基线",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-commentary-a",
+          kind: "assistant-message",
+          phase: "commentary",
+          text: "正在核对长对话顺序",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-command",
+          kind: "tool",
+          title: "运行命令",
+          status: "complete",
+          summary: "pnpm --filter @codex-local-remote/web test",
+          detail: "Test Files 33 passed\nTests 269 passed",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-file",
+          kind: "file-change",
+          path: "C:/Projects/codex-local-remote/apps/web/src/App.tsx",
+          change: "modified",
+          status: "completed",
+          diff: "@@ -1 +1 @@\n-old\n+new",
+          additions: 1,
+          deletions: 1,
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-subagent",
+          kind: "subagent-activity",
+          action: "close",
+          agents: [{ threadId: "long-work-agent", label: "历史完整性检查" }],
+          status: "complete",
+          summary: "检查完成",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-reasoning-b",
+          kind: "reasoning-summary",
+          text: "已完成合并并验证无重复",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-commentary-b",
+          kind: "assistant-message",
+          phase: "commentary",
+          text: "准备给出最终结果",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-generated-image",
+          kind: "image-activity",
+          action: "generated",
+          attachments: [
+            {
+              kind: "image",
+              name: "generated-evidence.svg",
+              path: "Q:/PublicFixtures/reports/mobile-evidence.svg",
+            },
+          ],
+          status: "complete",
+          summary: "AI 生成的验收图片",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+        {
+          id: "long-work-final",
+          kind: "assistant-message",
+          phase: "final_answer",
+          text: "完整工作记录之后的最终回答。",
+          turnId: "long-work-turn",
+          createdAt,
+        },
+      ];
+    }
     const items = complexState
       ? [
           queueItem("queue-queued", "queued", 0, "排队消息：等待当前回复结束"),
@@ -195,6 +392,7 @@ export class SharedRuntime {
     await context.addInitScript(() => {
       const sources = new Set<{
         closed: boolean;
+        onerror: ((event: Event) => void) | null;
         onmessage: ((event: MessageEvent<string>) => void) | null;
         onopen: ((event: Event) => void) | null;
       }>();
@@ -249,6 +447,18 @@ export class SharedRuntime {
           }
         }
       };
+      (window as EventSourceHarness).__codexRemoteE2eSetOnline = (online) => {
+        for (const source of sources) {
+          if (source.closed) continue;
+          if (online) {
+            source.readyState = HarnessEventSource.OPEN;
+            source.onopen?.(new Event("open"));
+          } else {
+            source.readyState = HarnessEventSource.CONNECTING;
+            source.onerror?.(new Event("error"));
+          }
+        }
+      };
     });
     await context.route("**/api/v1/**", (route) => this.handle(route));
   }
@@ -267,6 +477,22 @@ export class SharedRuntime {
             .evaluate(
               (nextEvent) => (window as EventSourceHarness).__codexRemoteE2eDispatch?.(nextEvent),
               envelope,
+            )
+            .catch(() => undefined);
+        }),
+      ),
+    );
+  }
+
+  async setOnline(online: boolean): Promise<void> {
+    await Promise.all(
+      [...this.contexts].flatMap((context) =>
+        context.pages().map(async (page) => {
+          await page
+            .evaluate(
+              (nextOnline) =>
+                (window as EventSourceHarness).__codexRemoteE2eSetOnline?.(nextOnline),
+              online,
             )
             .catch(() => undefined);
         }),
@@ -325,11 +551,24 @@ export class SharedRuntime {
           source: "registered",
           lastUsedAt: now(),
         },
+        {
+          id: "fixture-project",
+          name: "Fixture Project",
+          rootLabel: "Q:/PublicFixtures",
+          source: "registered",
+          lastUsedAt: now(),
+        },
       ]);
     }
     if (method === "GET" && path === "/models") return this.json(route, runtimeModels);
     if (method === "GET" && path === "/permission-profiles") {
       return this.json(route, runtimePermissionProfiles);
+    }
+    if (method === "GET" && path === "/approval-policies") {
+      return this.json(route, runtimeApprovalPolicies);
+    }
+    if (method === "GET" && path === "/approval-reviewers") {
+      return this.json(route, runtimeApprovalReviewers);
     }
     if (method === "GET" && path === "/collaboration-modes") {
       return this.json(route, runtimeCollaborationModes);
@@ -355,6 +594,59 @@ export class SharedRuntime {
       });
     }
     if (method === "GET" && path === "/approvals") return this.json(route, this.approvals);
+    if (method === "GET" && path === "/files/resolve") {
+      const requestedPath = url.searchParams.get("path") ?? "";
+      const isImage = requestedPath.endsWith("mobile-evidence.svg");
+      return this.json(route, {
+        downloadable: true,
+        kind: "file",
+        modifiedAt: now(),
+        name: isImage
+          ? "mobile-evidence.svg"
+          : requestedPath.endsWith("mobile-evidence.json")
+            ? "mobile-evidence.json"
+            : "review-evidence.json",
+        projectId: "fixture-project",
+        relativePath: isImage
+          ? "reports/mobile-evidence.svg"
+          : requestedPath.endsWith("mobile-evidence.json")
+            ? "reports/mobile-evidence.json"
+            : "reports/review-evidence.json",
+        size: 128,
+      });
+    }
+    if (method === "GET" && path === "/files/preview") {
+      const requestedPath = url.searchParams.get("path") ?? "";
+      if (requestedPath.endsWith("mobile-evidence.svg")) {
+        return route.fulfill({
+          body: '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="320" height="180" fill="#e8f7ef"/><text x="24" y="96" font-size="24" fill="#08783e">mobile evidence</text></svg>',
+          contentType: "image/svg+xml",
+          status: 200,
+        });
+      }
+      if (requestedPath.endsWith("mobile-evidence.json")) {
+        return route.fulfill({
+          body: '{\n  "attachment": "visible"\n}\n',
+          contentType: "application/json; charset=utf-8",
+          status: 200,
+        });
+      }
+      return route.fulfill({
+        body: '{\n  "fresh-task": "not_retested"\n}\n',
+        contentType: "application/json; charset=utf-8",
+        status: 200,
+      });
+    }
+    if (method === "GET" && path === "/files/download") {
+      return route.fulfill({
+        body: '{\n  "fresh-task": "not_retested"\n}\n',
+        contentType: "application/octet-stream",
+        headers: {
+          "content-disposition": 'attachment; filename="review-evidence.json"',
+        },
+        status: 200,
+      });
+    }
 
     if (segments[0] === "approvals" && segments[2] === "resolve" && method === "POST") {
       const approvalId = segments[1]!;
@@ -373,7 +665,28 @@ export class SharedRuntime {
       if (segments.length === 2 && method === "GET") return this.json(route, this.thread);
       if (segments[2] === "subagents" && method === "GET") return this.json(route, []);
       if (segments[2] === "goal" && method === "GET") {
-        return this.json(route, { goal: null });
+        return this.json(route, { goal: this.goal });
+      }
+      if (segments[2] === "goal" && method === "PUT") {
+        const input = request.postDataJSON() as SetThreadGoalInput;
+        const timestamp = now();
+        this.goal = {
+          threadId: this.thread.id,
+          objective: input.objective,
+          status: "active",
+          ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: this.goal?.createdAt ?? timestamp,
+          updatedAt: timestamp,
+        };
+        this.goalUpdates.push(structuredClone(input));
+        return this.json(route, undefined, 204);
+      }
+      if (segments[2] === "goal" && method === "DELETE") {
+        this.goal = null;
+        this.goalUpdates.push(null);
+        return this.json(route, undefined, 204);
       }
       if (segments[2] === "settings" && method === "PATCH") {
         const input = request.postDataJSON() as Record<string, string | null | undefined>;
@@ -386,6 +699,9 @@ export class SharedRuntime {
           ...(input["permissionProfileId"]
             ? { permissionProfileId: input["permissionProfileId"] }
             : {}),
+          ...(input["approvalPolicy"] ? { approvalPolicy: input["approvalPolicy"] } : {}),
+          ...(input["approvalsReviewer"] ? { approvalsReviewer: input["approvalsReviewer"] } : {}),
+          ...(input["collaborationMode"] ? { collaborationMode: input["collaborationMode"] } : {}),
         };
         return this.json(route, undefined, 204);
       }

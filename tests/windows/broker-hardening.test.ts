@@ -81,20 +81,105 @@ windowsOnly("Windows shared app-server broker hardening", () => {
       Description: string;
       Execute: string;
       Arguments: string;
+      TaskExecute: string;
+      TaskArguments: string;
       Bootstrap: string;
     };
-    expect(definition.Description).toContain("startup-task/v3");
+    expect(definition.Description).toContain("startup-task/v5");
     expect(definition.Execute).toBe(resolve(pwshPath));
+    expect(definition.TaskExecute).toBe(
+      resolve(process.env.SystemRoot ?? "C:\\Windows", "System32", "conhost.exe"),
+    );
+    expect(definition.TaskArguments).toContain("--headless");
+    expect(definition.TaskArguments).toContain(resolve(pwshPath));
     expect(result.stdout).not.toContain("/ws/");
     expect(definition.Bootstrap).toBe(
       resolve(installRoot, "scripts", "windows", "Start-CodexLocalRemote.ps1"),
     );
     expect(definition.Arguments).toContain("-File");
+    expect(definition.Arguments).toContain("-WindowStyle Hidden");
     expect(definition.Arguments).toContain("-BrokerPort 18791");
     expect(definition.Arguments).toContain("-BrokerUpstreamPort 18792");
     expect(definition.Arguments).toContain("-SidecarPort 18790");
+    expect(definition.Arguments).toContain("-DesktopOwnerCoordinator");
+    expect(definition.Arguments).toContain("-TakeOverExistingNativeDesktop");
+    expect(definition.Arguments).not.toContain("-NoDesktopLaunch");
     expect(definition.Arguments).not.toContain("-CodexPath");
     expect(definition.Arguments).not.toContain(resolve(codexPath));
+  });
+
+  it("separates the active owner V5 bootstrap from exact V4 and V3 bootstrap contracts", () => {
+    const definitionResult = runDriver([
+      "-Operation",
+      "startup-definition",
+      "-InstallRoot",
+      installRoot,
+      "-DataDir",
+      dataDir,
+      "-NodePath",
+      nodePath,
+      "-CodexPath",
+      codexPath,
+      "-PwshPath",
+      pwshPath,
+    ]);
+    expect(definitionResult.status).toBe(0);
+    const definition = JSON.parse(definitionResult.stdout) as { Arguments: string };
+    const classify = (arguments_: string) =>
+      runDriver([
+        "-Operation",
+        "classify-bootstrap-contract",
+        "-InstallRoot",
+        installRoot,
+        "-DataDir",
+        dataDir,
+        "-NodePath",
+        nodePath,
+        "-PwshPath",
+        pwshPath,
+        "-ExecutablePath",
+        pwshPath,
+        "-CommandLine",
+        `"${pwshPath}" ${arguments_}`,
+      ]);
+
+    const current = classify(definition.Arguments);
+    expect(current.status, `${current.stdout}${current.stderr}`).toBe(0);
+    expect(JSON.parse(current.stdout)).toMatchObject({
+      IsManaged: true,
+      Contract: "desktop-owner-v5",
+    });
+
+    const legacyV4 = classify(
+      definition.Arguments.replace(
+        / -DesktopOwnerCoordinator -TakeOverExistingNativeDesktop$/u,
+        " -NoDesktopLaunch",
+      ),
+    );
+    expect(legacyV4.status, `${legacyV4.stdout}${legacyV4.stderr}`).toBe(0);
+    expect(JSON.parse(legacyV4.stdout)).toMatchObject({
+      IsManaged: true,
+      Contract: "headless-v4",
+    });
+
+    const legacyV3 = classify(
+      definition.Arguments.replace(
+        / -DesktopOwnerCoordinator -TakeOverExistingNativeDesktop$/u,
+        " -TakeOverExistingNativeDesktop",
+      ),
+    );
+    expect(legacyV3.status, `${legacyV3.stdout}${legacyV3.stderr}`).toBe(0);
+    expect(JSON.parse(legacyV3.stdout)).toMatchObject({
+      IsManaged: true,
+      Contract: "desktop-owner-v3",
+    });
+
+    const foreign = classify(`${definition.Arguments} -Foreign`);
+    expect(foreign.status, `${foreign.stdout}${foreign.stderr}`).toBe(0);
+    expect(JSON.parse(foreign.stdout)).toMatchObject({
+      IsManaged: false,
+      Contract: "unverified",
+    });
   });
 
   it.each([

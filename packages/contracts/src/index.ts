@@ -182,13 +182,33 @@ export interface ToolOccurrenceDetail {
   createdAt?: string;
 }
 
+export interface ConversationAttachment {
+  kind: "file" | "image";
+  name: string;
+  path: string;
+}
+
 export type ConversationItem = ConversationItemContext &
   (
     | {
         id: string;
-        kind: "user-message" | "assistant-message" | "reasoning-summary";
+        kind: "user-message";
+        text: string;
+        attachments?: ConversationAttachment[];
+      }
+    | {
+        id: string;
+        kind: "assistant-message" | "reasoning-summary";
         text: string;
         phase?: "commentary" | "final_answer";
+      }
+    | {
+        id: string;
+        kind: "image-activity";
+        action: "generated" | "viewed";
+        attachments: ConversationAttachment[];
+        status: "running" | "complete" | "failed";
+        summary?: string;
       }
     | {
         id: string;
@@ -232,13 +252,42 @@ export type ConversationItem = ConversationItemContext &
           status: "pending" | "inProgress" | "completed";
         }>;
       }
+    | {
+        id: string;
+        kind: "formal-plan";
+        text: string;
+      }
+    | {
+        id: string;
+        kind: "interaction-record";
+        interaction: "question";
+        status: "answered" | "skipped";
+        title: string;
+        questions: Array<{
+          id: string;
+          header: string;
+          question: string;
+          isSecret: boolean;
+          options?: Array<{
+            label: string;
+            description: string;
+          }>;
+          answers?: string[];
+        }>;
+      }
   );
 
 export interface ThreadDetail extends ThreadSummary {
   items: ConversationItem[];
   historyNextCursor?: string;
+  /**
+   * Evidence about the supplemental Desktop session history merged into this
+   * response. Absence remains supported for older Sidecars.
+   */
+  persistedHistoryIntegrity?: PersistedConversationHistoryIntegrity;
   activeTurnId?: string;
   snapshotEventSeq?: number;
+  snapshotEventCursor?: string;
   availableActions: {
     steer: boolean;
     interrupt: boolean;
@@ -247,6 +296,29 @@ export interface ThreadDetail extends ThreadSummary {
     compact?: boolean;
     updateSettings?: boolean;
   };
+}
+
+export type PersistedConversationHistoryScope = "complete" | "recent";
+
+export interface PersistedConversationHistoryIntegrity {
+  status: "complete" | "partial" | "failed";
+  scope: PersistedConversationHistoryScope;
+  reason:
+    | "verified-complete"
+    | "recent-window"
+    | "invalid-json"
+    | "unterminated-line"
+    | "overlong-line"
+    | "projection-limit"
+    | "read-failed"
+    | "unstable-file"
+    | "diagnostic-unavailable";
+  observedCount: number;
+}
+
+export interface PersistedConversationReadResult {
+  items: ConversationItem[];
+  integrity: PersistedConversationHistoryIntegrity;
 }
 
 export interface ThreadSettingsInput {
@@ -273,6 +345,39 @@ export interface ThreadGoal {
 export interface SetThreadGoalInput {
   objective: string;
   tokenBudget?: number;
+}
+
+export type SubagentHistoryIntegrityStatus = "complete" | "partial" | "unknown" | "failed";
+
+export type SubagentHistoryIntegrityReason =
+  | "verified-exhaustive"
+  | "pagination-pending"
+  | "pagination-failed"
+  | "read-failed"
+  | "read-truncated"
+  | "upstream-short-page-without-cursor"
+  | "verification-mismatch"
+  | "continuation-unverified";
+
+export interface SubagentHistoryStreamIntegrity {
+  status: "exhausted" | "more-available" | "failed" | "not-requested";
+  /** Number of raw thread records observed from this stream in the current response. */
+  observedCount: number;
+}
+
+/**
+ * Read-only evidence about whether a subagent page represents all history that
+ * app-server made available. Absence remains supported for older producers.
+ */
+export interface SubagentHistoryIntegrity {
+  status: SubagentHistoryIntegrityStatus;
+  reason: SubagentHistoryIntegrityReason;
+  /** Number of unique subagents returned in the current response. */
+  observedCount: number;
+  streams: {
+    current: SubagentHistoryStreamIntegrity;
+    archived: SubagentHistoryStreamIntegrity;
+  };
 }
 
 export interface SubagentSummary {
@@ -458,6 +563,13 @@ export interface FileEntry {
 
 export interface ResolvedFileEntry extends FileEntry {
   projectId: string;
+}
+
+export interface FileRoot {
+  id: string;
+  kind: "host" | "project";
+  name: string;
+  rootLabel: string;
 }
 
 export interface FileListing {

@@ -34,6 +34,7 @@ test.describe("单密码登录与完整远程旅程", () => {
     await expect(page.getByText("把移动端首页和对话页做完整。", { exact: false })).toBeVisible();
     await expect(page.getByTestId("turn-composer")).toBeVisible();
     await expect(page.getByTestId("turn-interrupt")).toBeVisible();
+    await page.getByTestId("turn-composer").click();
     await page.getByTestId("turn-composer").fill("补充一条不会立即提交的验收要求");
     await expect(page.getByTestId("turn-steer-submit")).toBeVisible();
     await expect(page.getByTestId("composer-settings-open")).toBeVisible();
@@ -48,6 +49,7 @@ test.describe("单密码登录与完整远程旅程", () => {
     await expect(page.getByTestId("turn-running")).toHaveCount(0);
     await expect(page.getByTestId("turn-composer")).toBeVisible();
     await expect(page.getByTestId("turn-interrupt")).toBeVisible();
+    await page.getByTestId("turn-composer").click();
     await page.getByTestId("turn-composer").fill("验证 Desktop 创建任务仍可从手机引导");
     await expect(page.getByTestId("turn-steer-submit")).toBeVisible();
   });
@@ -127,14 +129,19 @@ test.describe("单密码登录与完整远程旅程", () => {
     });
 
     await test.step("运行中追加引导并停止", async () => {
-      await page.getByTestId("turn-composer").fill("先只检查，不要修改任何文件。");
+      const composer = page.getByTestId("turn-composer");
+      await composer.click();
+      await composer.fill("先只检查，不要修改任何文件。");
       await page.getByTestId("turn-steer-submit").click();
       await expect(page.getByTestId("steer-accepted")).toBeVisible();
       await page.getByTestId("turn-interrupt").click();
       await expect(page.getByTestId("turn-interrupted")).toBeVisible();
+      await expect(page.getByTestId("turn-interrupt")).toHaveCount(0);
+      await expect(page.getByTestId("turn-reply-submit")).toBeVisible();
     });
 
     await test.step("模型选择明确标为下一轮", async () => {
+      await page.getByTestId("turn-composer").click();
       await page.getByTestId("composer-settings-open").click();
       const settings = page.getByRole("dialog");
       await expect(settings.getByRole("heading", { name: "下一轮设置" })).toBeVisible();
@@ -185,6 +192,15 @@ test.describe("单密码登录与完整远程旅程", () => {
       await page.getByTestId("subagent-node").first().click();
       await expect(page.getByTestId("subagent-thread")).toBeVisible();
       await expect(page.getByTestId("parent-thread-back")).toBeVisible();
+      await expect(
+        page.getByText("只检查分配给你的模块，并把可验证结论返回父对话。"),
+      ).toBeVisible();
+      await expect(
+        page.getByText("相关文件和边界已经核对完成，正在整理可以回读的验证结果。"),
+      ).toBeVisible();
+      await expect(
+        page.getByText("子任务已完成：检查记录、工具活动和最终结论都保留在这个子智能体对话中。"),
+      ).toBeVisible();
       await page.getByTestId("parent-thread-back").click();
       await expect(page.getByTestId("thread-view")).toBeVisible();
     });

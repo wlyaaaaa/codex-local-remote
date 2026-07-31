@@ -6,7 +6,11 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet(
         'valid-running',
+        'valid-running-null-triggers',
         'valid-running-sid',
+        'legacy-headless-v4',
+        'legacy-no-desktop-launch',
+        'legacy-pre-headless',
         'valid-ready',
         'foreign-action',
         'foreign-working-directory',
@@ -30,8 +34,21 @@ param(
         'sidecar-multiple',
         'sidecar-foreign',
         'persistent-user-override',
+        'launcher-legacy-takeover',
+        'launcher-non-elevated',
+        'launcher-minimized',
         'valid-launch-receipt',
-        'invalid-launch-receipt'
+        'invalid-launch-receipt',
+        'valid-launch-receipt-v2',
+        'valid-launch-receipt-v2-success',
+        'invalid-launch-receipt-v2-extra',
+        'invalid-launch-receipt-v2-stage',
+        'invalid-launch-receipt-v2-code',
+        'invalid-launch-receipt-v2-decision',
+        'invalid-launch-receipt-v2-correlation',
+        'invalid-launch-receipt-v2-feedback-status',
+        'invalid-launch-receipt-v2-feedback',
+        'invalid-launch-receipt-v2-failure-pair'
     )]
     [string]$Mode,
 
@@ -88,31 +105,25 @@ $task = [pscustomobject]@{
     State = $(if ($Mode -ceq 'valid-ready') { 'Ready' } else { 'Running' })
     Actions = @(
         [pscustomobject]@{
-            Execute = $expected.Execute
-            Arguments = $expected.Arguments
+            Execute = $expected.TaskExecute
+            Arguments = $expected.TaskArguments
             WorkingDirectory = $expected.WorkingDirectory
         }
     )
     Principal = [pscustomobject]@{
         UserId = $currentUser
         LogonType = 'Interactive'
-        RunLevel = 'Limited'
+        RunLevel = 'Highest'
     }
-    Triggers = @(
-        [pscustomobject]@{
-            CimClassName = 'MSFT_TaskLogonTrigger'
-            UserId = $currentUserSid
-            Enabled = $true
-        }
-    )
+    Triggers = @()
     Settings = [pscustomobject]@{
         DisallowStartIfOnBatteries = $false
         StopIfGoingOnBatteries = $false
         ExecutionTimeLimit = 'P3650D'
         MultipleInstances = 'IgnoreNew'
-        RestartCount = 3
-        RestartInterval = 'PT1M'
-        StartWhenAvailable = $true
+        RestartCount = 0
+        RestartInterval = ''
+        StartWhenAvailable = $false
         Enabled = $true
         AllowDemandStart = $true
         RunOnlyIfIdle = $false
@@ -121,8 +132,55 @@ $task = [pscustomobject]@{
 }
 
 switch ($Mode) {
+    'valid-running-null-triggers' {
+        $task.Triggers = $null
+    }
     'valid-running-sid' {
         $task.Principal.UserId = $currentUserSid
+    }
+    { $_ -cin @('legacy-no-desktop-launch', 'legacy-pre-headless') } {
+        $task.Triggers = @(
+            [pscustomobject]@{
+                CimClassName = 'MSFT_TaskLogonTrigger'
+                UserId = $currentUserSid
+                Enabled = $true
+            }
+        )
+        $task.Settings.RestartCount = 3
+        $task.Settings.RestartInterval = 'PT1M'
+        $task.Settings.StartWhenAvailable = $true
+        $legacyDefinition =
+            Get-LegacyDesktopOwningStartupTaskDefinitionV3 `
+                -Definition $expected
+        $task.Description = [string]$legacyDefinition.Description
+        if ($Mode -ceq 'legacy-pre-headless') {
+            $task.Actions[0].Execute = [string]$legacyDefinition.Execute
+            $task.Actions[0].Arguments = [string]$legacyDefinition.Arguments
+        } else {
+            $task.Actions[0].Arguments =
+                [string]$legacyDefinition.TaskArguments
+        }
+    }
+    'legacy-headless-v4' {
+        $task.Triggers = @(
+            [pscustomobject]@{
+                CimClassName = 'MSFT_TaskLogonTrigger'
+                UserId = $currentUserSid
+                Enabled = $true
+            }
+        )
+        $task.Settings.RestartCount = 3
+        $task.Settings.RestartInterval = 'PT1M'
+        $task.Settings.StartWhenAvailable = $true
+        $legacyDefinition =
+            Get-LegacyHeadlessStartupTaskDefinitionV4 `
+                -Definition $expected
+        $task.Description = [string]$legacyDefinition.Description
+        $task.Actions[0].Execute = [string]$legacyDefinition.TaskExecute
+        $task.Actions[0].Arguments =
+            [string]$legacyDefinition.TaskArguments
+        $task.Actions[0].WorkingDirectory =
+            [string]$legacyDefinition.WorkingDirectory
     }
     'foreign-action' {
         $task.Actions[0].Arguments = "$($task.Actions[0].Arguments) --foreign"
@@ -140,25 +198,51 @@ switch ($Mode) {
         $task.Principal.LogonType = 'ServiceAccount'
     }
     'foreign-principal-run-level' {
-        $task.Principal.RunLevel = 'Highest'
+        $task.Principal.RunLevel = 'Limited'
     }
     'missing-principal-user' {
         $task.Principal.PSObject.Properties.Remove('UserId')
     }
     'foreign-trigger-class' {
-        $task.Triggers[0].CimClassName = 'MSFT_TaskTimeTrigger'
+        $task.Triggers = @([pscustomobject]@{
+            CimClassName = 'MSFT_TaskTimeTrigger'
+            UserId = $currentUserSid
+            Enabled = $true
+        })
     }
     'foreign-trigger-user' {
-        $task.Triggers[0].UserId = 'unresolvable-foreign-user'
+        $task.Triggers = @([pscustomobject]@{
+            CimClassName = 'MSFT_TaskLogonTrigger'
+            UserId = 'unresolvable-foreign-user'
+            Enabled = $true
+        })
     }
     'foreign-trigger-disabled' {
-        $task.Triggers[0].Enabled = $false
+        $task.Triggers = @([pscustomobject]@{
+            CimClassName = 'MSFT_TaskLogonTrigger'
+            UserId = $currentUserSid
+            Enabled = $false
+        })
     }
     'foreign-trigger-extra' {
-        $task.Triggers = @($task.Triggers[0], $task.Triggers[0].PSObject.Copy())
+        $task.Triggers = @(
+            [pscustomobject]@{
+                CimClassName = 'MSFT_TaskLogonTrigger'
+                UserId = $currentUserSid
+                Enabled = $true
+            },
+            [pscustomobject]@{
+                CimClassName = 'MSFT_TaskLogonTrigger'
+                UserId = $currentUserSid
+                Enabled = $true
+            }
+        )
     }
     'missing-trigger-user' {
-        $task.Triggers[0].PSObject.Properties.Remove('UserId')
+        $task.Triggers = @([pscustomobject]@{
+            CimClassName = 'MSFT_TaskLogonTrigger'
+            Enabled = $true
+        })
     }
     'foreign-setting' {
         $task.Settings.RestartCount = 4
@@ -279,13 +363,29 @@ $capabilityTokenPath = Get-BrokerCapabilityTokenPath -DataDir $resolvedDataDir
     ('A' * 43),
     [System.Text.UTF8Encoding]::new($false)
 )
-$launcherPath = [System.IO.Path]::GetFullPath(
+$legacyLauncherPath = [System.IO.Path]::GetFullPath(
     (Join-Path $InstallRoot 'scripts\windows\Launch-CodexWithRemote.ps1')
+)
+$launcherPath =
+    Get-CodexLocalRemoteControlDispatcherPath -DataDir $resolvedDataDir
+$null = [System.IO.Directory]::CreateDirectory(
+    (Split-Path -Parent $launcherPath)
+)
+[System.IO.File]::Copy(
+    (Join-Path `
+        (Split-Path -Parent $TargetScript) `
+        'CodexLocalRemote.Control.ps1'),
+    $launcherPath,
+    $true
 )
 $safeLaunchName = 'Codex Remote (' +
     (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
     ')'
 $launcherShortcutPath = Join-Path $resolvedDataDir 'status-launcher.lnk'
+$fixtureIconSource = Join-Path $PSHOME 'pwsh.exe'
+$managedIcon = Install-CodexLocalRemoteManagedDesktopIcon `
+    -DataDir $resolvedDataDir `
+    -DesktopExecutablePath $fixtureIconSource
 $userEnvironmentFixturePath = Join-Path $resolvedDataDir 'user-environment.json'
 $userEnvironmentFixture = if ($Mode -ceq 'persistent-user-override') {
     [ordered]@{
@@ -302,7 +402,10 @@ $userEnvironmentFixture |
     ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath $userEnvironmentFixturePath -Encoding utf8NoBOM
 $desktopLaunchReceiptPath = Join-Path $resolvedDataDir 'desktop-launch-last.json'
-if ($Mode -cin @('valid-launch-receipt', 'invalid-launch-receipt')) {
+if ($Mode -cin @(
+    'valid-launch-receipt',
+    'invalid-launch-receipt'
+)) {
     $desktopLaunchReceipt = [ordered]@{
         Signature = 'codex-local-remote/desktop-launch/v1'
         Version = 1
@@ -320,8 +423,92 @@ if ($Mode -cin @('valid-launch-receipt', 'invalid-launch-receipt')) {
     $desktopLaunchReceipt |
         ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath $desktopLaunchReceiptPath -Encoding utf8NoBOM
+} elseif ($Mode -like '*launch-receipt-v2*') {
+    $desktopLaunchReceipt = [ordered]@{
+        Signature = 'codex-local-remote/desktop-launch/v2'
+        Version = 2
+        Status = 'launched-native'
+        RemoteEnabled = $false
+        RemoteDecision = 'remote-start-failed'
+        RemoteFallbackAttempts = 1
+        RemoteStopAttempts = 0
+        DesktopProcessId = 42424
+        RemoteFailureStage = 'runtime-handoff'
+        RemoteFailureCode = 'runtime-handoff-failed'
+        CorrelationId = '0123456789abcdef0123456789abcdef'
+        FeedbackStatus = 'render-failed'
+        FeedbackFailureCode = 'feedback-render-failed'
+        RecordedAtUtc = '2026-07-29T23:45:56.0000000Z'
+    }
+    switch ($Mode) {
+        'valid-launch-receipt-v2-success' {
+            $desktopLaunchReceipt.Status = 'launched-remote'
+            $desktopLaunchReceipt.RemoteEnabled = $true
+            $desktopLaunchReceipt.RemoteDecision = 'remote-attached'
+            $desktopLaunchReceipt.RemoteFallbackAttempts = 0
+            $desktopLaunchReceipt.RemoteFailureStage = $null
+            $desktopLaunchReceipt.RemoteFailureCode = $null
+            $desktopLaunchReceipt.CorrelationId = $null
+            $desktopLaunchReceipt.FeedbackStatus = 'rendered'
+            $desktopLaunchReceipt.FeedbackFailureCode = $null
+        }
+        'invalid-launch-receipt-v2-extra' {
+            $desktopLaunchReceipt.RawException =
+                'PRIVATE_FAILURE_SENTINEL C:\private\path at hidden stack'
+        }
+        'invalid-launch-receipt-v2-stage' {
+            $desktopLaunchReceipt.RemoteFailureStage = 7
+        }
+        'invalid-launch-receipt-v2-code' {
+            $desktopLaunchReceipt.RemoteFailureCode =
+                'PRIVATE_FAILURE_SENTINEL C:\private\path'
+        }
+        'invalid-launch-receipt-v2-decision' {
+            $desktopLaunchReceipt.RemoteDecision =
+                'PRIVATE_FAILURE_SENTINEL raw-exception'
+        }
+        'invalid-launch-receipt-v2-correlation' {
+            $desktopLaunchReceipt.CorrelationId =
+                'PRIVATE_FAILURE_SENTINEL-not-a-correlation-id'
+        }
+        'invalid-launch-receipt-v2-feedback-status' {
+            $desktopLaunchReceipt.FeedbackStatus =
+                'PRIVATE_FAILURE_SENTINEL raw-feedback-error'
+            $desktopLaunchReceipt.FeedbackFailureCode = $null
+        }
+        'invalid-launch-receipt-v2-feedback' {
+            $desktopLaunchReceipt.FeedbackStatus = 'rendered'
+        }
+        'invalid-launch-receipt-v2-failure-pair' {
+            $desktopLaunchReceipt.RemoteFailureStage = $null
+        }
+    }
+    $desktopLaunchReceipt |
+        ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath $desktopLaunchReceiptPath -Encoding utf8NoBOM
 }
-$launcherArguments = @(
+$launcherIsLegacy = $Mode -ceq 'launcher-legacy-takeover'
+$launcherArguments = if ($launcherIsLegacy) {
+    @(
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-WindowStyle',
+        'Hidden',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $legacyLauncherPath,
+        '-DataDir',
+        $resolvedDataDir,
+        '-BrokerPort',
+        '18791',
+        '-TaskName',
+        $taskName,
+        '-TakeOverExistingNativeDesktop'
+    )
+} else {
+    @(
     '-NoLogo',
     '-NoProfile',
     '-NonInteractive',
@@ -331,13 +518,15 @@ $launcherArguments = @(
     'Bypass',
     '-File',
     $launcherPath,
-    '-DataDir',
-    $resolvedDataDir,
-    '-BrokerPort',
-    '18791',
-    '-TaskName',
-    $taskName
-) | ForEach-Object {
+    '-Operation',
+    'Open',
+        '-DataDir',
+        $resolvedDataDir,
+        '-AllowDesktopRestart',
+        '-InteractiveShortcutFeedback'
+    )
+}
+$launcherArguments = $launcherArguments | ForEach-Object {
     ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
 }
 $shell = New-Object -ComObject WScript.Shell
@@ -345,15 +534,52 @@ $launcherShortcut = $shell.CreateShortcut($launcherShortcutPath)
 try {
     $launcherShortcut.TargetPath = [System.IO.Path]::GetFullPath($PwshPath)
     $launcherShortcut.Arguments = $launcherArguments -join ' '
-    $launcherShortcut.WorkingDirectory = [System.IO.Path]::GetFullPath($InstallRoot)
-    $launcherShortcut.Description =
+    $launcherShortcut.WorkingDirectory = if ($launcherIsLegacy) {
+        [System.IO.Path]::GetFullPath($InstallRoot)
+    } else {
+        $resolvedDataDir
+    }
+    $launcherShortcut.Description = if ($launcherIsLegacy) {
         "$safeLaunchName - Uses Remote when ready and otherwise starts Codex Desktop natively."
+    } else {
+        "$safeLaunchName - Explicitly opens Remote through the stable control dispatcher."
+    }
+    $launcherShortcut.IconLocation = "$($managedIcon.IconPath),0"
+    $launcherShortcut.WindowStyle = if ($Mode -ceq 'launcher-minimized') {
+        7
+    } else {
+        1
+    }
     $launcherShortcut.Save()
 } finally {
     $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject(
         $launcherShortcut
     )
     $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+}
+if ($Mode -cne 'launcher-non-elevated') {
+    $stream = [System.IO.File]::Open(
+        $launcherShortcutPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $header = [byte[]]::new(24)
+        if ($stream.Read($header, 0, $header.Length) -ne $header.Length -or
+            [BitConverter]::ToUInt32($header, 0) -ne 76) {
+            throw 'fixture launcher shell link header is invalid'
+        }
+        $flags = [uint32](
+            [BitConverter]::ToUInt32($header, 20) -bor 0x00002000
+        )
+        $flagBytes = [BitConverter]::GetBytes($flags)
+        $null = $stream.Seek(20, [System.IO.SeekOrigin]::Begin)
+        $stream.Write($flagBytes, 0, $flagBytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 try {

@@ -32,12 +32,34 @@ param(
     [ValidateRange(5, 3600)]
     [int]$DesktopRuntimeCheckIntervalSeconds = 30,
 
+    [ValidateRange(10, 3600)]
+    [int]$DesktopOwnerResumeGapSeconds = 30,
+
     [Parameter(DontShow)]
-    [switch]$NoDesktopLaunch
+    [switch]$NoDesktopLaunch,
+
+    [switch]$DesktopOwnerCoordinator,
+
+    [switch]$TakeOverExistingNativeDesktop
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'CodexLocalRemote.Windows.psm1') -Force
+$managedConfiguration = Get-CodexLocalRemoteManagedConfiguration -DataDir $DataDir
+if ($null -ne $managedConfiguration) {
+    if (-not $PSBoundParameters.ContainsKey('SidecarPort')) {
+        $SidecarPort = [int]$managedConfiguration.SidecarPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BrokerPort')) {
+        $BrokerPort = [int]$managedConfiguration.BrokerPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BrokerUpstreamPort')) {
+        $BrokerUpstreamPort = [int]$managedConfiguration.BrokerUpstreamPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BasePath')) {
+        $BasePath = [string]$managedConfiguration.BasePath
+    }
+}
 
 # A persistent Desktop override is intentionally unsupported. The scheduled
 # bootstrap starts from a clean process environment and grants the capability
@@ -48,7 +70,13 @@ $resolvedCodex = $null
 $resolvedNode = [System.IO.Path]::GetFullPath($NodePath)
 $resolvedRoot = [System.IO.Path]::GetFullPath($InstallRoot)
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
-$null = Protect-CodexLocalRemoteDataDirectory -DataDir $resolvedDataDir
+$brokerSidecarCompatibilityId =
+    'codex-local-remote/broker-sidecar/v1'
+$null = Assert-CodexLocalRemoteDataDirectoryStartupProtection `
+    -DataDir $resolvedDataDir
+$null = Sync-CodexLocalRemoteCurrentRuntime `
+    -DataDir $resolvedDataDir `
+    -InstallRoot $resolvedRoot
 $startupStatusPath = Join-Path $resolvedDataDir 'startup-last.json'
 $bootstrapInvocationId = [Guid]::NewGuid().ToString('N')
 $runtimeInvocationId = $null
@@ -79,6 +107,36 @@ function Write-StartupStatus {
         Runtime = $runtimeDiscovery
         RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
     })
+}
+
+function Get-DesktopHandoffPreparationForRuntime {
+    param(
+        [AllowNull()]
+        [object]$Runtime,
+
+        [switch]$RequireLiveOwnership
+    )
+
+    if ($null -eq $Runtime -or
+        [string]$Runtime.CurrentVersionId -cnotmatch
+            '^[0-9a-f]{64}$' -or
+        [string]$Runtime.CurrentManifestSha256 -cnotmatch
+            '^[0-9a-f]{64}$' -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$Runtime.CurrentRoot
+        )) {
+        return $null
+    }
+    return Read-CodexLocalRemoteDesktopHandoffPreparation `
+        -DataDir $resolvedDataDir `
+        -ExpectedRuntimeVersionId (
+            [string]$Runtime.CurrentVersionId
+        ) `
+        -ExpectedRuntimeRoot ([string]$Runtime.CurrentRoot) `
+        -ExpectedManifestSha256 (
+            [string]$Runtime.CurrentManifestSha256
+        ) `
+        -RequireLiveOwnership:$RequireLiveOwnership
 }
 
 function New-RuntimeProcessReceipt {
@@ -135,7 +193,10 @@ function Write-BrokerRuntimeReceipt {
         ProcessStartTimeUtcTicks = [long]$BrokerReceipt.ProcessStartTimeUtcTicks
         NodePath = $resolvedNode
         BrokerCliPath = $brokerCli
+        BrokerSidecarCompatibilityId =
+            $brokerSidecarCompatibilityId
         CodexPath = $resolvedCodex
+        CodexRuntime = $runtimeDiscovery
         StartedByThisInvocation = $startedBroker
         RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
     })
@@ -271,7 +332,10 @@ function Resolve-NewCodexDesktopRuntime {
             DiscoveredAtUtc = [DateTime]::UtcNow.ToString('O')
         }
     }
-    return Resolve-CodexDesktopRuntime
+    return Resolve-CodexDesktopRuntime `
+        -RuntimeCachePath (
+            Join-Path $resolvedDataDir 'desktop-runtime-cache.json'
+        )
 }
 
 function Test-DesktopRuntimeIdentityCurrent {
@@ -343,6 +407,42 @@ trap {
     exit 1
 }
 
+$initialDesiredMode =
+    Get-CodexLocalRemoteDesiredMode -DataDir $resolvedDataDir
+if ([string]$initialDesiredMode.Mode -ceq 'Native') {
+    $startupStage = 'native-default'
+    Write-StartupStatus `
+        -Status 'inactive' `
+        -Message (
+            'Remote is explicitly closed. The demand-start task exited ' +
+            'without starting Broker, Sidecar, or Codex Desktop.'
+        )
+    exit 0
+}
+
+$startupSelectedRuntime =
+    Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+$desktopHandoffPreparationPath =
+    Get-CodexLocalRemoteDesktopHandoffPreparationPath `
+        -DataDir $resolvedDataDir
+$desktopHandoffPreparationPathPresent =
+    Test-Path -LiteralPath $desktopHandoffPreparationPath
+$desktopHandoffPreparation =
+    Get-DesktopHandoffPreparationForRuntime `
+        -Runtime $startupSelectedRuntime
+$liveDesktopHandoffPreparation = if (
+    $null -ne $desktopHandoffPreparation -and
+    [string]$desktopHandoffPreparation.Phase -cin @(
+        'requested',
+        'ready'
+    )
+) {
+    Get-DesktopHandoffPreparationForRuntime `
+        -Runtime $startupSelectedRuntime `
+        -RequireLiveOwnership
+} else {
+    $null
+}
 $runtimeDiscovery = Get-ActiveRuntimeDiscoveryReceipt
 if ($null -ne $runtimeDiscovery) {
     $resolvedCodex = [System.IO.Path]::GetFullPath(
@@ -398,6 +498,13 @@ foreach ($candidate in @(
     if (Test-IndependentDesktopAppServer `
         -CommandLine ([string]$candidate.CommandLine) `
         -ParentProcessName ([string]$parent.Name)) {
+        if ($null -ne $liveDesktopHandoffPreparation -and
+            [int]$candidate.ProcessId -eq
+                [int](
+                    $liveDesktopHandoffPreparation.DesktopAppServerProcessId
+                )) {
+            continue
+        }
         $desktopStdioPids.Add([int]$candidate.ProcessId)
     }
 }
@@ -511,7 +618,25 @@ function Test-SidecarRequestReady {
 }
 
 function Invoke-ManagedDesktopLaunch {
-    if ($NoDesktopLaunch) {
+    param(
+        [switch]$SuppressFeedback,
+
+        [switch]$NotifyOnRemoteSuccessOnly,
+
+        [AllowEmptyString()]
+        [string]$ExpectedTakeoverRootIdentityKey = '',
+
+        [AllowEmptyString()]
+        [string]$ExpectedSelectedRuntimeVersionId = '',
+
+        [AllowEmptyString()]
+        [string]$ExpectedSelectedRuntimeRoot = '',
+
+        [AllowEmptyString()]
+        [string]$LaunchCorrelationId = ''
+    )
+
+    if ($NoDesktopLaunch -or -not $DesktopOwnerCoordinator) {
         return $null
     }
     $launcherPath = Join-Path $PSScriptRoot 'Launch-CodexWithRemote.ps1'
@@ -523,7 +648,16 @@ function Invoke-ManagedDesktopLaunch {
         -BrokerPort $BrokerPort `
         -InfrastructureStartupTimeoutSeconds 0 `
         -DesktopAttachTimeoutSeconds 20 `
-        -SuppressNotification
+        -DesktopOwnerExecution `
+        -TakeOverExistingNativeDesktop:$TakeOverExistingNativeDesktop `
+        -ExpectedTakeoverRootIdentityKey $ExpectedTakeoverRootIdentityKey `
+        -ExpectedSelectedRuntimeVersionId (
+            $ExpectedSelectedRuntimeVersionId
+        ) `
+        -ExpectedSelectedRuntimeRoot $ExpectedSelectedRuntimeRoot `
+        -LaunchCorrelationId $LaunchCorrelationId `
+        -SuppressNotification:$SuppressFeedback `
+        -NotifyOnRemoteSuccessOnly:$NotifyOnRemoteSuccessOnly
 }
 
 function Get-RunningCodexDesktopRootProcesses {
@@ -543,6 +677,320 @@ function Get-RunningCodexDesktopRootProcesses {
                 )
             }
     )
+}
+
+function Get-CodexDesktopOwnerHandoffRootProcesses {
+    [CmdletBinding()]
+    param()
+
+    return @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "Name = 'ChatGPT.exe'" `
+            -ErrorAction Stop |
+            Where-Object {
+                [string]$_.CommandLine -notmatch
+                    '(?i)(?:^|\s)--type=' -and
+                (
+                    [string]::IsNullOrWhiteSpace(
+                        [string]$_.ExecutablePath
+                    ) -or
+                    [string]$_.ExecutablePath -match
+                        '(?i)\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$'
+                )
+            }
+    )
+}
+
+function Test-CodexDesktopOwnerRuntimePathEqual {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Left,
+
+        [Parameter(Mandatory)]
+        [string]$Right
+    )
+
+    try {
+        return [string]::Equals(
+            [System.IO.Path]::GetFullPath($Left),
+            [System.IO.Path]::GetFullPath($Right),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Assert-CodexDesktopOwnerTakeoverSafetyWindow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ExpectedRootIdentityKey,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeInvocationId,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$ExpectedBrokerProcessId,
+
+        [ValidateRange(2, 5)]
+        [int]$RequiredObservations = 2,
+
+        [ValidateRange(1, 1000)]
+        [int]$GraceMilliseconds = 150
+    )
+
+    for ($observation = 1;
+        $observation -le $RequiredObservations;
+        $observation++) {
+        $roots = @(Get-CodexDesktopOwnerHandoffRootProcesses)
+        $rootIdentityKey = Get-UniqueCodexDesktopRootIdentityKey `
+            -Processes $roots
+        if ([string]$rootIdentityKey -cne
+            $ExpectedRootIdentityKey) {
+            throw (
+                'Desktop takeover safety found a changed or ambiguous root.'
+            )
+        }
+        $currentRuntime = Get-CodexLocalRemoteCurrentRuntime `
+            -DataDir $resolvedDataDir
+        if ($null -eq $currentRuntime -or
+            [string]$currentRuntime.CurrentVersionId -cne
+                $ExpectedRuntimeVersionId -or
+            -not (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$currentRuntime.CurrentRoot) `
+                -Right $ExpectedRuntimeRoot)) {
+            throw 'Desktop takeover safety found selected runtime drift.'
+        }
+        $runtimeSnapshot = Get-VerifiedBrokerRuntimeSnapshot `
+            -ExpectedBrokerProcessId $ExpectedBrokerProcessId
+        $readiness = if ($null -eq $runtimeSnapshot) {
+            $null
+        } else {
+            $runtimeSnapshot.Readiness
+        }
+        if ($null -eq $readiness -or
+            [string]$runtimeSnapshot.RuntimeInvocationId -cne
+                $ExpectedRuntimeInvocationId -or
+            $readiness.desktopConnected -isnot [bool] -or
+            [bool]$readiness.desktopConnected) {
+            throw (
+                'Desktop takeover safety found an unreachable, changed, or ' +
+                'still-connected Broker. Managed turns remain owned by the ' +
+                'verified Broker during this Desktop-only reconnect.'
+            )
+        }
+        if ($observation -lt $RequiredObservations) {
+            Start-Sleep -Milliseconds $GraceMilliseconds
+        }
+    }
+}
+
+function Get-UniqueCodexDesktopRootIdentityKey {
+    param(
+        [AllowNull()]
+        [object[]]$Processes
+    )
+
+    $roots = @($Processes)
+    if ($roots.Count -ne 1) {
+        return $null
+    }
+    $root = $roots[0]
+    if ($null -eq $root.PSObject.Properties['ProcessId'] -or
+        [int]$root.ProcessId -lt 1 -or
+        $null -eq $root.PSObject.Properties['CreationDate'] -or
+        [string]::IsNullOrWhiteSpace([string]$root.ExecutablePath)) {
+        return $null
+    }
+    try {
+        $creationIdentity = Get-ProcessCreationIdentity `
+            -CreationDate $root.CreationDate
+        $identityHandle = Open-ProcessIdentityHandle `
+            -ProcessId ([int]$root.ProcessId) `
+            -ExpectedCreationDateUtcTicks (
+                [long]$creationIdentity.CreationDateUtcTicks
+            )
+        try {
+            return Get-CodexDesktopOwnerRootIdentityKey `
+                -ProcessId ([int]$root.ProcessId) `
+                -StartTimeUtcTicks ([long]$identityHandle.StartTimeUtcTicks) `
+                -ExecutablePath ([string]$root.ExecutablePath)
+        } finally {
+            $identityHandle.Process.Dispose()
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Get-CodexDesktopFallbackSuppressionRootIdentityKey {
+    $path = Join-Path `
+        $resolvedDataDir `
+        'desktop-owner-fallback-suppression.json'
+    try {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $null
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -lt 64 -or
+            [long]$item.Length -gt 8192) {
+            return $null
+        }
+        $rawBefore = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $receipt = $rawBefore |
+            ConvertFrom-Json -Depth 8 -DateKind String -ErrorAction Stop
+        $rawAfter = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $expiresAt = [DateTimeOffset]::Parse(
+            [string]$receipt.ExpiresAtUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+        if ($rawBefore -cne $rawAfter -or
+            [string]$receipt.Signature -cne
+                'codex-local-remote/desktop-owner-fallback-suppression/v1' -or
+            [int]$receipt.Version -ne 1 -or
+            [string]$receipt.RootIdentityKey -cnotmatch
+                '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9a-f]{64}$' -or
+            [string]$receipt.Reason -cne 'package-refresh-failed' -or
+            $expiresAt.Offset -ne [TimeSpan]::Zero -or
+            $expiresAt -lt [DateTimeOffset]::UtcNow) {
+            return $null
+        }
+        $currentRootKey = Get-UniqueCodexDesktopRootIdentityKey `
+            -Processes @(Get-RunningCodexDesktopRootProcesses)
+        if ($currentRootKey -ceq [string]$receipt.RootIdentityKey) {
+            return $currentRootKey
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
+function Get-CodexPackageRefreshWorkerRootIdentityKey {
+    $path = Join-Path `
+        $resolvedDataDir `
+        'desktop-package-refresh-intent.json'
+    try {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $null
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -lt 64 -or
+            [long]$item.Length -gt 8192) {
+            return $null
+        }
+        $rawBefore = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $intent = $rawBefore |
+            ConvertFrom-Json -Depth 8 -DateKind String -ErrorAction Stop
+        $rawAfter = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $requestedAt = [DateTimeOffset]::Parse(
+            [string]$intent.RequestedAtUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+        if ($rawBefore -cne $rawAfter -or
+            [string]$intent.Signature -cne
+                'codex-local-remote/desktop-package-refresh-intent/v1' -or
+            [int]$intent.Version -ne 1 -or
+            [string]$intent.ExpectedRootIdentityKey -cnotmatch
+                '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9a-f]{64}$' -or
+            [string]$intent.WorkerNonce -cnotmatch '^[0-9a-f]{32}$' -or
+            $requestedAt.Offset -ne [TimeSpan]::Zero -or
+            $requestedAt -lt [DateTimeOffset]::UtcNow.AddMinutes(-2) -or
+            -not (Test-NonNegativeInteger -Value $intent.WorkerProcessId) -or
+            -not (Test-NonNegativeInteger `
+                -Value $intent.WorkerStartTimeUtcTicks)) {
+            return $null
+        }
+        $currentRootKey = Get-UniqueCodexDesktopRootIdentityKey `
+            -Processes @(Get-RunningCodexDesktopRootProcesses)
+        if ($currentRootKey -cne
+            [string]$intent.ExpectedRootIdentityKey) {
+            return $null
+        }
+        if ([int]$intent.WorkerProcessId -eq 0 -and
+            [long]$intent.WorkerStartTimeUtcTicks -eq 0 -and
+            $requestedAt -ge [DateTimeOffset]::UtcNow.AddSeconds(-15)) {
+            return $currentRootKey
+        }
+        $worker = Get-Process `
+            -Id ([int]$intent.WorkerProcessId) `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $worker) {
+            return $null
+        }
+        try {
+            $worker.Refresh()
+            if ($worker.HasExited -or
+                $worker.StartTime.ToUniversalTime().Ticks -ne
+                    [long]$intent.WorkerStartTimeUtcTicks) {
+                return $null
+            }
+        } finally {
+            $worker.Dispose()
+        }
+        return $currentRootKey
+    } catch {
+        return $null
+    }
+    return $null
+}
+
+function Update-CodexDesktopOwnerPackageRefreshState {
+    param(
+        [Parameter(Mandatory)]
+        [object]$State,
+
+        [AllowEmptyString()]
+        [string]$CurrentRootIdentityKey = '',
+
+        [AllowEmptyString()]
+        [string]$SuppressedRootIdentityKey = '',
+
+        [AllowEmptyString()]
+        [string]$ActiveRefreshRootIdentityKey = ''
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace(
+        $SuppressedRootIdentityKey
+    )) {
+        $State.LastAttemptedRootIdentityKey =
+            $SuppressedRootIdentityKey
+        $State.PendingPackageRefreshRootIdentityKey = $null
+    } elseif (-not [string]::IsNullOrWhiteSpace(
+        $ActiveRefreshRootIdentityKey
+    )) {
+        $State.LastAttemptedRootIdentityKey =
+            $ActiveRefreshRootIdentityKey
+        $State.PendingPackageRefreshRootIdentityKey =
+            $ActiveRefreshRootIdentityKey
+    } elseif (
+        -not [string]::IsNullOrWhiteSpace(
+            $State.PendingPackageRefreshRootIdentityKey
+        ) -and
+        $State.PendingPackageRefreshRootIdentityKey -ceq
+            $CurrentRootIdentityKey
+    ) {
+        $State.LastAttemptedRootIdentityKey = $null
+        $State.PendingPackageRefreshRootIdentityKey = $null
+    }
+    return $State
 }
 
 function Test-BrokerReadinessRuntimeIdentity {
@@ -809,7 +1257,10 @@ if ($null -eq $brokerProcess) {
     $startupStage = 'runtime-discovered'
     Write-StartupStatus -Status 'starting'
     if ($env:CODEX_REMOTE_TEST_FIXTURE -cne '1') {
-        $freshRuntime = Resolve-CodexDesktopRuntime
+        $freshRuntime = Resolve-CodexDesktopRuntime `
+            -RuntimeCachePath (
+                Join-Path $resolvedDataDir 'desktop-runtime-cache.json'
+            )
         if ([string]$freshRuntime.PackageFullName -cne
                 [string]$runtimeDiscovery.PackageFullName -or
             -not [string]::Equals(
@@ -943,22 +1394,80 @@ Write-BrokerRuntimeReceipt `
 
 $startupStage = 'sidecar-start'
 Write-StartupStatus -Status 'starting'
-$sidecarArguments = @(
-    (ConvertTo-WindowsCommandLineArgument -Value $sidecarCli)
-    'serve'
-    '--host'
-    '127.0.0.1'
-    '--port'
-    $SidecarPort.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-    '--base-path'
-    (ConvertTo-WindowsCommandLineArgument -Value $BasePath)
-    '--codex-path'
-    (ConvertTo-WindowsCommandLineArgument -Value $resolvedCodex)
-    '--data-dir'
-    (ConvertTo-WindowsCommandLineArgument -Value $resolvedDataDir)
-) -join ' '
+
+function Get-VerifiedSidecarRuntimeBinding {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Runtime
+    )
+
+    $runtimeCheck = Test-CodexLocalRemoteRuntimeVersion `
+        -RuntimeRoot ([string]$Runtime.CurrentRoot) `
+        -ExpectedVersionId ([string]$Runtime.CurrentVersionId)
+    if (-not $runtimeCheck.IsValid) {
+        throw "Selected Sidecar runtime is invalid: $($runtimeCheck.Reason)"
+    }
+    $runtimeRoot =
+        [System.IO.Path]::GetFullPath([string]$Runtime.CurrentRoot)
+    $runtimeSidecarCli = [System.IO.Path]::GetFullPath(
+        (Join-Path $runtimeRoot 'apps\sidecar\dist\cli.js')
+    )
+    $runtimePrefix =
+        [System.IO.Path]::TrimEndingDirectorySeparator($runtimeRoot) + '\'
+    if (-not $runtimeSidecarCli.StartsWith(
+        $runtimePrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or
+        -not (Test-Path -LiteralPath $runtimeSidecarCli -PathType Leaf)) {
+        throw 'Selected Sidecar entry escaped or is missing from its runtime.'
+    }
+    $sidecarItem =
+        Get-Item -LiteralPath $runtimeSidecarCli -Force -ErrorAction Stop
+    if ($sidecarItem.PSIsContainer -or
+        ($sidecarItem.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Selected Sidecar entry is not one ordinary file.'
+    }
+    return [pscustomobject]@{
+        VersionId = [string]$Runtime.CurrentVersionId
+        RuntimeRoot = $runtimeRoot
+        SidecarCli = $runtimeSidecarCli
+        BrokerSidecarCompatibilityId =
+            [string]$runtimeCheck.BrokerSidecarCompatibilityId
+    }
+}
+
+function Get-ManagedSidecarArguments {
+    param(
+        [Parameter(Mandatory)]
+        [object]$RuntimeBinding
+    )
+
+    return @(
+        (ConvertTo-WindowsCommandLineArgument `
+            -Value ([string]$RuntimeBinding.SidecarCli))
+        'serve'
+        '--host'
+        '127.0.0.1'
+        '--port'
+        $SidecarPort.ToString(
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        '--base-path'
+        (ConvertTo-WindowsCommandLineArgument -Value $BasePath)
+        '--codex-path'
+        (ConvertTo-WindowsCommandLineArgument -Value $resolvedCodex)
+        '--data-dir'
+        (ConvertTo-WindowsCommandLineArgument -Value $resolvedDataDir)
+    ) -join ' '
+}
 
 function Start-ManagedSidecarChild {
+    param(
+        [Parameter(Mandatory)]
+        [object]$RuntimeBinding
+    )
+
     $process = $null
     try {
         # The capability endpoint is scoped to this Sidecar child process.
@@ -967,10 +1476,13 @@ function Start-ManagedSidecarChild {
         # infrastructure readiness.
         try {
             $env:CODEX_APP_SERVER_WS_URL = $webSocketUrl
+            $sidecarArguments =
+                Get-ManagedSidecarArguments `
+                    -RuntimeBinding $RuntimeBinding
             $process = Start-Process `
                 -FilePath $resolvedNode `
                 -ArgumentList $sidecarArguments `
-                -WorkingDirectory $resolvedRoot `
+                -WorkingDirectory ([string]$RuntimeBinding.RuntimeRoot) `
                 -WindowStyle Hidden `
                 -PassThru
         } finally {
@@ -1003,6 +1515,7 @@ function Start-ManagedSidecarChild {
             Process = $process
             IdentityHandle = $identityHandle
             Receipt = $receipt
+            RuntimeBinding = $RuntimeBinding
         }
     } catch {
         if ($null -ne $process) {
@@ -1042,7 +1555,107 @@ function New-VerifiedUpstreamReceipt {
     }
 }
 
-$sidecarChild = Start-ManagedSidecarChild
+function Get-SidecarOnlyUpdateInvariant {
+    param(
+        [Parameter(Mandatory)]
+        [object]$TargetRuntimeBinding
+    )
+
+    $selectedRuntime =
+        Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+    if ($null -eq $selectedRuntime -or
+        [string]$selectedRuntime.CurrentVersionId -cne
+            [string]$TargetRuntimeBinding.VersionId -or
+        -not [string]::Equals(
+            [string]$selectedRuntime.CurrentRoot,
+            [string]$TargetRuntimeBinding.RuntimeRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw 'Selected runtime drifted during the Sidecar-only update.'
+    }
+    $runtimeCheck = Test-CodexLocalRemoteRuntimeVersion `
+        -RuntimeRoot ([string]$TargetRuntimeBinding.RuntimeRoot) `
+        -ExpectedVersionId ([string]$TargetRuntimeBinding.VersionId)
+    if (-not $runtimeCheck.IsValid) {
+        throw "Selected Sidecar runtime changed: $($runtimeCheck.Reason)"
+    }
+    $snapshot = Get-VerifiedBrokerRuntimeSnapshot `
+        -ExpectedBrokerProcessId $brokerPid
+    if ($null -eq $snapshot -or
+        $null -eq $snapshot.Upstream -or
+        [string]$snapshot.RuntimeInvocationId -cne
+            $runtimeInvocationId) {
+        throw 'Broker/upstream identity is not exact for a Sidecar-only update.'
+    }
+    $upstreamCreationIdentity = Get-ProcessCreationIdentity `
+        -CreationDate $snapshot.Upstream.CreationDate
+    $upstreamIdentityHandle = Open-ProcessIdentityHandle `
+        -ProcessId ([int]$snapshot.Upstream.ProcessId) `
+        -ExpectedCreationDateUtcTicks (
+            [long]$upstreamCreationIdentity.CreationDateUtcTicks
+        )
+    try {
+        $desktopRootIdentityKey =
+            Get-UniqueCodexDesktopRootIdentityKey `
+                -Processes @(Get-RunningCodexDesktopRootProcesses)
+        return [pscustomobject]@{
+            SelectedVersionId =
+                [string]$TargetRuntimeBinding.VersionId
+            SelectedRoot =
+                [string]$TargetRuntimeBinding.RuntimeRoot
+            BrokerProcessId = [int]$brokerPid
+            BrokerStartTimeUtcTicks =
+                [long]$brokerIdentityHandle.StartTimeUtcTicks
+            RuntimeInvocationId = $runtimeInvocationId
+            UpstreamProcessId = [int]$snapshot.Upstream.ProcessId
+            UpstreamStartTimeUtcTicks =
+                [long]$upstreamIdentityHandle.StartTimeUtcTicks
+            DesktopRootIdentityKey =
+                [string]$desktopRootIdentityKey
+            BrokerSidecarCompatibilityId =
+                $brokerSidecarCompatibilityId
+            CandidateSidecarCompatibilityId =
+                [string](
+                    $TargetRuntimeBinding.BrokerSidecarCompatibilityId
+                )
+            UnsafeThreadCount =
+                [int]$snapshot.Readiness.unsafeThreadCount
+            UnknownCount =
+                [int]$snapshot.Readiness.unknownCount
+            DesktopConnected =
+                [bool]$snapshot.Readiness.desktopConnected
+        }
+    } finally {
+        $upstreamIdentityHandle.Process.Dispose()
+    }
+}
+
+function Stop-ManagedSidecarChildExact {
+    param(
+        [Parameter(Mandatory)]
+        [object]$SidecarChild
+    )
+
+    $null = Stop-ProcessIdentityHandle `
+        -IdentityHandle $SidecarChild.IdentityHandle `
+        -TimeoutMilliseconds 10000
+}
+
+$startupSidecarRuntime =
+    Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+if ($null -eq $startupSidecarRuntime -or
+    -not [string]::Equals(
+        [string]$startupSidecarRuntime.CurrentRoot,
+        $resolvedRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw 'Startup Sidecar runtime is not the exact selected generation.'
+}
+$activeSidecarRuntimeBinding =
+    Get-VerifiedSidecarRuntimeBinding `
+        -Runtime $startupSidecarRuntime
+$sidecarChild = Start-ManagedSidecarChild `
+    -RuntimeBinding $activeSidecarRuntimeBinding
 $sidecarProcess = $sidecarChild.Process
 $sidecarIdentityHandle = $sidecarChild.IdentityHandle
 $sidecarReceipt = $sidecarChild.Receipt
@@ -1063,13 +1676,109 @@ try {
         -UpstreamReceipt $readyUpstreamReceipt
 
     $initialDesktopLaunch = $null
-    if (-not $NoDesktopLaunch) {
-        $initialDesktopLaunch = Invoke-ManagedDesktopLaunch
+    $desktopOwnerState = [pscustomobject]@{
+        StartupIntentPending = [bool]$DesktopOwnerCoordinator
+        LastAttemptedRootIdentityKey = $null
+        LastVerifiedConnectedRootIdentityKey = $null
+        LastDisconnectedRecoveryRootIdentityKey = $null
+        PendingPackageRefreshRootIdentityKey = $null
+        PendingFinalRootCapture = $false
+        FinalRootCaptureDeadlineUtc = [DateTime]::MinValue
+        LastSuppressedRootIdentityKey = $null
+    }
+    $desktopOwnerRuntime = Get-CodexLocalRemoteCurrentRuntime `
+        -DataDir $resolvedDataDir
+    if ($DesktopOwnerCoordinator) {
+        $desktopOwnerState.StartupIntentPending = $false
+        if ($null -ne $desktopHandoffPreparation -and
+            [string]$desktopHandoffPreparation.Phase -cnotin @(
+                'requested',
+                'ready'
+            )) {
+            throw (
+                'The live Desktop handoff preparation has an unsupported ' +
+                'startup phase.'
+            )
+        }
+        if ($desktopHandoffPreparationPathPresent -and
+            $null -eq $desktopHandoffPreparation) {
+            $initialDesktopLaunch = [pscustomobject]@{
+                Status = 'handoff-preparation-blocked'
+            }
+            $startupStage = 'handoff-preparation-blocked'
+            Write-StartupStatus `
+                -Status 'degraded' `
+                -Message (
+                    'A Desktop handoff preparation exists but could not be ' +
+                    'validated. Automatic Desktop launch remains suppressed.'
+                )
+        } elseif ($null -ne $desktopHandoffPreparation) {
+            $initialDesktopLaunch = [pscustomobject]@{
+                Status = 'handoff-preparing'
+                PreparationId =
+                    [string]$desktopHandoffPreparation.PreparationId
+            }
+            $desktopOwnerState.LastAttemptedRootIdentityKey =
+                [string]$desktopHandoffPreparation.DesktopRootIdentityKey
+            $startupStage = 'handoff-preparing'
+            Write-StartupStatus `
+                -Status 'degraded' `
+                -Message (
+                    'Broker and Sidecar are ready for the exact prepared ' +
+                    'native Desktop owner. Desktop launch remains suppressed.'
+                )
+        } else {
+            try {
+                $initialDesktopLaunch = Invoke-WithCodexDesktopOwnerMutex `
+                    -DataDir $resolvedDataDir `
+                    -Action {
+                        $suppressedRootIdentityKey =
+                            Get-CodexDesktopFallbackSuppressionRootIdentityKey
+                        if (-not [string]::IsNullOrWhiteSpace(
+                            $suppressedRootIdentityKey
+                        )) {
+                            return [pscustomobject]@{
+                                Status = 'already-running'
+                                SuppressedRootIdentityKey =
+                                    $suppressedRootIdentityKey
+                            }
+                        }
+                        Invoke-ManagedDesktopLaunch `
+                            -ExpectedSelectedRuntimeVersionId (
+                                [string]$desktopOwnerRuntime.CurrentVersionId
+                            ) `
+                            -ExpectedSelectedRuntimeRoot (
+                                [string]$desktopOwnerRuntime.CurrentRoot
+                            )
+                    }
+                $suppressedRootProperty =
+                    $initialDesktopLaunch.PSObject.Properties[
+                        'SuppressedRootIdentityKey'
+                    ]
+                if ($null -ne $suppressedRootProperty) {
+                    $desktopOwnerState.LastAttemptedRootIdentityKey =
+                        [string]$suppressedRootProperty.Value
+                } else {
+                    $desktopOwnerState.LastAttemptedRootIdentityKey =
+                        Get-UniqueCodexDesktopRootIdentityKey `
+                            -Processes @(
+                                Get-RunningCodexDesktopRootProcesses
+                            )
+                }
+            } catch {
+                $startupStage = 'desktop-owner-startup-degraded'
+                Write-StartupStatus `
+                    -Status 'degraded' `
+                    -Message "The single Desktop owner preserved native availability after startup launch failed: $($_.Exception.Message)"
+            }
+        }
         if ($null -eq $initialDesktopLaunch -or
             [string]$initialDesktopLaunch.Status -cnotin @(
                 'launched-remote',
                 'already-running',
-                'remote-launch-unverified'
+                'remote-launch-unverified',
+                'handoff-preparing',
+                'handoff-preparation-blocked'
             )) {
             $startupStage = 'desktop-launch-fallback'
             Write-StartupStatus `
@@ -1101,13 +1810,192 @@ try {
     }
     $runtimeTransitionDeadline = $null
     $runtimeApplicationDegraded = $false
-    $nextDesktopRuntimeCheckAt = [DateTime]::UtcNow.AddSeconds(
-        $DesktopRuntimeCheckIntervalSeconds
-    )
-    $nextDesktopLaunchRecoveryAt = [DateTime]::UtcNow.AddSeconds(10)
+    $desktopRuntimeCheckClock = [Diagnostics.Stopwatch]::StartNew()
+    $nextDesktopRuntimeCheckElapsedMilliseconds =
+        [long]$DesktopRuntimeCheckIntervalSeconds * 1000
+    $nextDesktopLaunchRecoveryAt = [DateTime]::UtcNow.AddSeconds(1)
     $sidecarRecoveryAttempt = 0
     $nextSidecarRecoveryAt = [DateTime]::MinValue
+    $nextSidecarRuntimeUpdateCheckAt =
+        [DateTime]::UtcNow.AddSeconds(2)
+    $sidecarRuntimeUpdateAttempt = 0
+    $nativeModeStatusWritten = $false
+    $lastDesktopOwnerSupervisorObservationUtc = [DateTimeOffset]::UtcNow
+    $desktopOwnerResumeSuppressedAtUtc = $null
     while ($true) {
+        $desktopOwnerSupervisorObservationUtc =
+            [DateTimeOffset]::UtcNow
+        if ($DesktopOwnerCoordinator -and
+            (Test-CodexDesktopOwnerResumeGap `
+                -PreviousObservationUtc (
+                    $lastDesktopOwnerSupervisorObservationUtc
+                ) `
+                -CurrentObservationUtc (
+                    $desktopOwnerSupervisorObservationUtc
+                ) `
+                -MinimumGapSeconds $DesktopOwnerResumeGapSeconds) -and
+            $null -eq $desktopOwnerResumeSuppressedAtUtc) {
+            $desktopOwnerResumeSuppressedAtUtc =
+                $lastDesktopOwnerSupervisorObservationUtc
+        }
+        $lastDesktopOwnerSupervisorObservationUtc =
+            $desktopOwnerSupervisorObservationUtc
+        $desiredMode =
+            Get-CodexLocalRemoteDesiredMode `
+                -DataDir $resolvedDataDir
+        if ([string]$desiredMode.Mode -ceq 'Native') {
+            if ($null -ne $sidecarIdentityHandle) {
+                try {
+                    Stop-ManagedSidecarChildExact `
+                        -SidecarChild ([pscustomobject]@{
+                            Process = $sidecarProcess
+                            IdentityHandle = $sidecarIdentityHandle
+                            Receipt = $sidecarReceipt
+                            RuntimeBinding =
+                                $activeSidecarRuntimeBinding
+                        })
+                } finally {
+                    $sidecarIdentityHandle.Process.Dispose()
+                    $sidecarProcess = $null
+                    $sidecarIdentityHandle = $null
+                    $sidecarReceipt = $null
+                }
+                $nativeModeSnapshot =
+                    Get-VerifiedBrokerRuntimeSnapshot `
+                        -ExpectedBrokerProcessId $brokerPid
+                $nativeModeUpstreamReceipt = if (
+                    $null -eq $nativeModeSnapshot
+                ) {
+                    $null
+                } else {
+                    New-VerifiedUpstreamReceipt `
+                        -UpstreamProcess (
+                            $nativeModeSnapshot.Upstream
+                        )
+                }
+                Write-BrokerRuntimeReceipt `
+                    -Status 'broker-ready' `
+                    -BrokerReceipt $brokerReceipt `
+                    -SidecarReceipt $null `
+                    -UpstreamReceipt $nativeModeUpstreamReceipt
+            }
+            $remainingDesktopRoots =
+                @(Get-RunningCodexDesktopRootProcesses)
+            if ($remainingDesktopRoots.Count -eq 0) {
+                $startupStage = 'native-owner-exited'
+                Write-StartupStatus `
+                    -Status 'inactive' `
+                    -Message (
+                        'Remote stayed closed until Codex Desktop exited ' +
+                        'naturally; the exact Broker is now stopping.'
+                    )
+                Stop-ExactManagedBrokerAndOrphan `
+                    -Broker $brokerCimProcess
+                exit 0
+            }
+            $startupStage = 'native-awaiting-desktop-exit'
+            if (-not $nativeModeStatusWritten) {
+                Write-StartupStatus `
+                    -Status 'inactive' `
+                    -Message (
+                        'Public Remote is closed. The current Codex Desktop ' +
+                        'and its Broker remain untouched until Desktop exits ' +
+                        'naturally.'
+                    )
+                $nativeModeStatusWritten = $true
+            }
+            Start-Sleep -Seconds 1
+            continue
+        }
+        $nativeModeStatusWritten = $false
+        if ($DesktopOwnerCoordinator) {
+            $leaseRuntime =
+                Get-CodexLocalRemoteCurrentRuntime `
+                    -DataDir $resolvedDataDir
+            $leaseIntent = if ($null -eq $leaseRuntime) {
+                $null
+            } else {
+                Read-CodexDesktopOwnerIntent `
+                    -DataDir $resolvedDataDir `
+                    -ExpectedRuntimeVersionId (
+                        [string]$leaseRuntime.CurrentVersionId
+                    ) `
+                    -ExpectedRuntimeRoot (
+                        [string]$leaseRuntime.CurrentRoot
+                    )
+            }
+            $leaseHandoffPreparation =
+                Get-DesktopHandoffPreparationForRuntime `
+                    -Runtime $leaseRuntime
+            $leaseHandoffActive = $false
+            if ($null -ne $leaseHandoffPreparation -and
+                [string]$leaseHandoffPreparation.Phase -cin @(
+                    'requested',
+                    'ready'
+                )) {
+                $liveLeaseHandoffPreparation =
+                    Get-DesktopHandoffPreparationForRuntime `
+                        -Runtime $leaseRuntime `
+                        -RequireLiveOwnership
+                $leaseHandoffActive = (
+                    $null -ne $liveLeaseHandoffPreparation -and
+                    [string]$liveLeaseHandoffPreparation.PreparationId -ceq
+                        [string]$leaseHandoffPreparation.PreparationId
+                )
+            } elseif ($null -ne $leaseHandoffPreparation -and
+                [string]$leaseHandoffPreparation.Phase -ceq 'attaching') {
+                try {
+                    $attachStartedAt = [DateTimeOffset]::Parse(
+                        [string](
+                            $leaseHandoffPreparation.AttachStartedAtUtc
+                        ),
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::RoundtripKind
+                    )
+                    $leaseHandoffActive = (
+                        $attachStartedAt.Offset -eq [TimeSpan]::Zero -and
+                        $attachStartedAt -ge
+                            [DateTimeOffset]::UtcNow.AddSeconds(-60) -and
+                        $attachStartedAt -le
+                            [DateTimeOffset]::UtcNow.AddSeconds(5)
+                    )
+                } catch {
+                    $leaseHandoffActive = $false
+                }
+            }
+            $leaseSnapshot = try {
+                Get-VerifiedBrokerRuntimeSnapshot `
+                    -ExpectedBrokerProcessId $brokerPid
+            } catch {
+                $null
+            }
+            $leaseDesktopConnected = (
+                $null -ne $leaseSnapshot -and
+                [bool]$leaseSnapshot.Readiness.desktopConnected
+            )
+            if ($null -eq $leaseIntent -and
+                -not $leaseDesktopConnected -and
+                $null -ne $leaseRuntime -and
+                -not $leaseHandoffActive) {
+                $null = Set-CodexLocalRemoteDesiredMode `
+                    -DataDir $resolvedDataDir `
+                    -Mode Native `
+                    -RuntimeVersionId (
+                        [string]$leaseRuntime.CurrentVersionId
+                    ) `
+                    -RuntimeRoot (
+                        [string]$leaseRuntime.CurrentRoot
+                    )
+                $startupStage = 'remote-lease-ended'
+                Write-StartupStatus `
+                    -Status 'inactive' `
+                    -Message (
+                        'The explicit Remote Desktop lease ended. ' +
+                        'A later ordinary vendor launch remains native.'
+                    )
+                continue
+            }
+        }
         if ($null -eq $sidecarProcess -or $sidecarProcess.HasExited) {
             $exitSummary = if ($null -eq $sidecarProcess) {
                 'the previous recovery attempt did not start a child'
@@ -1132,7 +2020,8 @@ try {
                 -Status 'degraded' `
                 -Message "Remote transport is recovering because $exitSummary. The verified Broker and Codex Desktop remain untouched."
             try {
-                $sidecarChild = Start-ManagedSidecarChild
+                $sidecarChild = Start-ManagedSidecarChild `
+                    -RuntimeBinding $activeSidecarRuntimeBinding
                 $sidecarProcess = $sidecarChild.Process
                 $sidecarIdentityHandle = $sidecarChild.IdentityHandle
                 $sidecarReceipt = $sidecarChild.Receipt
@@ -1191,33 +2080,511 @@ try {
                 -ErrorAction SilentlyContinue
             exit 1
         }
-        if (-not $NoDesktopLaunch -and
-            [DateTime]::UtcNow -ge $nextDesktopLaunchRecoveryAt) {
-            $desktopRecoveryReadiness = Get-BrokerReadinessSnapshot
-            $desktopConnected = (
-                $null -ne $desktopRecoveryReadiness -and
-                $desktopRecoveryReadiness.desktopConnected -is [bool] -and
-                [bool]$desktopRecoveryReadiness.desktopConnected
-            )
-            if (-not $desktopConnected -and
-                @(Get-RunningCodexDesktopRootProcesses).Count -eq 0) {
-                try {
-                    $desktopRecoveryLaunch = Invoke-ManagedDesktopLaunch
-                    if ($null -ne $desktopRecoveryLaunch -and
-                        [string]$desktopRecoveryLaunch.Status -ceq
-                            'launched-remote') {
-                        $startupStage = 'supervising'
-                        Write-StartupStatus -Status 'ready'
-                    }
-                } catch {
-                    $startupStage = 'desktop-recovery-blocked'
-                    Write-StartupStatus `
-                        -Status 'degraded' `
-                        -Message "Automatic Codex Desktop recovery is blocked: $($_.Exception.Message)"
+        if ([DateTime]::UtcNow -ge
+            $nextSidecarRuntimeUpdateCheckAt) {
+            $nextSidecarRuntimeUpdateCheckAt =
+                [DateTime]::UtcNow.AddSeconds(2)
+            try {
+                $selectedSidecarRuntime =
+                    Get-CodexLocalRemoteCurrentRuntime `
+                        -DataDir $resolvedDataDir
+                if ($null -eq $selectedSidecarRuntime) {
+                    throw 'Selected immutable runtime is missing.'
                 }
+                if ([string]$selectedSidecarRuntime.CurrentVersionId -cne
+                        [string]$activeSidecarRuntimeBinding.VersionId -or
+                    -not [string]::Equals(
+                        [string]$selectedSidecarRuntime.CurrentRoot,
+                        [string]$activeSidecarRuntimeBinding.RuntimeRoot,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    $candidateSidecarRuntimeBinding =
+                        Get-VerifiedSidecarRuntimeBinding `
+                            -Runtime $selectedSidecarRuntime
+                    $oldSidecarRuntimeBinding =
+                        $activeSidecarRuntimeBinding
+                    $oldSidecarChild = [pscustomobject]@{
+                        Process = $sidecarProcess
+                        IdentityHandle = $sidecarIdentityHandle
+                        Receipt = $sidecarReceipt
+                        RuntimeBinding = $oldSidecarRuntimeBinding
+                    }
+                    $sidecarUpdate =
+                        Invoke-CodexLocalRemoteSidecarUpdateTransaction `
+                            -CaptureInvariant {
+                                Get-SidecarOnlyUpdateInvariant `
+                                    -TargetRuntimeBinding (
+                                        $candidateSidecarRuntimeBinding
+                                    )
+                            } `
+                            -StopOldSidecar {
+                                Stop-ManagedSidecarChildExact `
+                                    -SidecarChild $oldSidecarChild
+                            } `
+                            -StartNewSidecar {
+                                Start-ManagedSidecarChild `
+                                    -RuntimeBinding (
+                                        $candidateSidecarRuntimeBinding
+                                    )
+                            } `
+                            -VerifyNewSidecar {
+                                param($candidateChild)
+                                Wait-ForSidecarHandshake `
+                                    -SidecarProcess (
+                                        $candidateChild.Process
+                                    ) `
+                                    -BrokerIdentityHandle (
+                                        $brokerIdentityHandle
+                                    ) `
+                                    -TimeoutSeconds (
+                                        $SidecarHandshakeTimeoutSeconds
+                                    )
+                            } `
+                            -StopNewSidecar {
+                                param($candidateChild)
+                                Stop-ManagedSidecarChildExact `
+                                    -SidecarChild $candidateChild
+                                $candidateChild.IdentityHandle.Process.Dispose()
+                            } `
+                            -StartOldSidecar {
+                                $oldSidecarChild.Process.Refresh()
+                                if (-not
+                                    $oldSidecarChild.Process.HasExited) {
+                                    $oldSidecarChild
+                                } else {
+                                    Start-ManagedSidecarChild `
+                                        -RuntimeBinding (
+                                            $oldSidecarRuntimeBinding
+                                        )
+                                }
+                            } `
+                            -VerifyOldSidecar {
+                                param($rollbackChild)
+                                Wait-ForSidecarHandshake `
+                                    -SidecarProcess (
+                                        $rollbackChild.Process
+                                    ) `
+                                    -BrokerIdentityHandle (
+                                        $brokerIdentityHandle
+                                    ) `
+                                    -TimeoutSeconds (
+                                        $SidecarHandshakeTimeoutSeconds
+                                    )
+                            }
+                    if ([int]$sidecarUpdate.Sidecar.IdentityHandle.ProcessId -ne
+                        [int]$oldSidecarChild.IdentityHandle.ProcessId) {
+                        $oldSidecarChild.IdentityHandle.Process.Dispose()
+                    }
+                    $sidecarProcess = $sidecarUpdate.Sidecar.Process
+                    $sidecarIdentityHandle =
+                        $sidecarUpdate.Sidecar.IdentityHandle
+                    $sidecarReceipt = $sidecarUpdate.Sidecar.Receipt
+                    $activeSidecarRuntimeBinding = if (
+                        [string]$sidecarUpdate.Status -ceq 'updated'
+                    ) {
+                        $candidateSidecarRuntimeBinding
+                    } else {
+                        $oldSidecarRuntimeBinding
+                    }
+                    $updatedUpstreamReceipt =
+                        New-VerifiedUpstreamReceipt `
+                            -UpstreamProcess (
+                                $sidecarUpdate.Verification
+                            )
+                    Write-BrokerRuntimeReceipt `
+                        -Status 'ready' `
+                        -BrokerReceipt $brokerReceipt `
+                        -SidecarReceipt $sidecarReceipt `
+                        -UpstreamReceipt $updatedUpstreamReceipt
+                    if ([string]$sidecarUpdate.Status -ceq 'updated') {
+                        $sidecarRuntimeUpdateAttempt = 0
+                        $desktopOwnerRuntime =
+                            $selectedSidecarRuntime
+                        $startupStage = 'sidecar-runtime-updated'
+                        Write-StartupStatus `
+                            -Status 'ready' `
+                            -Message (
+                                'The selected immutable Sidecar runtime ' +
+                                'was adopted without restarting Broker, ' +
+                                'upstream, or Codex Desktop.'
+                            )
+                    } else {
+                        $sidecarRuntimeUpdateAttempt++
+                        $nextSidecarRuntimeUpdateCheckAt =
+                            [DateTime]::UtcNow.AddSeconds(
+                                [Math]::Min(
+                                    30,
+                                    [Math]::Pow(
+                                        2,
+                                        [Math]::Min(
+                                            $sidecarRuntimeUpdateAttempt,
+                                            4
+                                        )
+                                    )
+                                )
+                            )
+                        $startupStage = 'sidecar-runtime-rollback'
+                        Write-StartupStatus `
+                            -Status 'degraded' `
+                            -Message (
+                                'The selected Sidecar update failed and ' +
+                                'the exact prior Sidecar was restored; ' +
+                                'Broker and Codex Desktop were untouched.'
+                            )
+                    }
+                }
+            } catch {
+                $sidecarRuntimeUpdateAttempt++
+                $nextSidecarRuntimeUpdateCheckAt =
+                    [DateTime]::UtcNow.AddSeconds(
+                        [Math]::Min(
+                            30,
+                            [Math]::Pow(
+                                2,
+                                [Math]::Min(
+                                    $sidecarRuntimeUpdateAttempt,
+                                    4
+                                )
+                            )
+                        )
+                    )
+                Write-StartupStatus `
+                    -Status 'degraded' `
+                    -Message (
+                        'Sidecar-only update was deferred or rolled back: ' +
+                        "$($_.Exception.Message) Broker and Codex Desktop " +
+                        'were not restarted.'
+                    )
+            }
+        }
+        if ($DesktopOwnerCoordinator -and
+            [DateTime]::UtcNow -ge $nextDesktopLaunchRecoveryAt) {
+            $desktopRecoverySnapshot = try {
+                Get-VerifiedBrokerRuntimeSnapshot `
+                    -ExpectedBrokerProcessId $brokerPid
+            } catch {
+                $null
+            }
+            $desktopRootProcesses = @(
+                Get-RunningCodexDesktopRootProcesses
+            )
+            $desktopRootIdentityKey =
+                Get-UniqueCodexDesktopRootIdentityKey `
+                    -Processes $desktopRootProcesses
+            $desktopOwnerProof =
+                Read-CodexDesktopOwnerConnectionProof `
+                    -DataDir $resolvedDataDir
+            $desktopConnected = (
+                $null -ne $desktopRecoverySnapshot -and
+                (Test-CodexDesktopOwnerConnectionProof `
+                    -Readiness $desktopRecoverySnapshot.Readiness `
+                    -Proof $desktopOwnerProof `
+                    -ExpectedRuntimeInvocationId $runtimeInvocationId `
+                    -RootIdentityKey $desktopRootIdentityKey)
+            )
+            if ($desktopOwnerState.PendingFinalRootCapture -and
+                -not [string]::IsNullOrWhiteSpace(
+                    $desktopRootIdentityKey
+                )) {
+                $desktopOwnerState.LastAttemptedRootIdentityKey =
+                    $desktopRootIdentityKey
+                $desktopOwnerState.LastDisconnectedRecoveryRootIdentityKey =
+                    $desktopRootIdentityKey
+                $desktopOwnerState.PendingFinalRootCapture = $false
+            } elseif ($desktopOwnerState.PendingFinalRootCapture -and
+                [DateTime]::UtcNow -ge
+                    $desktopOwnerState.FinalRootCaptureDeadlineUtc) {
+                $desktopOwnerState.PendingFinalRootCapture = $false
+            }
+            $desktopRecoveryLaunchAttempted = $false
+            try {
+                Invoke-WithCodexDesktopOwnerMutex `
+                    -DataDir $resolvedDataDir `
+                    -TimeoutSeconds 5 `
+                    -Action {
+                        $suppressedRootIdentityKey =
+                            Get-CodexDesktopFallbackSuppressionRootIdentityKey
+                        $activeRefreshRootIdentityKey =
+                            Get-CodexPackageRefreshWorkerRootIdentityKey
+                        $desktopOwnerState =
+                            Update-CodexDesktopOwnerPackageRefreshState `
+                                -State $desktopOwnerState `
+                                -CurrentRootIdentityKey (
+                                    [string]$desktopRootIdentityKey
+                                ) `
+                                -SuppressedRootIdentityKey (
+                                    [string]$suppressedRootIdentityKey
+                                ) `
+                                -ActiveRefreshRootIdentityKey (
+                                    [string]$activeRefreshRootIdentityKey
+                                )
+                        $pendingIntent = Read-CodexDesktopOwnerIntent `
+                            -DataDir $resolvedDataDir `
+                            -ExpectedRuntimeVersionId (
+                                [string]$desktopOwnerRuntime.CurrentVersionId
+                            ) `
+                            -ExpectedRuntimeRoot (
+                                [string]$desktopOwnerRuntime.CurrentRoot
+                            )
+                        if ($null -ne $pendingIntent -and
+                            [string]$pendingIntent.Freshness -cne 'fresh') {
+                            $intentFreshness = [string]$pendingIntent.Freshness
+                            Complete-CodexDesktopOwnerIntent `
+                                -DataDir $resolvedDataDir `
+                                -Intent $pendingIntent `
+                                -RuntimeInvocationId $runtimeInvocationId `
+                                -Outcome $intentFreshness
+                            $pendingIntent = $null
+                        }
+                        if ($null -ne $pendingIntent -and
+                            $null -ne $desktopOwnerResumeSuppressedAtUtc) {
+                            $intentRequestedAt =
+                                [DateTimeOffset]::Parse(
+                                    [string]$pendingIntent.RequestedAtUtc,
+                                    [Globalization.CultureInfo]::InvariantCulture,
+                                    [Globalization.DateTimeStyles]::RoundtripKind
+                                )
+                            if ($intentRequestedAt -le
+                                $desktopOwnerResumeSuppressedAtUtc) {
+                                Complete-CodexDesktopOwnerIntent `
+                                    -DataDir $resolvedDataDir `
+                                    -Intent $pendingIntent `
+                                    -RuntimeInvocationId $runtimeInvocationId `
+                                    -Outcome 'resume-suppressed'
+                                $pendingIntent = $null
+                            } else {
+                                $desktopOwnerResumeSuppressedAtUtc = $null
+                            }
+                        }
+                        if ($desktopConnected) {
+                            $desktopOwnerState.LastVerifiedConnectedRootIdentityKey =
+                                $desktopRootIdentityKey
+                            $desktopOwnerState.LastDisconnectedRecoveryRootIdentityKey =
+                                $null
+                        }
+                        $automaticRuntimeGenerationCurrent = $true
+                        if ($null -eq $pendingIntent -and
+                            -not [string]::IsNullOrWhiteSpace(
+                                $desktopRootIdentityKey
+                            )) {
+                            $automaticRuntimeGenerationCurrent = try {
+                                Test-DesktopRuntimeIdentityCurrent `
+                                    -ActiveRuntime $runtimeDiscovery `
+                                    -CurrentRuntime (
+                                        Resolve-NewCodexDesktopRuntime
+                                    )
+                            } catch {
+                                $false
+                            }
+                        }
+                        $automaticTakeoverAllowed = (
+                            $null -ne $pendingIntent -and
+                            $null -eq $desktopOwnerResumeSuppressedAtUtc
+                        )
+                        $desktopOwnerDecision = Get-CodexDesktopOwnerDecision `
+                            -DesktopConnected $desktopConnected `
+                            -StartupIntentPending (
+                                $desktopOwnerState.StartupIntentPending
+                            ) `
+                            -HasPendingIntent ($null -ne $pendingIntent) `
+                            -RootIdentityKey $desktopRootIdentityKey `
+                            -LastAttemptedRootIdentityKey (
+                                $desktopOwnerState.LastAttemptedRootIdentityKey
+                            ) `
+                            -LastVerifiedConnectedRootIdentityKey (
+                                $desktopOwnerState.LastVerifiedConnectedRootIdentityKey
+                            ) `
+                            -LastDisconnectedRecoveryRootIdentityKey (
+                                $desktopOwnerState.LastDisconnectedRecoveryRootIdentityKey
+                            ) `
+                            -AutomaticTakeoverAllowed (
+                                $automaticTakeoverAllowed
+                            ) `
+                            -RuntimeGenerationCurrent (
+                                $automaticRuntimeGenerationCurrent
+                            )
+                        if ($desktopOwnerDecision -ceq 'idle' -and
+                            $null -eq $pendingIntent -and
+                            -not [string]::IsNullOrWhiteSpace(
+                                $desktopRootIdentityKey
+                            ) -and
+                            [string]$desktopOwnerState.LastSuppressedRootIdentityKey -cne
+                                $desktopRootIdentityKey) {
+                            $desktopOwnerState.LastSuppressedRootIdentityKey =
+                                $desktopRootIdentityKey
+                            $startupStage = if (
+                                -not $automaticTakeoverAllowed
+                            ) {
+                                'resume-suppressed'
+                            } else {
+                                'package-update-suppressed'
+                            }
+                            Write-StartupStatus `
+                                -Status 'degraded' `
+                                -Message $(if (
+                                    -not $automaticTakeoverAllowed
+                                ) {
+                                    'Sleep/resume was detected. The native Desktop was preserved and Remote takeover now requires a fresh explicit Open request.'
+                                } else {
+                                    'Codex Desktop package generation changed. The native Desktop was preserved and Remote takeover now requires a fresh explicit Open request.'
+                                })
+                        }
+                        if ($desktopOwnerDecision -ceq 'idle-connected' -and
+                            $null -ne $pendingIntent) {
+                            Complete-CodexDesktopOwnerIntent `
+                                -DataDir $resolvedDataDir `
+                                -Intent $pendingIntent `
+                                -RuntimeInvocationId $runtimeInvocationId `
+                                -Outcome 'already-connected'
+                        } elseif ($desktopOwnerDecision -cin @(
+                            'launch-intent',
+                            'takeover-new-native-root',
+                            'recover-disconnected-root'
+                        )) {
+                            $desktopOwnerState.StartupIntentPending = $false
+                            if ($desktopOwnerDecision -cin @(
+                                'takeover-new-native-root',
+                                'recover-disconnected-root'
+                            )) {
+                                Assert-CodexDesktopOwnerTakeoverSafetyWindow `
+                                    -ExpectedRootIdentityKey (
+                                        $desktopRootIdentityKey
+                                    ) `
+                                    -ExpectedRuntimeVersionId (
+                                        [string]$desktopOwnerRuntime.CurrentVersionId
+                                    ) `
+                                    -ExpectedRuntimeRoot (
+                                        [string]$desktopOwnerRuntime.CurrentRoot
+                                    ) `
+                                    -ExpectedRuntimeInvocationId (
+                                        $runtimeInvocationId
+                                    ) `
+                                    -ExpectedBrokerProcessId $brokerPid `
+                                    -RequiredObservations $(if (
+                                        $desktopOwnerDecision -ceq
+                                            'recover-disconnected-root'
+                                    ) { 4 } else { 2 }) `
+                                    -GraceMilliseconds $(if (
+                                        $desktopOwnerDecision -ceq
+                                            'recover-disconnected-root'
+                                    ) { 1000 } else { 150 })
+                            }
+                            if ($desktopOwnerDecision -ceq
+                                'takeover-new-native-root') {
+                                $desktopOwnerState.LastAttemptedRootIdentityKey =
+                                    $desktopRootIdentityKey
+                            } elseif ($desktopOwnerDecision -ceq
+                                'recover-disconnected-root') {
+                                $desktopOwnerState.LastDisconnectedRecoveryRootIdentityKey =
+                                    $desktopRootIdentityKey
+                            }
+                            $desktopRecoveryLaunchAttempted = $true
+                            $desktopRecoveryLaunch =
+                                Invoke-ManagedDesktopLaunch `
+                                    -NotifyOnRemoteSuccessOnly `
+                                    -ExpectedTakeoverRootIdentityKey $(if (
+                                        $desktopOwnerDecision -ceq
+                                            'takeover-new-native-root'
+                                    ) {
+                                        $desktopRootIdentityKey
+                                    } else {
+                                        ''
+                                    }) `
+                                    -ExpectedSelectedRuntimeVersionId $(if (
+                                        $null -ne $pendingIntent
+                                    ) {
+                                        [string]$pendingIntent.TargetRuntimeVersionId
+                                    } else {
+                                        [string]$desktopOwnerRuntime.CurrentVersionId
+                                    }) `
+                                    -ExpectedSelectedRuntimeRoot $(if (
+                                        $null -ne $pendingIntent
+                                    ) {
+                                        [string]$pendingIntent.TargetRuntimeRoot
+                                    } else {
+                                        [string]$desktopOwnerRuntime.CurrentRoot
+                                    }) `
+                                    -LaunchCorrelationId $(if (
+                                        $null -ne $pendingIntent
+                                    ) {
+                                        [string]$pendingIntent.IntentId
+                                    } else {
+                                        ''
+                                    })
+                            if ([string]$desktopRecoveryLaunch.RemoteFailureCode -ceq
+                                'handoff-launch-denied') {
+                                $desktopOwnerState.PendingPackageRefreshRootIdentityKey =
+                                    $desktopRootIdentityKey
+                            }
+                            $finalDesktopRootIdentityKey =
+                                Get-UniqueCodexDesktopRootIdentityKey `
+                                    -Processes @(
+                                        Get-RunningCodexDesktopRootProcesses
+                                    )
+                            if (-not [string]::IsNullOrWhiteSpace(
+                                $finalDesktopRootIdentityKey
+                            )) {
+                                $desktopOwnerState.LastAttemptedRootIdentityKey =
+                                    $finalDesktopRootIdentityKey
+                                if ($desktopOwnerDecision -ceq
+                                    'recover-disconnected-root') {
+                                    $desktopOwnerState.LastDisconnectedRecoveryRootIdentityKey =
+                                        $finalDesktopRootIdentityKey
+                                }
+                                $desktopOwnerState.PendingFinalRootCapture =
+                                    $false
+                            } else {
+                                $desktopOwnerState.PendingFinalRootCapture =
+                                    $true
+                                $desktopOwnerState.FinalRootCaptureDeadlineUtc =
+                                    [DateTime]::UtcNow.AddSeconds(10)
+                            }
+                            if ($null -ne $pendingIntent) {
+                                Complete-CodexDesktopOwnerIntent `
+                                    -DataDir $resolvedDataDir `
+                                    -Intent $pendingIntent `
+                                    -RuntimeInvocationId $runtimeInvocationId `
+                                    -Outcome (
+                                        [string]$desktopRecoveryLaunch.Status
+                                    )
+                            }
+                            if ($null -ne $desktopRecoveryLaunch -and
+                                [string]$desktopRecoveryLaunch.Status -ceq
+                                    'launched-remote') {
+                                $startupStage = 'supervising'
+                                Write-StartupStatus -Status 'ready'
+                            }
+                        }
+                    }
+            } catch {
+                $desktopOwnerState.StartupIntentPending = $false
+                if ($desktopRecoveryLaunchAttempted) {
+                    $finalDesktopRootIdentityKey =
+                        Get-UniqueCodexDesktopRootIdentityKey `
+                            -Processes @(
+                                Get-RunningCodexDesktopRootProcesses
+                            )
+                    if (-not [string]::IsNullOrWhiteSpace(
+                        $finalDesktopRootIdentityKey
+                    )) {
+                        $desktopOwnerState.LastAttemptedRootIdentityKey =
+                            $finalDesktopRootIdentityKey
+                        $desktopOwnerState.LastDisconnectedRecoveryRootIdentityKey =
+                            $finalDesktopRootIdentityKey
+                        $desktopOwnerState.PendingFinalRootCapture = $false
+                    } else {
+                        $desktopOwnerState.PendingFinalRootCapture = $true
+                        $desktopOwnerState.FinalRootCaptureDeadlineUtc =
+                            [DateTime]::UtcNow.AddSeconds(10)
+                    }
+                }
+                $startupStage = 'desktop-recovery-blocked'
+                Write-StartupStatus `
+                    -Status 'degraded' `
+                    -Message "The single Desktop owner preserved the current Desktop after one bounded recovery attempt failed: $($_.Exception.Message)"
             }
             $nextDesktopLaunchRecoveryAt =
-                [DateTime]::UtcNow.AddSeconds(10)
+                [DateTime]::UtcNow.AddSeconds(1)
         }
         $runtimeDecision = Get-SharedRuntimeDecision
         if ($runtimeDecision -ceq 'Ready' -and
@@ -1267,15 +2634,28 @@ try {
                 }
             }
         }
-        if ([DateTime]::UtcNow -ge $nextDesktopRuntimeCheckAt) {
+        if ($desktopRuntimeCheckClock.ElapsedMilliseconds -ge
+            $nextDesktopRuntimeCheckElapsedMilliseconds) {
             try {
                 $currentDesktopRuntime = Resolve-NewCodexDesktopRuntime
                 $currentBrokerRuntimeSnapshot =
                     Get-VerifiedBrokerRuntimeSnapshot `
                         -ExpectedBrokerProcessId $brokerPid
+                $currentDesktopRootIdentityKey =
+                    Get-UniqueCodexDesktopRootIdentityKey `
+                        -Processes @(
+                            Get-RunningCodexDesktopRootProcesses
+                        )
+                $currentDesktopOwnerProof =
+                    Read-CodexDesktopOwnerConnectionProof `
+                        -DataDir $resolvedDataDir
                 $desktopConnected = (
                     $null -ne $currentBrokerRuntimeSnapshot -and
-                    [bool]$currentBrokerRuntimeSnapshot.Readiness.desktopConnected
+                    (Test-CodexDesktopOwnerConnectionProof `
+                        -Readiness $currentBrokerRuntimeSnapshot.Readiness `
+                        -Proof $currentDesktopOwnerProof `
+                        -ExpectedRuntimeInvocationId $runtimeInvocationId `
+                        -RootIdentityKey $currentDesktopRootIdentityKey)
                 )
                 $runtimeIdentityCurrent =
                     Test-DesktopRuntimeIdentityCurrent `
@@ -1332,9 +2712,9 @@ try {
                     -Status 'degraded' `
                     -Message $desktopRuntimeHealthMessage
             }
-            $nextDesktopRuntimeCheckAt = [DateTime]::UtcNow.AddSeconds(
-                $DesktopRuntimeCheckIntervalSeconds
-            )
+            $nextDesktopRuntimeCheckElapsedMilliseconds =
+                $desktopRuntimeCheckClock.ElapsedMilliseconds +
+                ([long]$DesktopRuntimeCheckIntervalSeconds * 1000)
         }
         Start-Sleep -Seconds 1
     }

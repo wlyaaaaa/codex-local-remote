@@ -35,6 +35,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'CodexLocalRemote.Windows.psm1') -Force
+$managedConfiguration = Get-CodexLocalRemoteManagedConfiguration -DataDir $DataDir
+if ($null -ne $managedConfiguration) {
+    if (-not $PSBoundParameters.ContainsKey('Port')) {
+        $Port = [int]$managedConfiguration.SidecarPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BrokerPort')) {
+        $BrokerPort = [int]$managedConfiguration.BrokerPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BrokerUpstreamPort')) {
+        $BrokerUpstreamPort = [int]$managedConfiguration.BrokerUpstreamPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BasePath')) {
+        $BasePath = [string]$managedConfiguration.BasePath
+    }
+    if (-not $PSBoundParameters.ContainsKey('TaskName')) {
+        $TaskName = [string]$managedConfiguration.TaskName
+    }
+}
 Assert-CanonicalBasePath -BasePath $BasePath
 
 if ([string]::IsNullOrWhiteSpace($NodePath)) {
@@ -56,6 +74,7 @@ if (-not [string]::IsNullOrWhiteSpace($LauncherShortcutPath) -and
 }
 $sourceInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
 $effectiveInstallRoot = $sourceInstallRoot
+$currentRuntime = $null
 if (-not $SkipEnvironmentConfiguration) {
     $currentRuntime = Get-CodexLocalRemoteCurrentRuntime -DataDir $DataDir
     if ($null -ne $currentRuntime) {
@@ -82,6 +101,28 @@ $legacyExpected = Get-LegacyStartupTaskDefinition `
 $sidecarStopScript = Join-Path $effectiveInstallRoot 'scripts\windows\Stop-CodexLocalRemoteSidecar.ps1'
 $brokerStopScript = Join-Path $effectiveInstallRoot 'scripts\windows\Stop-CodexAppServerBroker.ps1'
 
+function Get-PreTakeoverStartupTaskDefinition {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Arguments = ([string]$Definition.Arguments).Replace(
+        ' -TakeOverExistingNativeDesktop',
+        ''
+    )
+    if ($null -ne $Definition.PSObject.Properties['TaskArguments']) {
+        $properties.TaskArguments = (
+            [string]$Definition.TaskArguments
+        ).Replace(
+            ' -TakeOverExistingNativeDesktop',
+            ''
+        )
+    }
+    return [pscustomobject]$properties
+}
+
 function Test-ExistingTaskOwnership {
     param([AllowNull()][object]$Task)
 
@@ -91,6 +132,68 @@ function Test-ExistingTaskOwnership {
     $current = Test-ManagedStartupTask -Task $Task -Expected $expected
     if ($current.IsManaged) {
         return [pscustomobject]@{ IsManaged = $true; Kind = 'current'; Mismatches = @() }
+    }
+    $legacyAutoStartExpected =
+        Get-LegacyAutoStartStartupTaskDefinitionV5 -Definition $expected
+    $legacyAutoStartV5 = Test-ManagedStartupTask `
+        -Task $Task `
+        -Expected $legacyAutoStartExpected
+    if ($legacyAutoStartV5.IsManaged) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Kind = 'legacy-auto-start-v5'
+            Mismatches = @()
+        }
+    }
+    $legacyHeadlessExpected =
+        Get-LegacyHeadlessStartupTaskDefinitionV4 `
+            -Definition $expected
+    $legacyHeadlessV4 = Test-ManagedStartupTask `
+        -Task $Task `
+        -Expected $legacyHeadlessExpected
+    if ($legacyHeadlessV4.IsManaged) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Kind = 'legacy-headless-v4'
+            Mismatches = @()
+        }
+    }
+    $legacyDesktopOwnerExpected =
+        Get-LegacyDesktopOwningStartupTaskDefinitionV3 `
+            -Definition $expected
+    $legacyDesktopOwnerV3 = Test-ManagedStartupTask `
+        -Task $Task `
+        -Expected $legacyDesktopOwnerExpected
+    if ($legacyDesktopOwnerV3.IsManaged) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Kind = 'legacy-desktop-owner-v3'
+            Mismatches = @()
+        }
+    }
+    $preTakeover = Test-ManagedStartupTask `
+        -Task $Task `
+        -Expected (
+            Get-PreTakeoverStartupTaskDefinition `
+                -Definition $legacyDesktopOwnerExpected
+        )
+    if ($preTakeover.IsManaged) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Kind = 'current'
+            Mismatches = @()
+        }
+    }
+    $preHeadlessExpected =
+        Get-PreHeadlessConsoleStartupTaskDefinition `
+            -Definition $legacyDesktopOwnerExpected
+    $preHeadless = Test-ManagedStartupTask -Task $Task -Expected $preHeadlessExpected
+    if ($preHeadless.IsManaged) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Kind = 'current'
+            Mismatches = @()
+        }
     }
     $actions = @($Task.Actions)
     if ($actions.Count -eq 1) {
@@ -264,9 +367,25 @@ function Remove-LegacyPersistentOverride {
 }
 
 function Get-ManagedLauncherShortcutDefinition {
-    $launcher = [System.IO.Path]::GetFullPath(
-        (Join-Path $expected.WorkingDirectory 'scripts\windows\Launch-CodexWithRemote.ps1')
+    param(
+        [string]$RuntimeRoot = ([string]$expected.WorkingDirectory)
     )
+
+    $resolvedRuntimeRoot = [System.IO.Path]::GetFullPath($RuntimeRoot)
+    $isLegacyRuntimeLauncher =
+        $PSBoundParameters.ContainsKey('RuntimeRoot')
+    $launcher = if ($isLegacyRuntimeLauncher) {
+        [System.IO.Path]::GetFullPath(
+            (Join-Path `
+                $resolvedRuntimeRoot `
+                'scripts\windows\Launch-CodexWithRemote.ps1')
+        )
+    } else {
+        [System.IO.Path]::GetFullPath(
+            (Get-CodexLocalRemoteControlDispatcherPath `
+                -DataDir ([string]$expected.DataDir))
+        )
+    }
     $safeLaunchName = 'Codex Remote (' +
         (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
         ')'
@@ -280,23 +399,46 @@ function Get-ManagedLauncherShortcutDefinition {
     if ([System.IO.Path]::GetExtension($shortcut) -cne '.lnk') {
         throw "Managed launcher shortcut '$shortcut' must use the .lnk extension."
     }
-    $argumentValues = @(
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-WindowStyle',
-        'Hidden',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        $launcher,
-        '-DataDir',
-        $expected.DataDir,
-        '-BrokerPort',
-        [string]$BrokerPort,
-        '-TaskName',
-        $TaskName
-    )
+    $iconPath = Get-CodexLocalRemoteManagedDesktopIconPath `
+        -DataDir ([string]$expected.DataDir)
+    $argumentValues = if ($isLegacyRuntimeLauncher) {
+        @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-WindowStyle',
+            'Hidden',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $launcher,
+            '-DataDir',
+            $expected.DataDir,
+            '-BrokerPort',
+            [string]$BrokerPort,
+            '-TaskName',
+            $TaskName,
+            '-RequestDesktopLaunch'
+        )
+    } else {
+        @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-WindowStyle',
+            'Hidden',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $launcher,
+            '-Operation',
+            'Open',
+            '-DataDir',
+            $expected.DataDir,
+            '-AllowDesktopRestart',
+            '-InteractiveShortcutFeedback'
+        )
+    }
     return [pscustomobject]@{
         LauncherPath = $launcher
         ShortcutPath = [System.IO.Path]::GetFullPath($shortcut)
@@ -307,8 +449,56 @@ function Get-ManagedLauncherShortcutDefinition {
                     ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
                 }
         ) -join ' '
-        WorkingDirectory = [System.IO.Path]::GetFullPath($expected.WorkingDirectory)
-        Description = "$safeLaunchName - Uses Remote when ready and otherwise starts Codex Desktop natively."
+        WorkingDirectory = if ($isLegacyRuntimeLauncher) {
+            $resolvedRuntimeRoot
+        } else {
+            [System.IO.Path]::GetFullPath([string]$expected.DataDir)
+        }
+        Description = if ($isLegacyRuntimeLauncher) {
+            "$safeLaunchName - Uses Remote when ready and otherwise starts Codex Desktop natively."
+        } else {
+            "$safeLaunchName - Explicitly opens Remote through the stable control dispatcher."
+        }
+        IconLocation = "$iconPath,0"
+        WindowStyle = 1
+        RunAsUser = $true
+    }
+}
+
+function Get-ManagedLauncherShortcutLinkFlags {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $attributes = [System.IO.File]::GetAttributes($fullPath)
+    if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0 -or
+        ($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The managed launcher shell link is not an ordinary file.'
+    }
+    $stream = [System.IO.File]::Open(
+        $fullPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        if ($stream.Length -lt 76 -or $stream.Length -gt 1048576) {
+            throw 'The managed launcher shell link has an invalid bounded length.'
+        }
+        $header = [byte[]]::new(24)
+        if ($stream.Read($header, 0, $header.Length) -ne $header.Length -or
+            [BitConverter]::ToUInt32($header, 0) -ne 76) {
+            throw 'The managed launcher shell link header is invalid.'
+        }
+        $expectedClsid = [Guid]'00021401-0000-0000-C000-000000000046'
+        $clsidBytes = $expectedClsid.ToByteArray()
+        foreach ($index in 0..15) {
+            if ($header[$index + 4] -ne $clsidBytes[$index]) {
+                throw 'The managed launcher shell link CLSID is invalid.'
+            }
+        }
+        return [uint32][BitConverter]::ToUInt32($header, 20)
+    } finally {
+        $stream.Dispose()
     }
 }
 
@@ -335,7 +525,19 @@ function Test-ManagedLauncherShortcut {
                 [string]$Definition.WorkingDirectory,
                 [System.StringComparison]::OrdinalIgnoreCase
             ) -and
-            [string]$shortcut.Description -ceq [string]$Definition.Description
+            [string]$shortcut.Description -ceq [string]$Definition.Description -and
+            [int]$shortcut.WindowStyle -eq [int]$Definition.WindowStyle -and
+            (
+                (
+                    (Get-ManagedLauncherShortcutLinkFlags `
+                        -Path $Definition.ShortcutPath) -band 0x00002000
+                ) -ne 0
+            ) -eq [bool]$Definition.RunAsUser -and
+            [string]::Equals(
+                [string]$shortcut.IconLocation,
+                [string]$Definition.IconLocation,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
         )
     } catch {
         return $false
@@ -347,6 +549,163 @@ function Test-ManagedLauncherShortcut {
             $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
         }
     }
+}
+
+function Test-NonElevatedManagedLauncherShortcut {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.RunAsUser = $false
+    return Test-ManagedLauncherShortcut `
+        -Definition ([pscustomobject]$properties)
+}
+
+function Test-MinimizedManagedLauncherShortcut {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    foreach ($runAsUser in @([bool]$Definition.RunAsUser, $false)) {
+        $properties = [ordered]@{}
+        foreach ($property in $Definition.PSObject.Properties) {
+            $properties[[string]$property.Name] = $property.Value
+        }
+        $properties.WindowStyle = 7
+        $properties.RunAsUser = $runAsUser
+        if (Test-ManagedLauncherShortcut `
+            -Definition ([pscustomobject]$properties)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-PreTakeoverManagedLauncherShortcut {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $currentArguments = [string]$Definition.Arguments
+    $legacyArguments = @(
+        $currentArguments.Replace(
+            ' -RequestDesktopLaunch',
+            ' -TakeOverExistingNativeDesktop'
+        )
+        $currentArguments.Replace(
+            ' -RequestDesktopLaunch',
+            ''
+        )
+    ) | Select-Object -Unique
+    if ($legacyArguments.Count -eq 1 -and
+        [string]$legacyArguments[0] -ceq $currentArguments) {
+        return $false
+    }
+    foreach ($arguments in $legacyArguments) {
+        foreach ($windowStyle in @([int]$Definition.WindowStyle, 7)) {
+            foreach ($runAsUser in @([bool]$Definition.RunAsUser, $false)) {
+                if (Test-ManagedLauncherShortcut -Definition ([pscustomobject]@{
+                    ShortcutPath = [string]$Definition.ShortcutPath
+                    TargetPath = [string]$Definition.TargetPath
+                    Arguments = [string]$arguments
+                    WorkingDirectory = [string]$Definition.WorkingDirectory
+                    Description = [string]$Definition.Description
+                    IconLocation = [string]$Definition.IconLocation
+                    WindowStyle = $windowStyle
+                    RunAsUser = $runAsUser
+                })) {
+                    return $true
+                }
+            }
+        }
+    }
+    return $false
+}
+
+function Test-VisibleManagedLauncherShortcut {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $arguments = [string]$Definition.Arguments
+    $visibleArguments = $arguments.Replace(' -WindowStyle Hidden ', ' ')
+    if ($visibleArguments -ceq $arguments) {
+        return $false
+    }
+    foreach ($windowStyle in @([int]$Definition.WindowStyle, 7)) {
+        foreach ($runAsUser in @([bool]$Definition.RunAsUser, $false)) {
+            $properties = [ordered]@{}
+            foreach ($property in $Definition.PSObject.Properties) {
+                $properties[[string]$property.Name] = $property.Value
+            }
+            $properties.Arguments = $visibleArguments
+            $properties.WindowStyle = $windowStyle
+            $properties.RunAsUser = $runAsUser
+            if (Test-ManagedLauncherShortcut `
+                -Definition ([pscustomobject]$properties)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Test-VisiblePreTakeoverManagedLauncherShortcut {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $currentArguments = [string]$Definition.Arguments
+    $visibleArguments = $currentArguments.Replace(
+        ' -WindowStyle Hidden ',
+        ' '
+    )
+    if ($visibleArguments -ceq $currentArguments) {
+        return $false
+    }
+    $legacyArguments = @(
+        $visibleArguments.Replace(
+            ' -RequestDesktopLaunch',
+            ' -TakeOverExistingNativeDesktop'
+        )
+        $visibleArguments.Replace(' -RequestDesktopLaunch', '')
+    ) | Select-Object -Unique
+    foreach ($arguments in $legacyArguments) {
+        foreach ($windowStyle in @([int]$Definition.WindowStyle, 7)) {
+            foreach ($runAsUser in @([bool]$Definition.RunAsUser, $false)) {
+                $properties = [ordered]@{}
+                foreach ($property in $Definition.PSObject.Properties) {
+                    $properties[[string]$property.Name] = $property.Value
+                }
+                $properties.Arguments = [string]$arguments
+                $properties.WindowStyle = $windowStyle
+                $properties.RunAsUser = $runAsUser
+                if (Test-ManagedLauncherShortcut `
+                    -Definition ([pscustomobject]$properties)) {
+                    return $true
+                }
+            }
+        }
+    }
+    return $false
+}
+
+function Test-RecognizedManagedLauncherShortcut {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Definitions
+    )
+
+    foreach ($definition in $Definitions) {
+        if ((Test-ManagedLauncherShortcut -Definition $definition) -or
+            (Test-NonElevatedManagedLauncherShortcut `
+                -Definition $definition) -or
+            (Test-MinimizedManagedLauncherShortcut `
+                -Definition $definition) -or
+            (Test-VisibleManagedLauncherShortcut `
+                -Definition $definition) -or
+            (Test-PreTakeoverManagedLauncherShortcut `
+                -Definition $definition) -or
+            (Test-VisiblePreTakeoverManagedLauncherShortcut `
+                -Definition $definition)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-UninstallRuntimePreflight {
@@ -456,6 +815,39 @@ function Get-UninstallRuntimePreflight {
 }
 
 $launcherDefinition = Get-ManagedLauncherShortcutDefinition
+$launcherDefinitions =
+    [System.Collections.Generic.List[object]]::new()
+$launcherDefinitions.Add($launcherDefinition)
+$launcherRuntimeRoots = [System.Collections.Generic.List[string]]::new()
+$launcherRuntimeRoots.Add($sourceInstallRoot)
+if ($null -ne $currentRuntime) {
+    $launcherRuntimeRoots.Add([string]$currentRuntime.CurrentRoot)
+    if (-not [string]::IsNullOrWhiteSpace(
+        [string]$currentRuntime.PreviousRoot
+    )) {
+        $launcherRuntimeRoots.Add([string]$currentRuntime.PreviousRoot)
+    }
+}
+foreach ($runtimeRoot in $launcherRuntimeRoots) {
+    if ([string]::IsNullOrWhiteSpace([string]$runtimeRoot)) {
+        continue
+    }
+    $candidateDefinition =
+        Get-ManagedLauncherShortcutDefinition `
+            -RuntimeRoot ([string]$runtimeRoot)
+    if (-not @(
+        $launcherDefinitions |
+            Where-Object {
+                [string]::Equals(
+                    [string]$_.WorkingDirectory,
+                    [string]$candidateDefinition.WorkingDirectory,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )) {
+        $launcherDefinitions.Add($candidateDefinition)
+    }
+}
 $existing = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
 $ownership = Test-ExistingTaskOwnership -Task $existing
 if (-not $ownership.IsManaged) {
@@ -474,12 +866,106 @@ $launcherPreflight = if ($SkipEnvironmentConfiguration) {
     [pscustomobject]@{ Status = 'fixture-skipped' }
 } elseif (-not (Test-Path -LiteralPath $launcherDefinition.ShortcutPath)) {
     [pscustomobject]@{ Status = 'not-found' }
-} elseif (Test-ManagedLauncherShortcut -Definition $launcherDefinition) {
+} elseif (Test-RecognizedManagedLauncherShortcut `
+    -Definitions @($launcherDefinitions)) {
     [pscustomobject]@{ Status = 'removable' }
 } else {
     throw "Launcher shortcut '$($launcherDefinition.ShortcutPath)' is not the exact managed Codex Remote entry; refusing to remove it."
 }
+$launcherIconPath = Get-CodexLocalRemoteManagedDesktopIconPath `
+    -DataDir $expected.DataDir
+$launcherIconPreflight = if ($SkipEnvironmentConfiguration) {
+    [pscustomobject]@{ Status = 'fixture-skipped' }
+} elseif (-not (Test-Path -LiteralPath $launcherIconPath)) {
+    [pscustomobject]@{ Status = 'not-found' }
+} elseif (Test-CodexLocalRemoteManagedDesktopIcon -Path $launcherIconPath) {
+    [pscustomobject]@{ Status = 'removable' }
+} else {
+    throw "Managed ChatGPT icon '$launcherIconPath' is not an exact ordinary ICO file; refusing to remove it."
+}
+$controlDispatcherPreflight = if ($SkipEnvironmentConfiguration) {
+    [pscustomobject]@{ Status = 'fixture-skipped' }
+} else {
+    Get-CodexLocalRemoteControlDispatcherState `
+        -DataDir $expected.DataDir
+}
+$desiredModePreflight = if ($SkipEnvironmentConfiguration) {
+    [pscustomobject]@{ Status = 'fixture-skipped' }
+} else {
+    Get-CodexLocalRemoteDesiredMode `
+        -DataDir $expected.DataDir
+}
 $runtimeStopPreflight = Get-UninstallRuntimePreflight
+
+function Get-UnregistrationOrdinaryFilePreImage {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $resolvedPath)) {
+        return $null
+    }
+    $item = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$item.Length -gt 1048576) {
+        throw 'An unregistration pre-image is not one ordinary bounded file.'
+    }
+    return [pscustomobject]@{
+        Path = $resolvedPath
+        Bytes = [System.IO.File]::ReadAllBytes($resolvedPath)
+        Sha256 = (
+            Get-FileHash `
+                -LiteralPath $resolvedPath `
+                -Algorithm SHA256 `
+                -ErrorAction Stop
+        ).Hash.ToLowerInvariant()
+    }
+}
+
+function Restore-UnregistrationOrdinaryFilePreImages {
+    param([Parameter(Mandatory)][object[]]$PreImages)
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($preImage in @($PreImages)) {
+        if ($null -eq $preImage) {
+            continue
+        }
+        $path = [string]$preImage.Path
+        try {
+            if (Test-Path -LiteralPath $path) {
+                throw 'A removed file path was claimed before rollback.'
+            }
+            $directory = Split-Path -Parent $path
+            $null = [System.IO.Directory]::CreateDirectory($directory)
+            $stream = [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $bytes = [byte[]]$preImage.Bytes
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush($true)
+            } finally {
+                $stream.Dispose()
+            }
+            $restoredSha256 = (
+                Get-FileHash `
+                    -LiteralPath $path `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash.ToLowerInvariant()
+            if ($restoredSha256 -cne [string]$preImage.Sha256) {
+                throw 'An unregistration pre-image did not verify.'
+            }
+        } catch {
+            $failures.Add((Split-Path -Leaf $path))
+        }
+    }
+    return @($failures)
+}
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task')) {
     # Re-check immediately before the first mutation so a same-name replacement
@@ -524,6 +1010,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task')) {
             -Confirm:$false | Out-Null
     }
 
+    $taskReadyForRemoval = $false
     if ($null -ne $current) {
         $finalTask = Get-ScheduledTask `
             -TaskName $TaskName `
@@ -535,8 +1022,34 @@ if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task')) {
             [string]$finalOwnership.Kind -cne $expectedTaskKind) {
             throw "Scheduled task '$TaskName' changed after process cleanup; refusing to remove it."
         }
-        Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false
+        $taskReadyForRemoval = $true
     }
+    $unregistrationPreImages =
+        [System.Collections.Generic.List[object]]::new()
+    if (-not $SkipEnvironmentConfiguration) {
+        foreach ($ownedPath in @(
+            [string]$launcherDefinition.ShortcutPath,
+            [string]$launcherIconPath,
+            [string]$tokenPath,
+            [string]$controlDispatcherPreflight.Path,
+            [string]$controlDispatcherPreflight.ReceiptPath,
+            [string]$desiredModePreflight.Path,
+            $(if ([string]$legacyOverridePlan.Action -ceq
+                    'remove-stale-state') {
+                [string]$legacyOverridePlan.StatePath
+            })
+        )) {
+            if (-not [string]::IsNullOrWhiteSpace($ownedPath)) {
+                $preImage =
+                    Get-UnregistrationOrdinaryFilePreImage `
+                        -Path $ownedPath
+                if ($null -ne $preImage) {
+                    $unregistrationPreImages.Add($preImage)
+                }
+            }
+        }
+    }
+    try {
     $legacyOverride = if ($SkipEnvironmentConfiguration) {
         [pscustomobject]@{ Status = 'fixture-skipped' }
     } else {
@@ -549,30 +1062,116 @@ if ($PSCmdlet.ShouldProcess($TaskName, 'Stop and remove the startup task')) {
     } elseif ($launcherPreflight.Status -ceq 'not-found') {
         [pscustomobject]@{ Status = 'not-found' }
     } else {
-        if (-not (Test-ManagedLauncherShortcut -Definition $launcherDefinition)) {
+        if (-not (Test-RecognizedManagedLauncherShortcut `
+            -Definitions @($launcherDefinitions))) {
             throw "Launcher shortcut '$($launcherDefinition.ShortcutPath)' changed before removal; refusing to delete it."
         }
         Remove-Item -LiteralPath $launcherDefinition.ShortcutPath -Force
         [pscustomobject]@{ Status = 'removed' }
+    }
+    $launcherIconRemoval = if ($SkipEnvironmentConfiguration) {
+        [pscustomobject]@{ Status = 'fixture-skipped' }
+    } elseif ($launcherIconPreflight.Status -ceq 'not-found') {
+        [pscustomobject]@{ Status = 'not-found' }
+    } else {
+        Remove-CodexLocalRemoteManagedDesktopIcon -DataDir $expected.DataDir
     }
     $tokenRemoval = if ($SkipEnvironmentConfiguration) {
         [pscustomobject]@{ Status = 'fixture-skipped' }
     } else {
         Remove-BrokerCapabilityToken -DataDir $expected.DataDir
     }
+    $controlDispatcherRemoval = if ($SkipEnvironmentConfiguration) {
+        [pscustomobject]@{ Status = 'fixture-skipped' }
+    } else {
+        Remove-CodexLocalRemoteControlDispatcher `
+            -DataDir $expected.DataDir
+    }
+    $desiredModeRemoval = if ($SkipEnvironmentConfiguration) {
+        [pscustomobject]@{ Status = 'fixture-skipped' }
+    } else {
+        Remove-CodexLocalRemoteDesiredMode `
+            -DataDir $expected.DataDir
+    }
+    if ($taskReadyForRemoval) {
+        $finalTask = Get-ScheduledTask `
+            -TaskName $TaskName `
+            -TaskPath '\' `
+            -ErrorAction SilentlyContinue
+        $finalOwnership = Test-ExistingTaskOwnership -Task $finalTask
+        if ($null -eq $finalTask -or
+            -not $finalOwnership.IsManaged -or
+            [string]$finalOwnership.Kind -cne $expectedTaskKind -or
+            [string]$finalTask.State -ceq 'Running') {
+            throw "Scheduled task '$TaskName' changed before final removal."
+        }
+        Unregister-ScheduledTask `
+            -TaskName $TaskName `
+            -TaskPath '\' `
+            -Confirm:$false
+        $remainingTask = Get-ScheduledTask `
+            -TaskName $TaskName `
+            -TaskPath '\' `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $remainingTask) {
+            throw "Scheduled task '$TaskName' remained after removal."
+        }
+    }
+    } catch {
+        $unregistrationFailure = $_
+        $remainingTask = Get-ScheduledTask `
+            -TaskName $TaskName `
+            -TaskPath '\' `
+            -ErrorAction SilentlyContinue
+        if (-not ($taskReadyForRemoval -and $null -eq $remainingTask)) {
+            $restoreFailures =
+                Restore-UnregistrationOrdinaryFilePreImages `
+                    -PreImages @($unregistrationPreImages)
+            if (@($restoreFailures).Count -gt 0) {
+                throw (
+                    "$($unregistrationFailure.Exception.Message) " +
+                    'Unregistration rollback was incomplete for: ' +
+                    (@($restoreFailures) -join ', ')
+                )
+            }
+            if ([string]$legacyOverridePlan.Action -ceq
+                'restore-managed' -and
+                [string]$legacyOverride.Status -cne 'not-found') {
+                try {
+                    $null = Install-BrokerUserEnvironment `
+                        -DataDir $expected.DataDir `
+                        -WebSocketUrl (
+                            [string]$legacyOverridePlan.WebSocketUrl
+                        )
+                } catch {
+                    throw (
+                        "$($unregistrationFailure.Exception.Message) " +
+                        'Legacy environment rollback was incomplete.'
+                    )
+                }
+            }
+            throw $unregistrationFailure
+        }
+    }
     [pscustomobject]@{
         Status = if ($null -eq $current) { 'residual-state-removed' } else { 'removed' }
         TaskName = $TaskName
         LaunchMode = 'native-only'
         LauncherShortcut = $launcherRemoval.Status
+        LauncherIcon = $launcherIconRemoval.Status
         LegacyPersistentOverride = $legacyOverride.Status
         BrokerCapabilityToken = $tokenRemoval.Status
+        ControlDispatcher = $controlDispatcherRemoval.Status
+        DesiredMode = $desiredModeRemoval.Status
     }
 } else {
     [pscustomobject]@{
         Status = 'what-if'
         TaskName = $TaskName
         LauncherShortcut = $launcherPreflight.Status
+        LauncherIcon = $launcherIconPreflight.Status
         LegacyPersistentOverride = $legacyOverridePlan.Status
+        ControlDispatcher = $controlDispatcherPreflight.Status
+        DesiredMode = $desiredModePreflight.Status
     }
 }

@@ -97,6 +97,19 @@ describe("ThreadLifecycleArbiter", () => {
     expect(arbiter.snapshot("thread-1")?.phase).toBe("idle");
   });
 
+  it("rejects a delayed status snapshot after the lifecycle revision changes", () => {
+    const arbiter = new ThreadLifecycleArbiter();
+    arbiter.observeStarted("thread-1", "turn-running");
+    const revisionBeforeCompletion = arbiter.revision("thread-1");
+
+    arbiter.complete("thread-1", "turn-running");
+
+    expect(arbiter.observeStatusAtRevision("thread-1", "active", revisionBeforeCompletion)).toBe(
+      false,
+    );
+    expect(arbiter.snapshot("thread-1")?.phase).toBe("idle");
+  });
+
   it("fails closed after an owning connection disappears mid-start", async () => {
     const arbiter = new ThreadLifecycleArbiter();
     arbiter.observeStatus("thread-1", "idle");
@@ -133,5 +146,73 @@ describe("ThreadLifecycleArbiter", () => {
     arbiter.observeStatus("active-thread", "idle");
     arbiter.observeStatus("unknown-thread", "idle");
     expect(arbiter.unsafeThreadCount()).toBe(0);
+  });
+
+  it("blocks turn starts for an atomically reserved archive tree", async () => {
+    const arbiter = new ThreadLifecycleArbiter();
+    arbiter.observeStatus("thread-root", "idle");
+    arbiter.observeStatus("thread-child", "idle");
+
+    const archive = arbiter.reserveArchive("thread-root", ["thread-child"], 7);
+
+    await expect(arbiter.reserve("thread-root", 1, async () => "idle")).rejects.toMatchObject({
+      code: -32_094,
+      message: "Thread is being archived",
+    });
+    await expect(arbiter.reserve("thread-child", 2, async () => "idle")).rejects.toMatchObject({
+      code: -32_094,
+      message: "Thread is being archived",
+    });
+    expect(arbiter.unsafeThreadCount()).toBe(2);
+
+    arbiter.releaseArchive(archive);
+    await expect(arbiter.reserve("thread-child", 2, async () => "idle")).resolves.toMatchObject({
+      threadId: "thread-child",
+    });
+  });
+
+  it("refuses to overlap an archive with a pending turn and releases archive locks on disconnect", async () => {
+    const arbiter = new ThreadLifecycleArbiter();
+    arbiter.observeStatus("thread-root", "idle");
+    const pendingTurn = await arbiter.reserve("thread-root", 1, async () => "idle");
+
+    expect(() => arbiter.reserveArchive("thread-root", [], 7)).toThrow(TurnStartConflictError);
+
+    arbiter.release(pendingTurn);
+    arbiter.reserveArchive("thread-root", [], 7);
+    arbiter.connectionClosed(7);
+
+    await expect(arbiter.reserve("thread-root", 2, async () => "idle")).resolves.toMatchObject({
+      threadId: "thread-root",
+    });
+  });
+
+  it("extends an archive reservation to descendants discovered during reconciliation", async () => {
+    const arbiter = new ThreadLifecycleArbiter();
+    arbiter.observeStatus("thread-root", "idle");
+    arbiter.observeStatus("thread-child", "idle");
+    const archive = arbiter.reserveArchive("thread-root", [], 7);
+
+    arbiter.extendArchive(archive, ["thread-child"]);
+
+    await expect(arbiter.reserve("thread-child", 2, async () => "idle")).rejects.toMatchObject({
+      message: "Thread is being archived",
+    });
+  });
+
+  it("forgets archived lifecycle and archive reservations idempotently", async () => {
+    const arbiter = new ThreadLifecycleArbiter();
+    arbiter.observeStarted("thread-root", "turn-old");
+    arbiter.complete("thread-root", "turn-old");
+    arbiter.reserveArchive("thread-root", ["thread-child"], 7);
+
+    arbiter.forget(["thread-root", "thread-child"]);
+    arbiter.forget(["thread-root", "thread-child"]);
+
+    expect(arbiter.snapshot("thread-root")).toBeUndefined();
+    expect(arbiter.unsafeThreadCount()).toBe(0);
+    await expect(arbiter.reserve("thread-root", 2, async () => "idle")).resolves.toMatchObject({
+      threadId: "thread-root",
+    });
   });
 });

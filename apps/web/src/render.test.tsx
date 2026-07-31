@@ -1,4 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
@@ -37,6 +38,16 @@ import {
 } from "./usage-display";
 
 describe("界面基础渲染", () => {
+  it("对话行菜单在窄屏保留 44x44 触控入口且菜单不越出视口", () => {
+    const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    expect(styles).toMatch(
+      /\.thread-actions__trigger\s*\{[^}]*height:\s*44px;[^}]*width:\s*44px;/su,
+    );
+    expect(styles).toMatch(
+      /@media \(max-width:\s*700px\)\s*\{[\s\S]*?\.thread-actions__menu\s*\{[^}]*max-width:\s*calc\(100vw - 24px\);/u,
+    );
+  });
+
   it("为主要按钮保留可访问名称与触控标记", () => {
     const html = renderToStaticMarkup(
       <Button icon="plus" variant="primary">

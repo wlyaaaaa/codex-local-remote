@@ -1,7 +1,10 @@
 Set-StrictMode -Version Latest
 
-$script:StartupTaskSignature = 'codex-local-remote/startup-task/v3'
-$script:StartupTaskDescription = "$script:StartupTaskSignature - Starts the loopback app-server broker before the local-only Codex Local Remote sidecar at user sign-in."
+$script:StartupTaskSignature = 'codex-local-remote/startup-task/v5'
+$script:StartupTaskDescription = "$script:StartupTaskSignature - Starts the loopback app-server broker and local-only Codex Local Remote sidecar only on an explicit demand start."
+$script:LegacyAutoStartStartupTaskV5Description = 'codex-local-remote/startup-task/v5 - Starts the loopback app-server broker before the local-only Codex Local Remote sidecar at user sign-in.'
+$script:LegacyHeadlessStartupTaskV4Description = 'codex-local-remote/startup-task/v4 - Starts the loopback app-server broker before the local-only Codex Local Remote sidecar at user sign-in.'
+$script:LegacyDesktopOwningStartupTaskV3Description = 'codex-local-remote/startup-task/v3 - Starts the loopback app-server broker before the local-only Codex Local Remote sidecar at user sign-in.'
 $script:PinnedStartupTaskV2Description = 'codex-local-remote/startup-task/v2 - Starts the loopback app-server broker before the local-only Codex Local Remote sidecar at user sign-in.'
 $script:BrokerStateSignature = 'codex-local-remote/app-server-broker/v3'
 $script:EnvironmentStateSignature = 'codex-local-remote/user-environment/v2'
@@ -16,6 +19,13 @@ $script:LegacyDataDirectoryFiles = @(
     'startup-last.json',
     'app-server-broker.json',
     'windows-broker-environment.json',
+    'managed-config.json',
+    'desktop-owner-intent.json',
+    'desktop-owner-intent-last.json',
+    'desktop-owner-proof.json',
+    'desktop-package-refresh-intent.json',
+    'desktop-package-refresh-last.json',
+    'desktop-owner-fallback-suppression.json',
     'broker-capability.token',
     'app-server-upstream.token'
 )
@@ -176,6 +186,177 @@ function Test-CodexDesktopRuntimePathInsideRoot {
     }
 }
 
+function Get-CodexDesktopRuntimeCachePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LocalAppDataPath,
+
+        [string]$RuntimeCachePath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeCachePath)) {
+        return [System.IO.Path]::GetFullPath($RuntimeCachePath)
+    }
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path $LocalAppDataPath 'CodexLocalRemote\desktop-runtime-cache.json')
+    )
+}
+
+function Read-CodexDesktopRuntimeCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [object]$Package,
+
+        [Parameter(Mandatory)]
+        [string]$PackageRoot,
+
+        [Parameter(Mandatory)]
+        [string]$DesktopExecutablePath,
+
+        [Parameter(Mandatory)]
+        [string]$DesktopExecutableSha256,
+
+        [Parameter(Mandatory)]
+        [string]$BundledCodexPath,
+
+        [Parameter(Mandatory)]
+        [string]$BundledCodexSha256,
+
+        [Parameter(Mandatory)]
+        [string]$CodexCacheRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Codex Desktop runtime cache receipt '$Path' is not an ordinary file."
+    }
+    if ([long]$item.Length -lt 2 -or [long]$item.Length -gt 32768) {
+        return $null
+    }
+    try {
+        $rawBefore = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+        $cache = $rawBefore | ConvertFrom-Json -Depth 10 -ErrorAction Stop
+        $rawAfter = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    } catch {
+        return $null
+    }
+    try {
+        if ($rawBefore -cne $rawAfter -or
+            [string]$cache.Signature -cne
+                'codex-local-remote/codex-desktop-runtime-cache/v1' -or
+            [int]$cache.Version -ne 1 -or
+            [string]$cache.PackageName -cne [string]$Package.Name -or
+            [string]$cache.PackageFamilyName -cne
+                [string]$Package.PackageFamilyName -or
+            [string]$cache.PackageFullName -cne
+                [string]$Package.PackageFullName -or
+            [string]$cache.PackageVersion -cne [string]$Package.Version -or
+            -not [string]::Equals(
+                [string]$cache.PackageInstallLocation,
+                $PackageRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            -not [string]::Equals(
+                [string]$cache.DesktopExecutablePath,
+                $DesktopExecutablePath,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            -not [string]::Equals(
+                [string]$cache.BundledCodexPath,
+                $BundledCodexPath,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$cache.DesktopExecutableSha256 -cne
+                $DesktopExecutableSha256 -or
+            [string]$cache.BundledCodexSha256 -cne $BundledCodexSha256 -or
+            [string]$cache.CodexSha256 -cnotmatch '^[0-9A-F]{64}$') {
+            return $null
+        }
+        $cachedCodexPath = [System.IO.Path]::GetFullPath(
+            [string]$cache.CodexPath
+        )
+    } catch {
+        return $null
+    }
+    if (-not (
+        (Test-CodexDesktopRuntimePathInsideRoot `
+            -Path $cachedCodexPath `
+            -Root $PackageRoot) -or
+        (Test-CodexDesktopRuntimePathInsideRoot `
+            -Path $cachedCodexPath `
+            -Root $CodexCacheRoot)
+    ) -or
+        -not (Test-CodexDesktopRuntimeOrdinaryFile -Path $cachedCodexPath)) {
+        return $null
+    }
+    try {
+        $cachedCodexSha256 = if ([string]::Equals(
+            $cachedCodexPath,
+            $BundledCodexPath,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            $BundledCodexSha256
+        } else {
+            (
+                Get-FileHash `
+                    -LiteralPath $cachedCodexPath `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash.ToUpperInvariant()
+        }
+    } catch {
+        return $null
+    }
+    if ($cachedCodexSha256 -cne [string]$cache.CodexSha256 -or
+        $cachedCodexSha256 -cne $BundledCodexSha256) {
+        return $null
+    }
+
+    return [pscustomobject][ordered]@{
+        CodexPath = $cachedCodexPath
+        CodexSha256 = $cachedCodexSha256
+        Source = 'persistent-runtime-cache-hash-verified'
+    }
+}
+
+function Write-CodexDesktopRuntimeCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [object]$Runtime
+    )
+
+    Write-AtomicJsonFile -Path $Path -Value ([ordered]@{
+        Signature = 'codex-local-remote/codex-desktop-runtime-cache/v1'
+        Version = 1
+        PackageName = [string]$Runtime.PackageName
+        PackageFamilyName = [string]$Runtime.PackageFamilyName
+        PackageFullName = [string]$Runtime.PackageFullName
+        PackageVersion = [string]$Runtime.PackageVersion
+        PackageInstallLocation = [string]$Runtime.PackageInstallLocation
+        DesktopExecutablePath = [string]$Runtime.DesktopExecutablePath
+        DesktopExecutableSha256 = [string]$Runtime.DesktopExecutableSha256
+        BundledCodexPath = [string]$Runtime.BundledCodexPath
+        BundledCodexSha256 = [string]$Runtime.BundledCodexSha256
+        CodexPath = [string]$Runtime.CodexPath
+        CodexSha256 = [string]$Runtime.CodexSha256
+        RuntimeSource = [string]$Runtime.Source
+        RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
+    })
+}
+
 function Resolve-CodexDesktopPackageStatusIdentity {
     [CmdletBinding()]
     param(
@@ -256,6 +437,8 @@ function Resolve-CodexDesktopRuntime {
 
         [string]$LocalAppDataPath = $env:LOCALAPPDATA,
 
+        [string]$RuntimeCachePath,
+
         [string]$PackageName = $script:CodexDesktopPackageName,
 
         [string]$PublisherId = $script:CodexDesktopPublisherId
@@ -316,6 +499,12 @@ function Resolve-CodexDesktopRuntime {
         $desktopExecutableSha256 -cnotmatch '^[0-9A-F]{64}$') {
         throw 'Codex Desktop package runtime hashing returned an invalid SHA-256 fingerprint.'
     }
+    $cacheRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $LocalAppDataPath 'OpenAI\Codex\bin')
+    )
+    $resolvedRuntimeCachePath = Get-CodexDesktopRuntimeCachePath `
+        -LocalAppDataPath $LocalAppDataPath `
+        -RuntimeCachePath $RuntimeCachePath
 
     if (-not $PSBoundParameters.ContainsKey('DesktopProcessCandidates')) {
         $DesktopProcessCandidates = @(
@@ -357,11 +546,38 @@ function Resolve-CodexDesktopRuntime {
         throw 'A running Codex Desktop process belongs to a different package generation. Remote startup is disabled until the Desktop update/restart converges; the Desktop process was left untouched.'
     }
 
+    $cachedRuntime = Read-CodexDesktopRuntimeCache `
+        -Path $resolvedRuntimeCachePath `
+        -Package $package `
+        -PackageRoot $packageRoot `
+        -DesktopExecutablePath $desktopExecutablePath `
+        -DesktopExecutableSha256 $desktopExecutableSha256 `
+        -BundledCodexPath $bundledCodexPath `
+        -BundledCodexSha256 $bundledCodexSha256 `
+        -CodexCacheRoot $cacheRoot
+    if ($null -ne $cachedRuntime) {
+        return [pscustomobject][ordered]@{
+            Signature = 'codex-local-remote/codex-desktop-runtime/v1'
+            Version = 1
+            PackageName = [string]$package.Name
+            PackageFamilyName = [string]$package.PackageFamilyName
+            PackageFullName = [string]$package.PackageFullName
+            PackageVersion = [string]$package.Version
+            PackageInstallLocation = $packageRoot
+            DesktopExecutablePath = $desktopExecutablePath
+            DesktopExecutableSha256 = $desktopExecutableSha256
+            BundledCodexPath = $bundledCodexPath
+            BundledCodexSha256 = $bundledCodexSha256
+            CodexPath = [string]$cachedRuntime.CodexPath
+            CodexSha256 = [string]$cachedRuntime.CodexSha256
+            Source = [string]$cachedRuntime.Source
+            RunningDesktopObserved = ($codexPackageProcessPaths.Count -gt 0)
+            DiscoveredAtUtc = [DateTime]::UtcNow.ToString('O')
+        }
+    }
+
     $runtimePath = $bundledCodexPath
     $runtimeSource = 'package-bundled'
-    $cacheRoot = [System.IO.Path]::GetFullPath(
-        (Join-Path $LocalAppDataPath 'OpenAI\Codex\bin')
-    )
     $matchingCacheFiles = @()
     if (Test-Path -LiteralPath $cacheRoot -PathType Container) {
         $cacheRootItem = Get-Item -LiteralPath $cacheRoot -Force -ErrorAction Stop
@@ -408,7 +624,7 @@ function Resolve-CodexDesktopRuntime {
         throw 'The selected Codex Desktop runtime changed during discovery and no longer hash-matches the installed package.'
     }
 
-    return [pscustomobject][ordered]@{
+    $runtime = [pscustomobject][ordered]@{
         Signature = 'codex-local-remote/codex-desktop-runtime/v1'
         Version = 1
         PackageName = [string]$package.Name
@@ -425,6 +641,172 @@ function Resolve-CodexDesktopRuntime {
         Source = $runtimeSource
         RunningDesktopObserved = ($codexPackageProcessPaths.Count -gt 0)
         DiscoveredAtUtc = [DateTime]::UtcNow.ToString('O')
+    }
+    try {
+        Write-CodexDesktopRuntimeCache `
+            -Path $resolvedRuntimeCachePath `
+            -Runtime $runtime
+    } catch {
+        # Discovery remains correct without the optimization; a later managed
+        # startup can rebuild the bounded, hash-verified receipt.
+    }
+    return $runtime
+}
+
+function Get-CodexLocalRemoteManagedDesktopIconPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $resolvedDataDir = Assert-CodexLocalRemoteDataDirectoryPath -DataDir $DataDir
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path $resolvedDataDir 'managed-chatgpt.ico')
+    )
+}
+
+function Test-CodexLocalRemoteManagedDesktopIcon {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $item = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $item.Length -lt 128 -or
+            $item.Length -gt 4194304) {
+            return $false
+        }
+        $stream = [System.IO.File]::Open(
+            $resolvedPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $header = [byte[]]::new(6)
+            if ($stream.Read($header, 0, $header.Length) -ne $header.Length) {
+                return $false
+            }
+            return (
+                $header[0] -eq 0 -and
+                $header[1] -eq 0 -and
+                $header[2] -eq 1 -and
+                $header[3] -eq 0 -and
+                ($header[4] -ne 0 -or $header[5] -ne 0)
+            )
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return $false
+    }
+}
+
+function Install-CodexLocalRemoteManagedDesktopIcon {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$DesktopExecutablePath
+    )
+
+    $resolvedDataDir = Assert-CodexLocalRemoteDataDirectoryPath -DataDir $DataDir
+    $resolvedExecutable = [System.IO.Path]::GetFullPath($DesktopExecutablePath)
+    if (-not (Test-CodexDesktopRuntimeOrdinaryFile -Path $resolvedExecutable)) {
+        throw "ChatGPT Desktop executable is missing or unsafe: '$resolvedExecutable'."
+    }
+    $null = [System.IO.Directory]::CreateDirectory($resolvedDataDir)
+    $iconPath = Get-CodexLocalRemoteManagedDesktopIconPath -DataDir $resolvedDataDir
+    $temporaryPath = Join-Path (
+        Split-Path -Parent $iconPath
+    ) ".$([guid]::NewGuid().ToString('N')).ico"
+    $icon = $null
+    $stream = $null
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($resolvedExecutable)
+        if ($null -eq $icon) {
+            throw "ChatGPT Desktop does not expose an associated icon: '$resolvedExecutable'."
+        }
+        $stream = [System.IO.File]::Open(
+            $temporaryPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $icon.Save($stream)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        if (-not (Test-CodexLocalRemoteManagedDesktopIcon -Path $temporaryPath)) {
+            throw 'The extracted ChatGPT Desktop icon failed ICO validation.'
+        }
+        $newHash = (
+            Get-FileHash -LiteralPath $temporaryPath -Algorithm SHA256 -ErrorAction Stop
+        ).Hash
+        if ((Test-CodexLocalRemoteManagedDesktopIcon -Path $iconPath) -and
+            (Get-FileHash -LiteralPath $iconPath -Algorithm SHA256 -ErrorAction Stop).Hash -ceq
+                $newHash) {
+            return [pscustomobject]@{
+                Status = 'reused'
+                IconPath = $iconPath
+            }
+        }
+        $status = if (Test-Path -LiteralPath $iconPath) {
+            'refreshed'
+        } else {
+            'created'
+        }
+        Move-Item -LiteralPath $temporaryPath -Destination $iconPath -Force
+        if (-not (Test-CodexLocalRemoteManagedDesktopIcon -Path $iconPath)) {
+            throw 'The installed ChatGPT Desktop icon failed exact verification.'
+        }
+        return [pscustomobject]@{
+            Status = $status
+            IconPath = $iconPath
+        }
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $icon) {
+            $icon.Dispose()
+        }
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-CodexLocalRemoteManagedDesktopIcon {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $iconPath = Get-CodexLocalRemoteManagedDesktopIconPath -DataDir $DataDir
+    if (-not (Test-Path -LiteralPath $iconPath)) {
+        return [pscustomobject]@{
+            Status = 'not-found'
+            IconPath = $iconPath
+        }
+    }
+    if (-not (Test-CodexLocalRemoteManagedDesktopIcon -Path $iconPath)) {
+        throw "Managed ChatGPT icon '$iconPath' is not an exact ordinary ICO file; refusing to remove it."
+    }
+    Remove-Item -LiteralPath $iconPath -Force
+    return [pscustomobject]@{
+        Status = 'removed'
+        IconPath = $iconPath
     }
 }
 
@@ -534,6 +916,51 @@ function Get-CodexLocalRemoteCurrentUserSid {
     return $currentUserSid
 }
 
+function Test-CodexLocalRemoteManagedEphemeralFileName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    return (
+        $Name -cmatch '^\..+\.[0-9a-f]{32}\.tmp$' -or
+        $Name -cmatch '^\.(?:state|turn-outbox)-[1-9][0-9]*-[0-9a-f]{12}\.tmp$' -or
+        $Name -cmatch '^app-server-upstream\.token\.[1-9][0-9]*\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$'
+    )
+}
+
+function Get-CodexLocalRemoteManagedDataItemAcl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$ItemPath
+    )
+
+    try {
+        $currentPath = Assert-CodexLocalRemoteManagedDataItemPath `
+            -DataDir $DataDir `
+            -ItemPath $ItemPath
+        $currentItem = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+        if (($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Managed data directory contains reparse point '$currentPath'."
+        }
+        return [pscustomobject]@{
+            Item = $currentItem
+            Acl = Get-Acl -LiteralPath $currentPath -ErrorAction Stop
+        }
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return $null
+    } catch [System.IO.FileNotFoundException] {
+        return $null
+    } catch [System.IO.DirectoryNotFoundException] {
+        return $null
+    }
+}
+
 function Get-CodexLocalRemoteDataDirectoryItems {
     [CmdletBinding()]
     param(
@@ -575,6 +1002,10 @@ function Get-CodexLocalRemoteDataDirectoryItems {
         foreach ($item in @(Get-ChildItem -LiteralPath $directoryPath -Force)) {
             if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "Managed data directory contains reparse point '$($item.FullName)'."
+            }
+            if (-not $item.PSIsContainer -and
+                (Test-CodexLocalRemoteManagedEphemeralFileName -Name $item.Name)) {
+                continue
             }
             $items.Add($item)
             if ($item.PSIsContainer) {
@@ -1079,7 +1510,13 @@ function Test-CodexLocalRemoteDataAclTree {
         return $false
     }
     foreach ($item in $items) {
-        $itemAcl = Get-Acl -LiteralPath $item.FullName
+        $itemState = Get-CodexLocalRemoteManagedDataItemAcl `
+            -DataDir $resolvedDataDir `
+            -ItemPath $item.FullName
+        if ($null -eq $itemState) {
+            continue
+        }
+        $itemAcl = $itemState.Acl
         if (-not (Test-CodexLocalRemoteDataAcl `
             -Acl $itemAcl `
             -AllowedSidValues $AclContext.AllowedSidValues `
@@ -1088,6 +1525,56 @@ function Test-CodexLocalRemoteDataAclTree {
         }
     }
     return $true
+}
+
+function Assert-CodexLocalRemoteDataDirectoryStartupProtection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    # Startup and atomic state writes must not recursively walk immutable
+    # runtime packages. Registration performs the full descendant ACL repair;
+    # this bounded gate revalidates the exact owner, root ACL and immediate
+    # path boundary before the Broker is allowed to start or state is written.
+    $resolvedDataDir = Assert-CodexLocalRemoteDataDirectoryPath -DataDir $DataDir
+    Assert-CodexLocalRemoteDataDirectoryAncestors -DataDir $resolvedDataDir
+    if (Test-CodexLocalRemoteBroadKnownFolder -DataDir $resolvedDataDir) {
+        throw "Managed data directory '$resolvedDataDir' is a broad known folder."
+    }
+    if (Test-CodexLocalRemotePathInsideGitRepository -DataDir $resolvedDataDir) {
+        throw "Managed data directory '$resolvedDataDir' is inside a Git repository."
+    }
+    if (-not (Test-Path -LiteralPath $resolvedDataDir -PathType Container)) {
+        throw "Managed data directory '$resolvedDataDir' is unavailable."
+    }
+    $root = Get-Item -LiteralPath $resolvedDataDir -Force
+    if (($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Managed data directory '$resolvedDataDir' is a reparse point."
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $resolvedDataDir -Force)) {
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Managed data directory contains immediate reparse point '$($item.FullName)'."
+        }
+    }
+
+    $marker = Assert-CodexLocalRemoteDataDirectoryOwnerMarker `
+        -DataDir $resolvedDataDir
+    $aclContext = Get-CodexLocalRemoteDataAclContext
+    $rootAcl = Get-Acl -LiteralPath $resolvedDataDir
+    if (-not (Test-CodexLocalRemoteDataAcl `
+        -Acl $rootAcl `
+        -AllowedSidValues $aclContext.AllowedSidValues)) {
+        throw "Managed data directory '$resolvedDataDir' no longer has the required protected root ACL."
+    }
+
+    return [pscustomobject]@{
+        Status = 'startup-protected'
+        DataDir = $resolvedDataDir
+        MarkerPath = $marker.MarkerPath
+        InstanceId = $marker.InstanceId
+    }
 }
 
 function New-CodexLocalRemoteDataDirectoryOwnerMarker {
@@ -2305,6 +2792,160 @@ function Test-ManagedBootstrapProcess {
     }
 }
 
+function Test-BootstrapProcessDefinitionCommandLine {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [Parameter(Mandatory)]
+        [string]$CommandLine,
+
+        [AllowEmptyString()]
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath,
+
+        [Parameter(Mandatory)]
+        [object]$Definition
+    )
+
+    $resolvedActual = try {
+        if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
+            ''
+        } else {
+            [System.IO.Path]::GetFullPath($ExecutablePath)
+        }
+    } catch {
+        ''
+    }
+    if (-not [string]::Equals(
+        $resolvedActual,
+        [string]$Definition.Execute,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $false
+    }
+
+    $expectedArguments = [System.Collections.Generic.List[string]]::new()
+    $expectedArguments.Add([string]$Definition.Execute)
+    foreach ($argument in @(
+        ConvertFrom-WindowsCommandLine `
+            -CommandLine ([string]$Definition.Arguments)
+    )) {
+        $expectedArguments.Add([string]$argument)
+    }
+    $pathIndexes = [System.Collections.Generic.List[int]]::new()
+    $pathIndexes.Add(0)
+    foreach ($pathSwitch in @(
+        '-File',
+        '-NodePath',
+        '-InstallRoot',
+        '-DataDir'
+    )) {
+        $switchIndex = $expectedArguments.IndexOf($pathSwitch)
+        if ($switchIndex -lt 0 -or
+            $switchIndex + 1 -ge $expectedArguments.Count) {
+            return $false
+        }
+        $pathIndexes.Add($switchIndex + 1)
+    }
+    return Test-ExactWindowsCommandLine `
+        -CommandLine $CommandLine `
+        -ExpectedArguments $expectedArguments.ToArray() `
+        -PathArgumentIndexes $pathIndexes.ToArray()
+}
+
+function Get-ManagedBootstrapProcessContract {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [Parameter(Mandatory)]
+        [string]$CommandLine,
+
+        [AllowEmptyString()]
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath,
+
+        [Parameter(Mandatory)]
+        [string]$TaskName,
+
+        [Parameter(Mandatory)]
+        [string]$NodePath,
+
+        [Parameter(Mandatory)]
+        [string]$PwshPath,
+
+        [Parameter(Mandatory)]
+        [string]$InstallRoot,
+
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [int]$Port,
+
+        [Parameter(Mandatory)]
+        [int]$BrokerPort,
+
+        [Parameter(Mandatory)]
+        [int]$BrokerUpstreamPort,
+
+        [Parameter(Mandatory)]
+        [string]$BasePath
+    )
+
+    $current = Get-StartupTaskDefinition `
+        -TaskName $TaskName `
+        -NodePath $NodePath `
+        -PwshPath $PwshPath `
+        -InstallRoot $InstallRoot `
+        -DataDir $DataDir `
+        -Port $Port `
+        -BrokerPort $BrokerPort `
+        -BrokerUpstreamPort $BrokerUpstreamPort `
+        -BasePath $BasePath
+    if (Test-BootstrapProcessDefinitionCommandLine `
+        -CommandLine $CommandLine `
+        -ExecutablePath $ExecutablePath `
+        -Definition $current) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Contract = 'desktop-owner-v5'
+            Reason = 'exact-managed-desktop-owner-v5-command'
+        }
+    }
+
+    $legacyHeadlessV4 = Get-LegacyHeadlessStartupTaskDefinitionV4 `
+        -Definition $current
+    if (Test-BootstrapProcessDefinitionCommandLine `
+        -CommandLine $CommandLine `
+        -ExecutablePath $ExecutablePath `
+        -Definition $legacyHeadlessV4) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Contract = 'headless-v4'
+            Reason = 'exact-managed-headless-v4-command'
+        }
+    }
+
+    $legacy = Get-LegacyDesktopOwningStartupTaskDefinitionV3 `
+        -Definition $current
+    if (Test-BootstrapProcessDefinitionCommandLine `
+        -CommandLine $CommandLine `
+        -ExecutablePath $ExecutablePath `
+        -Definition $legacy) {
+        return [pscustomobject]@{
+            IsManaged = $true
+            Contract = 'desktop-owner-v3'
+            Reason = 'exact-managed-desktop-owner-v3-command'
+        }
+    }
+
+    return [pscustomobject]@{
+        IsManaged = $false
+        Contract = 'unverified'
+        Reason = 'command-line-mismatch'
+    }
+}
+
 function Test-IndependentDesktopAppServer {
     [CmdletBinding()]
     param(
@@ -2325,6 +2966,834 @@ function Test-IndependentDesktopAppServer {
             $CommandLine -match '(?:^|\s)--analytics-default-enabled(?:\s|$)'
         )
     )
+}
+
+function Get-CodexLocalRemoteDesktopHandoffPreparationPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path `
+            ([System.IO.Path]::GetFullPath($DataDir)) `
+            'desktop-handoff-preparation.json')
+    )
+}
+
+function Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DesktopExecutablePath
+    )
+
+    $expectedDesktopPath =
+        [System.IO.Path]::GetFullPath($DesktopExecutablePath)
+    $expectedAppServerPath = [System.IO.Path]::GetFullPath(
+        (Join-Path `
+            (Split-Path -Parent $expectedDesktopPath) `
+            'resources\codex.exe')
+    )
+    $allDesktopRoots = @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "Name = 'ChatGPT.exe'" `
+            -ErrorAction Stop |
+            Where-Object {
+                [string]$_.CommandLine -notmatch
+                    '(?i)(?:^|\s)--type='
+            }
+    )
+    if ($allDesktopRoots.Count -ne 1) {
+        throw (
+            'Desktop handoff preparation requires one unique native ' +
+            "Desktop root, found $($allDesktopRoots.Count)."
+        )
+    }
+    $desktopRoots = @(
+        $allDesktopRoots |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace(
+                    [string]$_.ExecutablePath
+                ) -and
+                [string]::Equals(
+                    [System.IO.Path]::GetFullPath(
+                        [string]$_.ExecutablePath
+                    ),
+                    $expectedDesktopPath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )
+    if ($desktopRoots.Count -ne 1) {
+        throw (
+            'Desktop handoff preparation requires one exact native ' +
+            "Desktop root, found $($desktopRoots.Count)."
+        )
+    }
+    $desktopRoot = $desktopRoots[0]
+    $appServers = @(
+        foreach ($candidate in @(
+            Get-CimInstance `
+                Win32_Process `
+                -Filter "Name = 'codex.exe'" `
+                -ErrorAction Stop
+        )) {
+            if ([int]$candidate.ParentProcessId -ne
+                [int]$desktopRoot.ProcessId) {
+                continue
+            }
+            if (-not (Test-IndependentDesktopAppServer `
+                -CommandLine ([string]$candidate.CommandLine) `
+                -ParentProcessName 'ChatGPT.exe')) {
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace(
+                [string]$candidate.ExecutablePath
+            ) -or -not [string]::Equals(
+                [System.IO.Path]::GetFullPath(
+                    [string]$candidate.ExecutablePath
+                ),
+                $expectedAppServerPath,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                continue
+            }
+            $candidate
+        }
+    )
+    if ($appServers.Count -ne 1) {
+        throw (
+            'Desktop handoff preparation requires one exact native ' +
+            "stdio app-server, found $($appServers.Count)."
+        )
+    }
+    $appServer = $appServers[0]
+    $rootCreation = Get-ProcessCreationIdentity `
+        -CreationDate $desktopRoot.CreationDate
+    $appServerCreation = Get-ProcessCreationIdentity `
+        -CreationDate $appServer.CreationDate
+    $rootHandle = Open-ProcessIdentityHandle `
+        -ProcessId ([int]$desktopRoot.ProcessId) `
+        -ExpectedCreationDateUtcTicks (
+            [long]$rootCreation.CreationDateUtcTicks
+        )
+    $appServerHandle = $null
+    try {
+        $appServerHandle = Open-ProcessIdentityHandle `
+            -ProcessId ([int]$appServer.ProcessId) `
+            -ExpectedCreationDateUtcTicks (
+                [long]$appServerCreation.CreationDateUtcTicks
+            )
+        return [pscustomobject]@{
+            DesktopRoot = $desktopRoot
+            DesktopRootProcessId = [int]$desktopRoot.ProcessId
+            DesktopRootStartTimeUtcTicks =
+                [long]$rootHandle.StartTimeUtcTicks
+            DesktopExecutablePath = $expectedDesktopPath
+            DesktopRootIdentityKey =
+                Get-CodexDesktopOwnerRootIdentityKey `
+                    -ProcessId ([int]$desktopRoot.ProcessId) `
+                    -StartTimeUtcTicks (
+                        [long]$rootHandle.StartTimeUtcTicks
+                    ) `
+                    -ExecutablePath $expectedDesktopPath
+            DesktopAppServer = $appServer
+            DesktopAppServerProcessId = [int]$appServer.ProcessId
+            DesktopAppServerStartTimeUtcTicks =
+                [long]$appServerHandle.StartTimeUtcTicks
+            DesktopAppServerExecutablePath = $expectedAppServerPath
+            DesktopAppServerIdentityKey =
+                Get-CodexDesktopOwnerRootIdentityKey `
+                    -ProcessId ([int]$appServer.ProcessId) `
+                    -StartTimeUtcTicks (
+                        [long]$appServerHandle.StartTimeUtcTicks
+                    ) `
+                    -ExecutablePath $expectedAppServerPath
+        }
+    } finally {
+        if ($null -ne $appServerHandle) {
+            $appServerHandle.Process.Dispose()
+        }
+        $rootHandle.Process.Dispose()
+    }
+}
+
+function Read-CodexLocalRemoteDesktopHandoffPreparation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$ExpectedRuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$ExpectedManifestSha256,
+
+        [ValidateRange(1, 7200)]
+        [int]$MaximumAgeSeconds = 3600,
+
+        [switch]$RequireLiveOwnership
+    )
+
+    $path =
+        Get-CodexLocalRemoteDesktopHandoffPreparationPath `
+            -DataDir $DataDir
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -lt 128 -or
+            [long]$item.Length -gt 32768) {
+            return $null
+        }
+        $rawBefore =
+            Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $preparation = $rawBefore |
+            ConvertFrom-Json -Depth 12 -DateKind String -ErrorAction Stop
+        $rawAfter =
+            Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $runtimeRoot = [System.IO.Path]::GetFullPath(
+            [string]$preparation.RuntimeRoot
+        )
+        $desktopPath = [System.IO.Path]::GetFullPath(
+            [string]$preparation.DesktopExecutablePath
+        )
+        $appServerPath = [System.IO.Path]::GetFullPath(
+            [string]$preparation.DesktopAppServerExecutablePath
+        )
+    } catch {
+        return $null
+    }
+    $expectedProperties = @(
+        'Signature',
+        'Version',
+        'PreparationId',
+        'Phase',
+        'RuntimeVersionId',
+        'RuntimeRoot',
+        'ManifestSha256',
+        'DesktopRootProcessId',
+        'DesktopRootStartTimeUtcTicks',
+        'DesktopExecutablePath',
+        'DesktopRootIdentityKey',
+        'DesktopAppServerProcessId',
+        'DesktopAppServerStartTimeUtcTicks',
+        'DesktopAppServerExecutablePath',
+        'DesktopAppServerIdentityKey',
+        'RequestedAtUtc',
+        'ReadyAtUtc',
+        'AttachStartedAtUtc',
+        'RuntimeInvocationId',
+        'BrokerProcessId',
+        'UpstreamProcessId',
+        'SidecarProcessId'
+    )
+    $actualProperties =
+        @($preparation.PSObject.Properties.Name | Sort-Object)
+    if ($rawBefore -cne $rawAfter -or
+        (ConvertTo-CanonicalJson $actualProperties) -cne
+            (ConvertTo-CanonicalJson @(
+                $expectedProperties | Sort-Object
+            )) -or
+        [string]$preparation.Signature -cne
+            'codex-local-remote/desktop-handoff-preparation/v1' -or
+        [int]$preparation.Version -ne 1 -or
+        [string]$preparation.PreparationId -cnotmatch
+            '^[a-f0-9]{32}$' -or
+        [string]$preparation.Phase -cnotin @(
+            'requested',
+            'ready',
+            'attaching'
+        ) -or
+        [string]$preparation.RuntimeVersionId -cne
+            $ExpectedRuntimeVersionId -or
+        [string]$preparation.ManifestSha256 -cne
+            $ExpectedManifestSha256 -or
+        -not [string]::Equals(
+            $runtimeRoot,
+            [System.IO.Path]::GetFullPath(
+                $ExpectedRuntimeRoot
+            ),
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not (Test-NonNegativeInteger `
+            -Value $preparation.DesktopRootProcessId) -or
+        [decimal]$preparation.DesktopRootProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $preparation.DesktopRootStartTimeUtcTicks) -or
+        [decimal]$preparation.DesktopRootStartTimeUtcTicks -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $preparation.DesktopAppServerProcessId) -or
+        [decimal]$preparation.DesktopAppServerProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $preparation.DesktopAppServerStartTimeUtcTicks) -or
+        [decimal]$preparation.DesktopAppServerStartTimeUtcTicks -le 0) {
+        return $null
+    }
+    $expectedRootKey = Get-CodexDesktopOwnerRootIdentityKey `
+        -ProcessId ([int]$preparation.DesktopRootProcessId) `
+        -StartTimeUtcTicks (
+            [long]$preparation.DesktopRootStartTimeUtcTicks
+        ) `
+        -ExecutablePath $desktopPath
+    $expectedAppServerKey =
+        Get-CodexDesktopOwnerRootIdentityKey `
+            -ProcessId (
+                [int]$preparation.DesktopAppServerProcessId
+            ) `
+            -StartTimeUtcTicks (
+                [long]$preparation.DesktopAppServerStartTimeUtcTicks
+            ) `
+            -ExecutablePath $appServerPath
+    if ([string]$preparation.DesktopRootIdentityKey -cne
+            $expectedRootKey -or
+        [string]$preparation.DesktopAppServerIdentityKey -cne
+            $expectedAppServerKey) {
+        return $null
+    }
+    $readyFieldsAreNull = (
+        $null -eq $preparation.ReadyAtUtc -and
+        $null -eq $preparation.AttachStartedAtUtc -and
+        $null -eq $preparation.RuntimeInvocationId -and
+        $null -eq $preparation.BrokerProcessId -and
+        $null -eq $preparation.UpstreamProcessId -and
+        $null -eq $preparation.SidecarProcessId
+    )
+    if ([string]$preparation.Phase -ceq 'requested') {
+        if (-not $readyFieldsAreNull) {
+            return $null
+        }
+    } else {
+        try {
+            $readyAt = [DateTimeOffset]::Parse(
+                [string]$preparation.ReadyAtUtc,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            )
+            $attachStartedAt = if (
+                [string]$preparation.Phase -ceq 'attaching'
+            ) {
+                [DateTimeOffset]::Parse(
+                    [string]$preparation.AttachStartedAtUtc,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                )
+            } else {
+                $null
+            }
+        } catch {
+            return $null
+        }
+        if ($readyAt.Offset -ne [TimeSpan]::Zero -or
+            ([string]$preparation.Phase -ceq 'ready' -and
+                $null -ne $preparation.AttachStartedAtUtc) -or
+            ([string]$preparation.Phase -ceq 'attaching' -and
+                ($null -eq $attachStartedAt -or
+                    $attachStartedAt.Offset -ne [TimeSpan]::Zero)) -or
+            [string]$preparation.RuntimeInvocationId -cnotmatch
+                '^[a-f0-9]{32}$' -or
+            -not (Test-NonNegativeInteger `
+                -Value $preparation.BrokerProcessId) -or
+            [decimal]$preparation.BrokerProcessId -le 0 -or
+            -not (Test-NonNegativeInteger `
+                -Value $preparation.UpstreamProcessId) -or
+            [decimal]$preparation.UpstreamProcessId -le 0 -or
+            -not (Test-NonNegativeInteger `
+                -Value $preparation.SidecarProcessId) -or
+            [decimal]$preparation.SidecarProcessId -le 0) {
+            return $null
+        }
+    }
+    $freshness = Get-CodexDesktopOwnerIntentFreshnessDecision `
+        -RequestedAtUtc ([string]$preparation.RequestedAtUtc) `
+        -MaximumAgeSeconds $MaximumAgeSeconds
+    if ($freshness -cne 'fresh') {
+        return $null
+    }
+    if ($RequireLiveOwnership) {
+        try {
+            $ownership =
+                Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot `
+                    -DesktopExecutablePath $desktopPath
+        } catch {
+            return $null
+        }
+        if ([string]$ownership.DesktopRootIdentityKey -cne
+                [string]$preparation.DesktopRootIdentityKey -or
+            [string]$ownership.DesktopAppServerIdentityKey -cne
+                [string]$preparation.DesktopAppServerIdentityKey) {
+            return $null
+        }
+    }
+    $preparation | Add-Member `
+        -NotePropertyName 'Path' `
+        -NotePropertyValue $path
+    $preparation | Add-Member `
+        -NotePropertyName 'DesktopExecutablePathResolved' `
+        -NotePropertyValue $desktopPath
+    $preparation | Add-Member `
+        -NotePropertyName 'DesktopAppServerExecutablePathResolved' `
+        -NotePropertyValue $appServerPath
+    return $preparation
+}
+
+function New-CodexLocalRemoteDesktopHandoffPreparation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$RuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$ManifestSha256,
+
+        [Parameter(Mandatory)]
+        [object]$Ownership
+    )
+
+    $resolvedRuntimeRoot =
+        [System.IO.Path]::GetFullPath($RuntimeRoot)
+    $path =
+        Get-CodexLocalRemoteDesktopHandoffPreparationPath `
+            -DataDir $DataDir
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $existing =
+            Read-CodexLocalRemoteDesktopHandoffPreparation `
+                -DataDir $DataDir `
+                -ExpectedRuntimeVersionId $RuntimeVersionId `
+                -ExpectedRuntimeRoot $resolvedRuntimeRoot `
+                -ExpectedManifestSha256 $ManifestSha256
+        if ($null -eq $existing) {
+            try {
+                $existingItem =
+                    Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                $existingRaw =
+                    Get-Content -LiteralPath $path -Raw -Encoding utf8
+                $existingUnverified = $existingRaw |
+                    ConvertFrom-Json `
+                        -Depth 12 `
+                        -DateKind String `
+                        -ErrorAction Stop
+            } catch {
+                throw (
+                    'An existing Desktop handoff preparation could not be ' +
+                    'safely inspected.'
+                )
+            }
+            if ($existingItem.PSIsContainer -or
+                ($existingItem.Attributes -band
+                    [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                [long]$existingItem.Length -lt 128 -or
+                [long]$existingItem.Length -gt 32768 -or
+                [string]$existingUnverified.Signature -cne
+                    'codex-local-remote/desktop-handoff-preparation/v1' -or
+                [int]$existingUnverified.Version -ne 1) {
+                throw (
+                    'An existing Desktop handoff preparation is foreign or ' +
+                    'has unsafe filesystem identity.'
+                )
+            }
+            $existingSelf = $null
+            try {
+                if ([string]$existingUnverified.RuntimeVersionId -cmatch
+                        '^[a-f0-9]{64}$' -and
+                    [string]$existingUnverified.ManifestSha256 -cmatch
+                        '^[a-f0-9]{64}$' -and
+                    -not [string]::IsNullOrWhiteSpace(
+                        [string]$existingUnverified.RuntimeRoot
+                    )) {
+                    $existingSelf =
+                        Read-CodexLocalRemoteDesktopHandoffPreparation `
+                            -DataDir $DataDir `
+                            -ExpectedRuntimeVersionId (
+                                [string](
+                                    $existingUnverified.RuntimeVersionId
+                                )
+                            ) `
+                            -ExpectedRuntimeRoot (
+                                [string]$existingUnverified.RuntimeRoot
+                            ) `
+                            -ExpectedManifestSha256 (
+                                [string](
+                                    $existingUnverified.ManifestSha256
+                                )
+                            )
+                }
+            } catch {
+                $existingSelf = $null
+            }
+            if ($null -ne $existingSelf) {
+                throw (
+                    'A different fresh Desktop handoff preparation already ' +
+                    'exists.'
+                )
+            }
+            Remove-Item `
+                -LiteralPath $path `
+                -Force `
+                -ErrorAction Stop
+            $existing = $null
+        }
+        if ($null -ne $existing -and
+            [string]$existing.DesktopRootIdentityKey -ceq
+                [string]$Ownership.DesktopRootIdentityKey -and
+            [string]$existing.DesktopAppServerIdentityKey -ceq
+                [string]$Ownership.DesktopAppServerIdentityKey -and
+            [string]$existing.Phase -cin @(
+                'requested',
+                'ready'
+            )) {
+            return $existing
+        }
+        if ($null -ne $existing) {
+            throw (
+                'A different live Desktop handoff preparation already exists.'
+            )
+        }
+    }
+    $preparation = [ordered]@{
+        Signature =
+            'codex-local-remote/desktop-handoff-preparation/v1'
+        Version = 1
+        PreparationId = [Guid]::NewGuid().ToString('N')
+        Phase = 'requested'
+        RuntimeVersionId = $RuntimeVersionId
+        RuntimeRoot = $resolvedRuntimeRoot
+        ManifestSha256 = $ManifestSha256
+        DesktopRootProcessId =
+            [int]$Ownership.DesktopRootProcessId
+        DesktopRootStartTimeUtcTicks =
+            [long]$Ownership.DesktopRootStartTimeUtcTicks
+        DesktopExecutablePath =
+            [System.IO.Path]::GetFullPath(
+                [string]$Ownership.DesktopExecutablePath
+            )
+        DesktopRootIdentityKey =
+            [string]$Ownership.DesktopRootIdentityKey
+        DesktopAppServerProcessId =
+            [int]$Ownership.DesktopAppServerProcessId
+        DesktopAppServerStartTimeUtcTicks =
+            [long]$Ownership.DesktopAppServerStartTimeUtcTicks
+        DesktopAppServerExecutablePath =
+            [System.IO.Path]::GetFullPath(
+                [string]$Ownership.DesktopAppServerExecutablePath
+            )
+        DesktopAppServerIdentityKey =
+            [string]$Ownership.DesktopAppServerIdentityKey
+        RequestedAtUtc = [DateTime]::UtcNow.ToString('O')
+        ReadyAtUtc = $null
+        AttachStartedAtUtc = $null
+        RuntimeInvocationId = $null
+        BrokerProcessId = $null
+        UpstreamProcessId = $null
+        SidecarProcessId = $null
+    }
+    Write-AtomicJsonFile -Path $path -Value $preparation
+    $readBack =
+        Read-CodexLocalRemoteDesktopHandoffPreparation `
+            -DataDir $DataDir `
+            -ExpectedRuntimeVersionId $RuntimeVersionId `
+            -ExpectedRuntimeRoot $resolvedRuntimeRoot `
+            -ExpectedManifestSha256 $ManifestSha256 `
+            -RequireLiveOwnership
+    if ($null -eq $readBack -or
+        [string]$readBack.PreparationId -cne
+            [string]$preparation.PreparationId) {
+        throw (
+            'Desktop handoff preparation failed exact read-back ' +
+            'verification.'
+        )
+    }
+    return $readBack
+}
+
+function Set-CodexLocalRemoteDesktopHandoffPreparationReady {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [object]$Preparation,
+
+        [Parameter(Mandatory)]
+        [object]$Readiness,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$SidecarProcessId
+    )
+
+    if ([string]$Readiness.status -cne 'ready' -or
+        -not [bool]$Readiness.appServerReady -or
+        [bool]$Readiness.desktopConnected -or
+        -not [bool]$Readiness.sidecarConnected -or
+        [bool]$Readiness.degraded -or
+        -not (Test-NonNegativeInteger `
+            -Value $Readiness.unknownCount) -or
+        [int]$Readiness.unknownCount -ne 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Readiness.unsafeThreadCount) -or
+        [int]$Readiness.unsafeThreadCount -ne 0 -or
+        [string]$Readiness.runtimeInvocationId -cnotmatch
+            '^[a-f0-9]{32}$' -or
+        -not (Test-NonNegativeInteger `
+            -Value $Readiness.brokerProcessId) -or
+        [int]$Readiness.brokerProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Readiness.upstreamProcessId) -or
+        [int]$Readiness.upstreamProcessId -le 0) {
+        throw (
+            'Desktop handoff preparation cannot become ready from an ' +
+            'unverified transport snapshot.'
+        )
+    }
+    $current =
+        Read-CodexLocalRemoteDesktopHandoffPreparation `
+            -DataDir $DataDir `
+            -ExpectedRuntimeVersionId (
+                [string]$Preparation.RuntimeVersionId
+            ) `
+            -ExpectedRuntimeRoot (
+                [string]$Preparation.RuntimeRoot
+            ) `
+            -ExpectedManifestSha256 (
+                [string]$Preparation.ManifestSha256
+            ) `
+            -RequireLiveOwnership
+    if ($null -eq $current -or
+        [string]$current.PreparationId -cne
+            [string]$Preparation.PreparationId -or
+        [string]$current.Phase -cnotin @('requested', 'ready')) {
+        throw (
+            'Desktop handoff preparation changed before transport ' +
+            'readiness was committed.'
+        )
+    }
+    if ([string]$current.Phase -ceq 'ready') {
+        if ([string]$current.RuntimeInvocationId -ceq
+                [string]$Readiness.runtimeInvocationId -and
+            [int]$current.BrokerProcessId -eq
+                [int]$Readiness.brokerProcessId -and
+            [int]$current.UpstreamProcessId -eq
+                [int]$Readiness.upstreamProcessId -and
+            [int]$current.SidecarProcessId -eq $SidecarProcessId) {
+            return $current
+        }
+        throw (
+            'Desktop handoff preparation readiness identity changed.'
+        )
+    }
+    $ready = [ordered]@{}
+    foreach ($property in @(
+        'Signature',
+        'Version',
+        'PreparationId',
+        'RuntimeVersionId',
+        'RuntimeRoot',
+        'ManifestSha256',
+        'DesktopRootProcessId',
+        'DesktopRootStartTimeUtcTicks',
+        'DesktopExecutablePath',
+        'DesktopRootIdentityKey',
+        'DesktopAppServerProcessId',
+        'DesktopAppServerStartTimeUtcTicks',
+        'DesktopAppServerExecutablePath',
+        'DesktopAppServerIdentityKey',
+        'RequestedAtUtc'
+    )) {
+        $ready[$property] = $current.$property
+    }
+    $ready.Phase = 'ready'
+    $ready.ReadyAtUtc = [DateTime]::UtcNow.ToString('O')
+    $ready.AttachStartedAtUtc = $null
+    $ready.RuntimeInvocationId =
+        [string]$Readiness.runtimeInvocationId
+    $ready.BrokerProcessId = [int]$Readiness.brokerProcessId
+    $ready.UpstreamProcessId = [int]$Readiness.upstreamProcessId
+    $ready.SidecarProcessId = $SidecarProcessId
+    Write-AtomicJsonFile -Path ([string]$current.Path) -Value $ready
+    $readBack =
+        Read-CodexLocalRemoteDesktopHandoffPreparation `
+            -DataDir $DataDir `
+            -ExpectedRuntimeVersionId (
+                [string]$current.RuntimeVersionId
+            ) `
+            -ExpectedRuntimeRoot ([string]$current.RuntimeRoot) `
+            -ExpectedManifestSha256 (
+                [string]$current.ManifestSha256
+            ) `
+            -RequireLiveOwnership
+    if ($null -eq $readBack -or
+        [string]$readBack.PreparationId -cne
+            [string]$current.PreparationId -or
+        [string]$readBack.Phase -cne 'ready') {
+        throw (
+            'Desktop handoff ready preparation failed exact read-back ' +
+            'verification.'
+        )
+    }
+    return $readBack
+}
+
+function Set-CodexLocalRemoteDesktopHandoffPreparationAttaching {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [object]$Preparation
+    )
+
+    $current =
+        Read-CodexLocalRemoteDesktopHandoffPreparation `
+            -DataDir $DataDir `
+            -ExpectedRuntimeVersionId (
+                [string]$Preparation.RuntimeVersionId
+            ) `
+            -ExpectedRuntimeRoot (
+                [string]$Preparation.RuntimeRoot
+            ) `
+            -ExpectedManifestSha256 (
+                [string]$Preparation.ManifestSha256
+            ) `
+            -RequireLiveOwnership
+    if ($null -eq $current -or
+        [string]$current.PreparationId -cne
+            [string]$Preparation.PreparationId -or
+        [string]$current.Phase -cnotin @('ready', 'attaching')) {
+        throw (
+            'Desktop handoff preparation is not ready for attach.'
+        )
+    }
+    if ([string]$current.Phase -ceq 'attaching') {
+        return $current
+    }
+    $attaching = [ordered]@{}
+    foreach ($property in @(
+        'Signature',
+        'Version',
+        'PreparationId',
+        'RuntimeVersionId',
+        'RuntimeRoot',
+        'ManifestSha256',
+        'DesktopRootProcessId',
+        'DesktopRootStartTimeUtcTicks',
+        'DesktopExecutablePath',
+        'DesktopRootIdentityKey',
+        'DesktopAppServerProcessId',
+        'DesktopAppServerStartTimeUtcTicks',
+        'DesktopAppServerExecutablePath',
+        'DesktopAppServerIdentityKey',
+        'RequestedAtUtc',
+        'ReadyAtUtc',
+        'RuntimeInvocationId',
+        'BrokerProcessId',
+        'UpstreamProcessId',
+        'SidecarProcessId'
+    )) {
+        $attaching[$property] = $current.$property
+    }
+    $attaching.Phase = 'attaching'
+    $attaching.AttachStartedAtUtc = [DateTime]::UtcNow.ToString('O')
+    Write-AtomicJsonFile `
+        -Path ([string]$current.Path) `
+        -Value $attaching
+    $readBack =
+        Read-CodexLocalRemoteDesktopHandoffPreparation `
+            -DataDir $DataDir `
+            -ExpectedRuntimeVersionId (
+                [string]$current.RuntimeVersionId
+            ) `
+            -ExpectedRuntimeRoot ([string]$current.RuntimeRoot) `
+            -ExpectedManifestSha256 (
+                [string]$current.ManifestSha256
+            )
+    if ($null -eq $readBack -or
+        [string]$readBack.PreparationId -cne
+            [string]$current.PreparationId -or
+        [string]$readBack.Phase -cne 'attaching') {
+        throw (
+            'Desktop handoff attaching preparation failed exact ' +
+            'read-back verification.'
+        )
+    }
+    return $readBack
+}
+
+function Complete-CodexLocalRemoteDesktopHandoffPreparation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [object]$Preparation,
+
+        [Parameter(Mandatory)]
+        [string]$Outcome
+    )
+
+    $current =
+        Read-CodexLocalRemoteDesktopHandoffPreparation `
+            -DataDir $DataDir `
+            -ExpectedRuntimeVersionId (
+                [string]$Preparation.RuntimeVersionId
+            ) `
+            -ExpectedRuntimeRoot (
+                [string]$Preparation.RuntimeRoot
+            ) `
+            -ExpectedManifestSha256 (
+                [string]$Preparation.ManifestSha256
+            )
+    if ($null -eq $current -or
+        [string]$current.PreparationId -cne
+            [string]$Preparation.PreparationId) {
+        return $false
+    }
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    Write-AtomicJsonFile `
+        -Path (
+            Join-Path `
+                $resolvedDataDir `
+                'desktop-handoff-preparation-last.json'
+        ) `
+        -Value ([ordered]@{
+            Signature =
+                'codex-local-remote/desktop-handoff-preparation-receipt/v1'
+            Version = 1
+            PreparationId = [string]$current.PreparationId
+            RuntimeVersionId = [string]$current.RuntimeVersionId
+            RuntimeInvocationId = $current.RuntimeInvocationId
+            Outcome = $Outcome
+            RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
+        })
+    Remove-Item `
+        -LiteralPath ([string]$current.Path) `
+        -Force `
+        -ErrorAction Stop
+    return $true
 }
 
 function Assert-ForceCliDisabled {
@@ -2350,6 +3819,19 @@ function Assert-ForceCliDisabled {
     }
 }
 
+function Get-CodexLocalRemoteAtomicWriteMutexName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $pathIdentity = $resolvedPath.ToUpperInvariant()
+    $pathHash = Get-StringSha256 -Value $pathIdentity
+    return "Global\CodexLocalRemote.AtomicJson.$pathHash"
+}
+
 function Write-AtomicJsonFile {
     [CmdletBinding()]
     param(
@@ -2360,17 +3842,845 @@ function Write-AtomicJsonFile {
         [object]$Value
     )
 
-    $parent = [System.IO.Path]::GetFullPath((Split-Path -Parent $Path))
-    $null = Protect-CodexLocalRemoteDataDirectory -DataDir $parent
-    $temporary = Join-Path $parent ".$([System.IO.Path]::GetFileName($Path)).$([guid]::NewGuid().ToString('N')).tmp"
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $parent = [System.IO.Path]::GetDirectoryName($resolvedPath)
+    $mutexName = Get-CodexLocalRemoteAtomicWriteMutexName -Path $resolvedPath
+    $writeMutex = [System.Threading.Mutex]::new($false, $mutexName)
+    $lockTaken = $false
+    $temporary = $null
     try {
+        try {
+            $lockTaken = $writeMutex.WaitOne([TimeSpan]::FromSeconds(15))
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockTaken = $true
+        }
+        if (-not $lockTaken) {
+            throw "Timed out waiting for the managed JSON writer lock for '$resolvedPath'."
+        }
+
+        $ownershipPlan = Get-CodexLocalRemoteDataDirectoryOwnershipPlan `
+            -DataDir $parent
+        if ($ownershipPlan.Action -cne 'owned') {
+            $null = Protect-CodexLocalRemoteDataDirectory -DataDir $parent
+        }
+        $null = Assert-CodexLocalRemoteDataDirectoryStartupProtection `
+            -DataDir $parent
+        $temporary = Join-Path $parent ".$([System.IO.Path]::GetFileName($resolvedPath)).$([guid]::NewGuid().ToString('N')).tmp"
         $Value |
             ConvertTo-Json -Depth 20 |
             Set-Content -LiteralPath $temporary -Encoding utf8NoBOM
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
+        [System.IO.File]::Move($temporary, $resolvedPath, $true)
     } finally {
-        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($temporary)) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+        if ($lockTaken) {
+            try {
+                $writeMutex.ReleaseMutex()
+            } catch [System.ApplicationException] {
+                # The lock was abandoned or released while unwinding; disposal remains safe.
+            }
+        }
+        $writeMutex.Dispose()
     }
+}
+
+function Get-CodexDesktopOwnerIntentPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path ([System.IO.Path]::GetFullPath($DataDir)) 'desktop-owner-intent.json')
+    )
+}
+
+function Get-CodexDesktopOwnerConnectionProofPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path ([System.IO.Path]::GetFullPath($DataDir)) 'desktop-owner-proof.json')
+    )
+}
+
+function Get-CodexDesktopOwnerRootIdentityKey {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$ProcessId,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [long]::MaxValue)]
+        [long]$StartTimeUtcTicks,
+
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($ExecutablePath)
+    if ([string]::IsNullOrWhiteSpace($resolvedPath)) {
+        throw 'The Desktop owner executable path is invalid.'
+    }
+    $pathDigest = Get-StringSha256 -Value $resolvedPath.ToUpperInvariant()
+    return "$ProcessId|$StartTimeUtcTicks|$pathDigest"
+}
+
+function Get-CodexDesktopOwnerMutexName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $identity = [System.IO.Path]::GetFullPath($DataDir).ToUpperInvariant()
+    return "Global\CodexLocalRemote.DesktopOwner.$(Get-StringSha256 -Value $identity)"
+}
+
+function Invoke-WithCodexDesktopOwnerMutex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$Action,
+
+        [ValidateRange(1, 120)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    $mutex = [System.Threading.Mutex]::new(
+        $false,
+        (Get-CodexDesktopOwnerMutexName -DataDir $DataDir)
+    )
+    $lockTaken = $false
+    try {
+        try {
+            $lockTaken = $mutex.WaitOne(
+                [TimeSpan]::FromSeconds($TimeoutSeconds)
+            )
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockTaken = $true
+        }
+        if (-not $lockTaken) {
+            throw 'Timed out waiting for the single Desktop owner.'
+        }
+        return & $Action
+    } finally {
+        if ($lockTaken) {
+            try {
+                $mutex.ReleaseMutex()
+            } catch [System.ApplicationException] {
+                # An abandoned owner is still safe to dispose.
+            }
+        }
+        $mutex.Dispose()
+    }
+}
+
+function New-CodexDesktopOwnerIntent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$TargetRuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$TargetRuntimeRoot
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    return Invoke-WithCodexDesktopOwnerMutex `
+        -DataDir $resolvedDataDir `
+        -Action {
+            New-CodexDesktopOwnerIntentUnderOwnerLock `
+                -DataDir $resolvedDataDir `
+                -TargetRuntimeVersionId $TargetRuntimeVersionId `
+                -TargetRuntimeRoot $TargetRuntimeRoot
+        }
+}
+
+function New-CodexDesktopOwnerIntentUnderOwnerLock {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$TargetRuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$TargetRuntimeRoot
+    )
+
+    if ($TargetRuntimeVersionId -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'The Desktop owner intent runtime version is invalid.'
+    }
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $resolvedRuntimeRoot = [System.IO.Path]::GetFullPath($TargetRuntimeRoot)
+    $existingIntent = Read-CodexDesktopOwnerIntent `
+        -DataDir $resolvedDataDir `
+        -ExpectedRuntimeVersionId $TargetRuntimeVersionId `
+        -ExpectedRuntimeRoot $resolvedRuntimeRoot
+    if ($null -ne $existingIntent -and
+        [string]$existingIntent.Freshness -ceq 'fresh') {
+        return $existingIntent
+    }
+    $intent = [ordered]@{
+        Signature = 'codex-local-remote/desktop-owner-intent/v1'
+        Version = 1
+        IntentId = [Guid]::NewGuid().ToString('N')
+        TargetRuntimeVersionId = $TargetRuntimeVersionId
+        TargetRuntimeRoot = $resolvedRuntimeRoot
+        RequestedAtUtc = [DateTime]::UtcNow.ToString('O')
+    }
+    Write-AtomicJsonFile `
+        -Path (Get-CodexDesktopOwnerIntentPath -DataDir $resolvedDataDir) `
+        -Value $intent
+    return [pscustomobject]$intent
+}
+
+function Get-CodexDesktopOwnerIntentFreshnessDecision {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RequestedAtUtc,
+
+        [DateTimeOffset]$NowUtc = [DateTimeOffset]::UtcNow,
+
+        [ValidateRange(1, 3600)]
+        [int]$MaximumAgeSeconds = 120,
+
+        [ValidateRange(0, 60)]
+        [int]$MaximumFutureSkewSeconds = 5
+    )
+
+    try {
+        $requestedAt = [DateTimeOffset]::Parse(
+            $RequestedAtUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+    } catch {
+        return 'invalid'
+    }
+    if ($requestedAt.Offset -ne [TimeSpan]::Zero) {
+        return 'invalid'
+    }
+    if ($requestedAt -gt
+        $NowUtc.ToUniversalTime().AddSeconds($MaximumFutureSkewSeconds)) {
+        return 'future'
+    }
+    if ($requestedAt -lt
+        $NowUtc.ToUniversalTime().AddSeconds(-$MaximumAgeSeconds)) {
+        return 'expired'
+    }
+    return 'fresh'
+}
+
+function Read-CodexDesktopOwnerIntent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeRoot,
+
+        [ValidateRange(1, 3600)]
+        [int]$MaximumAgeSeconds = 120,
+
+        [DateTimeOffset]$NowUtc = [DateTimeOffset]::UtcNow
+    )
+
+    $path = Get-CodexDesktopOwnerIntentPath -DataDir $DataDir
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$item.Length -lt 32 -or
+        [long]$item.Length -gt 8192) {
+        return $null
+    }
+    try {
+        $rawBefore = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $intent = $rawBefore |
+            ConvertFrom-Json -Depth 8 -DateKind String -ErrorAction Stop
+        $rawAfter = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $runtimeRoot = [System.IO.Path]::GetFullPath(
+            [string]$intent.TargetRuntimeRoot
+        )
+    } catch {
+        return $null
+    }
+    $expectedProperties = @(
+        'Signature',
+        'Version',
+        'IntentId',
+        'TargetRuntimeVersionId',
+        'TargetRuntimeRoot',
+        'RequestedAtUtc'
+    )
+    $actualProperties = @($intent.PSObject.Properties.Name | Sort-Object)
+    if ($rawBefore -cne $rawAfter -or
+        (ConvertTo-CanonicalJson $actualProperties) -cne
+            (ConvertTo-CanonicalJson @($expectedProperties | Sort-Object)) -or
+        [string]$intent.Signature -cne
+            'codex-local-remote/desktop-owner-intent/v1' -or
+        [int]$intent.Version -ne 1 -or
+        [string]$intent.IntentId -cnotmatch '^[0-9a-f]{32}$' -or
+        [string]$intent.TargetRuntimeVersionId -cne
+            $ExpectedRuntimeVersionId -or
+        -not [string]::Equals(
+            $runtimeRoot,
+            [System.IO.Path]::GetFullPath($ExpectedRuntimeRoot),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        return $null
+    }
+    $freshness = Get-CodexDesktopOwnerIntentFreshnessDecision `
+        -RequestedAtUtc ([string]$intent.RequestedAtUtc) `
+        -NowUtc $NowUtc `
+        -MaximumAgeSeconds $MaximumAgeSeconds
+    $intent | Add-Member `
+        -NotePropertyName 'Freshness' `
+        -NotePropertyValue $freshness
+    return $intent
+}
+
+function Write-CodexDesktopOwnerConnectionProof {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeInvocationId,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$ProcessId,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [long]::MaxValue)]
+        [long]$StartTimeUtcTicks,
+
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath,
+
+        [Parameter(Mandatory)]
+        [string]$LaunchNonceDigest
+    )
+
+    if ($RuntimeInvocationId -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'The Desktop owner proof runtime invocation is invalid.'
+    }
+    if ($LaunchNonceDigest -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'The Desktop owner proof launch nonce digest is invalid.'
+    }
+    $resolvedPath = [System.IO.Path]::GetFullPath($ExecutablePath)
+    $rootIdentityKey = Get-CodexDesktopOwnerRootIdentityKey `
+        -ProcessId $ProcessId `
+        -StartTimeUtcTicks $StartTimeUtcTicks `
+        -ExecutablePath $resolvedPath
+    $proof = [ordered]@{
+        Signature = 'codex-local-remote/desktop-owner-proof/v1'
+        Version = 1
+        RuntimeInvocationId = $RuntimeInvocationId
+        ProcessId = $ProcessId
+        StartTimeUtcTicks = $StartTimeUtcTicks
+        ExecutablePath = $resolvedPath
+        RootIdentityKey = $rootIdentityKey
+        LaunchNonceDigest = $LaunchNonceDigest
+        RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
+    }
+    Write-AtomicJsonFile `
+        -Path (Get-CodexDesktopOwnerConnectionProofPath -DataDir $DataDir) `
+        -Value $proof
+    return [pscustomobject]$proof
+}
+
+function Read-CodexDesktopOwnerConnectionProof {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $path = Get-CodexDesktopOwnerConnectionProofPath -DataDir $DataDir
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -lt 64 -or
+            [long]$item.Length -gt 8192) {
+            return $null
+        }
+        $rawBefore = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $proof = $rawBefore |
+            ConvertFrom-Json -Depth 8 -DateKind String -ErrorAction Stop
+        $rawAfter = Get-Content -LiteralPath $path -Raw -Encoding utf8
+        $resolvedPath = [System.IO.Path]::GetFullPath(
+            [string]$proof.ExecutablePath
+        )
+        $recordedAt = [DateTimeOffset]::Parse(
+            [string]$proof.RecordedAtUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+    } catch {
+        return $null
+    }
+    $expectedProperties = @(
+        'Signature',
+        'Version',
+        'RuntimeInvocationId',
+        'ProcessId',
+        'StartTimeUtcTicks',
+        'ExecutablePath',
+        'RootIdentityKey',
+        'LaunchNonceDigest',
+        'RecordedAtUtc'
+    )
+    $actualProperties = @($proof.PSObject.Properties.Name | Sort-Object)
+    if ($rawBefore -cne $rawAfter -or
+        (ConvertTo-CanonicalJson $actualProperties) -cne
+            (ConvertTo-CanonicalJson @($expectedProperties | Sort-Object)) -or
+        [string]$proof.Signature -cne
+            'codex-local-remote/desktop-owner-proof/v1' -or
+        [int]$proof.Version -ne 1 -or
+        [string]$proof.RuntimeInvocationId -cnotmatch '^[0-9a-f]{32}$' -or
+        -not (Test-NonNegativeInteger -Value $proof.ProcessId) -or
+        [decimal]$proof.ProcessId -le 0 -or
+        [decimal]$proof.ProcessId -gt [int]::MaxValue -or
+        -not (Test-NonNegativeInteger -Value $proof.StartTimeUtcTicks) -or
+        [decimal]$proof.StartTimeUtcTicks -le 0 -or
+        [decimal]$proof.StartTimeUtcTicks -gt [long]::MaxValue -or
+        [string]$proof.LaunchNonceDigest -cnotmatch '^[0-9a-f]{64}$' -or
+        $recordedAt.Offset -ne [TimeSpan]::Zero) {
+        return $null
+    }
+    $rootIdentityKey = Get-CodexDesktopOwnerRootIdentityKey `
+        -ProcessId ([int]$proof.ProcessId) `
+        -StartTimeUtcTicks ([long]$proof.StartTimeUtcTicks) `
+        -ExecutablePath $resolvedPath
+    if ([string]$proof.RootIdentityKey -cne $rootIdentityKey) {
+        return $null
+    }
+    return [pscustomobject]@{
+        RuntimeInvocationId = [string]$proof.RuntimeInvocationId
+        ProcessId = [int]$proof.ProcessId
+        StartTimeUtcTicks = [long]$proof.StartTimeUtcTicks
+        ExecutablePath = $resolvedPath
+        RootIdentityKey = $rootIdentityKey
+        LaunchNonceDigest = [string]$proof.LaunchNonceDigest
+        RecordedAtUtc = [string]$proof.RecordedAtUtc
+    }
+}
+
+function Remove-CodexDesktopOwnerConnectionProof {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $path = Get-CodexDesktopOwnerConnectionProofPath -DataDir $DataDir
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+    }
+}
+
+function Complete-CodexDesktopOwnerIntent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [object]$Intent,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeInvocationId,
+
+        [Parameter(Mandatory)]
+        [string]$Outcome
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    Write-AtomicJsonFile `
+        -Path (Join-Path $resolvedDataDir 'desktop-owner-intent-last.json') `
+        -Value ([ordered]@{
+            Signature = 'codex-local-remote/desktop-owner-intent-receipt/v1'
+            Version = 1
+            IntentId = [string]$Intent.IntentId
+            RuntimeInvocationId = $RuntimeInvocationId
+            Outcome = $Outcome
+            RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
+        })
+    $path = Get-CodexDesktopOwnerIntentPath -DataDir $resolvedDataDir
+    $current = Read-CodexDesktopOwnerIntent `
+        -DataDir $resolvedDataDir `
+        -ExpectedRuntimeVersionId ([string]$Intent.TargetRuntimeVersionId) `
+        -ExpectedRuntimeRoot ([string]$Intent.TargetRuntimeRoot)
+    if ($null -ne $current -and
+        [string]$current.IntentId -ceq [string]$Intent.IntentId) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-CodexDesktopOwnerResumeGap {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [DateTimeOffset]$PreviousObservationUtc,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset]$CurrentObservationUtc,
+
+        [ValidateRange(10, 3600)]
+        [int]$MinimumGapSeconds = 30
+    )
+
+    $previous = $PreviousObservationUtc.ToUniversalTime()
+    $current = $CurrentObservationUtc.ToUniversalTime()
+    return (
+        $current -ge $previous -and
+        ($current - $previous).TotalSeconds -ge $MinimumGapSeconds
+    )
+}
+
+function Get-CodexDesktopOwnerDecision {
+    [CmdletBinding()]
+    param(
+        [bool]$DesktopConnected,
+        [bool]$StartupIntentPending,
+        [bool]$HasPendingIntent,
+        [AllowNull()][string]$RootIdentityKey,
+        [AllowNull()][string]$LastAttemptedRootIdentityKey,
+        [AllowNull()][string]$LastVerifiedConnectedRootIdentityKey,
+        [AllowNull()][string]$LastDisconnectedRecoveryRootIdentityKey,
+        [bool]$AutomaticTakeoverAllowed = $false,
+        [bool]$RuntimeGenerationCurrent = $true
+    )
+
+    if ($DesktopConnected) {
+        return 'idle-connected'
+    }
+    if ($StartupIntentPending -or $HasPendingIntent) {
+        return 'launch-intent'
+    }
+    # Observation never creates takeover authority. Root identity and runtime
+    # health can constrain an explicit intent, but no root may authorize its
+    # own takeover or crash recovery.
+    return 'idle'
+}
+
+function Test-CodexDesktopNonceReadinessSnapshot {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Readiness
+    )
+
+    if ((Get-BrokerReadinessDecision `
+        -Readiness $Readiness `
+        -Phase Infrastructure) -cne 'Ready') {
+        return $false
+    }
+    foreach ($name in @(
+        'runtimeInvocationId',
+        'brokerProcessId',
+        'upstreamProcessId',
+        'runtimeReceiptInvocationId',
+        'runtimeReceiptBrokerProcessId',
+        'runtimeReceiptUpstreamProcessId',
+        'desktopConnectionCount',
+        'desktopLaunchNonceDigests'
+    )) {
+        if ($null -eq $Readiness.PSObject.Properties[$name]) {
+            return $false
+        }
+    }
+    if ([string]$Readiness.runtimeInvocationId -cnotmatch
+            '^[0-9a-f]{32}$' -or
+        [string]$Readiness.runtimeReceiptInvocationId -cne
+            [string]$Readiness.runtimeInvocationId -or
+        -not (Test-NonNegativeInteger -Value $Readiness.brokerProcessId) -or
+        [decimal]$Readiness.brokerProcessId -le 0 -or
+        -not (Test-NonNegativeInteger -Value $Readiness.upstreamProcessId) -or
+        [decimal]$Readiness.upstreamProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Readiness.runtimeReceiptBrokerProcessId) -or
+        [decimal]$Readiness.runtimeReceiptBrokerProcessId -ne
+            [decimal]$Readiness.brokerProcessId -or
+        -not (Test-NonNegativeInteger `
+            -Value $Readiness.runtimeReceiptUpstreamProcessId) -or
+        [decimal]$Readiness.runtimeReceiptUpstreamProcessId -ne
+            [decimal]$Readiness.upstreamProcessId -or
+        -not (Test-NonNegativeInteger `
+            -Value $Readiness.desktopConnectionCount) -or
+        [decimal]$Readiness.desktopConnectionCount -gt 1024 -or
+        [bool]$Readiness.desktopConnected -ne
+            ([decimal]$Readiness.desktopConnectionCount -gt 0)) {
+        return $false
+    }
+    $digestProperty = $Readiness.PSObject.Properties[
+        'desktopLaunchNonceDigests'
+    ]
+    if ($digestProperty.Value -isnot [System.Array]) {
+        return $false
+    }
+    $digests = @($digestProperty.Value)
+    if ($digests.Count -gt [decimal]$Readiness.desktopConnectionCount) {
+        return $false
+    }
+    foreach ($digest in $digests) {
+        if ([string]$digest -cnotmatch '^[0-9a-f]{64}$') {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-CodexDesktopOwnerConnectedProof {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Readiness,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeInvocationId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedLaunchNonceDigest,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$RootIdentityKey
+    )
+
+    if ($ExpectedRuntimeInvocationId -cnotmatch '^[0-9a-f]{32}$' -or
+        $ExpectedLaunchNonceDigest -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]::IsNullOrWhiteSpace($RootIdentityKey) -or
+        -not (Test-CodexDesktopNonceReadinessSnapshot `
+            -Readiness $Readiness) -or
+        [string]$Readiness.runtimeInvocationId -cne
+            $ExpectedRuntimeInvocationId -or
+        -not [bool]$Readiness.desktopConnected -or
+        [int]$Readiness.unknownCount -ne 0) {
+        return $false
+    }
+    $connectionCount = [int]$Readiness.desktopConnectionCount
+    $digests = @($Readiness.desktopLaunchNonceDigests)
+    return (
+        $connectionCount -gt 0 -and
+        $digests.Count -eq $connectionCount -and
+        @($digests | Select-Object -Unique).Count -eq 1 -and
+        [string]$digests[0] -ceq $ExpectedLaunchNonceDigest
+    )
+}
+
+function Test-CodexDesktopOwnerConnectionProof {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Readiness,
+
+        [AllowNull()]
+        [object]$Proof,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeInvocationId,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$RootIdentityKey
+    )
+
+    if ($null -eq $Proof -or
+        $null -eq $Proof.PSObject.Properties['RuntimeInvocationId'] -or
+        $null -eq $Proof.PSObject.Properties['RootIdentityKey'] -or
+        $null -eq $Proof.PSObject.Properties['LaunchNonceDigest'] -or
+        [string]$Proof.RuntimeInvocationId -cne
+            $ExpectedRuntimeInvocationId -or
+        [string]$Proof.RootIdentityKey -cne $RootIdentityKey) {
+        return $false
+    }
+    return Test-CodexDesktopOwnerConnectedProof `
+        -Readiness $Readiness `
+        -ExpectedRuntimeInvocationId $ExpectedRuntimeInvocationId `
+        -ExpectedLaunchNonceDigest ([string]$Proof.LaunchNonceDigest) `
+        -RootIdentityKey $RootIdentityKey
+}
+
+function Get-CodexLocalRemoteManagedConfiguration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $configurationPath = Join-Path $resolvedDataDir 'managed-config.json'
+    if (-not (Test-Path -LiteralPath $configurationPath -PathType Leaf)) {
+        return $null
+    }
+    $null = Assert-CodexLocalRemoteDataDirectoryOwnerMarker -DataDir $resolvedDataDir
+    $item = Get-Item -LiteralPath $configurationPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$item.Length -lt 64 -or
+        [long]$item.Length -gt 16384) {
+        throw "Managed configuration '$configurationPath' is not an ordinary bounded file."
+    }
+    $configuration = Get-Content -LiteralPath $configurationPath -Raw -Encoding utf8 |
+        ConvertFrom-Json -Depth 10 -DateKind String -ErrorAction Stop
+    $expectedProperties = @(
+        'Signature',
+        'Version',
+        'SidecarPort',
+        'BrokerPort',
+        'BrokerUpstreamPort',
+        'BasePath',
+        'TaskName',
+        'UpdatedAtUtc'
+    )
+    $actualProperties = @($configuration.PSObject.Properties.Name | Sort-Object)
+    if ((ConvertTo-CanonicalJson $actualProperties) -cne
+        (ConvertTo-CanonicalJson @($expectedProperties | Sort-Object)) -or
+        [string]$configuration.Signature -cne
+            'codex-local-remote/managed-config/v1' -or
+        [int]$configuration.Version -ne 1) {
+        throw "Managed configuration '$configurationPath' has an invalid schema."
+    }
+    foreach ($port in @(
+        $configuration.SidecarPort,
+        $configuration.BrokerPort,
+        $configuration.BrokerUpstreamPort
+    )) {
+        if (-not (Test-NonNegativeInteger -Value $port) -or
+            [decimal]$port -lt 1 -or
+            [decimal]$port -gt 65535) {
+            throw "Managed configuration '$configurationPath' has an invalid port."
+        }
+    }
+    $ports = @(
+        [int]$configuration.SidecarPort,
+        [int]$configuration.BrokerPort,
+        [int]$configuration.BrokerUpstreamPort
+    )
+    if (@($ports | Sort-Object -Unique).Count -ne 3) {
+        throw "Managed configuration '$configurationPath' reuses a managed port."
+    }
+    Assert-CanonicalBasePath -BasePath ([string]$configuration.BasePath)
+    $taskName = [string]$configuration.TaskName
+    if ([string]::IsNullOrWhiteSpace($taskName) -or
+        $taskName.Length -gt 128 -or
+        $taskName -match '[\x00-\x1F]') {
+        throw "Managed configuration '$configurationPath' has an invalid task name."
+    }
+    try {
+        $updatedAt = [DateTimeOffset]::Parse(
+            [string]$configuration.UpdatedAtUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+    } catch {
+        throw "Managed configuration '$configurationPath' has an invalid timestamp."
+    }
+    if ($updatedAt.Offset -ne [TimeSpan]::Zero) {
+        throw "Managed configuration '$configurationPath' has an invalid timestamp."
+    }
+    return [pscustomobject]@{
+        Signature = [string]$configuration.Signature
+        Version = [int]$configuration.Version
+        SidecarPort = [int]$configuration.SidecarPort
+        BrokerPort = [int]$configuration.BrokerPort
+        BrokerUpstreamPort = [int]$configuration.BrokerUpstreamPort
+        BasePath = [string]$configuration.BasePath
+        TaskName = $taskName
+        UpdatedAtUtc = [string]$configuration.UpdatedAtUtc
+        ConfigurationPath = $configurationPath
+    }
+}
+
+function Set-CodexLocalRemoteManagedConfiguration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 65535)]
+        [int]$SidecarPort,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 65535)]
+        [int]$BrokerPort,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 65535)]
+        [int]$BrokerUpstreamPort,
+
+        [Parameter(Mandatory)]
+        [string]$BasePath,
+
+        [Parameter(Mandatory)]
+        [string]$TaskName
+    )
+
+    Assert-CanonicalBasePath -BasePath $BasePath
+    if (@(@($SidecarPort, $BrokerPort, $BrokerUpstreamPort) |
+            Sort-Object -Unique).Count -ne 3) {
+        throw 'Sidecar, Broker, and upstream ports must be distinct.'
+    }
+    if ([string]::IsNullOrWhiteSpace($TaskName) -or
+        $TaskName.Length -gt 128 -or
+        $TaskName -match '[\x00-\x1F]') {
+        throw 'TaskName is invalid.'
+    }
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $null = Protect-CodexLocalRemoteDataDirectory -DataDir $resolvedDataDir
+    $configurationPath = Join-Path $resolvedDataDir 'managed-config.json'
+    $value = [ordered]@{
+        Signature = 'codex-local-remote/managed-config/v1'
+        Version = 1
+        SidecarPort = $SidecarPort
+        BrokerPort = $BrokerPort
+        BrokerUpstreamPort = $BrokerUpstreamPort
+        BasePath = $BasePath
+        TaskName = $TaskName
+        UpdatedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    }
+    Write-AtomicJsonFile -Path $configurationPath -Value $value
+    $readBack = Get-CodexLocalRemoteManagedConfiguration -DataDir $resolvedDataDir
+    if ($null -eq $readBack -or
+        [int]$readBack.SidecarPort -ne $SidecarPort -or
+        [int]$readBack.BrokerPort -ne $BrokerPort -or
+        [int]$readBack.BrokerUpstreamPort -ne $BrokerUpstreamPort -or
+        [string]$readBack.BasePath -cne $BasePath -or
+        [string]$readBack.TaskName -cne $TaskName) {
+        throw 'Managed configuration failed exact read-back verification.'
+    }
+    return $readBack
 }
 
 function Get-CodexLocalRemoteRuntimeVersionPlan {
@@ -2482,8 +4792,12 @@ function Get-CodexLocalRemoteRuntimeVersionPlan {
         }
     }
 
+    $brokerSidecarCompatibilityId =
+        'codex-local-remote/broker-sidecar/v1'
     $identity = [ordered]@{
         Signature = 'codex-local-remote/runtime-content/v1'
+        BrokerSidecarCompatibilityId =
+            $brokerSidecarCompatibilityId
         Files = @($manifestFiles)
     }
     $versionId = Get-StringSha256 -Value (ConvertTo-CanonicalJson $identity)
@@ -2494,6 +4808,8 @@ function Get-CodexLocalRemoteRuntimeVersionPlan {
         Signature = 'codex-local-remote/runtime-manifest/v1'
         Version = 1
         VersionId = $versionId
+        BrokerSidecarCompatibilityId =
+            $brokerSidecarCompatibilityId
         SourceCommit = $sourceCommit
         SourceDirty = $sourceDirty
         FileCount = $manifestFiles.Count
@@ -2575,6 +4891,19 @@ function Test-CodexLocalRemoteRuntimeVersion {
             [string]$manifest.VersionId -cnotmatch '^[a-f0-9]{64}$') {
             return New-InvalidRuntimeResult 'runtime manifest schema is invalid'
         }
+        $manifestCompatibilityId = $null
+        if ($null -ne $manifest.PSObject.Properties[
+            'BrokerSidecarCompatibilityId'
+        ]) {
+            $manifestCompatibilityId =
+                [string]$manifest.BrokerSidecarCompatibilityId
+            if ($manifestCompatibilityId -cnotmatch
+                '^codex-local-remote/broker-sidecar/v[1-9][0-9]*$') {
+                return New-InvalidRuntimeResult (
+                    'runtime manifest Broker/Sidecar compatibility is invalid'
+                )
+            }
+        }
         $versionId = [string]$manifest.VersionId
         if (-not [string]::IsNullOrWhiteSpace($ExpectedVersionId) -and
             $versionId -cne $ExpectedVersionId) {
@@ -2644,8 +4973,14 @@ function Test-CodexLocalRemoteRuntimeVersion {
         }
         $identity = [ordered]@{
             Signature = 'codex-local-remote/runtime-content/v1'
-            Files = @($normalizedFiles | Sort-Object Path)
         }
+        if (-not [string]::IsNullOrWhiteSpace(
+            $manifestCompatibilityId
+        )) {
+            $identity.BrokerSidecarCompatibilityId =
+                $manifestCompatibilityId
+        }
+        $identity.Files = @($normalizedFiles | Sort-Object Path)
         $computedVersionId = Get-StringSha256 -Value (ConvertTo-CanonicalJson $identity)
         if ($computedVersionId -cne $versionId) {
             return New-InvalidRuntimeResult 'runtime manifest identity hash does not match its version id'
@@ -2660,6 +4995,8 @@ function Test-CodexLocalRemoteRuntimeVersion {
             RuntimeRoot = $resolvedRuntimeRoot
             ManifestPath = $manifestPath
             ManifestSha256 = $manifestSha256
+            BrokerSidecarCompatibilityId =
+                $manifestCompatibilityId
             SourceCommit = if ($null -eq $manifest.SourceCommit) {
                 $null
             } else {
@@ -2788,7 +5125,45 @@ function Install-CodexLocalRemoteRuntimeVersion {
     }
 }
 
-function Get-CodexLocalRemoteCurrentRuntime {
+function Test-CodexLocalRemoteTaskXmlRuntimeRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Xml,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRoot,
+
+        [AllowNull()]
+        [string]$ForbiddenRoot
+    )
+
+    try {
+        $document = [xml]$Xml
+    } catch {
+        return $false
+    }
+    $foundExpected = $false
+    foreach ($node in @($document.SelectNodes('//text()'))) {
+        $value = [string]$node.Value
+        if ($value.IndexOf(
+            $ExpectedRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -ge 0) {
+            $foundExpected = $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ForbiddenRoot) -and
+            $value.IndexOf(
+                $ForbiddenRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -ge 0) {
+            return $false
+        }
+    }
+    return $foundExpected
+}
+
+function Read-CodexLocalRemoteRuntimePointerRecord {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -2803,11 +5178,11 @@ function Get-CodexLocalRemoteCurrentRuntime {
     $pointerItem = Get-Item -LiteralPath $pointerPath -Force -ErrorAction Stop
     if (($pointerItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
         [long]$pointerItem.Length -lt 32 -or
-        [long]$pointerItem.Length -gt 65536) {
+        [long]$pointerItem.Length -gt 262144) {
         throw "Runtime pointer '$pointerPath' is not an ordinary bounded file."
     }
     $pointer = Get-Content -LiteralPath $pointerPath -Raw -Encoding utf8 |
-        ConvertFrom-Json -Depth 20 -ErrorAction Stop
+        ConvertFrom-Json -Depth 20 -DateKind String -ErrorAction Stop
     if ([string]$pointer.Signature -cne 'codex-local-remote/runtime-current/v1' -or
         [int]$pointer.Version -ne 1 -or
         [string]$pointer.CurrentVersionId -cnotmatch '^[a-f0-9]{64}$') {
@@ -2864,6 +5239,157 @@ function Get-CodexLocalRemoteCurrentRuntime {
         throw "Runtime pointer '$pointerPath' has a previous root without a version."
     }
 
+    $taskPreImageProperty =
+        $pointer.PSObject.Properties['PreviousTaskPreImage']
+    $taskPreImage = if ($null -eq $taskPreImageProperty) {
+        $null
+    } else {
+        $taskPreImageProperty.Value
+    }
+    $validatedTaskPreImage = $null
+    if ($null -ne $taskPreImage) {
+        $expectedProperties = @(
+            'Signature',
+            'Version',
+            'TaskName',
+            'RuntimeVersionId',
+            'RuntimeRoot',
+            'Xml',
+            'XmlSha256',
+            'CapturedAtUtc'
+        )
+        $actualProperties = @(
+            $taskPreImage.PSObject.Properties.Name |
+                Sort-Object
+        )
+        if ((ConvertTo-CanonicalJson $actualProperties) -cne
+            (ConvertTo-CanonicalJson @($expectedProperties | Sort-Object)) -or
+            [string]$taskPreImage.Signature -cne
+                'codex-local-remote/runtime-task-preimage/v1' -or
+            [int]$taskPreImage.Version -ne 1 -or
+            $null -eq $previousVersionId) {
+            throw "Runtime pointer '$pointerPath' has an invalid task pre-image schema."
+        }
+        $taskName = [string]$taskPreImage.TaskName
+        $taskXml = [string]$taskPreImage.Xml
+        $taskXmlSha256 = [string]$taskPreImage.XmlSha256
+        if ([string]::IsNullOrWhiteSpace($taskName) -or
+            $taskName.Length -gt 128 -or
+            $taskName -match '[\x00-\x1F]' -or
+            [string]$taskPreImage.RuntimeVersionId -cne
+                [string]$previousVersionId -or
+            -not [string]::Equals(
+                [System.IO.Path]::GetFullPath(
+                    [string]$taskPreImage.RuntimeRoot
+                ),
+                $previousRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            $taskXml.Length -lt 32 -or
+            $taskXml.Length -gt 196608 -or
+            $taskXmlSha256 -cnotmatch '^[a-f0-9]{64}$' -or
+            (Get-StringSha256 -Value $taskXml) -cne $taskXmlSha256 -or
+            -not (Test-CodexLocalRemoteTaskXmlRuntimeRoot `
+                -Xml $taskXml `
+                -ExpectedRoot $previousRoot `
+                -ForbiddenRoot $currentRoot)) {
+            throw "Runtime pointer '$pointerPath' has an invalid task pre-image."
+        }
+        try {
+            $capturedAt = [DateTimeOffset]::Parse(
+                [string]$taskPreImage.CapturedAtUtc,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            )
+        } catch {
+            throw "Runtime pointer '$pointerPath' has an invalid task pre-image timestamp."
+        }
+        if ($capturedAt.Offset -ne [TimeSpan]::Zero) {
+            throw "Runtime pointer '$pointerPath' has an invalid task pre-image timestamp."
+        }
+        $validatedTaskPreImage = [pscustomobject]@{
+            Signature = [string]$taskPreImage.Signature
+            Version = [int]$taskPreImage.Version
+            TaskName = $taskName
+            RuntimeVersionId = [string]$taskPreImage.RuntimeVersionId
+            RuntimeRoot = $previousRoot
+            Xml = $taskXml
+            XmlSha256 = $taskXmlSha256
+            CapturedAtUtc = [string]$taskPreImage.CapturedAtUtc
+        }
+    }
+
+    $currentTaskDefinitionProperty =
+        $pointer.PSObject.Properties['CurrentTaskDefinition']
+    $currentTaskDefinition = if (
+        $null -eq $currentTaskDefinitionProperty
+    ) {
+        $null
+    } else {
+        $currentTaskDefinitionProperty.Value
+    }
+    $validatedCurrentTaskDefinition = $null
+    if ($null -ne $currentTaskDefinition) {
+        $expectedProperties = @(
+            'Signature',
+            'Version',
+            'TaskName',
+            'RuntimeVersionId',
+            'RuntimeRoot',
+            'XmlSha256',
+            'BoundAtUtc'
+        )
+        $actualProperties = @(
+            $currentTaskDefinition.PSObject.Properties.Name |
+                Sort-Object
+        )
+        $bindingTaskName = [string]$currentTaskDefinition.TaskName
+        $bindingRuntimeRoot = [System.IO.Path]::GetFullPath(
+            [string]$currentTaskDefinition.RuntimeRoot
+        )
+        if ((ConvertTo-CanonicalJson $actualProperties) -cne
+            (ConvertTo-CanonicalJson @($expectedProperties | Sort-Object)) -or
+            [string]$currentTaskDefinition.Signature -cne
+                'codex-local-remote/runtime-task-binding/v1' -or
+            [int]$currentTaskDefinition.Version -ne 1 -or
+            [string]::IsNullOrWhiteSpace($bindingTaskName) -or
+            $bindingTaskName.Length -gt 128 -or
+            $bindingTaskName -match '[\x00-\x1F]' -or
+            [string]$currentTaskDefinition.RuntimeVersionId -cne
+                [string]$pointer.CurrentVersionId -or
+            -not [string]::Equals(
+                $bindingRuntimeRoot,
+                $currentRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$currentTaskDefinition.XmlSha256 -cnotmatch
+                '^[a-f0-9]{64}$') {
+            throw "Runtime pointer '$pointerPath' has an invalid current task binding."
+        }
+        try {
+            $boundAt = [DateTimeOffset]::Parse(
+                [string]$currentTaskDefinition.BoundAtUtc,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            )
+        } catch {
+            throw "Runtime pointer '$pointerPath' has an invalid current task binding timestamp."
+        }
+        if ($boundAt.Offset -ne [TimeSpan]::Zero) {
+            throw "Runtime pointer '$pointerPath' has an invalid current task binding timestamp."
+        }
+        $validatedCurrentTaskDefinition = [pscustomobject]@{
+            Signature = [string]$currentTaskDefinition.Signature
+            Version = [int]$currentTaskDefinition.Version
+            TaskName = $bindingTaskName
+            RuntimeVersionId =
+                [string]$currentTaskDefinition.RuntimeVersionId
+            RuntimeRoot = $bindingRuntimeRoot
+            XmlSha256 = [string]$currentTaskDefinition.XmlSha256
+            BoundAtUtc = [string]$currentTaskDefinition.BoundAtUtc
+        }
+    }
+
     return [pscustomobject]@{
         Signature = [string]$pointer.Signature
         Version = [int]$pointer.Version
@@ -2882,7 +5408,133 @@ function Get-CodexLocalRemoteCurrentRuntime {
             [string]$pointer.PreviousManifestSha256
         }
         UpdatedAtUtc = [string]$pointer.UpdatedAtUtc
+        PreviousTaskPreImage = $validatedTaskPreImage
+        CurrentTaskDefinition = $validatedCurrentTaskDefinition
         PointerPath = $pointerPath
+    }
+}
+
+function Get-CodexLocalRemoteCurrentRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $record = Read-CodexLocalRemoteRuntimePointerRecord -DataDir $DataDir
+    if ($null -eq $record) {
+        return $null
+    }
+    $taskPreImage = $record.PreviousTaskPreImage
+    $currentTaskDefinition = $record.CurrentTaskDefinition
+    return [pscustomobject]@{
+        Signature = [string]$record.Signature
+        Version = [int]$record.Version
+        CurrentVersionId = [string]$record.CurrentVersionId
+        CurrentRoot = [string]$record.CurrentRoot
+        CurrentManifestSha256 = [string]$record.CurrentManifestSha256
+        PreviousVersionId = $record.PreviousVersionId
+        PreviousRoot = $record.PreviousRoot
+        PreviousManifestSha256 = $record.PreviousManifestSha256
+        UpdatedAtUtc = [string]$record.UpdatedAtUtc
+        HasPreviousTaskPreImage = $null -ne $taskPreImage
+        PreviousTaskPreImageSha256 = if ($null -eq $taskPreImage) {
+            $null
+        } else {
+            [string]$taskPreImage.XmlSha256
+        }
+        PreviousTaskPreImageTaskName = if ($null -eq $taskPreImage) {
+            $null
+        } else {
+            [string]$taskPreImage.TaskName
+        }
+        PreviousTaskPreImageRuntimeVersionId = if ($null -eq $taskPreImage) {
+            $null
+        } else {
+            [string]$taskPreImage.RuntimeVersionId
+        }
+        PreviousTaskPreImageRuntimeRoot = if ($null -eq $taskPreImage) {
+            $null
+        } else {
+            [string]$taskPreImage.RuntimeRoot
+        }
+        HasCurrentTaskDefinition =
+            $null -ne $currentTaskDefinition
+        CurrentTaskDefinitionSha256 = if (
+            $null -eq $currentTaskDefinition
+        ) {
+            $null
+        } else {
+            [string]$currentTaskDefinition.XmlSha256
+        }
+        CurrentTaskDefinitionTaskName = if (
+            $null -eq $currentTaskDefinition
+        ) {
+            $null
+        } else {
+            [string]$currentTaskDefinition.TaskName
+        }
+        CurrentTaskDefinitionRuntimeVersionId = if (
+            $null -eq $currentTaskDefinition
+        ) {
+            $null
+        } else {
+            [string]$currentTaskDefinition.RuntimeVersionId
+        }
+        CurrentTaskDefinitionRuntimeRoot = if (
+            $null -eq $currentTaskDefinition
+        ) {
+            $null
+        } else {
+            [string]$currentTaskDefinition.RuntimeRoot
+        }
+        PointerPath = [string]$record.PointerPath
+    }
+}
+
+function Get-CodexLocalRemoteRuntimeTaskPreImage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedTaskName,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeRoot
+    )
+
+    $record = Read-CodexLocalRemoteRuntimePointerRecord -DataDir $DataDir
+    if ($null -eq $record -or
+        $null -eq $record.PreviousTaskPreImage) {
+        throw 'The selected runtime pointer has no scheduled-task pre-image.'
+    }
+    $taskPreImage = $record.PreviousTaskPreImage
+    if ([string]$taskPreImage.TaskName -cne $ExpectedTaskName -or
+        [string]$taskPreImage.RuntimeVersionId -cne
+            $ExpectedRuntimeVersionId -or
+        -not [string]::Equals(
+            [System.IO.Path]::GetFullPath(
+                [string]$taskPreImage.RuntimeRoot
+            ),
+            [System.IO.Path]::GetFullPath($ExpectedRuntimeRoot),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw 'The scheduled-task pre-image does not match the requested rollback identity.'
+    }
+    return [pscustomobject]@{
+        Signature = [string]$taskPreImage.Signature
+        Version = [int]$taskPreImage.Version
+        TaskName = [string]$taskPreImage.TaskName
+        RuntimeVersionId = [string]$taskPreImage.RuntimeVersionId
+        RuntimeRoot = [string]$taskPreImage.RuntimeRoot
+        Xml = [string]$taskPreImage.Xml
+        XmlSha256 = [string]$taskPreImage.XmlSha256
+        CapturedAtUtc = [string]$taskPreImage.CapturedAtUtc
     }
 }
 
@@ -2893,7 +5545,13 @@ function Set-CodexLocalRemoteCurrentRuntime {
         [string]$DataDir,
 
         [Parameter(Mandatory)]
-        [object]$Runtime
+        [object]$Runtime,
+
+        [AllowNull()]
+        [object]$PreviousTaskPreImage,
+
+        [AllowNull()]
+        [object]$CurrentTaskDefinition
     )
 
     $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
@@ -2915,20 +5573,126 @@ function Set-CodexLocalRemoteCurrentRuntime {
         throw 'Refusing to activate a runtime outside the managed version directory.'
     }
 
-    $previous = Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+    $previousRecord =
+        Read-CodexLocalRemoteRuntimePointerRecord -DataDir $resolvedDataDir
     $previousVersionId = $null
     $previousRoot = $null
     $previousManifestSha256 = $null
-    if ($null -ne $previous) {
-        if ([string]$previous.CurrentVersionId -ceq [string]$Runtime.VersionId) {
-            $previousVersionId = $previous.PreviousVersionId
-            $previousRoot = $previous.PreviousRoot
-            $previousManifestSha256 = $previous.PreviousManifestSha256
+    $persistedTaskPreImage = $null
+    $persistedCurrentTaskDefinition = $null
+    if ($null -ne $previousRecord) {
+        if ([string]$previousRecord.CurrentVersionId -ceq
+            [string]$Runtime.VersionId) {
+            $previousVersionId = $previousRecord.PreviousVersionId
+            $previousRoot = $previousRecord.PreviousRoot
+            $previousManifestSha256 =
+                $previousRecord.PreviousManifestSha256
+            if (-not $PSBoundParameters.ContainsKey(
+                'PreviousTaskPreImage'
+            )) {
+                $persistedTaskPreImage =
+                    $previousRecord.PreviousTaskPreImage
+            }
+            if (-not $PSBoundParameters.ContainsKey(
+                'CurrentTaskDefinition'
+            )) {
+                $persistedCurrentTaskDefinition =
+                    $previousRecord.CurrentTaskDefinition
+            }
         } else {
-            $previousVersionId = [string]$previous.CurrentVersionId
-            $previousRoot = [string]$previous.CurrentRoot
-            $previousManifestSha256 = [string]$previous.CurrentManifestSha256
+            $previousVersionId =
+                [string]$previousRecord.CurrentVersionId
+            $previousRoot = [string]$previousRecord.CurrentRoot
+            $previousManifestSha256 =
+                [string]$previousRecord.CurrentManifestSha256
         }
+    }
+    if ($PSBoundParameters.ContainsKey('PreviousTaskPreImage') -and
+        $null -ne $PreviousTaskPreImage) {
+        if ($null -eq $previousVersionId) {
+            throw 'A scheduled-task pre-image requires a previous runtime.'
+        }
+        $taskName = [string]$PreviousTaskPreImage.TaskName
+        $taskRuntimeVersionId =
+            [string]$PreviousTaskPreImage.RuntimeVersionId
+        $taskRuntimeRoot = [System.IO.Path]::GetFullPath(
+            [string]$PreviousTaskPreImage.RuntimeRoot
+        )
+        $taskXml = [string]$PreviousTaskPreImage.Xml
+        $taskXmlSha256 = [string]$PreviousTaskPreImage.XmlSha256
+        if ([string]::IsNullOrWhiteSpace($taskName) -or
+            $taskName.Length -gt 128 -or
+            $taskName -match '[\x00-\x1F]' -or
+            $taskRuntimeVersionId -cne [string]$previousVersionId -or
+            -not [string]::Equals(
+                $taskRuntimeRoot,
+                [System.IO.Path]::GetFullPath(
+                    [string]$previousRoot
+                ),
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            $taskXml.Length -lt 32 -or
+            $taskXml.Length -gt 196608 -or
+            $taskXmlSha256 -cnotmatch '^[a-f0-9]{64}$' -or
+            (Get-StringSha256 -Value $taskXml) -cne
+                $taskXmlSha256 -or
+            -not (Test-CodexLocalRemoteTaskXmlRuntimeRoot `
+                -Xml $taskXml `
+                -ExpectedRoot $taskRuntimeRoot `
+                -ForbiddenRoot $runtimeRoot)) {
+            throw 'The scheduled-task pre-image is invalid for the previous runtime.'
+        }
+        $persistedTaskPreImage = [ordered]@{
+            Signature =
+                'codex-local-remote/runtime-task-preimage/v1'
+            Version = 1
+            TaskName = $taskName
+            RuntimeVersionId = $taskRuntimeVersionId
+            RuntimeRoot = $taskRuntimeRoot
+            Xml = $taskXml
+            XmlSha256 = $taskXmlSha256
+            CapturedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+    } elseif ($PSBoundParameters.ContainsKey('PreviousTaskPreImage')) {
+        $persistedTaskPreImage = $null
+    }
+    if ($PSBoundParameters.ContainsKey('CurrentTaskDefinition') -and
+        $null -ne $CurrentTaskDefinition) {
+        $bindingTaskName = [string]$CurrentTaskDefinition.TaskName
+        $bindingRuntimeVersionId =
+            [string]$CurrentTaskDefinition.RuntimeVersionId
+        $bindingRuntimeRoot = [System.IO.Path]::GetFullPath(
+            [string]$CurrentTaskDefinition.RuntimeRoot
+        )
+        $bindingXmlSha256 =
+            [string]$CurrentTaskDefinition.XmlSha256
+        if ([string]::IsNullOrWhiteSpace($bindingTaskName) -or
+            $bindingTaskName.Length -gt 128 -or
+            $bindingTaskName -match '[\x00-\x1F]' -or
+            $bindingRuntimeVersionId -cne
+                [string]$runtimeValidation.VersionId -or
+            -not [string]::Equals(
+                $bindingRuntimeRoot,
+                $runtimeRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            $bindingXmlSha256 -cnotmatch '^[a-f0-9]{64}$') {
+            throw 'The current scheduled-task binding is invalid for the selected runtime.'
+        }
+        $persistedCurrentTaskDefinition = [ordered]@{
+            Signature =
+                'codex-local-remote/runtime-task-binding/v1'
+            Version = 1
+            TaskName = $bindingTaskName
+            RuntimeVersionId = $bindingRuntimeVersionId
+            RuntimeRoot = $bindingRuntimeRoot
+            XmlSha256 = $bindingXmlSha256
+            BoundAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+    } elseif ($PSBoundParameters.ContainsKey(
+        'CurrentTaskDefinition'
+    )) {
+        $persistedCurrentTaskDefinition = $null
     }
     $pointer = [ordered]@{
         Signature = 'codex-local-remote/runtime-current/v1'
@@ -2939,16 +5703,117 @@ function Set-CodexLocalRemoteCurrentRuntime {
         PreviousVersionId = $previousVersionId
         PreviousRoot = $previousRoot
         PreviousManifestSha256 = $previousManifestSha256
+        PreviousTaskPreImage = $persistedTaskPreImage
+        CurrentTaskDefinition = $persistedCurrentTaskDefinition
         UpdatedAtUtc = [DateTime]::UtcNow.ToString('o')
     }
     $pointerPath = Join-Path $resolvedDataDir 'runtime-current.json'
     Write-AtomicJsonFile -Path $pointerPath -Value $pointer
     $readBack = Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
     if ($null -eq $readBack -or
-        [string]$readBack.CurrentVersionId -cne [string]$Runtime.VersionId) {
+        [string]$readBack.CurrentVersionId -cne
+            [string]$Runtime.VersionId -or
+        [bool]$readBack.HasPreviousTaskPreImage -ne
+            ($null -ne $persistedTaskPreImage) -or
+        [bool]$readBack.HasCurrentTaskDefinition -ne
+            ($null -ne $persistedCurrentTaskDefinition)) {
         throw 'The active runtime pointer failed read-back verification.'
     }
+    if ($null -ne $persistedTaskPreImage) {
+        $preImageReadBack =
+            Get-CodexLocalRemoteRuntimeTaskPreImage `
+                -DataDir $resolvedDataDir `
+                -ExpectedTaskName (
+                    [string]$persistedTaskPreImage.TaskName
+                ) `
+                -ExpectedRuntimeVersionId (
+                    [string]$persistedTaskPreImage.RuntimeVersionId
+                ) `
+                -ExpectedRuntimeRoot (
+                    [string]$persistedTaskPreImage.RuntimeRoot
+                )
+        if ([string]$preImageReadBack.XmlSha256 -cne
+                [string]$persistedTaskPreImage.XmlSha256 -or
+            [string]$preImageReadBack.Xml -cne
+                [string]$persistedTaskPreImage.Xml) {
+            throw 'The scheduled-task pre-image failed exact read-back verification.'
+        }
+    }
+    if ($null -ne $persistedCurrentTaskDefinition -and
+        ([string]$readBack.CurrentTaskDefinitionTaskName -cne
+                [string]$persistedCurrentTaskDefinition.TaskName -or
+            [string]$readBack.CurrentTaskDefinitionRuntimeVersionId -cne
+                [string]$persistedCurrentTaskDefinition.RuntimeVersionId -or
+            -not [string]::Equals(
+                [System.IO.Path]::GetFullPath(
+                    [string]$readBack.CurrentTaskDefinitionRuntimeRoot
+                ),
+                [System.IO.Path]::GetFullPath(
+                    [string]$persistedCurrentTaskDefinition.RuntimeRoot
+                ),
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$readBack.CurrentTaskDefinitionSha256 -cne
+                [string]$persistedCurrentTaskDefinition.XmlSha256)) {
+        throw 'The current scheduled-task binding failed exact read-back verification.'
+    }
     return $readBack
+}
+
+function Sync-CodexLocalRemoteCurrentRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$InstallRoot
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $resolvedInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+    $versionsRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $resolvedDataDir 'RuntimeVersions')
+    )
+    $versionsPrefix = $versionsRoot.TrimEnd('\') + '\'
+    if (-not $resolvedInstallRoot.StartsWith(
+        $versionsPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        return [pscustomobject]@{
+            Status = 'unmanaged-runtime'
+            Current = Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+        }
+    }
+
+    $expectedVersionId = [System.IO.Path]::GetFileName($resolvedInstallRoot)
+    $validation = Test-CodexLocalRemoteRuntimeVersion `
+        -RuntimeRoot $resolvedInstallRoot `
+        -ExpectedVersionId $expectedVersionId
+    if (-not $validation.IsValid) {
+        throw "The scheduled immutable runtime is invalid: $($validation.Reason)."
+    }
+
+    $current = Get-CodexLocalRemoteCurrentRuntime -DataDir $resolvedDataDir
+    if ($null -ne $current -and
+        [string]$current.CurrentVersionId -ceq [string]$validation.VersionId -and
+        [string]::Equals(
+            [System.IO.Path]::GetFullPath([string]$current.CurrentRoot),
+            $resolvedInstallRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        return [pscustomobject]@{
+            Status = 'already-current'
+            Current = $current
+        }
+    }
+
+    return [pscustomobject]@{
+        Status = 'repaired'
+        Current = Set-CodexLocalRemoteCurrentRuntime `
+            -DataDir $resolvedDataDir `
+            -Runtime $validation
+    }
 }
 
 function Get-UserEnvironmentValueState {
@@ -3219,6 +6084,758 @@ function Assert-BrokerUserEnvironmentRestorable {
     return [pscustomobject]@{ Status = 'restorable'; StatePath = $statePath }
 }
 
+function Get-CodexLocalRemoteControlDispatcherPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path `
+            (Join-Path ([System.IO.Path]::GetFullPath($DataDir)) 'control') `
+            'CodexLocalRemote.Control.ps1')
+    )
+}
+
+function Get-CodexLocalRemoteControlDispatcherReceiptPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path `
+            (Join-Path ([System.IO.Path]::GetFullPath($DataDir)) 'control') `
+            'control-dispatcher.receipt.json')
+    )
+}
+
+function Test-CodexLocalRemoteControlDispatcher {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return $false
+        }
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -lt 64 -or
+            [long]$item.Length -gt 131072) {
+            return $false
+        }
+        $reader = [System.IO.StreamReader]::new(
+            $Path,
+            [System.Text.UTF8Encoding]::new($false),
+            $true
+        )
+        try {
+            $firstLine = $reader.ReadLine()
+        } finally {
+            $reader.Dispose()
+        }
+        return [string]$firstLine -ceq
+            '# codex-local-remote/control-dispatcher/v1'
+    } catch {
+        return $false
+    }
+}
+
+function Get-CodexLocalRemoteControlDispatcherState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $targetPath =
+        Get-CodexLocalRemoteControlDispatcherPath -DataDir $DataDir
+    $receiptPath =
+        Get-CodexLocalRemoteControlDispatcherReceiptPath -DataDir $DataDir
+    $targetPresent = Test-Path -LiteralPath $targetPath
+    $receiptPresent = Test-Path -LiteralPath $receiptPath
+    if (-not $targetPresent -and -not $receiptPresent) {
+        return [pscustomobject]@{
+            Status = 'absent'
+            Path = $targetPath
+            ReceiptPath = $receiptPath
+            Sha256 = $null
+        }
+    }
+    if ($targetPresent -ne $receiptPresent) {
+        throw (
+            "Control dispatcher ownership is incomplete at '$targetPath'; " +
+            'refusing marker-only adoption or partial-state repair.'
+        )
+    }
+    if (-not (Test-CodexLocalRemoteControlDispatcher -Path $targetPath)) {
+        throw "Control dispatcher '$targetPath' is not one recognized managed file."
+    }
+    $receiptItem =
+        Get-Item -LiteralPath $receiptPath -Force -ErrorAction Stop
+    if ($receiptItem.PSIsContainer -or
+        ($receiptItem.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$receiptItem.Length -lt 2 -or
+        [long]$receiptItem.Length -gt 131072) {
+        throw "Control dispatcher receipt '$receiptPath' is not ordinary."
+    }
+    try {
+        $receipt = Get-Content `
+            -LiteralPath $receiptPath `
+            -Raw `
+            -Encoding utf8 `
+            -ErrorAction Stop |
+            ConvertFrom-Json -Depth 10 -DateKind String -ErrorAction Stop
+    } catch {
+        throw "Control dispatcher receipt '$receiptPath' is invalid JSON."
+    }
+    if ([string]$receipt.Signature -cne
+            'codex-local-remote/control-dispatcher-receipt/v1' -or
+        [int]$receipt.Version -ne 1 -or
+        -not [string]::Equals(
+            [string]$receipt.Path,
+            $targetPath,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$receipt.Sha256 -cnotmatch '^[a-f0-9]{64}$') {
+        throw "Control dispatcher receipt '$receiptPath' is not canonical."
+    }
+    $targetHash = (
+        Get-FileHash `
+            -LiteralPath $targetPath `
+            -Algorithm SHA256 `
+            -ErrorAction Stop
+    ).Hash.ToLowerInvariant()
+    if ($targetHash -cne [string]$receipt.Sha256) {
+        throw (
+            "Control dispatcher '$targetPath' no longer matches its exact " +
+            'installation receipt.'
+        )
+    }
+    return [pscustomobject]@{
+        Status = 'managed'
+        Path = $targetPath
+        ReceiptPath = $receiptPath
+        Sha256 = $targetHash
+    }
+}
+
+function Invoke-WithCodexLocalRemoteControlDispatcherMutex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$Action,
+
+        [ValidateRange(1, 120)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    $identity =
+        [System.IO.Path]::GetFullPath($DataDir).ToUpperInvariant()
+    $name = (
+        'Global\CodexLocalRemote.ControlDispatcher.' +
+        (Get-StringSha256 -Value $identity)
+    )
+    $mutex = [System.Threading.Mutex]::new($false, $name)
+    $lockTaken = $false
+    try {
+        try {
+            $lockTaken =
+                $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockTaken = $true
+        }
+        if (-not $lockTaken) {
+            throw 'Timed out waiting for the control dispatcher transaction.'
+        }
+        return & $Action
+    } finally {
+        if ($lockTaken) {
+            try {
+                $mutex.ReleaseMutex()
+            } catch [System.ApplicationException] {
+                # An abandoned owner is still safe to dispose.
+            }
+        }
+        $mutex.Dispose()
+    }
+}
+
+function Install-CodexLocalRemoteControlDispatcher {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $resolvedSource = [System.IO.Path]::GetFullPath($SourcePath)
+    if (-not (Test-CodexLocalRemoteControlDispatcher `
+        -Path $resolvedSource)) {
+        throw 'The control dispatcher source is not one recognized managed file.'
+    }
+    $sourceHash = (
+        Get-FileHash `
+            -LiteralPath $resolvedSource `
+            -Algorithm SHA256 `
+            -ErrorAction Stop
+    ).Hash.ToLowerInvariant()
+    return Invoke-WithCodexLocalRemoteControlDispatcherMutex `
+        -DataDir $DataDir `
+        -Action {
+            $baseline =
+                Get-CodexLocalRemoteControlDispatcherState `
+                    -DataDir $DataDir
+            if ([string]$baseline.Status -ceq 'managed' -and
+                [string]$baseline.Sha256 -ceq $sourceHash) {
+                return [pscustomobject]@{
+                    Status = 'reused'
+                    Path = [string]$baseline.Path
+                    ReceiptPath = [string]$baseline.ReceiptPath
+                    Sha256 = $sourceHash
+                }
+            }
+
+            $targetPath = [string]$baseline.Path
+            $receiptPath = [string]$baseline.ReceiptPath
+            $controlDirectory = Split-Path -Parent $targetPath
+            $null =
+                [System.IO.Directory]::CreateDirectory($controlDirectory)
+            $directoryItem =
+                Get-Item `
+                    -LiteralPath $controlDirectory `
+                    -Force `
+                    -ErrorAction Stop
+            if (-not $directoryItem.PSIsContainer -or
+                ($directoryItem.Attributes -band
+                    [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Control directory '$controlDirectory' is not ordinary."
+            }
+            $targetPreImage = if (
+                [string]$baseline.Status -ceq 'managed'
+            ) {
+                [System.IO.File]::ReadAllBytes($targetPath)
+            } else {
+                $null
+            }
+            $receiptPreImage = if (
+                [string]$baseline.Status -ceq 'managed'
+            ) {
+                [System.IO.File]::ReadAllBytes($receiptPath)
+            } else {
+                $null
+            }
+            $transactionId = [Guid]::NewGuid().ToString('N')
+            $temporaryTarget =
+                Join-Path $controlDirectory ".$transactionId.dispatcher.tmp"
+            $temporaryReceipt =
+                Join-Path $controlDirectory ".$transactionId.receipt.tmp"
+            try {
+                [System.IO.File]::Copy(
+                    $resolvedSource,
+                    $temporaryTarget,
+                    $false
+                )
+                $temporaryHash = (
+                    Get-FileHash `
+                        -LiteralPath $temporaryTarget `
+                        -Algorithm SHA256 `
+                        -ErrorAction Stop
+                ).Hash.ToLowerInvariant()
+                if ($temporaryHash -cne $sourceHash -or
+                    -not (Test-CodexLocalRemoteControlDispatcher `
+                        -Path $temporaryTarget)) {
+                    throw 'The staged control dispatcher changed content.'
+                }
+                $receipt = [ordered]@{
+                    Signature =
+                        'codex-local-remote/control-dispatcher-receipt/v1'
+                    Version = 1
+                    Path = $targetPath
+                    Sha256 = $sourceHash
+                }
+                [System.IO.File]::WriteAllText(
+                    $temporaryReceipt,
+                    ($receipt | ConvertTo-Json -Depth 4),
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+
+                $freshBaseline =
+                    Get-CodexLocalRemoteControlDispatcherState `
+                        -DataDir $DataDir
+                if ([string]$freshBaseline.Status -cne
+                        [string]$baseline.Status -or
+                    [string]$freshBaseline.Sha256 -cne
+                        [string]$baseline.Sha256) {
+                    throw 'The control dispatcher changed during installation.'
+                }
+                [System.IO.File]::Move(
+                    $temporaryTarget,
+                    $targetPath,
+                    $true
+                )
+                [System.IO.File]::Move(
+                    $temporaryReceipt,
+                    $receiptPath,
+                    $true
+                )
+                $installed =
+                    Get-CodexLocalRemoteControlDispatcherState `
+                        -DataDir $DataDir
+                if ([string]$installed.Sha256 -cne $sourceHash) {
+                    throw 'The control dispatcher installation did not verify.'
+                }
+                return [pscustomobject]@{
+                    Status = if (
+                        [string]$baseline.Status -ceq 'absent'
+                    ) {
+                        'created'
+                    } else {
+                        'updated'
+                    }
+                    Path = $targetPath
+                    ReceiptPath = $receiptPath
+                    Sha256 = $sourceHash
+                }
+            } catch {
+                $failure = $_
+                try {
+                    if ([string]$baseline.Status -ceq 'managed') {
+                        [System.IO.File]::WriteAllBytes(
+                            $targetPath,
+                            $targetPreImage
+                        )
+                        [System.IO.File]::WriteAllBytes(
+                            $receiptPath,
+                            $receiptPreImage
+                        )
+                        $restored =
+                            Get-CodexLocalRemoteControlDispatcherState `
+                                -DataDir $DataDir
+                        if ([string]$restored.Sha256 -cne
+                            [string]$baseline.Sha256) {
+                            throw 'The dispatcher pre-image did not verify.'
+                        }
+                    } else {
+                        Remove-Item `
+                            -LiteralPath $targetPath `
+                            -Force `
+                            -ErrorAction SilentlyContinue
+                        Remove-Item `
+                            -LiteralPath $receiptPath `
+                            -Force `
+                            -ErrorAction SilentlyContinue
+                    }
+                } catch {
+                    throw (
+                        "$($failure.Exception.Message) Control dispatcher " +
+                        "rollback was incomplete: $($_.Exception.Message)"
+                    )
+                }
+                throw $failure
+            } finally {
+                Remove-Item `
+                    -LiteralPath $temporaryTarget `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+                Remove-Item `
+                    -LiteralPath $temporaryReceipt `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+}
+
+function Remove-CodexLocalRemoteControlDispatcher {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    return Invoke-WithCodexLocalRemoteControlDispatcherMutex `
+        -DataDir $DataDir `
+        -Action {
+            $baseline =
+                Get-CodexLocalRemoteControlDispatcherState `
+                    -DataDir $DataDir
+            if ([string]$baseline.Status -ceq 'absent') {
+                return [pscustomobject]@{
+                    Status = 'not-found'
+                    Path = [string]$baseline.Path
+                    ReceiptPath = [string]$baseline.ReceiptPath
+                }
+            }
+            $targetPreImage =
+                [System.IO.File]::ReadAllBytes([string]$baseline.Path)
+            $receiptPreImage =
+                [System.IO.File]::ReadAllBytes(
+                    [string]$baseline.ReceiptPath
+                )
+            try {
+                Remove-Item `
+                    -LiteralPath ([string]$baseline.ReceiptPath) `
+                    -Force `
+                    -ErrorAction Stop
+                Remove-Item `
+                    -LiteralPath ([string]$baseline.Path) `
+                    -Force `
+                    -ErrorAction Stop
+                $removed =
+                    Get-CodexLocalRemoteControlDispatcherState `
+                        -DataDir $DataDir
+                if ([string]$removed.Status -cne 'absent') {
+                    throw 'Control dispatcher removal did not converge.'
+                }
+                return [pscustomobject]@{
+                    Status = 'removed'
+                    Path = [string]$baseline.Path
+                    ReceiptPath = [string]$baseline.ReceiptPath
+                }
+            } catch {
+                $failure = $_
+                try {
+                    [System.IO.File]::WriteAllBytes(
+                        [string]$baseline.Path,
+                        $targetPreImage
+                    )
+                    [System.IO.File]::WriteAllBytes(
+                        [string]$baseline.ReceiptPath,
+                        $receiptPreImage
+                    )
+                    $restored =
+                        Get-CodexLocalRemoteControlDispatcherState `
+                            -DataDir $DataDir
+                    if ([string]$restored.Sha256 -cne
+                        [string]$baseline.Sha256) {
+                        throw 'The dispatcher pre-image did not verify.'
+                    }
+                } catch {
+                    throw (
+                        "$($failure.Exception.Message) Control dispatcher " +
+                        "rollback was incomplete: $($_.Exception.Message)"
+                    )
+                }
+                throw $failure
+            }
+        }
+}
+
+function Assert-CodexLocalRemoteSidecarUpdateInvariant {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Baseline,
+
+        [Parameter(Mandatory)]
+        [object]$Current
+    )
+
+    foreach ($required in @(
+        'SelectedVersionId',
+        'SelectedRoot',
+        'BrokerProcessId',
+        'BrokerStartTimeUtcTicks',
+        'RuntimeInvocationId',
+        'UpstreamProcessId',
+        'UpstreamStartTimeUtcTicks',
+        'DesktopRootIdentityKey',
+        'BrokerSidecarCompatibilityId',
+        'CandidateSidecarCompatibilityId',
+        'UnsafeThreadCount',
+        'UnknownCount',
+        'DesktopConnected'
+    )) {
+        if ($null -eq $Baseline.PSObject.Properties[$required] -or
+            $null -eq $Current.PSObject.Properties[$required]) {
+            throw "Sidecar update invariant is missing '$required'."
+        }
+    }
+    if ([string]$Current.SelectedVersionId -cnotmatch
+            '^[a-f0-9]{64}$' -or
+        [string]::IsNullOrWhiteSpace([string]$Current.SelectedRoot) -or
+        [int]$Current.BrokerProcessId -le 0 -or
+        [long]$Current.BrokerStartTimeUtcTicks -le 0 -or
+        [string]$Current.RuntimeInvocationId -cnotmatch
+            '^[a-f0-9]{32}$' -or
+        [int]$Current.UpstreamProcessId -le 0 -or
+        [long]$Current.UpstreamStartTimeUtcTicks -le 0 -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$Current.DesktopRootIdentityKey
+        ) -or
+        [string]$Current.BrokerSidecarCompatibilityId -cnotmatch
+            '^codex-local-remote/broker-sidecar/v[1-9][0-9]*$' -or
+        [string]$Current.CandidateSidecarCompatibilityId -cne
+            [string]$Current.BrokerSidecarCompatibilityId -or
+        [int]$Current.UnsafeThreadCount -ne 0 -or
+        [int]$Current.UnknownCount -ne 0 -or
+        -not [bool]$Current.DesktopConnected) {
+        throw 'Sidecar update invariant is not one safe connected lease.'
+    }
+    foreach ($property in @(
+        'SelectedVersionId',
+        'BrokerProcessId',
+        'BrokerStartTimeUtcTicks',
+        'RuntimeInvocationId',
+        'UpstreamProcessId',
+        'UpstreamStartTimeUtcTicks',
+        'DesktopRootIdentityKey',
+        'BrokerSidecarCompatibilityId',
+        'CandidateSidecarCompatibilityId'
+    )) {
+        if ([string]$Baseline.$property -cne
+            [string]$Current.$property) {
+            throw "Sidecar update invariant drifted at '$property'."
+        }
+    }
+    if (-not [string]::Equals(
+        [string]$Baseline.SelectedRoot,
+        [string]$Current.SelectedRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Sidecar update invariant drifted at 'SelectedRoot'."
+    }
+    return $true
+}
+
+function Invoke-CodexLocalRemoteSidecarUpdateTransaction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$CaptureInvariant,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$StopOldSidecar,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$StartNewSidecar,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$VerifyNewSidecar,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$StopNewSidecar,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$StartOldSidecar,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$VerifyOldSidecar
+    )
+
+    $baseline = & $CaptureInvariant
+    $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+        -Baseline $baseline `
+        -Current $baseline
+    $newSidecar = $null
+    try {
+        $null = & $StopOldSidecar
+        $afterStop = & $CaptureInvariant
+        $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+            -Baseline $baseline `
+            -Current $afterStop
+        $newSidecar = & $StartNewSidecar
+        $verification = & $VerifyNewSidecar $newSidecar
+        $afterStart = & $CaptureInvariant
+        $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+            -Baseline $baseline `
+            -Current $afterStart
+        return [pscustomobject]@{
+            Status = 'updated'
+            Sidecar = $newSidecar
+            Verification = $verification
+            Failure = $null
+        }
+    } catch {
+        $primaryFailure = $_
+        $rollbackSidecar = $null
+        try {
+            if ($null -ne $newSidecar) {
+                $null = & $StopNewSidecar $newSidecar
+            }
+            $rollbackInvariant = & $CaptureInvariant
+            $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+                -Baseline $baseline `
+                -Current $rollbackInvariant
+            $rollbackSidecar = & $StartOldSidecar
+            $rollbackVerification =
+                & $VerifyOldSidecar $rollbackSidecar
+            $finalInvariant = & $CaptureInvariant
+            $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+                -Baseline $baseline `
+                -Current $finalInvariant
+            return [pscustomobject]@{
+                Status = 'rolled-back'
+                Sidecar = $rollbackSidecar
+                Verification = $rollbackVerification
+                Failure = $primaryFailure.Exception.Message
+            }
+        } catch {
+            throw (
+                "$($primaryFailure.Exception.Message) Sidecar-only update " +
+                "rollback failed without restarting Broker or Desktop: " +
+                "$($_.Exception.Message)"
+            )
+        }
+    }
+}
+
+function Get-CodexLocalRemoteDesiredModePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    return [System.IO.Path]::GetFullPath(
+        (Join-Path `
+            ([System.IO.Path]::GetFullPath($DataDir)) `
+            'remote-mode.json')
+    )
+}
+
+function Get-CodexLocalRemoteDesiredMode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $path = Get-CodexLocalRemoteDesiredModePath -DataDir $DataDir
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Mode = 'Native'
+            Status = 'default-native'
+            Path = $path
+        }
+    }
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$item.Length -lt 2 -or
+        [long]$item.Length -gt 131072) {
+        throw "Remote mode receipt '$path' is not ordinary."
+    }
+    try {
+        $receipt = Get-Content `
+            -LiteralPath $path `
+            -Raw `
+            -Encoding utf8 `
+            -ErrorAction Stop |
+            ConvertFrom-Json -Depth 10 -DateKind String -ErrorAction Stop
+    } catch {
+        throw "Remote mode receipt '$path' is invalid JSON."
+    }
+    if ([string]$receipt.Signature -cne
+            'codex-local-remote/desired-mode/v1' -or
+        [int]$receipt.Version -ne 1 -or
+        [string]$receipt.Mode -cnotin @('Remote', 'Native') -or
+        [string]$receipt.RuntimeVersionId -cnotmatch '^[a-f0-9]{64}$' -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$receipt.RuntimeRoot
+        ) -or
+        [string]$receipt.IntentId -cnotmatch '^[a-f0-9]{32}$') {
+        throw "Remote mode receipt '$path' is not canonical."
+    }
+    return [pscustomobject]@{
+        Mode = [string]$receipt.Mode
+        Status = 'explicit'
+        Path = $path
+        RuntimeVersionId = [string]$receipt.RuntimeVersionId
+        RuntimeRoot = [System.IO.Path]::GetFullPath(
+            [string]$receipt.RuntimeRoot
+        )
+        IntentId = [string]$receipt.IntentId
+    }
+}
+
+function Set-CodexLocalRemoteDesiredMode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Remote', 'Native')]
+        [string]$Mode,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$RuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot
+    )
+
+    $resolvedRuntimeRoot =
+        [System.IO.Path]::GetFullPath($RuntimeRoot)
+    $receipt = [ordered]@{
+        Signature = 'codex-local-remote/desired-mode/v1'
+        Version = 1
+        Mode = $Mode
+        RuntimeVersionId = $RuntimeVersionId
+        RuntimeRoot = $resolvedRuntimeRoot
+        IntentId = [Guid]::NewGuid().ToString('N')
+    }
+    Write-AtomicJsonFile `
+        -Path (
+            Get-CodexLocalRemoteDesiredModePath -DataDir $DataDir
+        ) `
+        -Value $receipt
+    $readBack = Get-CodexLocalRemoteDesiredMode -DataDir $DataDir
+    if ([string]$readBack.Mode -cne $Mode -or
+        [string]$readBack.RuntimeVersionId -cne $RuntimeVersionId -or
+        -not [string]::Equals(
+            [string]$readBack.RuntimeRoot,
+            $resolvedRuntimeRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [string]$readBack.IntentId -cne [string]$receipt.IntentId) {
+        throw 'Remote desired mode failed exact read-back verification.'
+    }
+    return $readBack
+}
+
+function Remove-CodexLocalRemoteDesiredMode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    $baseline = Get-CodexLocalRemoteDesiredMode -DataDir $DataDir
+    if ([string]$baseline.Status -ceq 'default-native') {
+        return [pscustomobject]@{ Status = 'not-found' }
+    }
+    $fresh = Get-CodexLocalRemoteDesiredMode -DataDir $DataDir
+    if ([string]$fresh.IntentId -cne [string]$baseline.IntentId) {
+        throw 'Remote desired mode changed before exact removal.'
+    }
+    Remove-Item `
+        -LiteralPath ([string]$baseline.Path) `
+        -Force `
+        -ErrorAction Stop
+    $removed = Get-CodexLocalRemoteDesiredMode -DataDir $DataDir
+    if ([string]$removed.Status -cne 'default-native') {
+        throw 'Remote desired mode removal did not verify.'
+    }
+    return [pscustomobject]@{ Status = 'removed' }
+}
+
 function Get-CurrentStartupTaskFingerprint {
     [CmdletBinding()]
     param()
@@ -3231,18 +6848,19 @@ function Get-CurrentStartupTaskFingerprint {
     return [pscustomobject]@{
         PrincipalUserSid = $identity.User.Value
         PrincipalLogonType = 'Interactive'
-        PrincipalRunLevel = 'Limited'
-        TriggerClass = 'MSFT_TaskLogonTrigger'
-        TriggerUserSid = $identity.User.Value
-        TriggerEnabled = $true
+        PrincipalRunLevel = 'Highest'
+        TriggerCount = 0
+        TriggerClass = ''
+        TriggerUserSid = ''
+        TriggerEnabled = $false
         Settings = [pscustomobject]@{
             DisallowStartIfOnBatteries = $false
             StopIfGoingOnBatteries = $false
             ExecutionTimeLimit = 'P3650D'
             MultipleInstances = 'IgnoreNew'
-            RestartCount = 3
-            RestartInterval = 'PT1M'
-            StartWhenAvailable = $true
+            RestartCount = 0
+            RestartInterval = ''
+            StartWhenAvailable = $false
             Enabled = $true
             AllowDemandStart = $true
             RunOnlyIfIdle = $false
@@ -3265,6 +6883,32 @@ function Add-StartupTaskFingerprint {
             -NotePropertyValue $property.Value
     }
     return $Definition
+}
+
+function ConvertTo-LegacyAutoStartTaskFingerprint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Definition
+    )
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $legacySettings = [ordered]@{}
+    foreach ($property in $Definition.Settings.PSObject.Properties) {
+        $legacySettings[[string]$property.Name] = $property.Value
+    }
+    $legacySettings.StartWhenAvailable = $true
+    $legacySettings.RestartCount = 3
+    $legacySettings.RestartInterval = 'PT1M'
+    $properties.TriggerCount = 1
+    $properties.TriggerClass = 'MSFT_TaskLogonTrigger'
+    $properties.TriggerUserSid = [string]$Definition.PrincipalUserSid
+    $properties.TriggerEnabled = $true
+    $properties.Settings = [pscustomobject]$legacySettings
+    return [pscustomobject]$properties
 }
 
 function Resolve-ScheduledTaskIdentitySid {
@@ -3353,7 +6997,7 @@ function Get-LegacyStartupTaskDefinition {
         (ConvertTo-WindowsCommandLineArgument -Value $resolvedDataDir)
     ) -join ' '
 
-    return Add-StartupTaskFingerprint -Definition ([pscustomobject]@{
+    $definition = Add-StartupTaskFingerprint -Definition ([pscustomobject]@{
         TaskName = $TaskName
         TaskPath = '\'
         Description = 'codex-local-remote/startup-task/v1 - Starts the local-only Codex Local Remote sidecar at user sign-in.'
@@ -3363,6 +7007,8 @@ function Get-LegacyStartupTaskDefinition {
         Cli = $cli
         DataDir = $resolvedDataDir
     })
+    return ConvertTo-LegacyAutoStartTaskFingerprint `
+        -Definition $definition
 }
 
 function Get-StartupTaskDefinition {
@@ -3403,6 +7049,13 @@ function Get-StartupTaskDefinition {
     $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
     $resolvedNode = [System.IO.Path]::GetFullPath($NodePath)
     $resolvedPwsh = [System.IO.Path]::GetFullPath($PwshPath)
+    $windowsRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+    if ([string]::IsNullOrWhiteSpace($windowsRoot)) {
+        throw 'SystemRoot is unavailable; cannot resolve the headless console host.'
+    }
+    $taskExecute = [System.IO.Path]::GetFullPath(
+        (Join-Path $windowsRoot 'System32\conhost.exe')
+    )
     $cli = [System.IO.Path]::GetFullPath((Join-Path $resolvedRoot 'apps\sidecar\dist\cli.js'))
     $brokerCli = [System.IO.Path]::GetFullPath((Join-Path $resolvedRoot 'apps\broker\dist\cli.js'))
     $bootstrap = [System.IO.Path]::GetFullPath((Join-Path $resolvedRoot 'scripts\windows\Start-CodexLocalRemote.ps1'))
@@ -3410,6 +7063,8 @@ function Get-StartupTaskDefinition {
         '-NoLogo'
         '-NoProfile'
         '-NonInteractive'
+        '-WindowStyle'
+        'Hidden'
         '-ExecutionPolicy'
         'Bypass'
         '-File'
@@ -3428,6 +7083,13 @@ function Get-StartupTaskDefinition {
         $BrokerUpstreamPort.ToString([System.Globalization.CultureInfo]::InvariantCulture)
         '-BasePath'
         (ConvertTo-WindowsCommandLineArgument -Value $BasePath)
+        '-DesktopOwnerCoordinator'
+        '-TakeOverExistingNativeDesktop'
+    ) -join ' '
+    $taskArguments = @(
+        '--headless'
+        (ConvertTo-WindowsCommandLineArgument -Value $resolvedPwsh)
+        $arguments
     ) -join ' '
 
     Add-StartupTaskFingerprint -Definition ([pscustomobject]@{
@@ -3436,6 +7098,8 @@ function Get-StartupTaskDefinition {
         Description = $script:StartupTaskDescription
         Execute = $resolvedPwsh
         Arguments = $arguments
+        TaskExecute = $taskExecute
+        TaskArguments = $taskArguments
         WorkingDirectory = $resolvedRoot
         Bootstrap = $bootstrap
         Cli = $cli
@@ -3443,6 +7107,107 @@ function Get-StartupTaskDefinition {
         Node = $resolvedNode
         DataDir = $resolvedDataDir
     })
+}
+
+function Get-LegacyAutoStartStartupTaskDefinitionV5 {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Definition
+    )
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description =
+        $script:LegacyAutoStartStartupTaskV5Description
+    return ConvertTo-LegacyAutoStartTaskFingerprint `
+        -Definition ([pscustomobject]$properties)
+}
+
+function Get-LegacyDesktopOwningStartupTaskDefinitionV3 {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Definition
+    )
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = $script:LegacyDesktopOwningStartupTaskV3Description
+    $currentSuffix =
+        ' -DesktopOwnerCoordinator -TakeOverExistingNativeDesktop'
+    $legacySuffix = ' -TakeOverExistingNativeDesktop'
+    foreach ($name in @('Arguments', 'TaskArguments')) {
+        if (-not $properties.Contains($name)) {
+            continue
+        }
+        $value = [string]$properties[$name]
+        if (-not $value.EndsWith(
+            $currentSuffix,
+            [System.StringComparison]::Ordinal
+        )) {
+            throw "The current startup task definition does not end with $currentSuffix."
+        }
+        $properties[$name] =
+            $value.Substring(0, $value.Length - $currentSuffix.Length) +
+            $legacySuffix
+    }
+    return ConvertTo-LegacyAutoStartTaskFingerprint `
+        -Definition ([pscustomobject]$properties)
+}
+
+function Get-LegacyHeadlessStartupTaskDefinitionV4 {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Definition
+    )
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = $script:LegacyHeadlessStartupTaskV4Description
+    $currentSuffix =
+        ' -DesktopOwnerCoordinator -TakeOverExistingNativeDesktop'
+    $legacySuffix = ' -NoDesktopLaunch'
+    foreach ($name in @('Arguments', 'TaskArguments')) {
+        if (-not $properties.Contains($name)) {
+            continue
+        }
+        $value = [string]$properties[$name]
+        if (-not $value.EndsWith(
+            $currentSuffix,
+            [System.StringComparison]::Ordinal
+        )) {
+            throw "The current startup task definition does not end with $currentSuffix."
+        }
+        $properties[$name] =
+            $value.Substring(0, $value.Length - $currentSuffix.Length) +
+            $legacySuffix
+    }
+    return ConvertTo-LegacyAutoStartTaskFingerprint `
+        -Definition ([pscustomobject]$properties)
+}
+
+function Get-PreHeadlessConsoleStartupTaskDefinition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Definition
+    )
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.TaskExecute = [string]$Definition.Execute
+    $properties.TaskArguments = [string]$Definition.Arguments
+    return [pscustomobject]$properties
 }
 
 function Get-PinnedStartupTaskDefinitionV2 {
@@ -3520,7 +7285,7 @@ function Get-PinnedStartupTaskDefinitionV2 {
         (ConvertTo-WindowsCommandLineArgument -Value $BasePath)
     ) -join ' '
 
-    return Add-StartupTaskFingerprint -Definition ([pscustomobject]@{
+    $definition = Add-StartupTaskFingerprint -Definition ([pscustomobject]@{
         TaskName = $TaskName
         TaskPath = '\'
         Description = $script:PinnedStartupTaskV2Description
@@ -3534,6 +7299,8 @@ function Get-PinnedStartupTaskDefinitionV2 {
         Node = $resolvedNode
         DataDir = $resolvedDataDir
     })
+    return ConvertTo-LegacyAutoStartTaskFingerprint `
+        -Definition $definition
 }
 
 function Test-ManagedStartupTask {
@@ -3569,9 +7336,23 @@ function Test-ManagedStartupTask {
         $mismatches.Add('action count')
     } else {
         $action = $actions[0]
+        $expectedTaskExecute = if (
+            $null -ne $Expected.PSObject.Properties['TaskExecute']
+        ) {
+            [string]$Expected.TaskExecute
+        } else {
+            [string]$Expected.Execute
+        }
+        $expectedTaskArguments = if (
+            $null -ne $Expected.PSObject.Properties['TaskArguments']
+        ) {
+            [string]$Expected.TaskArguments
+        } else {
+            [string]$Expected.Arguments
+        }
         foreach ($actionSpec in @(
-            @{ Name = 'Execute'; Expected = [string]$Expected.Execute; Mismatch = 'action executable' },
-            @{ Name = 'Arguments'; Expected = [string]$Expected.Arguments; Mismatch = 'action arguments' },
+            @{ Name = 'Execute'; Expected = $expectedTaskExecute; Mismatch = 'action executable' },
+            @{ Name = 'Arguments'; Expected = $expectedTaskArguments; Mismatch = 'action arguments' },
             @{
                 Name = 'WorkingDirectory'
                 Expected = [string]$Expected.WorkingDirectory
@@ -3625,14 +7406,27 @@ function Test-ManagedStartupTask {
     }
 
     $triggersProperty = Get-StartupTaskObjectProperty -InputObject $Task -Name 'Triggers'
-    $triggers = @(
-        if ($triggersProperty.Exists) {
-            $triggersProperty.Value
+    $triggers = [System.Collections.Generic.List[object]]::new()
+    if (
+        $triggersProperty.Exists -and
+        $null -ne $triggersProperty.Value
+    ) {
+        foreach ($triggerValue in @($triggersProperty.Value)) {
+            $triggers.Add($triggerValue)
         }
-    )
-    if ($triggers.Count -ne 1) {
-        $mismatches.Add('logon trigger count')
+    }
+    $expectedTriggerCount = if (
+        $null -ne $Expected.PSObject.Properties['TriggerCount']
+    ) {
+        [int]$Expected.TriggerCount
     } else {
+        1
+    }
+    if (-not $triggersProperty.Exists) {
+        $mismatches.Add('triggers')
+    } elseif ($triggers.Count -ne $expectedTriggerCount) {
+        $mismatches.Add('logon trigger count')
+    } elseif ($expectedTriggerCount -eq 1) {
         $trigger = $triggers[0]
         $cimClassProperty = Get-StartupTaskObjectProperty -InputObject $trigger -Name 'CimClass'
         $triggerClass = $null
@@ -3858,8 +7652,13 @@ Export-ModuleMember -Function @(
     'Get-BrokerCapabilityTokenPath',
     'Resolve-CodexDesktopPackageStatusIdentity',
     'Resolve-CodexDesktopRuntime',
+    'Get-CodexLocalRemoteManagedDesktopIconPath',
+    'Test-CodexLocalRemoteManagedDesktopIcon',
+    'Install-CodexLocalRemoteManagedDesktopIcon',
+    'Remove-CodexLocalRemoteManagedDesktopIcon',
     'Assert-CodexLocalRemoteDataDirectoryPath',
     'Get-CodexLocalRemoteDataDirectoryOwnershipPlan',
+    'Assert-CodexLocalRemoteDataDirectoryStartupProtection',
     'Protect-CodexLocalRemoteDataDirectory',
     'Test-BrokerCapabilityToken',
     'Read-BrokerCapabilityToken',
@@ -3880,22 +7679,68 @@ Export-ModuleMember -Function @(
     'Test-ManagedBrokerProcess',
     'Test-ManagedSidecarProcess',
     'Test-ManagedBootstrapProcess',
+    'Get-ManagedBootstrapProcessContract',
     'Test-IndependentDesktopAppServer',
+    'Get-CodexLocalRemoteDesktopHandoffPreparationPath',
+    'Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot',
+    'Read-CodexLocalRemoteDesktopHandoffPreparation',
+    'New-CodexLocalRemoteDesktopHandoffPreparation',
+    'Set-CodexLocalRemoteDesktopHandoffPreparationReady',
+    'Set-CodexLocalRemoteDesktopHandoffPreparationAttaching',
+    'Complete-CodexLocalRemoteDesktopHandoffPreparation',
     'Assert-ForceCliDisabled',
     'Write-AtomicJsonFile',
+    'Get-CodexDesktopOwnerIntentPath',
+    'Get-CodexDesktopOwnerConnectionProofPath',
+    'Get-CodexDesktopOwnerRootIdentityKey',
+    'Invoke-WithCodexDesktopOwnerMutex',
+    'New-CodexDesktopOwnerIntent',
+    'New-CodexDesktopOwnerIntentUnderOwnerLock',
+    'Get-CodexDesktopOwnerIntentFreshnessDecision',
+    'Read-CodexDesktopOwnerIntent',
+    'Complete-CodexDesktopOwnerIntent',
+    'Write-CodexDesktopOwnerConnectionProof',
+    'Read-CodexDesktopOwnerConnectionProof',
+    'Remove-CodexDesktopOwnerConnectionProof',
+    'Test-CodexDesktopOwnerResumeGap',
+    'Get-CodexDesktopOwnerDecision',
+    'Test-CodexDesktopNonceReadinessSnapshot',
+    'Test-CodexDesktopOwnerConnectedProof',
+    'Test-CodexDesktopOwnerConnectionProof',
+    'Get-CodexLocalRemoteManagedConfiguration',
+    'Set-CodexLocalRemoteManagedConfiguration',
     'Get-CodexLocalRemoteRuntimeVersionPlan',
     'Test-CodexLocalRemoteRuntimeVersion',
     'Install-CodexLocalRemoteRuntimeVersion',
     'Get-CodexLocalRemoteCurrentRuntime',
+    'Get-CodexLocalRemoteRuntimeTaskPreImage',
     'Set-CodexLocalRemoteCurrentRuntime',
+    'Sync-CodexLocalRemoteCurrentRuntime',
     'Get-UserEnvironmentValueState',
     'New-BrokerEnvironmentBackupState',
     'Set-UserEnvironmentValue',
     'Install-BrokerUserEnvironment',
     'Assert-BrokerUserEnvironmentRestorable',
     'Restore-BrokerUserEnvironment',
+    'Get-CodexLocalRemoteControlDispatcherPath',
+    'Get-CodexLocalRemoteControlDispatcherReceiptPath',
+    'Test-CodexLocalRemoteControlDispatcher',
+    'Get-CodexLocalRemoteControlDispatcherState',
+    'Invoke-WithCodexLocalRemoteControlDispatcherMutex',
+    'Install-CodexLocalRemoteControlDispatcher',
+    'Remove-CodexLocalRemoteControlDispatcher',
+    'Assert-CodexLocalRemoteSidecarUpdateInvariant',
+    'Invoke-CodexLocalRemoteSidecarUpdateTransaction',
+    'Get-CodexLocalRemoteDesiredModePath',
+    'Get-CodexLocalRemoteDesiredMode',
+    'Set-CodexLocalRemoteDesiredMode',
+    'Remove-CodexLocalRemoteDesiredMode',
     'Get-LegacyStartupTaskDefinition',
     'Get-StartupTaskDefinition',
+    'Get-LegacyAutoStartStartupTaskDefinitionV5',
+    'Get-LegacyHeadlessStartupTaskDefinitionV4',
+    'Get-LegacyDesktopOwningStartupTaskDefinitionV3',
+    'Get-PreHeadlessConsoleStartupTaskDefinition',
     'Get-PinnedStartupTaskDefinitionV2',
     'Test-ManagedStartupTask',
     'ConvertTo-CanonicalJson',

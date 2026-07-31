@@ -21,6 +21,7 @@ interface RuntimeStatus {
   UpstreamIdentityReady: boolean;
   StartupInvocationReady: boolean;
   RuntimeReceiptReady: boolean;
+  DesktopOwnerProofReady: boolean;
 }
 
 interface DriverResult {
@@ -99,11 +100,29 @@ windowsOnly("Windows runtime receipt status", () => {
         UpstreamIdentityReady: true,
         StartupInvocationReady: true,
         RuntimeReceiptReady: true,
+        DesktopOwnerProofReady: true,
       });
       expect(result.TokenReadCount).toBe(0);
       expect(result.OutputContainsTokenSentinel).toBe(false);
     },
   );
+
+  it.each([
+    "proof-missing",
+    "proof-digest-mismatch",
+    "proof-runtime-mismatch",
+    "proof-root-mismatch",
+    "proof-unknown-client",
+  ])("keeps transport telemetry but rejects formal owner proof for %s", (mode) => {
+    const result = getStatus(mode);
+    expect(result.Status).toMatchObject({
+      Ready: false,
+      RuntimeReceiptReady: true,
+      DesktopOwnerProofReady: false,
+    });
+    expect(result.TokenReadCount).toBe(0);
+    expect(result.OutputContainsTokenSentinel).toBe(false);
+  });
 
   it.each(["runtime-package-drift", "runtime-hash-drift"])(
     "marks %s update-pending and fails the aggregate readiness gate",

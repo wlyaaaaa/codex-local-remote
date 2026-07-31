@@ -18,6 +18,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'CodexLocalRemote.Windows.psm1') -Force
+$managedConfiguration = Get-CodexLocalRemoteManagedConfiguration -DataDir $DataDir
+if ($null -ne $managedConfiguration) {
+    if (-not $PSBoundParameters.ContainsKey('BrokerPort')) {
+        $BrokerPort = [int]$managedConfiguration.BrokerPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BrokerUpstreamPort')) {
+        $BrokerUpstreamPort = [int]$managedConfiguration.BrokerUpstreamPort
+    }
+}
 
 $resolvedCodex = if ([string]::IsNullOrWhiteSpace($CodexPath)) {
     $null

@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet(
         'add-everyone-rule',
+        'assert-startup-protection',
         'current-sid',
         'inspect-acl',
         'plan',
@@ -29,6 +30,11 @@ switch ($Operation) {
             throw "icacls failed to introduce the test-only ACL drift: $output"
         }
         [pscustomobject]@{ Status = 'widened' } | ConvertTo-Json -Compress
+    }
+    'assert-startup-protection' {
+        Assert-CodexLocalRemoteDataDirectoryStartupProtection `
+            -DataDir $DataDir |
+            ConvertTo-Json -Compress -Depth 10
     }
     'current-sid' {
         [pscustomobject]@{

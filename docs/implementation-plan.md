@@ -50,11 +50,20 @@
 - 白底绿色设计系统；
 - Android Chrome、小米级旗舰尺寸、微信/系统浏览器基础兼容；
 - PWA 可选安装；
-- 当前用户登录启动、隐藏运行、单实例与诊断；
-- 提供不带常驻控制台的“ChatGPT 远程”入口，并用系统通知明确连接成功或
-  原生降级；用户不需要查看端口判断；
-- 每次启动动态发现当前 Desktop/app-server，兼容更新直接接管，不兼容更新
-  明确报警并 fail-open；不绑定 WindowsApps 版本目录或旧 hash；
+- 当前用户 `Interactive` / `Highest` 按需任务、隐藏运行、单实例与诊断；
+- 普通 vendor 启动、Codex 更新、Windows 重启和睡眠恢复永远原生；固定
+  DataDir dispatcher 承接显式 Open/Close/Status；
+- 提供不带常驻控制台的可选“ChatGPT 远程”兼容入口；它只调用固定 dispatcher
+  的显式 Open，不绑定 Desktop、源码目录或不可变运行代；
+- `Interactive` / `Highest` 计划任务中的 coordinator 独占受管 Desktop
+  process ownership，并从同会话 Explorer 的 medium-integrity primary token
+  创建 attached Desktop；只有显式 Open 授权时才允许至多一次受控交接；
+- 每次显式 Open 动态发现当前 Desktop/app-server；已 ready 时零重启，可兼容的
+  Web/Sidecar 更新只滚动公网层，不兼容更新明确报警并 fail-closed；
+- `-NoStart` 只登记内容寻址运行代；任务无登录触发、无 catch-up、无自动重启，
+  登记不得改变活动 Desktop/Broker/Sidecar；
+- Store 更新只更新发现结果，不接管普通 vendor 根；下次显式 Open 重新核对
+  package path/hash/generation 与 Broker receipt；
 - 诊断命令硬超时，单个状态源不可读时返回局部 unknown，不阻塞整体结果；
 - Tailscale Funnel 增量路径安装；
 - 公开安全复核、GitHub Actions、版本与升级说明。

@@ -16,6 +16,7 @@ import type { RawData } from "ws";
 
 import { BrokerCoordinator } from "./coordinator.js";
 import type { BrokerPair, BrokerWire } from "./coordinator.js";
+import { WebSocketLivenessMonitor } from "./websocket-liveness.js";
 
 export interface OwnedAppServer {
   endpoint: string;
@@ -37,6 +38,9 @@ export interface BrokerRuntimeOptions {
   capabilityToken?: string;
   codexPath: string;
   dataDir: string;
+  heartbeatDeadlineMs?: number;
+  heartbeatIntervalMs?: number;
+  heartbeatResumeToleranceMs?: number;
   host?: string;
   launchOwnedAppServer?: (options: LaunchOwnedAppServerOptions) => Promise<OwnedAppServer>;
   maxFrameBytes?: number;
@@ -70,6 +74,9 @@ const DEFAULT_UPSTREAM_PORT = 18_792;
 // 16 MiB ceiling. This listener is loopback-only and capability-authenticated,
 // so retain a finite bound while allowing real large-thread history.
 export const DEFAULT_BROKER_MAX_FRAME_BYTES = 128 * 1024 * 1024;
+export const DEFAULT_BROKER_HEARTBEAT_INTERVAL_MS = 30_000;
+export const DEFAULT_BROKER_HEARTBEAT_DEADLINE_MS = 30_000;
+export const DEFAULT_BROKER_HEARTBEAT_RESUME_TOLERANCE_MS = 5_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const STARTUP_PROBE_TIMEOUT_MS = 500;
 const MIN_CAPABILITY_TOKEN_LENGTH = 43;
@@ -78,6 +85,7 @@ const MAX_CAPABILITY_TOKEN_LENGTH = 256;
 const CAPABILITY_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/u;
 const APP_SERVER_LEASE_FILENAME = "app-server-upstream.lease";
 const UPSTREAM_TOKEN_FILENAME = "app-server-upstream.token";
+const DESKTOP_LAUNCH_NONCE_QUERY_PARAMETER = "desktopLaunchNonce";
 
 export async function startBroker(options: BrokerRuntimeOptions): Promise<RunningBroker> {
   const host = options.host ?? DEFAULT_HOST;
@@ -85,6 +93,10 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
   const upstreamHost = options.upstreamHost ?? DEFAULT_HOST;
   const upstreamPort = options.upstreamPort ?? DEFAULT_UPSTREAM_PORT;
   const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_BROKER_MAX_FRAME_BYTES;
+  const heartbeatDeadlineMs = options.heartbeatDeadlineMs ?? DEFAULT_BROKER_HEARTBEAT_DEADLINE_MS;
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_BROKER_HEARTBEAT_INTERVAL_MS;
+  const heartbeatResumeToleranceMs =
+    options.heartbeatResumeToleranceMs ?? DEFAULT_BROKER_HEARTBEAT_RESUME_TOLERANCE_MS;
   const capabilityToken = assertHighEntropyCapabilityToken(
     options.capabilityToken ?? generateCapabilityToken(),
   );
@@ -96,6 +108,14 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
   assertPort(port, "port", true);
   assertPort(upstreamPort, "upstreamPort", true);
   assertPositiveInteger(maxFrameBytes, "maxFrameBytes");
+  assertPositiveInteger(heartbeatDeadlineMs, "heartbeatDeadlineMs");
+  assertPositiveInteger(heartbeatIntervalMs, "heartbeatIntervalMs");
+  assertNonNegativeInteger(heartbeatResumeToleranceMs, "heartbeatResumeToleranceMs");
+  const liveness = new WebSocketLivenessMonitor({
+    deadlineMs: heartbeatDeadlineMs,
+    intervalMs: heartbeatIntervalMs,
+    resumeToleranceMs: heartbeatResumeToleranceMs,
+  });
 
   const launchOwnedAppServer = options.launchOwnedAppServer ?? launchCodexAppServer;
   const owned = await launchOwnedAppServer({
@@ -135,6 +155,7 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
   });
 
   const closeAllPairs = () => {
+    liveness.stop();
     coordinator.stop();
     activePairs.clear();
     for (const client of webSocketServer.clients) {
@@ -194,24 +215,23 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
       rejectUpgrade(socket, 403, "Forbidden");
       return;
     }
-    if (request.url !== capabilityPath) {
+    const launchIdentity = parseDownstreamLaunchIdentity(request.url, capabilityPath);
+    if (!launchIdentity) {
       rejectUpgrade(socket, 404, "Not Found");
       return;
     }
     webSocketServer.handleUpgrade(request, socket, head, (downstream) => {
-      webSocketServer.emit("connection", downstream, request);
+      connectDownstream(
+        coordinator,
+        activePairs,
+        downstream,
+        upstreamEndpoint,
+        upstreamCapabilityToken,
+        maxFrameBytes,
+        liveness,
+        launchIdentity.desktopLaunchNonceDigest,
+      );
     });
-  });
-
-  webSocketServer.on("connection", (downstream) => {
-    connectDownstream(
-      coordinator,
-      activePairs,
-      downstream,
-      upstreamEndpoint,
-      upstreamCapabilityToken,
-      maxFrameBytes,
-    );
   });
 
   try {
@@ -235,6 +255,7 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
     detachOwnedExit();
     ready = false;
     stopped = true;
+    closeAllPairs();
     await closeHttpServer(server);
     await closeWebSocketServer(webSocketServer);
     await owned.stop();
@@ -473,6 +494,8 @@ function connectDownstream(
   upstreamEndpoint: string,
   upstreamCapabilityToken: string,
   maxFrameBytes: number,
+  liveness: WebSocketLivenessMonitor,
+  desktopLaunchNonceDigest?: string,
 ): void {
   const upstream = new WebSocket(upstreamEndpoint, {
     headers: {
@@ -485,15 +508,44 @@ function connectDownstream(
   let bufferedBytes = 0;
   const downstreamBuffer: string[] = [];
   const upstreamBuffer: string[] = [];
+  let detachLiveness: () => void = () => undefined;
 
   const closeBeforeAttach = (code: number, reason: string) => {
     if (closed) {
       return;
     }
     closed = true;
+    detachLiveness();
     closeSocket(downstream, code, reason);
     closeSocket(upstream, code, reason);
   };
+  const closeAttachedPair = () => {
+    if (closed || !pair) {
+      return;
+    }
+    closed = true;
+    detachLiveness();
+    activePairs.delete(pair);
+    pair.close();
+  };
+  const failLiveness = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    detachLiveness();
+    if (pair) {
+      activePairs.delete(pair);
+      try {
+        pair.close();
+      } catch {
+        // Both WebSocket legs are still force-terminated below.
+      }
+    }
+    terminateSocket(downstream);
+    terminateSocket(upstream);
+  };
+  detachLiveness = liveness.watchPair(downstream, upstream, failLiveness);
 
   downstream.on("message", (data, isBinary) => {
     const frame = decodeTextFrame(data, isBinary, maxFrameBytes);
@@ -530,6 +582,7 @@ function connectDownstream(
       return;
     }
     pair = coordinator.attach({
+      ...(desktopLaunchNonceDigest === undefined ? {} : { desktopLaunchNonceDigest }),
       downstream: webSocketWire(downstream),
       upstream: webSocketWire(upstream),
     });
@@ -543,30 +596,28 @@ function connectDownstream(
   });
   upstream.on("error", () => {
     if (pair) {
-      pair.close();
+      closeAttachedPair();
     } else {
       closeBeforeAttach(1011, "upstream connection failed");
     }
   });
   downstream.on("error", () => {
     if (pair) {
-      pair.close();
+      closeAttachedPair();
     } else {
       closeBeforeAttach(1011, "downstream connection failed");
     }
   });
   upstream.once("close", () => {
     if (pair) {
-      activePairs.delete(pair);
-      pair.close();
+      closeAttachedPair();
     } else {
       closeBeforeAttach(1011, "upstream connection closed");
     }
   });
   downstream.once("close", () => {
     if (pair) {
-      activePairs.delete(pair);
-      pair.close();
+      closeAttachedPair();
     } else {
       closeBeforeAttach(1001, "downstream connection closed");
     }
@@ -578,6 +629,8 @@ interface BrokerReadiness {
   brokerProcessId: number;
   degraded: boolean;
   desktopConnected: boolean;
+  desktopConnectionCount: number;
+  desktopLaunchNonceDigests: string[];
   runtimeInvocationId: string;
   sidecarConnected: boolean;
   unknownCount: number;
@@ -657,6 +710,17 @@ function closeSocket(socket: WebSocket, code: number, reason: string): void {
     socket.close(code, reason);
   } catch {
     socket.terminate();
+  }
+}
+
+function terminateSocket(socket: WebSocket): void {
+  if (socket.readyState === WebSocket.CLOSED) {
+    return;
+  }
+  try {
+    socket.terminate();
+  } catch {
+    // Liveness eviction is best effort per leg; pair cleanup already ran.
   }
 }
 
@@ -843,6 +907,47 @@ export function assertHighEntropyCapabilityToken(token: string): string {
     );
   }
   return token;
+}
+
+interface DownstreamLaunchIdentity {
+  desktopLaunchNonceDigest?: string;
+}
+
+function parseDownstreamLaunchIdentity(
+  requestUrl: string | undefined,
+  capabilityPath: string,
+): DownstreamLaunchIdentity | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(requestUrl ?? "", "ws://127.0.0.1");
+  } catch {
+    return undefined;
+  }
+  if (parsed.pathname !== capabilityPath || parsed.hash !== "") {
+    return undefined;
+  }
+  if (parsed.search === "") {
+    return {};
+  }
+  const launchNonces = parsed.searchParams.getAll(DESKTOP_LAUNCH_NONCE_QUERY_PARAMETER);
+  if (launchNonces.length !== 1) {
+    return undefined;
+  }
+  const launchNonce = launchNonces[0];
+  if (launchNonce === undefined) {
+    return undefined;
+  }
+  try {
+    assertHighEntropyCapabilityToken(launchNonce);
+  } catch {
+    return undefined;
+  }
+  if (parsed.search !== `?${DESKTOP_LAUNCH_NONCE_QUERY_PARAMETER}=${launchNonce}`) {
+    return undefined;
+  }
+  return {
+    desktopLaunchNonceDigest: createHash("sha256").update(launchNonce, "utf8").digest("hex"),
+  };
 }
 
 async function acquireWindowsPipeLease(dataDir: string): Promise<AppServerDataDirLease> {
@@ -1061,6 +1166,12 @@ function assertPort(value: number, name: string, allowZero: boolean): void {
 function assertPositiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new TypeError(`${name} must be a positive integer`);
+  }
+}
+
+function assertNonNegativeInteger(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative integer`);
   }
 }
 

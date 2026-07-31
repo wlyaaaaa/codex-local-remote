@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
+import path from "node:path";
 
 import {
   RpcConnectionClosedError,
@@ -64,6 +65,7 @@ import {
   listProjectFiles,
   resolveProjectFileReference,
 } from "./files.js";
+import { HostFileStore } from "./host-files.js";
 import type { SessionLookup, SidecarStateStore } from "./state-store.js";
 import type { SidecarTurnQueueApi } from "./turn-queue.js";
 import { OutboxConflictError } from "./turn-outbox.js";
@@ -105,6 +107,7 @@ export interface SidecarDomainApi {
   }): Promise<ThreadPage>;
   resumeThread(threadId: string): Promise<ThreadDetail>;
   clearThreadGoal(threadId: string): Promise<void>;
+  setThreadArchived(threadId: string, archived: boolean): Promise<void>;
   setThreadGoal(threadId: string, input: SetThreadGoalInput): Promise<void>;
   setThreadName(threadId: string, name: string): Promise<void>;
   startTurn(threadId: string, input: SendTurnInput): Promise<TurnCommandResult>;
@@ -118,6 +121,7 @@ export interface CreateSidecarServerOptions {
   diagnostics: () => DiagnosticSnapshot;
   domain: SidecarDomainApi;
   events: RemoteEventBuffer;
+  hostFiles?: HostFileStore;
   queue?: SidecarTurnQueueApi;
   requestReady?: () => boolean;
   state: SidecarStateStore;
@@ -158,9 +162,18 @@ export async function createSidecarServer(
   );
   const api = `${config.basePath}/api/v1`;
   const uploads = await BrowserUploadStore.open(config.dataDir);
+  const hostFiles = options.hostFiles ?? (await HostFileStore.open());
   const streamInstanceId = randomUUID();
   const idempotencyCache = new Map<string, Promise<CachedCommand>>();
+  const runIdempotent = async (
+    request: FastifyRequest,
+    authentication: AuthenticatedRequest,
+    cache: Map<string, Promise<CachedCommand>>,
+    command: () => Promise<CachedCommand>,
+  ): Promise<CachedCommand> =>
+    await runPersistedIdempotent(request, authentication, cache, state, command);
   const recentThreadDetails = new Map<string, CachedThreadDetail>();
+  const recentThreadSnapshotWatermarks = new Map<string, number>();
   const loginLimiter = new LoginRateLimiter({
     baseDelayMs: 500,
     global: { lockoutMs: 15 * 60_000, maxAttempts: 50, windowMs: 10 * 60_000 },
@@ -353,14 +366,16 @@ export async function createSidecarServer(
     const historyCursor = optionalString(query.historyCursor);
     const threadId = routeParameter(request, "threadId");
     if (includeItems && historyCursor === undefined) {
-      return await loadRecentThreadDetail(threadId);
+      const snapshotEventSeq = events.latestSequence;
+      rememberThreadSnapshotWatermark(threadId, snapshotEventSeq);
+      return await loadRecentThreadDetail(threadId, snapshotEventSeq);
     }
     const snapshotEventSeq = events.latestSequence;
     const detail =
       includeItems && historyCursor !== undefined
         ? await domain.getThread(threadId, { historyCursor })
         : await domain.getThread(threadId, { includeTurns: false });
-    return attachSnapshotEventSequence(detail, snapshotEventSeq);
+    return attachSnapshotEventSequence(detail, snapshotEventSeq, streamInstanceId);
   });
 
   app.post(`${api}/uploads`, async (request, reply) => {
@@ -461,7 +476,10 @@ export async function createSidecarServer(
       const created = await domain.createThread(parseCreateThreadInput(request.body));
       publishDegradations(created.degradations, events);
       rememberThreadDetail(created.data, snapshotEventSeq);
-      return { body: attachSnapshotEventSequence(created.data, snapshotEventSeq), status: 201 };
+      return {
+        body: attachSnapshotEventSequence(created.data, snapshotEventSeq, streamInstanceId),
+        status: 201,
+      };
     });
     return await sendCached(reply, result);
   });
@@ -474,7 +492,7 @@ export async function createSidecarServer(
       const detail = await domain.resumeThread(threadId);
       rememberThreadDetail(detail, snapshotEventSeq);
       return {
-        body: attachSnapshotEventSequence(detail, snapshotEventSeq),
+        body: attachSnapshotEventSequence(detail, snapshotEventSeq, streamInstanceId),
         status: 200,
       };
     });
@@ -493,10 +511,26 @@ export async function createSidecarServer(
   app.put(`${api}/threads/:threadId/name`, async (request, reply) => {
     const authentication = await requireProtectedMutation(request, state);
     const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const threadId = routeParameter(request, "threadId");
       await domain.setThreadName(
-        routeParameter(request, "threadId"),
+        threadId,
         requireString(asRecord(request.body).name, "请输入对话名称"),
       );
+      recentThreadDetails.delete(threadId);
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.put(`${api}/threads/:threadId/archive`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const threadId = routeParameter(request, "threadId");
+      await domain.setThreadArchived(
+        threadId,
+        requireBoolean(asRecord(request.body).archived, "请选择归档或恢复"),
+      );
+      recentThreadDetails.delete(threadId);
       return { status: 204 };
     });
     return await sendCached(reply, result);
@@ -549,7 +583,7 @@ export async function createSidecarServer(
       const threadId = routeParameter(request, "threadId");
       await domain.startTurn(threadId, parseSendTurnInput(request.body));
       return {
-        body: await loadRecentThreadDetail(threadId, snapshotEventSeq),
+        body: await loadRecentThreadDetail(threadId, snapshotEventSeq, false),
         status: 200,
       };
     });
@@ -627,6 +661,12 @@ export async function createSidecarServer(
     if (page.nextCursor) {
       reply.header("X-Next-Cursor", page.nextCursor);
     }
+    if (page.historyIntegrity) {
+      reply.header(
+        "X-Subagent-History-Integrity",
+        encodeURIComponent(JSON.stringify(page.historyIntegrity)),
+      );
+    }
     return page.data;
   });
 
@@ -656,35 +696,56 @@ export async function createSidecarServer(
     return await sendCached(reply, result);
   });
 
+  app.get(`${api}/file-roots`, async (request) => {
+    await requireAuthentication(request, state);
+    return hostFiles.roots();
+  });
+
   app.get(`${api}/files`, async (request) => {
     await requireAuthentication(request, state);
     const query = asRecord(request.query);
-    return await listProjectFiles(
-      state,
-      requireString(query.projectId, "请选择项目"),
-      optionalString(query.path) ?? "",
-    );
+    const projectId = requireString(query.projectId, "请选择磁盘或项目");
+    const relativePath = optionalString(query.path) ?? "";
+    return hostFiles.isHostProject(projectId)
+      ? await hostFiles.list(projectId, relativePath)
+      : await listProjectFiles(state, projectId, relativePath);
   });
 
   app.get(`${api}/files/resolve`, async (request) => {
     await requireAuthentication(request, state);
     const query = asRecord(request.query);
-    return await resolveProjectFileReference(
-      state,
-      optionalString(query.projectId),
-      requireString(query.path, "请选择文件"),
-    );
+    const projectId = optionalString(query.projectId);
+    const sourcePath = requireString(query.path, "请选择文件");
+    if (projectId === undefined) {
+      try {
+        return await uploads.resolveHistoryPath(sourcePath);
+      } catch (error) {
+        if (
+          !(error instanceof ProductHttpError) ||
+          error.code !== "UPLOAD_HISTORY_NOT_APPLICABLE"
+        ) {
+          throw error;
+        }
+      }
+      if (path.isAbsolute(sourcePath)) {
+        return await hostFiles.grantAbsolutePath(sourcePath);
+      }
+    }
+    return hostFiles.isHostProject(projectId)
+      ? await hostFiles.resolve(requireString(projectId, "请选择磁盘"), sourcePath)
+      : await resolveProjectFileReference(state, projectId, sourcePath);
   });
 
   app.get(`${api}/files/preview`, async (request, reply) => {
     await requireAuthentication(request, state);
     const query = asRecord(request.query);
     const relativePath = requireString(query.path, "请选择文件");
-    const file = await getProjectPreview(
-      state,
-      requireString(query.projectId, "请选择项目"),
-      relativePath,
-    );
+    const projectId = requireString(query.projectId, "请选择项目");
+    const file = uploads.isHistoryProject(projectId)
+      ? await uploads.getPreview(projectId, relativePath)
+      : hostFiles.isHostProject(projectId)
+        ? await hostFiles.getPreview(projectId, relativePath)
+        : await getProjectPreview(state, projectId, relativePath);
     reply
       .header("Cache-Control", "no-store")
       .header("Content-Disposition", contentDisposition("inline", relativePath))
@@ -700,11 +761,12 @@ export async function createSidecarServer(
     await requireAuthentication(request, state);
     const query = asRecord(request.query);
     const relativePath = requireString(query.path, "请选择文件");
-    const file = await getProjectDownload(
-      state,
-      requireString(query.projectId, "请选择项目"),
-      relativePath,
-    );
+    const projectId = requireString(query.projectId, "请选择项目");
+    const file = uploads.isHistoryProject(projectId)
+      ? await uploads.getDownload(projectId, relativePath)
+      : hostFiles.isHostProject(projectId)
+        ? await hostFiles.getDownload(projectId, relativePath)
+        : await getProjectDownload(state, projectId, relativePath);
     reply
       .header("Cache-Control", "no-store")
       .header("Content-Disposition", contentDisposition("attachment", relativePath))
@@ -714,6 +776,99 @@ export async function createSidecarServer(
       void file.handle.close().catch(() => undefined);
     });
     return await reply.send(stream);
+  });
+
+  app.post(`${api}/files/folders`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const body = asRecord(request.body);
+      const projectId = requireHostMutationProject(hostFiles, body.projectId);
+      await hostFiles.createDirectory(projectId, requireString(body.path, "请输入文件夹名称"));
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.put(`${api}/files/content`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const query = asRecord(request.query);
+      const projectId = requireHostMutationProject(hostFiles, query.projectId);
+      const body = request.body;
+      if (!Buffer.isBuffer(body)) {
+        throw new ProductHttpError("INVALID_FILE_CONTENT", "上传内容无效", 400);
+      }
+      await hostFiles.writeFile(
+        projectId,
+        requireString(query.path, "请输入文件名"),
+        body,
+        optionalBoolean(query.overwrite) ?? false,
+      );
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.post(`${api}/files/rename`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const body = asRecord(request.body);
+      const projectId = requireHostMutationProject(hostFiles, body.projectId);
+      await hostFiles.rename(
+        projectId,
+        requireString(body.path, "请选择文件"),
+        requireString(body.name, "请输入新名称"),
+      );
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.post(`${api}/files/copy`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const body = asRecord(request.body);
+      await hostFiles.copy({
+        sourcePath: requireString(body.sourcePath, "请选择源文件"),
+        sourceProjectId: requireHostMutationProject(hostFiles, body.sourceProjectId),
+        targetPath: requireString(body.targetPath, "请选择目标位置"),
+        targetProjectId: requireHostMutationProject(hostFiles, body.targetProjectId),
+        overwrite: optionalBoolean(body.overwrite) ?? false,
+      });
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.post(`${api}/files/move`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const body = asRecord(request.body);
+      await hostFiles.move({
+        sourcePath: requireString(body.sourcePath, "请选择源文件"),
+        sourceProjectId: requireHostMutationProject(hostFiles, body.sourceProjectId),
+        targetPath: requireString(body.targetPath, "请选择目标位置"),
+        targetProjectId: requireHostMutationProject(hostFiles, body.targetProjectId),
+        overwrite: optionalBoolean(body.overwrite) ?? false,
+      });
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
+  });
+
+  app.delete(`${api}/files`, async (request, reply) => {
+    const authentication = await requireProtectedMutation(request, state);
+    const result = await runIdempotent(request, authentication, idempotencyCache, async () => {
+      const body = asRecord(request.body);
+      const projectId = requireHostMutationProject(hostFiles, body.projectId);
+      await hostFiles.delete(
+        projectId,
+        requireString(body.path, "请选择文件"),
+        optionalBoolean(body.permanent) ?? false,
+      );
+      return { status: 204 };
+    });
+    return await sendCached(reply, result);
   });
 
   app.get(`${api}/diagnostics`, async (request) => {
@@ -726,6 +881,20 @@ export async function createSidecarServer(
     const query = asRecord(request.query);
     const queryCursor = optionalEventStreamCursor(query.cursor);
     const threadId = optionalEventStreamThreadId(query.threadId);
+    const cachedDetailSequence =
+      queryCursor === undefined && threadId !== undefined
+        ? recentThreadDetails.get(threadId)?.snapshotEventSeq
+        : undefined;
+    const provisionalSequence =
+      queryCursor === undefined && threadId !== undefined
+        ? recentThreadSnapshotWatermarks.get(threadId)
+        : undefined;
+    const cachedSnapshotEventSeq =
+      cachedDetailSequence === undefined
+        ? provisionalSequence
+        : provisionalSequence === undefined
+          ? cachedDetailSequence
+          : Math.min(cachedDetailSequence, provisionalSequence);
     openEventStream(
       request,
       reply,
@@ -735,6 +904,7 @@ export async function createSidecarServer(
       authentication.record.tokenDigest,
       queryCursor,
       threadId,
+      cachedSnapshotEventSeq,
     );
   });
 
@@ -782,7 +952,13 @@ export async function createSidecarServer(
   async function loadRecentThreadDetail(
     threadId: string,
     fallbackSnapshotEventSeq = events.latestSequence,
+    includeItems = true,
   ): Promise<ThreadDetail> {
+    if (!includeItems) {
+      const detail = await domain.getThread(threadId, { includeTurns: false });
+      return attachSnapshotEventSequence(detail, fallbackSnapshotEventSeq, streamInstanceId);
+    }
+
     const cached = recentThreadDetails.get(threadId);
     if (cached !== undefined) {
       if (!events.replayAfter(cached.snapshotEventSeq).resetRequired) {
@@ -792,6 +968,7 @@ export async function createSidecarServer(
             items: [...cached.detail.items],
           },
           cached.snapshotEventSeq,
+          streamInstanceId,
         );
       }
       recentThreadDetails.delete(threadId);
@@ -799,10 +976,11 @@ export async function createSidecarServer(
 
     const detail = await domain.getThread(threadId);
     rememberThreadDetail(detail, fallbackSnapshotEventSeq);
-    return attachSnapshotEventSequence(detail, fallbackSnapshotEventSeq);
+    return attachSnapshotEventSequence(detail, fallbackSnapshotEventSeq, streamInstanceId);
   }
 
   function rememberThreadDetail(detail: ThreadDetail, snapshotEventSeq: number): void {
+    rememberThreadSnapshotWatermark(detail.id, snapshotEventSeq);
     recentThreadDetails.delete(detail.id);
     recentThreadDetails.set(detail.id, {
       detail: {
@@ -815,6 +993,21 @@ export async function createSidecarServer(
       const oldestThreadId = recentThreadDetails.keys().next().value;
       if (oldestThreadId === undefined) break;
       recentThreadDetails.delete(oldestThreadId);
+    }
+  }
+
+  function rememberThreadSnapshotWatermark(threadId: string, snapshotEventSeq: number): void {
+    const existing = recentThreadSnapshotWatermarks.get(threadId);
+    const reusableExisting = existing !== undefined && !events.replayAfter(existing).resetRequired;
+    recentThreadSnapshotWatermarks.delete(threadId);
+    recentThreadSnapshotWatermarks.set(
+      threadId,
+      reusableExisting ? Math.min(existing, snapshotEventSeq) : snapshotEventSeq,
+    );
+    while (recentThreadSnapshotWatermarks.size > RECENT_THREAD_DETAIL_CACHE_CAPACITY) {
+      const oldestThreadId = recentThreadSnapshotWatermarks.keys().next().value;
+      if (oldestThreadId === undefined) break;
+      recentThreadSnapshotWatermarks.delete(oldestThreadId);
     }
   }
 
@@ -1037,10 +1230,11 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return result;
 }
 
-async function runIdempotent(
+async function runPersistedIdempotent(
   request: FastifyRequest,
   authentication: AuthenticatedRequest,
   cache: Map<string, Promise<CachedCommand>>,
+  state: SidecarStateStore,
   command: () => Promise<CachedCommand>,
 ): Promise<CachedCommand> {
   const cacheKey = requireIdempotencyScope(request, authentication);
@@ -1048,7 +1242,27 @@ async function runIdempotent(
   if (cached) {
     return await cached;
   }
-  const pending = command();
+  const pending = (async () => {
+    const reservation = await state.reserveMutation(cacheKey, Date.now());
+    if (reservation !== "reserved") {
+      throw new ProductHttpError(
+        "IDEMPOTENCY_REPLAY_REQUIRES_REFRESH",
+        reservation === "completed"
+          ? "这项操作已经完成，请刷新页面查看最新状态"
+          : "上次操作的结果仍在确认中，请刷新页面查看最新状态",
+        409,
+      );
+    }
+    let result: CachedCommand;
+    try {
+      result = await command();
+    } catch (error) {
+      await state.releaseMutation(cacheKey);
+      throw error;
+    }
+    await state.completeMutation(cacheKey, Date.now());
+    return result;
+  })();
   cache.set(cacheKey, pending);
   while (cache.size > 1000) {
     const oldest = cache.keys().next().value;
@@ -1113,9 +1327,14 @@ function publishDegradations(degradations: ServiceDegradation[], events: RemoteE
   }
 }
 
-function attachSnapshotEventSequence(detail: ThreadDetail, snapshotEventSeq: number): ThreadDetail {
+function attachSnapshotEventSequence(
+  detail: ThreadDetail,
+  snapshotEventSeq: number,
+  streamInstanceId: string,
+): ThreadDetail {
   return {
     ...detail,
+    snapshotEventCursor: `${streamInstanceId}:${snapshotEventSeq}`,
     snapshotEventSeq,
   };
 }
@@ -1129,6 +1348,7 @@ function openEventStream(
   sessionTokenDigest: string,
   queryCursor?: string,
   threadId?: string,
+  freshReplayAfterSequence?: number,
 ): void {
   const raw = reply.raw;
   reply.hijack();
@@ -1142,7 +1362,7 @@ function openEventStream(
   const cursor = parseEventStreamCursor(lastEventId);
   const replay =
     lastEventId === undefined
-      ? events.replayAfter(events.latestSequence)
+      ? events.replayAfter(freshReplayAfterSequence ?? events.latestSequence)
       : cursor?.instanceId === streamInstanceId
         ? events.replayAfter(cursor.sequence)
         : { events: [], resetRequired: true };
@@ -1509,6 +1729,18 @@ function requireQueue(queue: SidecarTurnQueueApi | undefined): SidecarTurnQueueA
   return queue;
 }
 
+function requireHostMutationProject(hostFiles: HostFileStore, value: unknown): string {
+  const projectId = requireString(value, "请选择磁盘");
+  if (!projectId.startsWith("host-root:") || !hostFiles.isHostProject(projectId)) {
+    throw new ProductHttpError(
+      "FILE_MUTATION_ROOT_REQUIRED",
+      "请选择本机磁盘后再执行文件操作",
+      400,
+    );
+  }
+  return projectId;
+}
+
 function requireString(value: unknown, message: string): string {
   if (typeof value !== "string" || !value.trim() || value.length > 16_384) {
     throw new ProductHttpError("INVALID_INPUT", message, 400);
@@ -1572,6 +1804,13 @@ function optionalBoolean(value: unknown): boolean | undefined {
     return false;
   }
   return undefined;
+}
+
+function requireBoolean(value: unknown, message: string): boolean {
+  if (value === true || value === false) {
+    return value;
+  }
+  throw new ProductHttpError("INVALID_INPUT", message, 400);
 }
 
 function isReasoningEffort(value: unknown): value is NonNullable<SendTurnInput["reasoningEffort"]> {

@@ -32,10 +32,27 @@ export function chooseCollaborationMode(
   current?: string,
 ): string | undefined {
   if (current && modes.some((mode) => mode.id === current && mode.available)) return current;
-  return (
-    modes.find((mode) => mode.id === "auto" && mode.available)?.id ??
-    modes.find((mode) => mode.available)?.id
-  );
+  const available = modes.filter((mode) => mode.available);
+  const normalized = (value: string) => value.trim().toLowerCase();
+  const standard = available.find((mode) => {
+    const id = normalized(mode.id);
+    const label = normalized(mode.displayName);
+    return (
+      id === "default" ||
+      id === "standard" ||
+      id === "normal" ||
+      id === "auto" ||
+      label === "默认" ||
+      label === "标准" ||
+      label === "default" ||
+      label === "standard"
+    );
+  });
+  if (standard) return standard.id;
+  return available.find((mode) => {
+    const signature = `${normalized(mode.id)} ${normalized(mode.displayName)}`;
+    return !signature.includes("plan") && !signature.includes("计划");
+  })?.id;
 }
 
 export function newThreadRuntimeSettings(input: {

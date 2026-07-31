@@ -469,4 +469,19 @@ windowsOnly("Windows DataDir ownership gate", () => {
     expect(readFileSync(markerPath(dataDir))).toEqual(markerBefore);
     expect(inspectAcl(dataDir, environment).Rules.map((rule) => rule.Sid)).not.toContain("S-1-1-0");
   }, 15_000);
+
+  it("provides a bounded startup gate that rejects root ACL drift", () => {
+    const dataDir = join(sandbox, "bounded startup protection");
+    mkdirSync(dataDir, { recursive: true });
+    expect(runDriver("protect", dataDir, environment).status).toBe(0);
+
+    const accepted = runDriver("assert-startup-protection", dataDir, environment);
+    expect(accepted.status).toBe(0);
+    expect(parseLastJson<{ Status: string }>(accepted.stdout).Status).toBe("startup-protected");
+
+    expect(runDriver("add-everyone-rule", dataDir, environment).status).toBe(0);
+    const rejected = runDriver("assert-startup-protection", dataDir, environment);
+    expect(rejected.status).not.toBe(0);
+    expect(`${rejected.stdout}${rejected.stderr}`).toContain("protected root ACL");
+  }, 15_000);
 });

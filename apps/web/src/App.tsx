@@ -23,17 +23,19 @@ import {
   useNavigate,
   useParams,
 } from "react-router-dom";
-import ReactMarkdown from "react-markdown";
-import rehypeSanitize from "rehype-sanitize";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import type {
   ApprovalPolicyOption,
   ApprovalRequest,
   ApprovalReviewerOption,
   AuthSession,
   CollaborationModeOption,
+  ConversationAttachment,
   DiagnosticSnapshot,
   FileEntry,
   FileListing,
+  FileRoot,
   ResolvedFileEntry,
   LocalInputReference,
   ModelOption,
@@ -45,8 +47,11 @@ import type {
   ReasoningEffort,
   RemoteEvent,
   RunState,
+  SubagentHistoryIntegrity,
   SubagentSummary,
   ThreadDetail,
+  ThreadGoal,
+  ThreadSettingsInput,
   ThreadSummary,
   UsageCredits,
   UsageSnapshot,
@@ -63,7 +68,7 @@ import {
   type IconName,
   type StatusTone,
 } from "@codex-local-remote/ui";
-import { ApiRequestError, createApiClient, type ApiClient } from "./api";
+import { ApiRequestError, createApiClient, type ApiClient, type SubagentCursorPage } from "./api";
 import { authenticatedBootstrap, loggedOutBootstrap } from "./auth-state";
 import { browserAttentionTitle } from "./browser-attention";
 import {
@@ -102,10 +107,10 @@ import { PaginationFooter } from "./PaginationFooter";
 import { registeredProjects } from "./project-access";
 import {
   WORKSPACE_REFRESH_MS,
+  approvalForCurrentThread,
   canRefreshDocument,
   isTextEntryElement,
   reconcileFetchedApprovals,
-  reconcileSelectedApproval,
   resolvedApprovalId,
   threadRefreshDelay,
   workspaceEventNeedsRefresh,
@@ -118,6 +123,7 @@ import {
 } from "./pagination";
 import { defaultReasoningEffortForModel, normalizeReasoningEffortForModel } from "./model-effort";
 import {
+  chooseCollaborationMode,
   choosePermissionProfileId,
   chooseServiceTier,
   newThreadRuntimeSettings,
@@ -129,16 +135,21 @@ import {
   writeNewThreadDraft,
 } from "./new-thread-draft";
 import {
+  activeWorkLogSegmentIndex,
   activitySummary,
   assistantPhaseForDisplay,
   conversationContentItems,
   currentLivePhase,
   groupConversationItems,
   latestPlanProgress,
+  subagentActivityStatusForDisplay,
+  workLogSegmentBelongsToActiveTurn,
+  workLogHeadline,
+  workLogSummary,
 } from "./conversation-presentation";
 import { fileChangeStatusLabel, toolFallbackSummary } from "./terminal-display";
 import { DiffView } from "./DiffView";
-import { localFilePathFromHref } from "./file-link";
+import { encodeLocalFileHrefForMarkdown, localFileReferenceFromHref } from "./file-link";
 import {
   localeCopy,
   readUiLocale,
@@ -161,6 +172,7 @@ import {
   reconcileThreadSnapshotLists,
   reconcileNextTurnSettingsDraft,
   synchronizeThreadRemoteEventProjection,
+  threadControlSnapshotIsCurrent,
   threadSummaryFromSnapshotEvent,
   updateNextTurnSettingsDraft,
 } from "./live-thread";
@@ -226,6 +238,11 @@ import {
 import { reduceRuntimeNotice, type RuntimeNotice } from "./runtime-notice";
 import { dismissNotice, noticeDismissalKey, readNoticeDismissal } from "./notice-dismissal";
 import { workspaceLoadFailurePolicy } from "./workspace-recovery";
+import { copyPlainText } from "./clipboard";
+import {
+  rejectedApprovalReviewerId,
+  threadSettingsReadbackMismatches,
+} from "./thread-settings-readback";
 
 const api = createApiClient();
 
@@ -246,6 +263,310 @@ function useUiLocale() {
 type LoadState = "loading" | "ready" | "error";
 type MoreState = "idle" | "loading" | "error";
 type DeferredLoadState = "idle" | LoadState;
+type ThreadActionMenuMode = "closed" | "menu" | "rename";
+type ThreadListMutation = { kind: "rename"; name: string } | { kind: "archive"; archived: boolean };
+type ThreadActionFeedback = {
+  kind: "busy" | "success" | "warning" | "error";
+  message: string;
+  threadId: string;
+};
+type ThreadMutationReceipt = {
+  mutation: ThreadListMutation;
+  threadId: string;
+};
+
+type ThreadListReadback = CursorPage<ThreadSummary> & {
+  firstPageItemCount?: number;
+};
+
+type AuthoritativeThreadLists = {
+  current: ThreadListReadback;
+  archived: ThreadListReadback;
+};
+
+const THREAD_LIST_READBACK_MAX_PAGES = 100;
+
+async function readThreadListThroughTarget(
+  apiClient: Pick<ApiClient, "threads">,
+  archived: boolean,
+  targetThreadId: string,
+  maxPages: number,
+): Promise<ThreadListReadback> {
+  let cursor: string | undefined;
+  let firstPageItemCount = 0;
+  let items: ThreadSummary[] = [];
+  const seenCursors = new Set<string>();
+
+  for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+    const page = await apiClient.threads({
+      archived,
+      ...(cursor === undefined ? {} : { cursor }),
+    });
+    if (pageIndex === 0) firstPageItemCount = page.items.length;
+    items = mergeCursorItems(items, page.items, (thread) => thread.id, "append");
+    const nextCursor = page.nextCursor;
+    if (items.some((thread) => thread.id === targetThreadId) || nextCursor === undefined) {
+      return {
+        firstPageItemCount,
+        items,
+        ...(nextCursor === undefined ? {} : { nextCursor }),
+      };
+    }
+    if (seenCursors.has(nextCursor)) {
+      throw new Error("电脑端对话列表分页游标重复，无法确认操作结果");
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+
+  return {
+    firstPageItemCount,
+    items,
+    ...(cursor === undefined ? {} : { nextCursor: cursor }),
+  };
+}
+
+export async function readAuthoritativeThreadLists(
+  apiClient: Pick<ApiClient, "threads">,
+  targetThreadId: string,
+  maxPages = THREAD_LIST_READBACK_MAX_PAGES,
+): Promise<AuthoritativeThreadLists> {
+  const [current, archived] = await Promise.all([
+    readThreadListThroughTarget(apiClient, false, targetThreadId, maxPages),
+    readThreadListThroughTarget(apiClient, true, targetThreadId, maxPages),
+  ]);
+  return { current, archived };
+}
+
+type ThreadListRefreshResult = { kind: "converged" } | { kind: "failed"; error: unknown };
+type ThreadListMutationResult =
+  | { kind: "converged" }
+  | { kind: "committed-refreshing"; refresh: Promise<ThreadListRefreshResult> };
+
+const THREAD_LIST_CONVERGENCE_RETRY_DELAYS_MS = [400, 1_200, 2_500] as const;
+const THREAD_MUTATION_RECEIPTS_STORAGE_KEY = "codex-remote:thread-mutation-receipts:v1";
+
+function waitForThreadListRefresh(delayMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    globalThis.setTimeout(resolve, delayMs);
+  });
+}
+
+function browserSessionStorage(): Storage | undefined {
+  try {
+    return typeof sessionStorage === "undefined" ? undefined : sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+function isThreadMutationReceipt(value: unknown): value is ThreadMutationReceipt {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as {
+    mutation?: { archived?: unknown; kind?: unknown; name?: unknown };
+    threadId?: unknown;
+  };
+  if (typeof candidate.threadId !== "string" || !candidate.threadId) return false;
+  if (candidate.mutation?.kind === "rename") {
+    return typeof candidate.mutation.name === "string" && candidate.mutation.name.length > 0;
+  }
+  return candidate.mutation?.kind === "archive" && typeof candidate.mutation.archived === "boolean";
+}
+
+export function readThreadMutationReceipts(
+  storage = browserSessionStorage(),
+): Map<string, ThreadMutationReceipt> {
+  if (!storage) return new Map();
+  try {
+    const parsed: unknown = JSON.parse(
+      storage.getItem(THREAD_MUTATION_RECEIPTS_STORAGE_KEY) ?? "[]",
+    );
+    if (!Array.isArray(parsed)) return new Map();
+    return new Map(
+      parsed.filter(isThreadMutationReceipt).map((receipt) => [receipt.threadId, receipt] as const),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+export function writeThreadMutationReceipts(
+  receipts: ReadonlyMap<string, ThreadMutationReceipt>,
+  storage = browserSessionStorage(),
+): void {
+  if (!storage) return;
+  try {
+    if (receipts.size === 0) {
+      storage.removeItem(THREAD_MUTATION_RECEIPTS_STORAGE_KEY);
+    } else {
+      storage.setItem(THREAD_MUTATION_RECEIPTS_STORAGE_KEY, JSON.stringify([...receipts.values()]));
+    }
+  } catch {
+    // A private or storage-constrained browser still keeps the in-memory gate.
+  }
+}
+
+export function threadMutationMatchesAuthoritativeLists(
+  lists: AuthoritativeThreadLists,
+  receipt: ThreadMutationReceipt,
+): boolean {
+  const current = lists.current.items.find((thread) => thread.id === receipt.threadId);
+  const archived = lists.archived.items.find((thread) => thread.id === receipt.threadId);
+  const currentAbsenceVerified = current === undefined && lists.current.nextCursor === undefined;
+  const archivedAbsenceVerified = archived === undefined && lists.archived.nextCursor === undefined;
+  if (receipt.mutation.kind === "rename") {
+    return (
+      ((current !== undefined && archivedAbsenceVerified) ||
+        (archived !== undefined && currentAbsenceVerified)) &&
+      (current ?? archived)?.title === receipt.mutation.name
+    );
+  }
+  return receipt.mutation.archived
+    ? currentAbsenceVerified && archived !== undefined
+    : current !== undefined && archivedAbsenceVerified;
+}
+
+export function mergeThreadListReadback(
+  current: readonly ThreadSummary[],
+  currentNextCursor: string | undefined,
+  loadedTailIds: ReadonlySet<string>,
+  readback: ThreadListReadback,
+): {
+  items: ThreadSummary[];
+  loadedTailIds: ReadonlySet<string>;
+  nextCursor: string | undefined;
+} {
+  const firstPageItemCount = Math.min(
+    readback.firstPageItemCount ?? readback.items.length,
+    readback.items.length,
+  );
+  const incomingIds = new Set(readback.items.map((thread) => thread.id));
+  const preservedTail =
+    readback.nextCursor === undefined
+      ? []
+      : current.filter((thread) => loadedTailIds.has(thread.id) && !incomingIds.has(thread.id));
+  const items = [...readback.items, ...preservedTail];
+  const nextLoadedTailIds = new Set([
+    ...readback.items.slice(firstPageItemCount).map((thread) => thread.id),
+    ...preservedTail.map((thread) => thread.id),
+  ]);
+  return {
+    items,
+    loadedTailIds: nextLoadedTailIds,
+    nextCursor:
+      readback.nextCursor === undefined
+        ? undefined
+        : loadedTailIds.size > 0
+          ? currentNextCursor
+          : readback.nextCursor,
+  };
+}
+
+export async function convergeThreadLists({
+  apply,
+  initialError,
+  read,
+  retryDelaysMs = THREAD_LIST_CONVERGENCE_RETRY_DELAYS_MS,
+  wait = waitForThreadListRefresh,
+}: {
+  apply: (lists: AuthoritativeThreadLists) => void;
+  initialError?: unknown;
+  read: () => Promise<AuthoritativeThreadLists>;
+  retryDelaysMs?: readonly number[];
+  wait?: (delayMs: number) => Promise<void>;
+}): Promise<ThreadListRefreshResult> {
+  let lastError = initialError;
+  if (initialError === undefined) {
+    try {
+      apply(await read());
+      return { kind: "converged" };
+    } catch (readError) {
+      lastError = readError;
+    }
+  }
+  for (const delayMs of retryDelaysMs) {
+    try {
+      await wait(delayMs);
+      apply(await read());
+      return { kind: "converged" };
+    } catch (refreshError) {
+      lastError = refreshError;
+    }
+  }
+  return { error: lastError, kind: "failed" };
+}
+
+export async function commitThenConvergeThreadLists({
+  apply,
+  commit,
+  onCommitted,
+  read,
+  retryDelaysMs = THREAD_LIST_CONVERGENCE_RETRY_DELAYS_MS,
+  wait = waitForThreadListRefresh,
+}: {
+  apply: (lists: AuthoritativeThreadLists) => void;
+  commit: () => Promise<void>;
+  onCommitted?: () => void;
+  read: () => Promise<AuthoritativeThreadLists>;
+  retryDelaysMs?: readonly number[];
+  wait?: (delayMs: number) => Promise<void>;
+}): Promise<ThreadListMutationResult> {
+  await commit();
+  onCommitted?.();
+
+  try {
+    apply(await read());
+    return { kind: "converged" };
+  } catch (initialError) {
+    const refresh = convergeThreadLists({
+      apply,
+      initialError,
+      read,
+      retryDelaysMs,
+      wait,
+    });
+    return { kind: "committed-refreshing", refresh };
+  }
+}
+
+type ThreadActionMenuPosition = { left: number; top: number };
+type FloatingRect = {
+  bottom: number;
+  height: number;
+  left: number;
+  right: number;
+  top: number;
+  width: number;
+};
+
+export function anchoredThreadActionMenuPosition({
+  anchor,
+  bottomBoundary,
+  floating,
+  margin = 12,
+  viewportWidth,
+}: {
+  anchor: FloatingRect;
+  bottomBoundary: number;
+  floating: Pick<FloatingRect, "height" | "width">;
+  margin?: number;
+  viewportWidth: number;
+}): ThreadActionMenuPosition {
+  const gap = 6;
+  const belowTop = anchor.bottom + gap;
+  const aboveTop = anchor.top - gap - floating.height;
+  const top =
+    belowTop + floating.height <= bottomBoundary
+      ? belowTop
+      : aboveTop >= margin
+        ? aboveTop
+        : Math.max(margin, bottomBoundary - floating.height);
+  const left = Math.min(
+    Math.max(margin, anchor.right - floating.width),
+    Math.max(margin, viewportWidth - margin - floating.width),
+  );
+  return { left, top };
+}
 
 type LiveEventEnvelope = {
   deliveryId: number;
@@ -290,6 +611,54 @@ export function threadIdFromConversationPath(pathname: string): string | undefin
   }
 }
 
+export type WorkspaceSnapshotEventCursor = {
+  cursor: string;
+  threadId: string;
+};
+
+export function retainWorkspaceSnapshotEventCursor(
+  current: WorkspaceSnapshotEventCursor | undefined,
+  activeThreadId: string | undefined,
+  observed: WorkspaceSnapshotEventCursor,
+): WorkspaceSnapshotEventCursor | undefined {
+  if (observed.threadId !== activeThreadId) return current;
+  return current?.threadId === observed.threadId ? current : observed;
+}
+
+export function retainWorkspaceSnapshotEventCursorForCurrentRoute(
+  current: WorkspaceSnapshotEventCursor | undefined,
+  activeThreadIdRef: Readonly<{ current: string | undefined }>,
+  observed: WorkspaceSnapshotEventCursor,
+): WorkspaceSnapshotEventCursor | undefined {
+  return retainWorkspaceSnapshotEventCursor(current, activeThreadIdRef.current, observed);
+}
+
+export function workspaceBootstrapEventCursor(
+  current: WorkspaceSnapshotEventCursor | undefined,
+  activeThreadId: string | undefined,
+): string | undefined {
+  return current !== undefined && current.threadId === activeThreadId ? current.cursor : undefined;
+}
+
+export function subscribeWorkspaceEventStream(
+  apiClient: Pick<ApiClient, "subscribe">,
+  onEvent: (event: RemoteEvent) => void,
+  onConnection: (online: boolean) => void,
+  threadId: string | undefined,
+  cursor: string | undefined,
+): () => void {
+  return apiClient.subscribe(
+    onEvent,
+    onConnection,
+    threadId
+      ? {
+          threadId,
+          ...(cursor === undefined ? {} : { cursor }),
+        }
+      : undefined,
+  );
+}
+
 type FilePreviewDerivedState = {
   generation: number;
   requestKey: string;
@@ -302,7 +671,7 @@ type FilePreviewDerivedState = {
 
 type FilePreviewRequest = Pick<FilePreviewDerivedState, "generation" | "requestKey">;
 
-export function filePreviewRequestKey(projectId: string, relativePath: string): string {
+export function filePreviewRequestKey(projectId: string | undefined, relativePath: string): string {
   return JSON.stringify([projectId, relativePath]);
 }
 
@@ -334,7 +703,91 @@ export function isCurrentFilePreviewRequest(
   return current.generation === candidate.generation && current.requestKey === candidate.requestKey;
 }
 
+type LatestRequestController = {
+  begin: (requestKey: string) => FilePreviewRequest;
+  cancel: () => void;
+  isCurrent: (candidate: FilePreviewRequest) => boolean;
+};
+
+export function createLatestRequestController(): LatestRequestController {
+  let current: FilePreviewRequest = { generation: 0, requestKey: "" };
+  return {
+    begin(requestKey) {
+      current = { generation: current.generation + 1, requestKey };
+      return current;
+    },
+    cancel() {
+      current = { generation: current.generation + 1, requestKey: "" };
+    },
+    isCurrent(candidate) {
+      return isCurrentFilePreviewRequest(current, candidate);
+    },
+  };
+}
+
+function useLatestRequestController(): LatestRequestController {
+  const controller = useRef<LatestRequestController | undefined>(undefined);
+  if (controller.current === undefined) {
+    controller.current = createLatestRequestController();
+  }
+  useEffect(
+    () => () => {
+      controller.current?.cancel();
+    },
+    [],
+  );
+  return controller.current;
+}
+
+type InterruptTerminalPollOptions = {
+  attempts?: number;
+  intervalMs?: number;
+  wait?: (delayMs: number) => Promise<void>;
+};
+
+export async function pollInterruptTerminal(
+  requestedTurnId: string,
+  readActiveTurnId: () => Promise<string | undefined>,
+  options: InterruptTerminalPollOptions = {},
+): Promise<{ state: "terminal" } | { state: "still-active"; lastError?: unknown }> {
+  const attempts = Math.max(1, Math.floor(options.attempts ?? 8));
+  const intervalMs = Math.max(0, options.intervalMs ?? 250);
+  const wait =
+    options.wait ??
+    ((delayMs: number) => new Promise<void>((resolve) => window.setTimeout(resolve, delayMs)));
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const activeTurnId = await readActiveTurnId();
+      lastError = undefined;
+      if (activeTurnId !== requestedTurnId) {
+        return { state: "terminal" };
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt < attempts - 1) {
+      await wait(intervalMs);
+    }
+  }
+
+  return lastError === undefined ? { state: "still-active" } : { state: "still-active", lastError };
+}
+
 const MAX_LIVE_EVENTS = 2_048;
+const markdownSanitizeSchema = {
+  ...defaultSchema,
+  protocols: {
+    ...defaultSchema.protocols,
+    href: [
+      ...(defaultSchema.protocols?.href ?? []),
+      ..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+      "file",
+    ],
+  },
+};
 
 type WorkspaceData = {
   projects: ProjectSummary[];
@@ -357,7 +810,7 @@ const emptyWorkspace: WorkspaceData = {
 };
 
 const runLabels: Record<RunState, string> = {
-  idle: "可继续",
+  idle: "空闲",
   running: "运行中",
   "waiting-for-approval": "等待审批",
   failed: "失败",
@@ -517,16 +970,23 @@ export function canShowThreadComposer(
     ThreadDetail,
     "activeTurnId" | "availableActions" | "mode" | "parentThreadId" | "state"
   >,
-  controlAvailable: boolean,
+  _controlAvailable: boolean,
 ): boolean {
-  if (!controlAvailable || thread.mode === "desktop-snapshot" || thread.parentThreadId) {
+  if (thread.mode === "desktop-snapshot" || thread.parentThreadId) {
     return false;
   }
+  // A managed task keeps its local draft surface while the live control channel
+  // reconnects. Only the mutating actions are disabled while offline.
+  if (thread.mode === "managed") return true;
   const running =
     Boolean(thread.activeTurnId) ||
     thread.state === "running" ||
     thread.state === "waiting-for-approval";
   return canDirectlyCompose(thread) || (thread.mode === "managed" && running);
+}
+
+export function composerDraftReadOnly(composerExpanded: boolean, _online: boolean): boolean {
+  return !composerExpanded;
 }
 
 export function desktopSnapshotPresentation(
@@ -648,6 +1108,28 @@ export function composerExpandedAfterIntent(intent: ComposerExpansionIntent): bo
   return intent === "focus";
 }
 
+export function collapsedComposerText(text: string, maxLength = 36): string {
+  const normalized = text.replace(/\s+/gu, " ").trim();
+  const characters = Array.from(normalized);
+  if (characters.length === 0) return "";
+  const hidesStructure = normalized !== text.trim();
+  if (characters.length <= maxLength) return hidesStructure ? `${normalized}…` : normalized;
+  if (maxLength <= 1) return "…";
+  return `${characters.slice(0, maxLength - 1).join("")}…`;
+}
+
+export function focusComposerControlAtEnd(
+  control: Pick<
+    HTMLTextAreaElement,
+    "focus" | "scrollHeight" | "scrollTop" | "setSelectionRange" | "value"
+  >,
+): void {
+  control.focus({ preventScroll: true });
+  const end = control.value.length;
+  control.setSelectionRange(end, end);
+  control.scrollTop = control.scrollHeight;
+}
+
 export function prependConversationHistory(
   current: ThreadDetail,
   olderPage: ThreadDetail,
@@ -667,14 +1149,88 @@ export function prependConversationHistory(
   };
 }
 
+export async function readThreadControlBeforeSubmit(
+  client: Pick<ApiClient, "threadShell">,
+  threadId: string,
+): Promise<ThreadDetail> {
+  return client.threadShell(threadId);
+}
+
+export async function readThreadRefreshSnapshots(
+  client: Pick<ApiClient, "thread" | "threadShell">,
+  threadId: string,
+  current?: Pick<ThreadDetail, "activeTurnId" | "state">,
+): Promise<{ control?: ThreadDetail; detail: ThreadDetail }> {
+  const detail = await client.thread(threadId);
+  const needsFreshControl = [current, detail].some(
+    (candidate) =>
+      candidate?.activeTurnId !== undefined ||
+      candidate?.state === "running" ||
+      candidate?.state === "waiting-for-approval",
+  );
+  if (!needsFreshControl) {
+    return { detail };
+  }
+  try {
+    return {
+      control: await client.threadShell(threadId),
+      detail,
+    };
+  } catch {
+    // The bounded transcript snapshot and live event stream remain usable if a
+    // lightweight control read races a transient app-server reconnect.
+    return { detail };
+  }
+}
+
+export function appendOptimisticUserMessage(
+  thread: ThreadDetail,
+  prompt: string,
+  itemId: string,
+  turnId?: string,
+): ThreadDetail {
+  return {
+    ...thread,
+    items: [
+      ...thread.items,
+      {
+        id: itemId,
+        kind: "user-message",
+        text: prompt,
+        ...(turnId === undefined ? {} : { turnId }),
+      },
+    ],
+  };
+}
+
+export function removeOptimisticConversationItem(
+  thread: ThreadDetail,
+  itemId: string,
+): ThreadDetail {
+  return {
+    ...thread,
+    items: thread.items.filter((item) => item.id !== itemId),
+  };
+}
+
+export function mergeQueuedThreadRefresh(
+  current: ThreadDetail,
+  incoming: ThreadDetail,
+): ThreadDetail {
+  return mergeThreadRefresh(current, incoming);
+}
+
 export function composerActionVisibility(
   running: boolean,
   canInterrupt: boolean,
   hasDraft: boolean,
+  interruptAccepted = false,
+  controlAvailable = true,
 ): { showInterrupt: boolean; showSubmit: boolean } {
+  const waitingForTerminalRefresh = running && interruptAccepted;
   return {
-    showInterrupt: running && canInterrupt,
-    showSubmit: !running || hasDraft,
+    showInterrupt: running && canInterrupt && controlAvailable && !waitingForTerminalRefresh,
+    showSubmit: !running || waitingForTerminalRefresh || hasDraft,
   };
 }
 
@@ -787,6 +1343,93 @@ function Wordmark() {
   );
 }
 
+function MarkdownLocalImage({
+  alt,
+  apiClient,
+  online,
+  projectId,
+  source,
+}: {
+  alt?: string;
+  apiClient: ApiClient;
+  online: boolean;
+  projectId?: string;
+  source: string;
+}) {
+  const [entry, setEntry] = useState<ResolvedFileEntry>();
+  const [state, setState] = useState<"loading" | "ready" | "error">(online ? "loading" : "error");
+  const [error, setError] = useState(online ? "" : "电脑当前离线");
+  const [url, setUrl] = useState("");
+
+  useEffect(() => {
+    if (!online) {
+      setState("error");
+      setError("电脑当前离线");
+      return;
+    }
+    let active = true;
+    let objectUrl = "";
+    setState("loading");
+    setError("");
+    setEntry(undefined);
+    setUrl("");
+    void apiClient
+      .resolveFile(projectId, source)
+      .then(async (resolved) => {
+        const result = await apiClient.preview(resolved.projectId, resolved.relativePath);
+        if (!result.contentType.startsWith("image/")) {
+          throw new Error("这个引用不是可预览的图片");
+        }
+        objectUrl = URL.createObjectURL(result.blob);
+        if (!active) {
+          URL.revokeObjectURL(objectUrl);
+          objectUrl = "";
+          return;
+        }
+        setEntry(resolved);
+        setUrl(objectUrl);
+        setState("ready");
+      })
+      .catch((imageError: unknown) => {
+        if (!active) return;
+        setError(errorMessage(imageError));
+        setState("error");
+      });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [apiClient, online, projectId, source]);
+
+  return (
+    <figure className="markdown-local-image">
+      {state === "loading" ? (
+        <div className="markdown-local-image__loading">
+          <Skeleton />
+        </div>
+      ) : state === "ready" && url && entry ? (
+        <>
+          <a href={url} rel="noreferrer" target="_blank" title="打开原图">
+            <img alt={alt || entry.name} loading="lazy" src={url} />
+          </a>
+          <figcaption>
+            <span>{alt || entry.name}</span>
+            <a
+              download={entry.name}
+              href={apiClient.downloadUrl(entry.projectId, entry.relativePath)}
+            >
+              <Icon name="download" size={14} />
+              下载
+            </a>
+          </figcaption>
+        </>
+      ) : (
+        <span className="unsafe-content-note">图片暂时不可用：{error}</span>
+      )}
+    </figure>
+  );
+}
+
 function Markdown({
   apiClient,
   children,
@@ -801,11 +1444,17 @@ function Markdown({
   projectId?: string;
 }) {
   const [linkedFile, setLinkedFile] = useState<FileEntry>();
+  const [linkedFileProjectId, setLinkedFileProjectId] = useState<string>();
+  const [linkedFileLine, setLinkedFileLine] = useState<number>();
   const [linkedFileError, setLinkedFileError] = useState("");
   const [linkedFileLoading, setLinkedFileLoading] = useState(false);
+  const linkedFileRequests = useLatestRequestController();
 
   function closeLinkedFile() {
+    linkedFileRequests.cancel();
     setLinkedFile(undefined);
+    setLinkedFileProjectId(undefined);
+    setLinkedFileLine(undefined);
     setLinkedFileError("");
     setLinkedFileLoading(false);
   }
@@ -814,29 +1463,48 @@ function Markdown({
     <>
       <div className={compact ? "markdown markdown--compact" : "markdown"}>
         <ReactMarkdown
-          rehypePlugins={[rehypeSanitize]}
+          rehypePlugins={[[rehypeSanitize, markdownSanitizeSchema]]}
           skipHtml
+          urlTransform={(value) =>
+            encodeLocalFileHrefForMarkdown(value) ?? defaultUrlTransform(value)
+          }
           components={{
             a: ({ children: linkChildren, href, ...props }) => {
-              const localPath = apiClient && projectId ? localFilePathFromHref(href) : undefined;
-              return localPath ? (
+              const localReference = localFileReferenceFromHref(href);
+              return localReference ? (
                 <a
                   {...props}
                   href={href}
                   onClick={(event) => {
                     event.preventDefault();
-                    if (!online || !apiClient || !projectId) {
+                    const request = linkedFileRequests.begin(
+                      filePreviewRequestKey(projectId, localReference.path),
+                    );
+                    setLinkedFile(undefined);
+                    setLinkedFileProjectId(undefined);
+                    setLinkedFileLine(localReference.line);
+                    setLinkedFileError("");
+                    if (!online || !apiClient) {
                       setLinkedFileError("电脑当前离线，恢复连接后才能打开这个文件。");
+                      setLinkedFileLoading(false);
                       return;
                     }
-                    setLinkedFile(undefined);
-                    setLinkedFileError("");
                     setLinkedFileLoading(true);
                     void apiClient
-                      .resolveFile(projectId, localPath)
-                      .then((entry) => setLinkedFile(entry))
-                      .catch((error: unknown) => setLinkedFileError(errorMessage(error)))
-                      .finally(() => setLinkedFileLoading(false));
+                      .resolveFile(projectId, localReference.path)
+                      .then((entry) => {
+                        if (!linkedFileRequests.isCurrent(request)) return;
+                        setLinkedFile(entry);
+                        setLinkedFileProjectId(entry.projectId);
+                      })
+                      .catch((error: unknown) => {
+                        if (linkedFileRequests.isCurrent(request)) {
+                          setLinkedFileError(errorMessage(error));
+                        }
+                      })
+                      .finally(() => {
+                        if (linkedFileRequests.isCurrent(request)) setLinkedFileLoading(false);
+                      });
                   }}
                 >
                   {linkChildren}
@@ -847,7 +1515,28 @@ function Markdown({
                 </a>
               );
             },
-            img: () => <span className="unsafe-content-note">图片链接已隐藏</span>,
+            img: ({ alt, src }) => {
+              const localReference = localFileReferenceFromHref(src);
+              if (localReference && apiClient) {
+                return (
+                  <MarkdownLocalImage
+                    {...(alt === undefined ? {} : { alt })}
+                    apiClient={apiClient}
+                    online={online}
+                    {...(projectId === undefined ? {} : { projectId })}
+                    source={localReference.path}
+                  />
+                );
+              }
+              if (src && /^https?:/i.test(src)) {
+                return (
+                  <a href={src} rel="noreferrer" target="_blank" title="打开原图">
+                    <img alt={alt ?? ""} loading="lazy" referrerPolicy="no-referrer" src={src} />
+                  </a>
+                );
+              }
+              return <span className="unsafe-content-note">图片链接不可用</span>;
+            },
           }}
         >
           {children}
@@ -865,14 +1554,16 @@ function Markdown({
           </div>
         ) : linkedFileError ? (
           <EmptyState description={linkedFileError} icon="alert" title="文件不可用" />
-        ) : linkedFile && apiClient && projectId ? (
+        ) : linkedFile && apiClient && linkedFileProjectId ? (
           linkedFile.kind === "file" ? (
             <FilePreview
               apiClient={apiClient}
               embedded
               entry={linkedFile}
+              downloadLabel="下载最新源文件"
+              {...(linkedFileLine !== undefined ? { focusLine: linkedFileLine } : {})}
               online={online}
-              projectId={projectId}
+              projectId={linkedFileProjectId}
             />
           ) : (
             <EmptyState
@@ -1509,6 +2200,347 @@ function RightInspector({
   );
 }
 
+export function ThreadActionMenuView({
+  archived,
+  busy,
+  feedback,
+  menuPosition,
+  menuRef,
+  mode,
+  onArchiveChange,
+  onCopy,
+  onRename,
+  onRenameValueChange,
+  onRequestClose,
+  onRequestRename,
+  onRetryConvergence,
+  online,
+  pendingConvergence = false,
+  renameValue,
+  thread,
+  triggerRef,
+}: {
+  archived: boolean;
+  busy: boolean;
+  feedback: string;
+  menuPosition?: ThreadActionMenuPosition | undefined;
+  menuRef?: RefObject<HTMLDivElement | null>;
+  mode: ThreadActionMenuMode;
+  onArchiveChange: (archived: boolean) => void;
+  onCopy: () => void;
+  onRename: () => void;
+  onRenameValueChange?: (value: string) => void;
+  onRequestClose: () => void;
+  onRequestRename: () => void;
+  onRetryConvergence?: () => void;
+  online: boolean;
+  pendingConvergence?: boolean;
+  renameValue: string;
+  thread: ThreadSummary;
+  triggerRef?: RefObject<HTMLButtonElement | null>;
+}) {
+  const menuId = `thread-actions-menu-${thread.id.replaceAll(/[^A-Za-z0-9_-]/gu, "-")}`;
+  const offlineReasonId = `${menuId}-offline-reason`;
+  const activeReasonId = `${menuId}-active-reason`;
+  const busyReasonId = `${menuId}-busy-reason`;
+  const pendingReasonId = `${menuId}-pending-reason`;
+  const archiveBlockedByActiveTurn =
+    !archived && (thread.state === "running" || thread.state === "waiting-for-approval");
+  const mutationBlocked = busy || !online || pendingConvergence;
+  const mutationReasonIds = [
+    busy ? busyReasonId : undefined,
+    !online ? offlineReasonId : undefined,
+    pendingConvergence ? pendingReasonId : undefined,
+  ].filter((value): value is string => value !== undefined);
+  const archiveReasonIds = [
+    ...mutationReasonIds,
+    archiveBlockedByActiveTurn ? activeReasonId : undefined,
+  ].filter((value): value is string => value !== undefined);
+  return (
+    <>
+      <button
+        aria-controls={menuId}
+        aria-expanded={mode !== "closed"}
+        aria-haspopup="dialog"
+        aria-label={`管理对话：${threadTitleForDisplay(thread.title)}`}
+        className="thread-actions__trigger"
+        data-testid={`thread-actions-${thread.id}`}
+        onClick={mode === "closed" ? onRequestRename : onRequestClose}
+        ref={triggerRef}
+        type="button"
+      >
+        <Icon name="more" size={20} />
+      </button>
+      {mode === "closed" ? null : (
+        <div
+          aria-label={`对话操作：${threadTitleForDisplay(thread.title)}`}
+          className="thread-actions__menu"
+          data-positioned={menuPosition !== undefined}
+          data-testid={`thread-actions-menu-${thread.id}`}
+          id={menuId}
+          ref={menuRef}
+          role="dialog"
+          style={menuPosition}
+        >
+          {mode === "rename" ? (
+            <form
+              className="thread-actions__rename"
+              onSubmit={(event) => {
+                event.preventDefault();
+                onRename();
+              }}
+            >
+              <label>
+                <span>新对话名称</span>
+                <input
+                  autoFocus
+                  disabled={mutationBlocked}
+                  maxLength={200}
+                  onChange={(event) => onRenameValueChange?.(event.target.value)}
+                  value={renameValue}
+                />
+              </label>
+              <div>
+                <button
+                  aria-describedby={
+                    mutationReasonIds.length ? mutationReasonIds.join(" ") : undefined
+                  }
+                  disabled={mutationBlocked || renameValue.trim().length === 0}
+                  type="submit"
+                >
+                  {busy ? "保存中…" : "保存"}
+                </button>
+                <button onClick={onRequestClose} type="button">
+                  取消
+                </button>
+              </div>
+            </form>
+          ) : (
+            <div className="thread-actions__list">
+              <button
+                aria-describedby={
+                  mutationReasonIds.length ? mutationReasonIds.join(" ") : undefined
+                }
+                aria-disabled={mutationBlocked}
+                onClick={() => {
+                  if (!mutationBlocked) onRequestRename();
+                }}
+                type="button"
+              >
+                <Icon name="edit" size={17} />
+                重命名
+              </button>
+              <button onClick={onCopy} type="button">
+                <Icon name="copy" size={17} />
+                复制对话 ID
+              </button>
+              <button
+                aria-describedby={archiveReasonIds.length ? archiveReasonIds.join(" ") : undefined}
+                aria-disabled={mutationBlocked || archiveBlockedByActiveTurn}
+                onClick={() => {
+                  if (!mutationBlocked && !archiveBlockedByActiveTurn) {
+                    onArchiveChange(!archived);
+                  }
+                }}
+                type="button"
+              >
+                <Icon name={archived ? "arrow-up" : "arrow-down"} size={17} />
+                {archived ? "恢复对话" : "归档"}
+              </button>
+              {pendingConvergence ? (
+                <button
+                  aria-describedby={!online ? offlineReasonId : undefined}
+                  aria-disabled={busy || !online}
+                  onClick={() => {
+                    if (!busy && online) onRetryConvergence?.();
+                  }}
+                  type="button"
+                >
+                  <Icon name="refresh" size={17} />
+                  重新同步
+                </button>
+              ) : null}
+              <small>
+                <Icon name="pin" size={14} />
+                置顶请在 Desktop 管理
+              </small>
+            </div>
+          )}
+          <div className="thread-actions__reasons">
+            {archiveBlockedByActiveTurn ? (
+              <small id={activeReasonId}>请先停止正在运行的任务再归档</small>
+            ) : null}
+            {pendingConvergence ? (
+              <small id={pendingReasonId}>上次操作已提交；请先重新同步，避免重复或冲突操作</small>
+            ) : null}
+            {!online ? <small id={offlineReasonId}>连接恢复后才能修改对话</small> : null}
+            {busy ? <small id={busyReasonId}>正在处理此对话，请稍候</small> : null}
+          </div>
+          {feedback ? (
+            <p aria-live="polite" className="thread-actions__feedback">
+              {feedback}
+            </p>
+          ) : null}
+        </div>
+      )}
+    </>
+  );
+}
+
+function ThreadActionsMenu({
+  archived,
+  busy,
+  busyLabel,
+  onArchiveChange,
+  onRename,
+  onRetryConvergence,
+  online,
+  pendingConvergence,
+  thread,
+}: {
+  archived: boolean;
+  busy: boolean;
+  busyLabel: string;
+  onArchiveChange: (archived: boolean) => Promise<void>;
+  onRename: (name: string) => Promise<void>;
+  onRetryConvergence: () => Promise<void>;
+  online: boolean;
+  pendingConvergence: boolean;
+  thread: ThreadSummary;
+}) {
+  const [mode, setMode] = useState<ThreadActionMenuMode>("closed");
+  const [renameValue, setRenameValue] = useState(threadTitleForDisplay(thread.title));
+  const [copyFeedback, setCopyFeedback] = useState("");
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const previousModeRef = useRef<ThreadActionMenuMode>("closed");
+  const [menuPosition, setMenuPosition] = useState<ThreadActionMenuPosition>();
+
+  useEffect(() => {
+    if (mode === "closed") return;
+    const closeForOutsidePointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) {
+        setMode("closed");
+      }
+    };
+    const closeForEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMode("closed");
+    };
+    document.addEventListener("pointerdown", closeForOutsidePointer);
+    document.addEventListener("keydown", closeForEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeForOutsidePointer);
+      document.removeEventListener("keydown", closeForEscape);
+    };
+  }, [mode]);
+
+  useLayoutEffect(() => {
+    const previousMode = previousModeRef.current;
+    previousModeRef.current = mode;
+    if (mode === "closed") {
+      setMenuPosition(undefined);
+      if (previousMode !== "closed" && triggerRef.current?.isConnected) {
+        triggerRef.current.focus();
+      }
+      return;
+    }
+    const target =
+      mode === "rename"
+        ? menuRef.current?.querySelector<HTMLInputElement>("input")
+        : menuRef.current?.querySelector<HTMLButtonElement>(
+            "button:not([disabled]):not([aria-disabled='true'])",
+          );
+    const frame = window.requestAnimationFrame(() => target?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [mode]);
+
+  useLayoutEffect(() => {
+    if (mode === "closed") return;
+    const position = () => {
+      const trigger = triggerRef.current;
+      const menu = menuRef.current;
+      if (!trigger || !menu) return;
+      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+      const obstructionTops = [
+        ...document.querySelectorAll<HTMLElement>(".mobile-nav, .mobile-approval-bar"),
+      ]
+        .map((element) => element.getBoundingClientRect())
+        .filter((rect) => rect.height > 0 && rect.top < viewportHeight)
+        .map((rect) => rect.top);
+      const bottomBoundary = Math.min(viewportHeight - 12, ...obstructionTops);
+      setMenuPosition(
+        anchoredThreadActionMenuPosition({
+          anchor: trigger.getBoundingClientRect(),
+          bottomBoundary,
+          floating: menu.getBoundingClientRect(),
+          viewportWidth: window.innerWidth,
+        }),
+      );
+    };
+    position();
+    window.addEventListener("resize", position);
+    window.addEventListener("scroll", position, true);
+    return () => {
+      window.removeEventListener("resize", position);
+      window.removeEventListener("scroll", position, true);
+    };
+  }, [busy, busyLabel, copyFeedback, mode, online, pendingConvergence]);
+
+  useEffect(() => {
+    setRenameValue(threadTitleForDisplay(thread.title));
+  }, [thread.title]);
+
+  async function copyId() {
+    try {
+      await copyPlainText(thread.id);
+      setCopyFeedback("已复制对话 ID");
+    } catch {
+      setCopyFeedback("复制失败，请重试");
+    }
+  }
+
+  return (
+    <div className="thread-actions" ref={rootRef}>
+      <ThreadActionMenuView
+        archived={archived}
+        busy={busy}
+        feedback={copyFeedback || (busy ? busyLabel : "")}
+        menuPosition={menuPosition}
+        menuRef={menuRef}
+        mode={mode}
+        onArchiveChange={(nextArchived) => {
+          void onArchiveChange(nextArchived)
+            .then(() => setMode("closed"))
+            .catch(() => undefined);
+        }}
+        onCopy={() => void copyId()}
+        onRename={() => {
+          const name = renameValue.trim();
+          if (!name) return;
+          void onRename(name)
+            .then(() => setMode("closed"))
+            .catch(() => undefined);
+        }}
+        onRenameValueChange={setRenameValue}
+        onRequestClose={() => setMode("closed")}
+        onRequestRename={() => {
+          setCopyFeedback("");
+          setMode((current) => (current === "closed" ? "menu" : "rename"));
+        }}
+        onRetryConvergence={() => {
+          void onRetryConvergence().catch(() => undefined);
+        }}
+        online={online}
+        pendingConvergence={pendingConvergence}
+        renameValue={renameValue}
+        thread={thread}
+        triggerRef={triggerRef}
+      />
+    </div>
+  );
+}
+
 function ThreadsPage({
   data,
   online,
@@ -1523,6 +2555,8 @@ function ThreadsPage({
   archivedError,
   onLoadArchived,
   onLoadMoreArchived,
+  onThreadMutation,
+  onThreadConvergenceRetry,
 }: {
   data: WorkspaceData;
   online: boolean;
@@ -1537,6 +2571,15 @@ function ThreadsPage({
   archivedError: string;
   onLoadArchived: () => void;
   onLoadMoreArchived: () => void;
+  onThreadMutation: (
+    thread: ThreadSummary,
+    mutation: ThreadListMutation,
+    onCommitted: () => void,
+  ) => Promise<ThreadListMutationResult>;
+  onThreadConvergenceRetry: (
+    thread: ThreadSummary,
+    mutation: ThreadListMutation,
+  ) => Promise<ThreadListRefreshResult>;
 }) {
   const navigate = useNavigate();
   const { copy, locale } = useUiLocale();
@@ -1546,6 +2589,13 @@ function ThreadsPage({
   const [query, setQuery] = useState("");
   const [archiveScope, setArchiveScope] = useState<"current" | "archived">("current");
   const [filter, setFilter] = useState<"all" | "active" | "snapshot">("all");
+  const [busyThreadIds, setBusyThreadIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [threadActionFeedback, setThreadActionFeedback] = useState<ThreadActionFeedback>();
+  const [threadMutationReceipts, setThreadMutationReceipts] = useState<
+    ReadonlyMap<string, ThreadMutationReceipt>
+  >(() => readThreadMutationReceipts());
+  const threadMutationInFlightRef = useRef(new Set<string>());
+  const threadMutationReceiptsRef = useRef(new Map(threadMutationReceipts));
   const visibleThreads = archiveScope === "archived" ? archivedThreads : threads;
   const visibleNextCursor = archiveScope === "archived" ? archivedNextCursor : nextCursor;
   const visibleMoreState = archiveScope === "archived" ? archivedState : moreState;
@@ -1569,10 +2619,168 @@ function ThreadsPage({
     return matchesQuery && matchesFilter;
   });
 
+  function setThreadBusy(threadId: string, busy: boolean) {
+    setBusyThreadIds((current) => {
+      const next = new Set(current);
+      if (busy) {
+        next.add(threadId);
+      } else {
+        next.delete(threadId);
+      }
+      return next;
+    });
+  }
+
+  function updateThreadMutationReceipt(
+    threadId: string,
+    receipt: ThreadMutationReceipt | undefined,
+  ) {
+    const next = new Map(threadMutationReceiptsRef.current);
+    if (receipt) {
+      next.set(threadId, receipt);
+    } else {
+      next.delete(threadId);
+    }
+    threadMutationReceiptsRef.current = next;
+    writeThreadMutationReceipts(next);
+    setThreadMutationReceipts(next);
+  }
+
+  useEffect(() => {
+    for (const receipt of threadMutationReceiptsRef.current.values()) {
+      const current = threads.find((thread) => thread.id === receipt.threadId);
+      const archived = archivedThreads.find((thread) => thread.id === receipt.threadId);
+      const matched =
+        archivedState === "ready" &&
+        (receipt.mutation.kind === "rename"
+          ? (current === undefined) !== (archived === undefined) &&
+            (current ?? archived)?.title === receipt.mutation.name
+          : receipt.mutation.archived
+            ? current === undefined && archived !== undefined
+            : current !== undefined && archived === undefined);
+      if (matched) updateThreadMutationReceipt(receipt.threadId, undefined);
+    }
+  }, [archivedState, archivedThreads, threads]);
+
   function selectArchiveScope(scope: "current" | "archived") {
     setArchiveScope(scope);
     setFilter("all");
     if (scope === "archived" && archivedState === "idle") onLoadArchived();
+  }
+
+  async function performThreadMutation(thread: ThreadSummary, mutation: ThreadListMutation) {
+    if (
+      threadMutationInFlightRef.current.has(thread.id) ||
+      threadMutationReceiptsRef.current.has(thread.id) ||
+      !online
+    ) {
+      return;
+    }
+    threadMutationInFlightRef.current.add(thread.id);
+    setThreadBusy(thread.id, true);
+    const verb = mutation.kind === "rename" ? "重命名" : mutation.archived ? "归档" : "恢复";
+    const successMessage =
+      mutation.kind === "rename"
+        ? `已重命名为“${mutation.name}”`
+        : mutation.archived
+          ? `已归档“${threadTitleForDisplay(thread.title)}”`
+          : `已恢复“${threadTitleForDisplay(thread.title)}”`;
+    let refreshContinues = false;
+    setThreadActionFeedback({ kind: "busy", message: `正在${verb}…`, threadId: thread.id });
+    try {
+      const result = await onThreadMutation(thread, mutation, () => {
+        updateThreadMutationReceipt(thread.id, { mutation, threadId: thread.id });
+      });
+      if (result.kind === "converged") {
+        updateThreadMutationReceipt(thread.id, undefined);
+        setThreadActionFeedback({ kind: "success", message: successMessage, threadId: thread.id });
+      } else {
+        refreshContinues = true;
+        setThreadActionFeedback({
+          kind: "busy",
+          message: `${verb}操作已完成，但列表刷新失败，正在重试…`,
+          threadId: thread.id,
+        });
+        void result.refresh
+          .then((refreshResult) => {
+            if (refreshResult.kind === "converged") {
+              updateThreadMutationReceipt(thread.id, undefined);
+              setThreadActionFeedback({
+                kind: "success",
+                message: `${successMessage}，列表已刷新`,
+                threadId: thread.id,
+              });
+            } else {
+              setThreadActionFeedback({
+                kind: "warning",
+                message: `${verb}操作已完成，但列表仍未同步；请重新同步后再修改此对话`,
+                threadId: thread.id,
+              });
+            }
+          })
+          .catch(() => {
+            setThreadActionFeedback({
+              kind: "warning",
+              message: `${verb}操作已完成，但列表仍未同步；请重新同步后再修改此对话`,
+              threadId: thread.id,
+            });
+          })
+          .finally(() => {
+            threadMutationInFlightRef.current.delete(thread.id);
+            setThreadBusy(thread.id, false);
+          });
+      }
+    } catch (mutationError) {
+      setThreadActionFeedback({
+        kind: "error",
+        message: `${verb}失败：${errorMessage(mutationError)}`,
+        threadId: thread.id,
+      });
+      throw mutationError;
+    } finally {
+      if (!refreshContinues) {
+        threadMutationInFlightRef.current.delete(thread.id);
+        setThreadBusy(thread.id, false);
+      }
+    }
+  }
+
+  async function retryThreadConvergence(thread: ThreadSummary) {
+    const receipt = threadMutationReceiptsRef.current.get(thread.id);
+    if (!receipt || !online || threadMutationInFlightRef.current.has(thread.id)) return;
+    threadMutationInFlightRef.current.add(thread.id);
+    setThreadBusy(thread.id, true);
+    setThreadActionFeedback({
+      kind: "busy",
+      message: "正在重新同步电脑端列表…",
+      threadId: thread.id,
+    });
+    try {
+      const result = await onThreadConvergenceRetry(thread, receipt.mutation);
+      if (result.kind === "converged") {
+        updateThreadMutationReceipt(thread.id, undefined);
+        setThreadActionFeedback({
+          kind: "success",
+          message: "列表已同步，可以继续操作此对话",
+          threadId: thread.id,
+        });
+      } else {
+        setThreadActionFeedback({
+          kind: "warning",
+          message: "列表仍未同步；已继续阻止重复或冲突操作，请稍后重试",
+          threadId: thread.id,
+        });
+      }
+    } catch (retryError) {
+      setThreadActionFeedback({
+        kind: "warning",
+        message: `列表仍未同步：${errorMessage(retryError)}`,
+        threadId: thread.id,
+      });
+    } finally {
+      threadMutationInFlightRef.current.delete(thread.id);
+      setThreadBusy(thread.id, false);
+    }
   }
 
   return (
@@ -1668,6 +2876,52 @@ function ThreadsPage({
             {copy.archived}
           </button>
         </div>
+        {threadActionFeedback ? (
+          <div
+            aria-live="polite"
+            className={`thread-action-feedback thread-action-feedback--${threadActionFeedback.kind}`}
+            data-testid="thread-action-feedback"
+            role={threadActionFeedback.kind === "error" ? "alert" : "status"}
+          >
+            <Icon
+              name={
+                threadActionFeedback.kind === "busy"
+                  ? "activity"
+                  : threadActionFeedback.kind === "success"
+                    ? "check"
+                    : "alert"
+              }
+              size={16}
+            />
+            <span>{threadActionFeedback.message}</span>
+            {threadActionFeedback.kind === "busy" ? null : (
+              <>
+                {threadMutationReceipts.has(threadActionFeedback.threadId) ? (
+                  <button
+                    aria-label="重新同步对话列表"
+                    disabled={!online || busyThreadIds.has(threadActionFeedback.threadId)}
+                    onClick={() => {
+                      const thread = [...threads, ...archivedThreads].find(
+                        (candidate) => candidate.id === threadActionFeedback.threadId,
+                      );
+                      if (thread) void retryThreadConvergence(thread);
+                    }}
+                    type="button"
+                  >
+                    <Icon name="refresh" size={16} />
+                  </button>
+                ) : null}
+                <button
+                  aria-label="关闭对话操作状态"
+                  onClick={() => setThreadActionFeedback(undefined)}
+                  type="button"
+                >
+                  <Icon name="close" size={16} />
+                </button>
+              </>
+            )}
+          </div>
+        ) : null}
         <div className="search-field">
           <Icon name="search" size={19} />
           <input
@@ -1735,49 +2989,72 @@ function ThreadsPage({
                         {copy.recent}
                       </div>
                     ) : null}
-                    <NavLink className="thread-list-item" to={`/threads/${thread.id}`}>
-                      <span
-                        className={`thread-list-item__icon thread-list-item__icon--${thread.state}`}
-                      >
-                        <Icon
-                          name={
-                            thread.mode === "desktop-snapshot"
-                              ? "clock"
-                              : thread.state === "running"
-                                ? "activity"
-                                : "message"
-                          }
-                          size={20}
-                        />
-                      </span>
-                      <span className="thread-list-item__copy">
-                        <span>
-                          <strong>{threadTitleForDisplay(thread.title)}</strong>
-                          <time>{timeAgo(thread.updatedAt)}</time>
-                        </span>
-                        <small>{localizedThreadLocation(thread, copy)}</small>
-                        <span className="thread-list-item__meta">
-                          <StatusPill
-                            tone={
-                              thread.mode === "desktop-snapshot" ? "info" : runTones[thread.state]
+                    <div className="thread-list-row">
+                      <NavLink className="thread-list-item" to={`/threads/${thread.id}`}>
+                        <span
+                          className={`thread-list-item__icon thread-list-item__icon--${thread.state}`}
+                        >
+                          <Icon
+                            name={
+                              thread.mode === "desktop-snapshot"
+                                ? "clock"
+                                : thread.state === "running"
+                                  ? "activity"
+                                  : "message"
                             }
-                          >
-                            {thread.mode === "desktop-snapshot"
-                              ? copy.history
-                              : runLabels[thread.state]}
-                          </StatusPill>
-                          {thread.pinnedRank === undefined ? null : (
-                            <span className="thread-list-item__pin">
-                              <Icon name="pin" size={14} />
-                              {copy.pinned}
-                            </span>
-                          )}
-                          {thread.model ? <span>{thread.model}</span> : null}
-                          {thread.childCount ? <span>{thread.childCount} 个子智能体</span> : null}
+                            size={20}
+                          />
                         </span>
-                      </span>
-                      <Icon name="chevron-right" size={19} />
-                    </NavLink>
+                        <span className="thread-list-item__copy">
+                          <span>
+                            <strong>{threadTitleForDisplay(thread.title)}</strong>
+                            <time>{timeAgo(thread.updatedAt)}</time>
+                          </span>
+                          <small>{localizedThreadLocation(thread, copy)}</small>
+                          <span className="thread-list-item__meta">
+                            <StatusPill
+                              tone={
+                                thread.mode === "desktop-snapshot" ? "info" : runTones[thread.state]
+                              }
+                            >
+                              {thread.mode === "desktop-snapshot"
+                                ? copy.history
+                                : runLabels[thread.state]}
+                            </StatusPill>
+                            {thread.pinnedRank === undefined ? null : (
+                              <span className="thread-list-item__pin">
+                                <Icon name="pin" size={14} />
+                                {copy.pinned}
+                              </span>
+                            )}
+                            {thread.model ? <span>{thread.model}</span> : null}
+                            {thread.childCount ? <span>{thread.childCount} 个子智能体</span> : null}
+                          </span>
+                        </span>
+                        <Icon name="chevron-right" size={19} />
+                      </NavLink>
+                      <ThreadActionsMenu
+                        archived={archiveScope === "archived"}
+                        busy={busyThreadIds.has(thread.id)}
+                        busyLabel={
+                          threadActionFeedback?.threadId === thread.id
+                            ? threadActionFeedback.message
+                            : "正在处理此对话…"
+                        }
+                        onArchiveChange={async (archived) => {
+                          await performThreadMutation(thread, { kind: "archive", archived });
+                        }}
+                        onRename={async (name) => {
+                          await performThreadMutation(thread, { kind: "rename", name });
+                        }}
+                        onRetryConvergence={async () => {
+                          await retryThreadConvergence(thread);
+                        }}
+                        online={online}
+                        pendingConvergence={threadMutationReceipts.has(thread.id)}
+                        thread={thread}
+                      />
+                    </div>
                   </Fragment>
                 );
               })}
@@ -1831,6 +3108,135 @@ function ThreadsPage({
   );
 }
 
+function AttachmentThumbnail({
+  apiClient,
+  attachment,
+  online,
+  onOpen,
+  projectId,
+}: {
+  apiClient: ApiClient;
+  attachment: ConversationAttachment;
+  online: boolean;
+  onOpen: () => void;
+  projectId?: string;
+}) {
+  const [state, setState] = useState<"loading" | "ready" | "fallback">(
+    online ? "loading" : "fallback",
+  );
+  const [url, setUrl] = useState("");
+
+  useEffect(() => {
+    if (!online) {
+      setState("fallback");
+      return;
+    }
+    let active = true;
+    let objectUrl = "";
+    setState("loading");
+    setUrl("");
+    void apiClient
+      .resolveFile(projectId, attachment.path)
+      .then(async (entry) => {
+        const result = await apiClient.preview(entry.projectId, entry.relativePath);
+        if (!result.contentType.startsWith("image/")) {
+          throw new Error("不是图片");
+        }
+        objectUrl = URL.createObjectURL(result.blob);
+        if (!active) {
+          URL.revokeObjectURL(objectUrl);
+          objectUrl = "";
+          return;
+        }
+        setUrl(objectUrl);
+        setState("ready");
+      })
+      .catch(() => {
+        if (active) setState("fallback");
+      });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [apiClient, attachment.path, online, projectId]);
+
+  return (
+    <button
+      aria-label={`预览 ${attachment.name}`}
+      className="message-image-thumb"
+      onClick={onOpen}
+      type="button"
+    >
+      {state === "ready" && url ? (
+        <img alt={attachment.name} loading="lazy" src={url} />
+      ) : state === "loading" ? (
+        <Skeleton />
+      ) : (
+        <span>
+          <Icon name="file" size={20} />
+          {attachment.name}
+        </span>
+      )}
+    </button>
+  );
+}
+
+function MessageImageGallery({
+  apiClient,
+  attachments,
+  collapsible = false,
+  label,
+  online,
+  onOpen,
+  projectId,
+}: {
+  apiClient: ApiClient;
+  attachments: ConversationAttachment[];
+  collapsible?: boolean;
+  label: string;
+  online: boolean;
+  onOpen: (attachment: ConversationAttachment) => void;
+  projectId?: string;
+}) {
+  const [expanded, setExpanded] = useState(!collapsible);
+  const gallery = expanded ? (
+    <div className="message-image-grid">
+      {attachments.map((attachment, index) => (
+        <AttachmentThumbnail
+          apiClient={apiClient}
+          attachment={attachment}
+          key={`${attachment.path}-${index}`}
+          online={online}
+          onOpen={() => onOpen(attachment)}
+          {...(projectId === undefined ? {} : { projectId })}
+        />
+      ))}
+    </div>
+  ) : null;
+  if (!collapsible) {
+    return (
+      <section aria-label={label} className="message-images">
+        {gallery}
+      </section>
+    );
+  }
+  return (
+    <section className="message-images message-images--collapsible">
+      <button
+        aria-expanded={expanded}
+        className="message-images__toggle"
+        onClick={() => setExpanded((current) => !current)}
+        type="button"
+      >
+        <Icon name="file" size={15} />
+        <span>{label}</span>
+        <Icon name={expanded ? "chevron-down" : "chevron-right"} size={15} />
+      </button>
+      {gallery}
+    </section>
+  );
+}
+
 const MessageItem = memo(function MessageItem({
   apiClient,
   item,
@@ -1844,19 +3250,154 @@ const MessageItem = memo(function MessageItem({
   online: boolean;
   projectId?: string;
 }) {
+  const [attachmentEntry, setAttachmentEntry] = useState<ResolvedFileEntry>();
+  const [attachmentError, setAttachmentError] = useState("");
+  const [attachmentLoading, setAttachmentLoading] = useState(false);
+  const [attachmentSelection, setAttachmentSelection] = useState<ConversationAttachment>();
+  const attachmentRequests = useLatestRequestController();
   const phase = assistantPhaseForDisplay(item, items);
 
+  function closeAttachment() {
+    attachmentRequests.cancel();
+    setAttachmentEntry(undefined);
+    setAttachmentError("");
+    setAttachmentLoading(false);
+    setAttachmentSelection(undefined);
+  }
+
+  function openAttachment(attachment: ConversationAttachment) {
+    const request = attachmentRequests.begin(filePreviewRequestKey(projectId, attachment.path));
+    setAttachmentSelection(attachment);
+    setAttachmentEntry(undefined);
+    setAttachmentError("");
+    if (!online) {
+      setAttachmentError("电脑当前离线；附件仍保留在消息中，恢复连接后可预览或下载。");
+      setAttachmentLoading(false);
+      return;
+    }
+    setAttachmentLoading(true);
+    void apiClient
+      .resolveFile(projectId, attachment.path)
+      .then((entry) => {
+        if (attachmentRequests.isCurrent(request)) setAttachmentEntry(entry);
+      })
+      .catch((error: unknown) => {
+        if (attachmentRequests.isCurrent(request)) setAttachmentError(errorMessage(error));
+      })
+      .finally(() => {
+        if (attachmentRequests.isCurrent(request)) setAttachmentLoading(false);
+      });
+  }
+
+  const attachmentSheet = (
+    <Sheet
+      onClose={closeAttachment}
+      open={
+        attachmentLoading ||
+        attachmentSelection !== undefined ||
+        attachmentEntry !== undefined ||
+        Boolean(attachmentError)
+      }
+      title={
+        attachmentEntry?.name ??
+        attachmentSelection?.name ??
+        (attachmentLoading ? "正在打开附件" : "附件")
+      }
+    >
+      {attachmentLoading ? (
+        <div className="activity-detail__loading">
+          <Skeleton />
+          <Skeleton width="72%" />
+        </div>
+      ) : attachmentError ? (
+        <EmptyState description={attachmentError} icon="alert" title="附件暂时不可用" />
+      ) : attachmentEntry ? (
+        <FilePreview
+          apiClient={apiClient}
+          embedded
+          entry={attachmentEntry}
+          online={online}
+          projectId={attachmentEntry.projectId}
+        />
+      ) : null}
+    </Sheet>
+  );
+
   if (item.kind === "user-message") {
+    const imageAttachments =
+      item.attachments?.filter((attachment) => attachment.kind === "image") ?? [];
+    const fileAttachments =
+      item.attachments?.filter((attachment) => attachment.kind !== "image") ?? [];
     return (
-      <article className="message message--user">
-        <div className="message__meta">
-          <span>你</span>
-          {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
-        </div>
-        <div className="message__bubble">
-          <UserMessageText>{item.text}</UserMessageText>
-        </div>
-      </article>
+      <>
+        <article className="message message--user">
+          <div className="message__meta">
+            <span>你</span>
+            {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
+            {item.text ? <CopyMessageButton label="复制你的消息" text={item.text} /> : null}
+          </div>
+          <div className="message__bubble">
+            {item.text ? <UserMessageText>{item.text}</UserMessageText> : null}
+            {fileAttachments.length ? (
+              <div aria-label="本条消息的附件" className="message__attachments">
+                {fileAttachments.map((attachment, index) => (
+                  <button
+                    key={`${attachment.path}-${index}`}
+                    onClick={() => openAttachment(attachment)}
+                    type="button"
+                  >
+                    <Icon name="file" size={15} />
+                    <span>{attachment.name}</span>
+                    <Icon name="chevron-right" size={15} />
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {imageAttachments.length ? (
+              <MessageImageGallery
+                apiClient={apiClient}
+                attachments={imageAttachments}
+                label={`本条消息的 ${imageAttachments.length} 张图片`}
+                online={online}
+                onOpen={openAttachment}
+                {...(projectId === undefined ? {} : { projectId })}
+              />
+            ) : null}
+          </div>
+        </article>
+        {attachmentSheet}
+      </>
+    );
+  }
+  if (item.kind === "image-activity") {
+    const label =
+      item.action === "viewed"
+        ? (item.summary ?? `已查看 ${item.attachments.length} 张图像`)
+        : (item.summary ?? "AI 生成的图片");
+    return (
+      <>
+        <article className={`image-activity image-activity--${item.action}`}>
+          <header>
+            <span>
+              <Icon name={item.action === "viewed" ? "file" : "spark"} size={15} />
+              {label}
+            </span>
+            {item.status === "failed" ? <small>生成失败</small> : null}
+          </header>
+          {item.attachments.length ? (
+            <MessageImageGallery
+              apiClient={apiClient}
+              attachments={item.attachments}
+              collapsible={item.action === "viewed"}
+              label={item.action === "viewed" ? label : "AI 生成的图片"}
+              online={online}
+              onOpen={openAttachment}
+              {...(projectId === undefined ? {} : { projectId })}
+            />
+          ) : null}
+        </article>
+        {attachmentSheet}
+      </>
     );
   }
   if (item.kind === "assistant-message") {
@@ -1868,6 +3409,28 @@ const MessageItem = memo(function MessageItem({
         >
           <div className="message__stage">
             <span>{phase === "commentary" ? "思考" : "回答"}</span>
+            {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
+            {phase === "final_answer" ? (
+              <CopyMessageButton label="复制最终回答" text={item.text} />
+            ) : null}
+          </div>
+          <Markdown
+            apiClient={apiClient}
+            online={online}
+            {...(projectId === undefined ? {} : { projectId })}
+          >
+            {item.text}
+          </Markdown>
+        </div>
+      </article>
+    );
+  }
+  if (item.kind === "reasoning-summary") {
+    return (
+      <article className="message message--assistant message--reasoning">
+        <div className="message__content">
+          <div className="message__stage">
+            <span>思考</span>
             {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
           </div>
           <Markdown
@@ -1881,15 +3444,134 @@ const MessageItem = memo(function MessageItem({
       </article>
     );
   }
+  if (item.kind === "formal-plan") {
+    return (
+      <article className="formal-plan">
+        <header className="formal-plan__header">
+          <span>
+            <Icon name="target" size={15} />
+            计划
+          </span>
+          {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
+          <CopyMessageButton label="复制计划" text={item.text} />
+        </header>
+        <Markdown
+          apiClient={apiClient}
+          online={online}
+          {...(projectId === undefined ? {} : { projectId })}
+        >
+          {item.text}
+        </Markdown>
+      </article>
+    );
+  }
+  if (item.kind === "interaction-record") {
+    return (
+      <article className="interaction-record">
+        <header className="interaction-record__header">
+          <span>
+            <Icon name="message" size={15} />
+            {item.title}
+          </span>
+          <small>{item.status === "answered" ? "已回答" : "已跳过"}</small>
+        </header>
+        <div className="interaction-record__questions">
+          {item.questions.map((question) => {
+            const selected = new Set(question.answers ?? []);
+            const optionLabels = new Set(question.options?.map((option) => option.label) ?? []);
+            const freeAnswers = (question.answers ?? []).filter(
+              (answer) => !optionLabels.has(answer),
+            );
+            return (
+              <section className="interaction-record__question" key={question.id}>
+                <small>{question.header}</small>
+                <strong>{question.question}</strong>
+                {question.options?.length ? (
+                  <ul className="interaction-record__options">
+                    {question.options.map((option) => (
+                      <li
+                        data-selected={selected.has(option.label) || undefined}
+                        key={option.label}
+                      >
+                        <span>{option.label}</span>
+                        <small>{option.description}</small>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {question.isSecret && item.status === "answered" ? (
+                  <p className="interaction-record__answer">已提交（内容已隐藏）</p>
+                ) : freeAnswers.length ? (
+                  <p className="interaction-record__answer">{freeAnswers.join("；")}</p>
+                ) : item.status === "skipped" ? (
+                  <p className="interaction-record__answer">未提供答案</p>
+                ) : null}
+              </section>
+            );
+          })}
+        </div>
+      </article>
+    );
+  }
   return null;
 });
 
+function CopyMessageButton({ label, text }: { label: string; text: string }) {
+  const [state, setState] = useState<"idle" | "copied" | "error">("idle");
+  return (
+    <button
+      aria-label={label}
+      className="message-copy"
+      data-copy-state={state}
+      onClick={() => {
+        void copyPlainText(text)
+          .then(() => setState("copied"))
+          .catch(() => setState("error"));
+      }}
+      title={state === "copied" ? "已复制" : state === "error" ? "复制失败" : label}
+      type="button"
+    >
+      <Icon name={state === "copied" ? "check" : "copy"} size={14} />
+    </button>
+  );
+}
+
+function CopyTextButton({ label, text }: { label: string; text: string }) {
+  const [state, setState] = useState<"idle" | "copied" | "error">("idle");
+  return (
+    <button
+      className="ui-button ui-button--secondary ui-button--regular"
+      data-copy-state={state}
+      data-touch-target="primary"
+      onClick={() => {
+        void copyPlainText(text)
+          .then(() => setState("copied"))
+          .catch(() => setState("error"));
+      }}
+      type="button"
+    >
+      <Icon name={state === "copied" ? "check" : "copy"} size={18} />
+      {state === "copied" ? "已复制" : state === "error" ? "复制失败" : label}
+    </button>
+  );
+}
+
 type ActivityItem = Extract<ThreadDetail["items"][number], { kind: "tool" | "file-change" }>;
+
+export function selectedActivityItem(
+  items: ReadonlyArray<ThreadDetail["items"][number]>,
+  selectedId: string | undefined,
+): ActivityItem | undefined {
+  if (selectedId === undefined) return undefined;
+  const selected = items.find((item) => item.id === selectedId);
+  return selected?.kind === "tool" || selected?.kind === "file-change" ? selected : undefined;
+}
 
 function ActivityRow({ item, onOpen }: { item: ActivityItem; onOpen: () => void }) {
   if (item.kind === "tool") {
     const canOpen =
       Boolean(item.detail) ||
+      (item.title === "运行命令" && Boolean(item.summary)) ||
       (item.occurrences ?? 0) > 1 ||
       Boolean(item.occurrenceDetails?.length);
     const content = (
@@ -1975,6 +3657,7 @@ function ActivityDetailSheet({
   const [resolvedEntry, setResolvedEntry] = useState<ResolvedFileEntry>();
   const [resolveError, setResolveError] = useState("");
   const [resolving, setResolving] = useState(false);
+  const resolveRequests = useLatestRequestController();
 
   useEffect(() => {
     setView(item?.kind === "file-change" && !item.diff ? "file" : "diff");
@@ -1983,33 +3666,39 @@ function ActivityDetailSheet({
   }, [item]);
 
   useEffect(() => {
-    if (!isFile || !item || !online || view !== "file") return;
-    let active = true;
+    if (!isFile || !item || !online || view !== "file") {
+      resolveRequests.cancel();
+      setResolving(false);
+      return;
+    }
+    const request = resolveRequests.begin(filePreviewRequestKey(projectId, item.path));
     setResolving(true);
     setResolveError("");
     void apiClient
       .resolveFile(projectId, item.path)
       .then((entry) => {
-        if (!active) return;
+        if (!resolveRequests.isCurrent(request)) return;
         setResolvedEntry(entry);
       })
       .catch((error: unknown) => {
-        if (!active) return;
+        if (!resolveRequests.isCurrent(request)) return;
         setResolveError(errorMessage(error));
       })
       .finally(() => {
-        if (active) setResolving(false);
+        if (resolveRequests.isCurrent(request)) setResolving(false);
       });
     return () => {
-      active = false;
+      resolveRequests.cancel();
     };
-  }, [apiClient, isFile, item, online, projectId, view]);
+  }, [apiClient, isFile, item, online, projectId, resolveRequests, view]);
 
   const description =
     item?.kind === "file-change"
       ? item.path
       : item?.kind === "tool"
-        ? (item.summary ?? toolFallbackSummary(item.status))
+        ? item.title === "运行命令"
+          ? "命令与输出"
+          : (item.summary ?? toolFallbackSummary(item.status))
         : undefined;
 
   return (
@@ -2065,16 +3754,37 @@ function ActivityDetailSheet({
                       </span>
                       {occurrence.detail ? <Icon name="chevron-down" size={14} /> : null}
                     </summary>
-                    {occurrence.detail ? (
-                      <pre className="activity-detail__code">{occurrence.detail}</pre>
-                    ) : null}
+                    <div className="activity-detail__occurrence-body">
+                      {occurrence.summary ? (
+                        <CopyableDetail
+                          label={item.title === "运行命令" ? "命令" : "摘要"}
+                          text={occurrence.summary}
+                        />
+                      ) : null}
+                      {occurrence.detail ? (
+                        <CopyableDetail
+                          label={item.title === "运行命令" ? "输出" : "详情"}
+                          text={occurrence.detail}
+                        />
+                      ) : null}
+                    </div>
                   </details>
                 </li>
               ))}
             </ol>
-          ) : item.detail ? (
-            <pre className="activity-detail__code">{item.detail}</pre>
-          ) : null}
+          ) : (
+            <>
+              {item.title === "运行命令" && item.summary ? (
+                <CopyableDetail label="命令" text={item.summary} />
+              ) : null}
+              {item.detail ? (
+                <CopyableDetail
+                  label={item.title === "运行命令" ? "输出" : "详情"}
+                  text={item.detail}
+                />
+              ) : null}
+            </>
+          )}
           {(item.occurrences ?? 0) > (item.occurrenceDetails?.length ?? 0) &&
           (item.occurrenceDetails?.length ?? 0) > 0 ? (
             <p className="activity-detail__note">
@@ -2146,6 +3856,26 @@ function ActivityDetailSheet({
   );
 }
 
+function CopyableDetail({ label, text }: { label: string; text: string }) {
+  const testId =
+    label === "命令"
+      ? "activity-detail-command"
+      : label === "输出"
+        ? "activity-detail-output"
+        : undefined;
+  return (
+    <section className="activity-detail__code-block">
+      <header>
+        <strong>{label}</strong>
+        <CopyMessageButton label={`复制${label}`} text={text} />
+      </header>
+      <pre aria-label={label} className="activity-detail__code" data-testid={testId} tabIndex={0}>
+        {text}
+      </pre>
+    </section>
+  );
+}
+
 function ActivityGroup({
   apiClient,
   items,
@@ -2163,11 +3893,18 @@ function ActivityGroup({
       (item.kind === "file-change" && item.status === "inProgress"),
   );
   const [open, setOpen] = useState(running);
-  const [selected, setSelected] = useState<ActivityItem>();
+  const [selectedId, setSelectedId] = useState<string>();
+  const selected = selectedActivityItem(items, selectedId);
 
   useEffect(() => {
     if (running) setOpen(true);
   }, [running]);
+
+  useEffect(() => {
+    if (selectedId !== undefined && selected === undefined) {
+      setSelectedId(undefined);
+    }
+  }, [selected, selectedId]);
 
   return (
     <>
@@ -2187,7 +3924,7 @@ function ActivityGroup({
           <div className="activity-record__items">
             {items.map((item) =>
               item.kind === "tool" || item.kind === "file-change" ? (
-                <ActivityRow item={item} key={item.id} onOpen={() => setSelected(item)} />
+                <ActivityRow item={item} key={item.id} onOpen={() => setSelectedId(item.id)} />
               ) : null,
             )}
           </div>
@@ -2198,16 +3935,18 @@ function ActivityGroup({
         item={selected}
         online={online}
         {...(projectId === undefined ? {} : { projectId })}
-        onClose={() => setSelected(undefined)}
+        onClose={() => setSelectedId(undefined)}
       />
     </>
   );
 }
 
 function SubagentActivityGroup({
+  active,
   items,
   subagents,
 }: {
+  active: boolean;
   items: ReadonlyArray<ThreadDetail["items"][number]>;
   subagents: readonly SubagentSummary[];
 }) {
@@ -2215,28 +3954,34 @@ function SubagentActivityGroup({
   const agentById = new Map(subagents.map((agent) => [agent.threadId, agent]));
   const latestById = new Map<
     string,
-    { label: string; status: "running" | "complete" | "failed" }
+    { label: string; status: "running" | "complete" | "failed" | "unknown" }
   >();
   for (const item of items) {
     if (item.kind !== "subagent-activity") continue;
     for (const agent of item.agents) {
       latestById.set(agent.threadId, {
         label: agent.label ?? agentById.get(agent.threadId)?.title ?? "子智能体",
-        status: item.status,
+        status: subagentActivityStatusForDisplay(item.status, active, item.action),
       });
     }
   }
   const latestActivity = [...items].reverse().find((item) => item.kind === "subagent-activity");
+  const latestStatus =
+    latestActivity?.kind === "subagent-activity"
+      ? subagentActivityStatusForDisplay(latestActivity.status, active, latestActivity.action)
+      : undefined;
   const activityLabel =
     latestActivity?.kind === "subagent-activity"
-      ? {
-          spawn: "已开始工作",
-          update: "已更新",
-          resume: "已继续工作",
-          wait: "正在等待",
-          close: "已完成",
-          activity: latestActivity.status === "running" ? "正在工作" : "已更新",
-        }[latestActivity.action]
+      ? latestStatus === "unknown"
+        ? "状态未确认"
+        : {
+            spawn: "已开始工作",
+            update: "已更新",
+            resume: "已继续工作",
+            wait: active ? "正在等待" : "已等待",
+            close: "已完成",
+            activity: latestStatus === "running" ? "正在工作" : "已更新",
+          }[latestActivity.action]
       : "";
   return (
     <div className="subagent-activity" aria-label="子智能体活动">
@@ -2252,6 +3997,7 @@ function SubagentActivityGroup({
               <Icon name="layers" size={13} />
             </span>
             <strong>{agent.label}</strong>
+            {agent.status === "unknown" ? <small>状态未确认</small> : null}
           </button>
         ))}
       </div>
@@ -2287,10 +4033,156 @@ function ContextCompactionRecord({
   );
 }
 
+type WorkLogSection =
+  | { kind: "content"; item: ThreadDetail["items"][number] }
+  | { kind: "activity"; items: Array<ThreadDetail["items"][number]> }
+  | { kind: "subagents"; items: Array<ThreadDetail["items"][number]> };
+
+function groupWorkLogSections(
+  items: ReadonlyArray<ThreadDetail["items"][number]>,
+): WorkLogSection[] {
+  const sections: WorkLogSection[] = [];
+  for (const item of items) {
+    const kind =
+      item.kind === "tool" || item.kind === "file-change"
+        ? "activity"
+        : item.kind === "subagent-activity"
+          ? "subagents"
+          : "content";
+    if (kind === "content") {
+      sections.push({ kind, item });
+      continue;
+    }
+    const previous = sections.at(-1);
+    if (previous?.kind === kind) {
+      previous.items.push(item);
+    } else {
+      sections.push({ kind, items: [item] });
+    }
+  }
+  return sections;
+}
+
+export function workLogOpenAfterItemsChange({
+  activeHeader,
+  currentOpen,
+  itemCount,
+  manuallyToggled,
+}: {
+  activeHeader: boolean;
+  currentOpen: boolean;
+  itemCount: number;
+  manuallyToggled: boolean;
+}): boolean {
+  return manuallyToggled ? currentOpen : activeHeader || itemCount <= 6;
+}
+
+export function conversationPresentationIdentity(
+  threadId: string,
+  resetGeneration: number,
+): string {
+  return `${threadId}:${resetGeneration}`;
+}
+
+function WorkLogGroup({
+  activeHeader,
+  apiClient,
+  belongsToActiveTurn,
+  items,
+  online,
+  projectId,
+  subagents,
+}: {
+  activeHeader: boolean;
+  apiClient: ApiClient;
+  belongsToActiveTurn: boolean;
+  items: ReadonlyArray<ThreadDetail["items"][number]>;
+  online: boolean;
+  projectId?: string;
+  subagents: readonly SubagentSummary[];
+}) {
+  const automaticallyCompact = items.length > 6;
+  const [open, setOpen] = useState(() =>
+    workLogOpenAfterItemsChange({
+      activeHeader,
+      currentOpen: false,
+      itemCount: items.length,
+      manuallyToggled: false,
+    }),
+  );
+  const manuallyToggled = useRef(false);
+  const headline = workLogHeadline(items);
+
+  useEffect(() => {
+    setOpen((currentOpen) =>
+      workLogOpenAfterItemsChange({
+        activeHeader,
+        currentOpen,
+        itemCount: items.length,
+        manuallyToggled: manuallyToggled.current,
+      }),
+    );
+  }, [activeHeader, automaticallyCompact, items.length]);
+
+  return (
+    <section className={`work-log${open ? " work-log--open" : ""}`}>
+      <button
+        aria-expanded={open}
+        className="work-log__toggle"
+        onClick={() => {
+          manuallyToggled.current = true;
+          setOpen((current) => !current);
+        }}
+        type="button"
+      >
+        <Icon name={activeHeader ? "activity" : "check"} size={15} />
+        <span className="work-log__label">
+          <strong>{activeHeader ? "正在工作" : "工作记录"}</strong>
+          {!open && headline ? <span>{headline}</span> : null}
+        </span>
+        <small>{workLogSummary(items)}</small>
+        <Icon name="chevron-down" size={15} />
+      </button>
+      {open ? (
+        <div className="work-log__items">
+          {groupWorkLogSections(items).map((section, index) =>
+            section.kind === "content" ? (
+              <MessageItem
+                apiClient={apiClient}
+                item={section.item}
+                items={items}
+                key={section.item.id}
+                online={online}
+                {...(projectId === undefined ? {} : { projectId })}
+              />
+            ) : section.kind === "activity" ? (
+              <ActivityGroup
+                apiClient={apiClient}
+                items={section.items}
+                key={`work-activity-${section.items[0]?.id ?? index}`}
+                online={online}
+                {...(projectId === undefined ? {} : { projectId })}
+              />
+            ) : (
+              <SubagentActivityGroup
+                active={belongsToActiveTurn}
+                items={section.items}
+                key={`work-subagents-${section.items[0]?.id ?? index}`}
+                subagents={subagents}
+              />
+            ),
+          )}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 const ConversationItems = memo(function ConversationItems({
   apiClient,
   items,
   activeTurnId,
+  presentationIdentity,
   online,
   projectId,
   showLivePhase,
@@ -2299,12 +4191,14 @@ const ConversationItems = memo(function ConversationItems({
   apiClient: ApiClient;
   items: ReadonlyArray<ThreadDetail["items"][number]>;
   activeTurnId?: string;
+  presentationIdentity: string;
   online: boolean;
   projectId?: string;
   showLivePhase: boolean;
   subagents: readonly SubagentSummary[];
 }) {
   const segments = groupConversationItems(conversationContentItems(items, activeTurnId));
+  const activeWorkSegmentIndex = activeWorkLogSegmentIndex(segments, activeTurnId);
   const livePhase = showLivePhase ? currentLivePhase(items, activeTurnId) : undefined;
   return (
     <>
@@ -2314,27 +4208,27 @@ const ConversationItems = memo(function ConversationItems({
             apiClient={apiClient}
             item={segment.item}
             items={items}
-            key={segment.item.id}
+            key={`${presentationIdentity}:content:${segment.item.id}`}
             online={online}
             {...(projectId === undefined ? {} : { projectId })}
           />
-        ) : segment.kind === "activity" ? (
-          <ActivityGroup
+        ) : segment.kind === "work" ? (
+          <WorkLogGroup
+            activeHeader={index === activeWorkSegmentIndex}
             apiClient={apiClient}
+            belongsToActiveTurn={workLogSegmentBelongsToActiveTurn(segments, index, activeTurnId)}
             items={segment.items}
-            key={`activity-${segment.items[0]?.id ?? index}`}
+            key={`${presentationIdentity}:work-${segment.items[0]?.id ?? index}`}
             online={online}
             {...(projectId === undefined ? {} : { projectId })}
-          />
-        ) : segment.kind === "compaction" ? (
-          <ContextCompactionRecord item={segment.item} key={`compaction-${segment.item.id}`} />
-        ) : (
-          <SubagentActivityGroup
-            items={segment.items}
-            key={`subagents-${segment.items[0]?.id ?? index}`}
             subagents={subagents}
           />
-        ),
+        ) : segment.kind === "compaction" ? (
+          <ContextCompactionRecord
+            item={segment.item}
+            key={`${presentationIdentity}:compaction-${segment.item.id}`}
+          />
+        ) : null,
       )}
       {livePhase ? (
         <p
@@ -2575,6 +4469,7 @@ type ConversationPageProps = {
   models: ModelOption[];
   online: boolean;
   onOpenApproval: (approval: ApprovalRequest) => void;
+  onSnapshotEventCursor: (threadId: string, cursor: string) => void;
   onThreadLoaded: (thread?: ThreadDetail) => void;
   onSubagentsLoaded: (agents: SubagentSummary[]) => void;
   onUsageLoaded: (usage?: UsageSnapshot) => void;
@@ -2586,6 +4481,220 @@ function ConversationPage(props: ConversationPageProps) {
   return <ConversationPageInstance key={id} {...props} id={id} />;
 }
 
+const subagentIntegrityRisk: Record<SubagentHistoryIntegrity["status"], number> = {
+  complete: 0,
+  unknown: 1,
+  partial: 2,
+  failed: 3,
+};
+
+const subagentStreamRisk: Record<SubagentHistoryIntegrity["streams"]["current"]["status"], number> =
+  {
+    exhausted: 0,
+    "not-requested": 0,
+    "more-available": 1,
+    failed: 2,
+  };
+
+function mergeSubagentHistoryStreams(
+  previous: SubagentHistoryIntegrity["streams"] | undefined,
+  incoming: SubagentHistoryIntegrity["streams"],
+  continuing: boolean,
+): SubagentHistoryIntegrity["streams"] {
+  if (!previous) return incoming;
+  const mergeStream = (
+    prior: SubagentHistoryIntegrity["streams"]["current"],
+    next: SubagentHistoryIntegrity["streams"]["current"],
+  ): SubagentHistoryIntegrity["streams"]["current"] => {
+    const status =
+      prior.status === "failed" || next.status === "failed"
+        ? "failed"
+        : continuing
+          ? next.status === "not-requested"
+            ? prior.status
+            : next.status
+          : subagentStreamRisk[next.status] > subagentStreamRisk[prior.status]
+            ? next.status
+            : prior.status;
+    return {
+      observedCount: continuing
+        ? prior.observedCount + next.observedCount
+        : Math.max(prior.observedCount, next.observedCount),
+      status,
+    };
+  };
+  return {
+    current: mergeStream(previous.current, incoming.current),
+    archived: mergeStream(previous.archived, incoming.archived),
+  };
+}
+
+export function accumulateSubagentHistoryIntegrity({
+  accumulatedCount,
+  continuing,
+  incoming,
+  nextCursor,
+  preserveExpandedHistory = false,
+  previous,
+}: {
+  accumulatedCount: number;
+  continuing: boolean;
+  incoming?: SubagentHistoryIntegrity | undefined;
+  nextCursor?: string | undefined;
+  preserveExpandedHistory?: boolean;
+  previous?: SubagentHistoryIntegrity | undefined;
+}): SubagentHistoryIntegrity | undefined {
+  const observedCount = Math.max(
+    accumulatedCount,
+    incoming?.observedCount ?? 0,
+    previous?.observedCount ?? 0,
+  );
+  const cumulativePrevious = continuing || preserveExpandedHistory ? previous : undefined;
+  if (!incoming) {
+    if (!cumulativePrevious) return undefined;
+    if (!continuing) {
+      return { ...cumulativePrevious, observedCount };
+    }
+    return {
+      ...cumulativePrevious,
+      status: "unknown",
+      reason: "continuation-unverified",
+      observedCount,
+    };
+  }
+
+  const streams = mergeSubagentHistoryStreams(
+    cumulativePrevious?.streams,
+    incoming.streams,
+    continuing,
+  );
+  const normalizedIncoming: SubagentHistoryIntegrity =
+    incoming.status === "complete" && nextCursor !== undefined
+      ? {
+          ...incoming,
+          status: "partial",
+          reason: "pagination-pending",
+          observedCount,
+          streams,
+        }
+      : { ...incoming, observedCount, streams };
+
+  if (!cumulativePrevious) {
+    if (continuing && normalizedIncoming.status === "complete") {
+      return {
+        ...normalizedIncoming,
+        status: "unknown",
+        reason: "continuation-unverified",
+      };
+    }
+    return normalizedIncoming;
+  }
+
+  // pagination-pending is a transient gap only the contiguous next page can
+  // close; durable failed/partial/unknown evidence must survive later pages.
+  if (continuing && cumulativePrevious.reason === "pagination-pending") {
+    return normalizedIncoming;
+  }
+
+  const selected =
+    subagentIntegrityRisk[normalizedIncoming.status] >
+    subagentIntegrityRisk[cumulativePrevious.status]
+      ? normalizedIncoming
+      : cumulativePrevious;
+  return { ...selected, observedCount, streams };
+}
+
+export function subagentHistoryIntegrityNotice(
+  integrity: SubagentHistoryIntegrity | undefined,
+): string {
+  if (!integrity || integrity.status === "complete") return "";
+  const observed = `当前已获取 ${integrity.observedCount} 条记录`;
+  if (integrity.status === "partial") {
+    return `${observed}；较早的子智能体记录可能尚未完整载入。`;
+  }
+  if (integrity.status === "failed") {
+    return `${observed}；子智能体历史读取失败，列表可能不完整。`;
+  }
+  return `${observed}；目前无法确认子智能体历史是否完整。`;
+}
+
+export function subagentHistoryPaginationCompleteLabel(
+  integrity: SubagentHistoryIntegrity | undefined,
+): string {
+  return integrity?.status === "complete" ? "已显示全部子智能体" : "子智能体历史尚未确认完整";
+}
+
+const persistedHistoryStatuses = new Set(["complete", "partial", "failed"]);
+const persistedHistoryScopes = new Set(["complete", "recent"]);
+const persistedHistoryReasons = new Set([
+  "verified-complete",
+  "recent-window",
+  "invalid-json",
+  "unterminated-line",
+  "overlong-line",
+  "projection-limit",
+  "read-failed",
+  "unstable-file",
+  "diagnostic-unavailable",
+]);
+
+function isPersistedHistoryIntegrity(
+  value: unknown,
+): value is NonNullable<ThreadDetail["persistedHistoryIntegrity"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.status === "string" &&
+    persistedHistoryStatuses.has(candidate.status) &&
+    typeof candidate.scope === "string" &&
+    persistedHistoryScopes.has(candidate.scope) &&
+    typeof candidate.reason === "string" &&
+    persistedHistoryReasons.has(candidate.reason) &&
+    typeof candidate.observedCount === "number" &&
+    Number.isInteger(candidate.observedCount) &&
+    candidate.observedCount >= 0
+  );
+}
+
+export function persistedConversationHistoryNotice({
+  historyNextCursor,
+  persistedHistoryIntegrity,
+}: {
+  historyNextCursor?: string | undefined;
+  persistedHistoryIntegrity?: unknown;
+}): string {
+  const hasEarlierPage = Boolean(historyNextCursor);
+  if (persistedHistoryIntegrity === undefined) {
+    return hasEarlierPage ? "可向上加载更早记录；当前历史尚未确认完整。" : "";
+  }
+  if (!isPersistedHistoryIntegrity(persistedHistoryIntegrity)) {
+    return `历史完整性元数据无法确认；当前仅显示已验证记录，历史尚未确认完整。${
+      hasEarlierPage ? " 可向上加载更早记录。" : ""
+    }`;
+  }
+  if (
+    persistedHistoryIntegrity.status === "complete" &&
+    persistedHistoryIntegrity.scope === "complete" &&
+    persistedHistoryIntegrity.reason === "verified-complete"
+  ) {
+    return "";
+  }
+  if (persistedHistoryIntegrity.status === "failed") {
+    return `持久历史读取失败；当前仅显示已验证记录，历史不完整。${
+      hasEarlierPage ? " 可向上加载更早记录。" : ""
+    }`;
+  }
+  if (
+    persistedHistoryIntegrity.scope === "recent" ||
+    persistedHistoryIntegrity.reason === "recent-window"
+  ) {
+    return `当前仅显示最近窗口内的已验证记录；${
+      hasEarlierPage ? "可向上加载更早记录，历史尚未确认完整。" : "持久历史尚未确认完整。"
+    }`;
+  }
+  return `持久历史不完整；当前仅显示已验证记录。${hasEarlierPage ? " 可向上加载更早记录。" : ""}`;
+}
+
 function ConversationPageInstance({
   apiClient,
   approvals,
@@ -2595,6 +4704,7 @@ function ConversationPageInstance({
   models,
   online,
   onOpenApproval,
+  onSnapshotEventCursor,
   onThreadLoaded,
   onSubagentsLoaded,
   onUsageLoaded,
@@ -2616,6 +4726,8 @@ function ConversationPageInstance({
   const initialThread = routeSeed ?? (summary ? detailFromThreadSummary(summary) : undefined);
   const [thread, setThread] = useState<ThreadDetail | undefined>(initialThread);
   const [subagents, setSubagents] = useState<SubagentSummary[]>([]);
+  const [subagentHistoryIntegrity, setSubagentHistoryIntegrity] =
+    useState<SubagentHistoryIntegrity>();
   const [subagentsNextCursor, setSubagentsNextCursor] = useState<string>();
   const [subagentsMoreState, setSubagentsMoreState] = useState<MoreState>("idle");
   const [subagentsError, setSubagentsError] = useState("");
@@ -2642,10 +4754,7 @@ function ConversationPageInstance({
   const [approvalPolicy, setApprovalPolicy] = useState(initialThread?.approvalPolicy ?? "");
   const [approvalReviewer, setApprovalReviewer] = useState(initialThread?.approvalsReviewer ?? "");
   const [collaborationMode, setCollaborationMode] = useState(
-    initialThread?.collaborationMode ??
-      collaborationModes.find((mode) => mode.id === "auto" && mode.available)?.id ??
-      collaborationModes.find((mode) => mode.available)?.id ??
-      "",
+    chooseCollaborationMode(collaborationModes, initialThread?.collaborationMode) ?? "",
   );
   const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([]);
   const [approvalPolicies, setApprovalPolicies] = useState<ApprovalPolicyOption[]>([]);
@@ -2661,9 +4770,11 @@ function ConversationPageInstance({
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [resumeBusy, setResumeBusy] = useState(false);
   const [goalDraft, setGoalDraft] = useState("");
+  const [threadGoal, setThreadGoal] = useState<ThreadGoal>();
   const [goalBusy, setGoalBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
+  const [interruptRequestedTurnId, setInterruptRequestedTurnId] = useState("");
   const [showAgents, setShowAgents] = useState(false);
   const [showUsage, setShowUsage] = useState(false);
   const [usageRefreshState, setUsageRefreshState] = useState<"idle" | "refreshing" | "error">(
@@ -2671,10 +4782,12 @@ function ConversationPageInstance({
   );
   const [usageRefreshError, setUsageRefreshError] = useState("");
   const [threadIdCopyState, setThreadIdCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const [draftCopyState, setDraftCopyState] = useState<"idle" | "copied" | "error">("idle");
   const [runtimeNotice, setRuntimeNotice] = useState<RuntimeNotice>();
   const [visibleItemLimit, setVisibleItemLimit] = useState(INITIAL_CONVERSATION_ITEM_LIMIT);
   const [conversationAway, setConversationAway] = useState(false);
   const [composerExpanded, setComposerExpanded] = useState(false);
+  const composerExpandedRef = useRef(false);
   const [historyNextCursor, setHistoryNextCursor] = useState<string>();
   const [historyMoreState, setHistoryMoreState] = useState<MoreState>("idle");
   const [actionError, setActionError] = useState("");
@@ -2686,6 +4799,10 @@ function ConversationPageInstance({
   const [compactionNotice, setCompactionNotice] = useState("");
   const [compactionError, setCompactionError] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
+  const composerShellRef = useRef<HTMLDivElement>(null);
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerCollapseTimerRef = useRef<number | undefined>(undefined);
+  const composerPointerActiveRef = useRef(false);
   const conversationScrollRef = useRef<HTMLDivElement>(null);
   const conversationStreamRef = useRef<HTMLDivElement>(null);
   const conversationAwayRef = useRef(false);
@@ -2706,8 +4823,11 @@ function ConversationPageInstance({
   const creationPromptLiveAliasItemIdRef = useRef<string | undefined>(undefined);
   const creationPromptPersistedItemIdRef = useRef<string | undefined>(undefined);
   const summaryRef = useRef(summary);
-  const loadInFlight = useRef<{ id: string; promise: Promise<void> } | undefined>(undefined);
+  const loadInFlight = useRef<
+    { id: string; featureKey: string; promise: Promise<void> } | undefined
+  >(undefined);
   const subagentsRef = useRef<SubagentSummary[]>([]);
+  const subagentHistoryIntegrityRef = useRef<SubagentHistoryIntegrity | undefined>(undefined);
   const subagentsNextCursorRef = useRef<string | undefined>(undefined);
   const subagentsExtendedRef = useRef(false);
   const subagentsMoreInFlightRef = useRef<{ id: string } | undefined>(undefined);
@@ -2719,6 +4839,7 @@ function ConversationPageInstance({
   const usagePanelRef = useRef<HTMLElement>(null);
   const goalLoadedRef = useRef(false);
   const productSettingsDirtyRef = useRef(false);
+  const productSettingsGenerationRef = useRef(0);
   const collaborationModeDirtyRef = useRef(false);
   const remoteProjectionRef = useRef(createThreadRemoteEventProjectionState());
   const queueSupported = composerFeatureSupported(capabilities, "queue");
@@ -2733,6 +4854,15 @@ function ConversationPageInstance({
   const approvalReviewersCapability = capabilities?.approvalReviewers === "available";
   const approvalReviewersSupported = approvalReviewersCapability && approvalReviewers.length > 0;
   const runtimeControlAvailable = online && appServerReady(capabilities);
+  const loadFeatureKey = [
+    queueSupported,
+    goalSupported,
+    permissionProfilesCapability,
+    approvalPoliciesCapability,
+    approvalReviewersCapability,
+  ]
+    .map((available) => (available ? "1" : "0"))
+    .join("");
   currentIdRef.current = id;
   conversationAwayRef.current = conversationAway;
   latestLiveDeliveryRef.current = liveEvents.at(-1)?.deliveryId ?? 0;
@@ -2750,6 +4880,7 @@ function ConversationPageInstance({
         if (
           item.kind === "user-message" ||
           item.kind === "assistant-message" ||
+          item.kind === "image-activity" ||
           item.kind === "plan-progress" ||
           item.kind === "subagent-activity"
         ) {
@@ -2758,6 +4889,10 @@ function ConversationPageInstance({
         return item.kind === "tool" && item.operation === "context-compaction";
       }),
     [presentationItems, visibleItemLimit],
+  );
+  const presentationIdentity = conversationPresentationIdentity(
+    id,
+    remoteProjectionRef.current.generation,
   );
   const composerPlan = useMemo(() => latestPlanProgress(thread?.items ?? []), [thread?.items]);
   const hiddenItemCount = hiddenConversationItemCount(
@@ -2783,9 +4918,12 @@ function ConversationPageInstance({
 
   const load = useCallback(
     (silent = false) => {
-      if (loadInFlight.current?.id === id) return loadInFlight.current.promise;
+      if (loadInFlight.current?.id === id && loadInFlight.current.featureKey === loadFeatureKey) {
+        return loadInFlight.current.promise;
+      }
       if (!silent) setState("loading");
       const projectionGeneration = remoteProjectionRef.current.generation;
+      const productSettingsGeneration = productSettingsGenerationRef.current;
       if (!silent && !threadRef.current) {
         void apiClient
           .threadShell(id)
@@ -2798,7 +4936,10 @@ function ConversationPageInstance({
             setNextTurnSettings((current) =>
               reconcileNextTurnSettingsDraft(current, models, shell),
             );
-            if (!productSettingsDirtyRef.current) {
+            if (
+              !productSettingsDirtyRef.current &&
+              productSettingsGenerationRef.current === productSettingsGeneration
+            ) {
               setServiceTier(shell.serviceTier ?? null);
               if (shell.permissionProfileId) {
                 setPermissionProfileId(shell.permissionProfileId);
@@ -2820,7 +4961,7 @@ function ConversationPageInstance({
             .subagents(id)
             .then((page) => ({ page, error: "" }))
             .catch((agentsError: unknown) => ({
-              page: { items: [] } as CursorPage<SubagentSummary>,
+              page: { items: [] } as SubagentCursorPage,
               error: errorMessage(agentsError),
             }));
           const usageSnapshotPromise = apiClient.usage(id).catch(() => undefined);
@@ -2848,8 +4989,16 @@ function ConversationPageInstance({
           const approvalReviewerResultPromise = approvalReviewersCapability
             ? apiClient.approvalReviewers().catch(() => [])
             : Promise.resolve([] as ApprovalReviewerOption[]);
-          const detail = await apiClient.thread(id);
+          const refreshSnapshots = await readThreadRefreshSnapshots(
+            apiClient,
+            id,
+            threadRef.current,
+          );
+          const { control, detail } = refreshSnapshots;
           if (currentIdRef.current !== id) return;
+          if (detail.snapshotEventCursor) {
+            onSnapshotEventCursor(detail.id, detail.snapshotEventCursor);
+          }
           const persistedPromptItemId = persistedCreationPromptItemId(
             detail,
             routeInitialPromptRef.current,
@@ -2875,7 +5024,17 @@ function ConversationPageInstance({
                   : { liveAliasItemId: creationPromptLiveAliasItemIdRef.current }),
               }
             : undefined;
-          const mergedDetail = mergeThreadRefresh(threadRef.current, detail, creationContext);
+          let mergedDetail = mergeThreadRefresh(threadRef.current, detail, creationContext);
+          if (
+            control &&
+            threadControlSnapshotIsCurrent(
+              remoteProjectionRef.current,
+              control,
+              projectionGeneration,
+            )
+          ) {
+            mergedDetail = mergeAuthoritativeThreadControl(mergedDetail, control, creationContext);
+          }
           if (!historyExtendedRef.current) {
             setHistoryNextCursor(detail.historyNextCursor);
           }
@@ -2893,7 +5052,10 @@ function ConversationPageInstance({
           setNextTurnSettings((current) =>
             reconcileNextTurnSettingsDraft(current, models, mergedDetail),
           );
-          if (!productSettingsDirtyRef.current) {
+          if (
+            !productSettingsDirtyRef.current &&
+            productSettingsGenerationRef.current === productSettingsGeneration
+          ) {
             setServiceTier(mergedDetail.serviceTier ?? null);
             if (mergedDetail.permissionProfileId) {
               setPermissionProfileId(mergedDetail.permissionProfileId);
@@ -2934,16 +5096,32 @@ function ConversationPageInstance({
                 (agent) => agent.threadId,
               )
             : agentsResult.page.items;
+          const preserveExpandedHistory =
+            silent && (subagentsExtendedRef.current || subagentsMoreInFlightRef.current?.id === id);
           const nextCursor = agentsResult.error
             ? subagentsNextCursorRef.current
             : nextCursorAfterRefresh(
                 subagentsNextCursorRef.current,
                 agentsResult.page.nextCursor,
-                silent &&
-                  (subagentsExtendedRef.current || subagentsMoreInFlightRef.current?.id === id),
+                preserveExpandedHistory,
               );
           subagentsRef.current = agents;
           setSubagents(agents);
+          if (!agentsResult.error) {
+            const integrity = accumulateSubagentHistoryIntegrity({
+              accumulatedCount: agents.length,
+              continuing: false,
+              incoming: agentsResult.page.historyIntegrity,
+              nextCursor: agentsResult.page.nextCursor,
+              preserveExpandedHistory,
+              previous: subagentHistoryIntegrityRef.current,
+            });
+            subagentHistoryIntegrityRef.current = integrity;
+            setSubagentHistoryIntegrity(integrity);
+          } else if (!silent) {
+            subagentHistoryIntegrityRef.current = undefined;
+            setSubagentHistoryIntegrity(undefined);
+          }
           subagentsNextCursorRef.current = nextCursor;
           setSubagentsNextCursor(nextCursor);
           setSubagentsError(agentsResult.error);
@@ -2960,37 +5138,27 @@ function ConversationPageInstance({
             );
           }
           setApprovalPolicies(approvalPolicyResult);
-          setApprovalPolicy((current) =>
-            chooseApprovalPolicy(approvalPolicyResult, mergedDetail.approvalPolicy ?? current),
-          );
           setApprovalReviewers(approvalReviewerResult);
-          setApprovalReviewer((current) =>
-            chooseApprovalReviewer(
-              approvalReviewerResult,
-              mergedDetail.approvalsReviewer ?? current,
-            ),
-          );
           if (!goalLoadedRef.current) {
             setGoalDraft(goalResult?.goal?.objective ?? "");
+            setThreadGoal(goalResult?.goal ?? undefined);
             goalLoadedRef.current = true;
           }
           onSubagentsLoaded(agents);
           onUsageLoaded(usageSnapshot);
-          if (!productSettingsDirtyRef.current) {
-            if (
-              mergedDetail.approvalPolicy &&
-              approvalPolicyResult.some((policy) => policy.id === mergedDetail.approvalPolicy)
-            ) {
-              setApprovalPolicy(mergedDetail.approvalPolicy);
-            }
-            if (
-              mergedDetail.approvalsReviewer &&
-              approvalReviewerResult.some(
-                (reviewer) => reviewer.id === mergedDetail.approvalsReviewer,
-              )
-            ) {
-              setApprovalReviewer(mergedDetail.approvalsReviewer);
-            }
+          if (
+            !productSettingsDirtyRef.current &&
+            productSettingsGenerationRef.current === productSettingsGeneration
+          ) {
+            setApprovalPolicy((current) =>
+              chooseApprovalPolicy(approvalPolicyResult, mergedDetail.approvalPolicy ?? current),
+            );
+            setApprovalReviewer((current) =>
+              chooseApprovalReviewer(
+                approvalReviewerResult,
+                mergedDetail.approvalsReviewer ?? current,
+              ),
+            );
           }
         } catch (loadError) {
           if (currentIdRef.current !== id || silent) return;
@@ -3000,7 +5168,7 @@ function ConversationPageInstance({
           onSubagentsLoaded([]);
         }
       })();
-      const request = { id, promise };
+      const request = { id, featureKey: loadFeatureKey, promise };
       loadInFlight.current = request;
       void promise.finally(() => {
         if (loadInFlight.current === request) loadInFlight.current = undefined;
@@ -3014,6 +5182,7 @@ function ConversationPageInstance({
       id,
       models,
       onSubagentsLoaded,
+      onSnapshotEventCursor,
       onThreadLoaded,
       onUsageLoaded,
       approvalReviewersCapability,
@@ -3021,15 +5190,18 @@ function ConversationPageInstance({
       permissionProfilesCapability,
       permissionProfileId,
       queueSupported,
+      loadFeatureKey,
     ],
   );
 
   useEffect(() => {
     handledLiveDelivery.current = 0;
     subagentsRef.current = [];
+    subagentHistoryIntegrityRef.current = undefined;
     subagentsNextCursorRef.current = undefined;
     subagentsExtendedRef.current = false;
     setSubagents([]);
+    setSubagentHistoryIntegrity(undefined);
     setSubagentsNextCursor(undefined);
     setSubagentsMoreState("idle");
     setSubagentsError("");
@@ -3063,12 +5235,15 @@ function ConversationPageInstance({
     conversationUserScrollIntentAtRef.current = 0;
     setConversationAway(false);
     setGoalDraft("");
+    setThreadGoal(undefined);
     setActionError("");
     setActionStatus("");
     setResumeBusy(false);
     setSending(false);
     setInterrupting(false);
+    setInterruptRequestedTurnId("");
     goalLoadedRef.current = false;
+    productSettingsGenerationRef.current += 1;
     productSettingsDirtyRef.current = false;
     collaborationModeDirtyRef.current = false;
     compactionAttemptRef.current = undefined;
@@ -3093,10 +5268,7 @@ function ConversationPageInstance({
       setApprovalPolicy(fallback.approvalPolicy ?? "");
       setApprovalReviewer(fallback.approvalsReviewer ?? "");
       setCollaborationMode(
-        fallback.collaborationMode ??
-          collaborationModes.find((mode) => mode.id === "auto" && mode.available)?.id ??
-          collaborationModes.find((mode) => mode.available)?.id ??
-          "",
+        chooseCollaborationMode(collaborationModes, fallback.collaborationMode) ?? "",
       );
       setState("ready");
       setError("");
@@ -3180,11 +5352,20 @@ function ConversationPageInstance({
 
   useEffect(() => {
     return () => {
+      if (composerCollapseTimerRef.current !== undefined) {
+        window.clearTimeout(composerCollapseTimerRef.current);
+      }
       onThreadLoaded(undefined);
       onSubagentsLoaded([]);
       onUsageLoaded(undefined);
     };
   }, [onSubagentsLoaded, onThreadLoaded, onUsageLoaded]);
+
+  useEffect(() => {
+    if (interruptRequestedTurnId && thread?.activeTurnId !== interruptRequestedTurnId) {
+      setInterruptRequestedTurnId("");
+    }
+  }, [interruptRequestedTurnId, thread?.activeTurnId]);
 
   useEffect(() => {
     if (thread) {
@@ -3214,11 +5395,21 @@ function ConversationPageInstance({
         cursor ? "append" : "prepend",
       );
       subagentsRef.current = agents;
-      const nextCursor =
-        !cursor && subagentsExtendedRef.current ? subagentsNextCursorRef.current : page.nextCursor;
-      if (cursor) subagentsExtendedRef.current = true;
+      const preserveExpandedHistory = cursor === undefined && subagentsExtendedRef.current;
+      const nextCursor = preserveExpandedHistory ? subagentsNextCursorRef.current : page.nextCursor;
+      if (cursor !== undefined) subagentsExtendedRef.current = true;
       subagentsNextCursorRef.current = nextCursor;
+      const integrity = accumulateSubagentHistoryIntegrity({
+        accumulatedCount: agents.length,
+        continuing: cursor !== undefined,
+        incoming: page.historyIntegrity,
+        nextCursor: page.nextCursor,
+        preserveExpandedHistory,
+        previous: subagentHistoryIntegrityRef.current,
+      });
+      subagentHistoryIntegrityRef.current = integrity;
       setSubagents(agents);
+      setSubagentHistoryIntegrity(integrity);
       setSubagentsNextCursor(nextCursor);
       onSubagentsLoaded(agents);
       setSubagentsMoreState("idle");
@@ -3410,7 +5601,10 @@ function ConversationPageInstance({
   useEffect(() => {
     let timer: number | undefined;
     let disposed = false;
-    const delay = threadRefreshDelay(thread?.state, compactionRequestState === "accepted");
+    const delay = threadRefreshDelay(
+      thread?.state,
+      compactionRequestState === "accepted" || Boolean(interruptRequestedTurnId),
+    );
     const clear = () => {
       if (timer !== undefined) window.clearTimeout(timer);
       timer = undefined;
@@ -3439,7 +5633,7 @@ function ConversationPageInstance({
       clear();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [compactionRequestState, load, thread?.state]);
+  }, [compactionRequestState, interruptRequestedTurnId, load, thread?.state]);
 
   useEffect(() => {
     window.localStorage.setItem(`draft:${id}`, draft);
@@ -3457,9 +5651,22 @@ function ConversationPageInstance({
 
   useEffect(() => {
     initialScrollThreadRef.current = "";
-    setComposerExpanded(composerExpandedAfterIntent("thread-change"));
+    setDraftCopyState("idle");
+    setComposerExpansion(composerExpandedAfterIntent("thread-change"));
     setAttachments(readConversationAttachments(window.localStorage, id));
   }, [id]);
+
+  useEffect(() => {
+    const collapseOutsideComposer = (event: PointerEvent) => {
+      if (!composerExpandedRef.current) return;
+      const target = event.target;
+      if (target instanceof Node && composerShellRef.current?.contains(target)) return;
+      composerExpandedRef.current = false;
+      setComposerExpanded(false);
+    };
+    document.addEventListener("pointerdown", collapseOutsideComposer);
+    return () => document.removeEventListener("pointerdown", collapseOutsideComposer);
+  }, []);
 
   useLayoutEffect(() => {
     if (state !== "ready" || !detailProjectionReady || initialScrollThreadRef.current === id) {
@@ -3529,7 +5736,7 @@ function ConversationPageInstance({
     if (activeElement instanceof HTMLElement && activeElement.closest(".composer-shell")) {
       activeElement.blur();
     }
-    setComposerExpanded(composerExpandedAfterIntent("conversation-scroll"));
+    setComposerExpansion(composerExpandedAfterIntent("conversation-scroll"));
   }
 
   function refreshUsageDetails() {
@@ -3570,10 +5777,20 @@ function ConversationPageInstance({
 
   async function copyThreadId() {
     try {
-      await navigator.clipboard.writeText(id);
+      await copyPlainText(id);
       if (currentIdRef.current === id) setThreadIdCopyState("copied");
     } catch {
       if (currentIdRef.current === id) setThreadIdCopyState("error");
+    }
+  }
+
+  async function copyDraft() {
+    if (!draft) return;
+    setDraftCopyState("copied");
+    try {
+      await copyPlainText(draft);
+    } catch {
+      if (currentIdRef.current === id) setDraftCopyState("error");
     }
   }
 
@@ -3716,7 +5933,7 @@ function ConversationPageInstance({
       let decision = composerDeliveryDecision(currentThread, deliveryMode, queueSupported);
       const decisionBeforeRefresh = decision;
       if (decision === "start" || decision === "synchronize") {
-        const authoritative = await apiClient.thread(currentThread.id);
+        const authoritative = await readThreadControlBeforeSubmit(apiClient, currentThread.id);
         if (currentIdRef.current !== id) return;
         const creationContext = routeSeedRef.current
           ? {
@@ -3768,18 +5985,12 @@ function ConversationPageInstance({
         reserveSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
         const optimisticId = `pending-steer-${Date.now()}`;
         const latestThread = threadRef.current ?? currentThread;
-        const optimistic: ThreadDetail = {
-          ...latestThread,
-          items: [
-            ...latestThread.items,
-            {
-              id: optimisticId,
-              kind: "user-message",
-              text: prompt,
-              turnId: currentThread.activeTurnId,
-            },
-          ],
-        };
+        const optimistic = appendOptimisticUserMessage(
+          latestThread,
+          prompt,
+          optimisticId,
+          currentThread.activeTurnId,
+        );
         threadRef.current = optimistic;
         setThread(optimistic);
         try {
@@ -3790,10 +6001,7 @@ function ConversationPageInstance({
         } catch (steerError) {
           cancelSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
           const latestAfterFailure = threadRef.current ?? optimistic;
-          const rolledBack: ThreadDetail = {
-            ...latestAfterFailure,
-            items: latestAfterFailure.items.filter((item) => item.id !== optimisticId),
-          };
+          const rolledBack = removeOptimisticConversationItem(latestAfterFailure, optimisticId);
           threadRef.current = rolledBack;
           setThread(rolledBack);
           throw steerError;
@@ -3803,21 +6011,35 @@ function ConversationPageInstance({
         setActionStatus("steer-accepted");
       } else {
         reserveSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
-        let updated: ThreadDetail;
+        const optimisticId = `pending-send-${Date.now()}`;
+        const latestThread = threadRef.current ?? currentThread;
+        const optimistic = appendOptimisticUserMessage(latestThread, prompt, optimisticId);
+        threadRef.current = optimistic;
+        setThread(optimistic);
+        let authoritative: ThreadDetail;
         try {
-          updated = await apiClient.sendTurn(currentThread.id, {
+          authoritative = await apiClient.sendTurn(currentThread.id, {
             prompt,
             ...(attachments.length ? { attachments } : {}),
             ...nextTurnProductSettings(),
           });
         } catch (sendError) {
           cancelSubmittedTurnUserAlias(remoteProjectionRef.current, currentThread.id, prompt);
+          const latestAfterFailure = threadRef.current ?? optimistic;
+          const rolledBack = removeOptimisticConversationItem(latestAfterFailure, optimisticId);
+          threadRef.current = rolledBack;
+          setThread(rolledBack);
           throw sendError;
         }
+        const updated = mergeAuthoritativeThreadControl(
+          threadRef.current ?? optimistic,
+          authoritative,
+        );
         rememberSubmittedTurnUserAlias(remoteProjectionRef.current, updated, prompt);
         threadRef.current = updated;
         setThread(updated);
         setNextTurnSettings((current) => consumeNextTurnSettingsDraft(current, models, updated));
+        productSettingsGenerationRef.current += 1;
         productSettingsDirtyRef.current = false;
         collaborationModeDirtyRef.current = false;
         setServiceTier(updated.serviceTier ?? serviceTier);
@@ -3839,7 +6061,7 @@ function ConversationPageInstance({
       }
       setDraft("");
       setAttachments([]);
-      setComposerExpanded(composerExpandedAfterIntent("submit"));
+      setComposerExpansion(composerExpandedAfterIntent("submit"));
       window.localStorage.removeItem(`draft:${id}`);
       window.localStorage.removeItem(`conversation-attachments:${encodeURIComponent(id)}`);
       window.setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 20);
@@ -3869,13 +6091,49 @@ function ConversationPageInstance({
     setActionError("");
     try {
       if (settingsUpdateSupported && thread.availableActions.updateSettings !== false) {
-        await apiClient.updateThreadSettings(thread.id, {
+        const requested: ThreadSettingsInput = {
           ...nextTurnProductSettings(overrides),
           ...(overrides.serviceTier === null ? serviceTierSetting(capabilities, null) : {}),
-        });
-        if (overrides.collaborationMode === undefined) {
-          productSettingsDirtyRef.current = false;
+        };
+        await apiClient.updateThreadSettings(thread.id, requested);
+        const authoritative = await apiClient.thread(thread.id);
+        if (currentIdRef.current !== thread.id) return;
+        const mismatches = threadSettingsReadbackMismatches(requested, authoritative);
+        const rejectedApprovalReviewer = rejectedApprovalReviewerId(requested, authoritative);
+        const authoritativeApprovalReviewers = rejectedApprovalReviewer
+          ? approvalReviewers.filter((reviewer) => reviewer.id !== rejectedApprovalReviewer)
+          : approvalReviewers;
+        if (rejectedApprovalReviewer) {
+          setApprovalReviewers(authoritativeApprovalReviewers);
         }
+        const synchronized = mergeAuthoritativeThreadControl(threadRef.current, authoritative);
+        threadRef.current = synchronized;
+        setThread(synchronized);
+        onThreadLoaded(synchronized);
+        setNextTurnSettings((current) =>
+          reconcileNextTurnSettingsDraft(current, models, authoritative),
+        );
+        setServiceTier(authoritative.serviceTier ?? null);
+        setPermissionProfileId(
+          choosePermissionProfileId(permissionProfiles, authoritative.permissionProfileId) ?? "",
+        );
+        setApprovalPolicy(chooseApprovalPolicy(approvalPolicies, authoritative.approvalPolicy));
+        setApprovalReviewer(
+          chooseApprovalReviewer(authoritativeApprovalReviewers, authoritative.approvalsReviewer),
+        );
+        setCollaborationMode(
+          chooseCollaborationMode(collaborationModes, authoritative.collaborationMode) ?? "",
+        );
+        if (mismatches.length > 0) {
+          setComposerSheet("");
+          setActionError(
+            `Codex 没有接受这些下一轮设置：${mismatches.join("、")}。已恢复为电脑端实际值。`,
+          );
+          return;
+        }
+        productSettingsGenerationRef.current += 1;
+        productSettingsDirtyRef.current = false;
+        collaborationModeDirtyRef.current = false;
       }
       setActionStatus("settings-applied");
       setComposerSheet("");
@@ -3961,9 +6219,10 @@ function ConversationPageInstance({
       setQueue(snapshot.items);
       setQueueRevision(snapshot.revision);
       const updated = await apiClient.thread(thread.id);
-      threadRef.current = updated;
-      setThread(updated);
-      onThreadLoaded(updated);
+      const merged = mergeQueuedThreadRefresh(threadRef.current ?? thread, updated);
+      threadRef.current = merged;
+      setThread(merged);
+      onThreadLoaded(merged);
     } catch (queueActionError) {
       setQueueError(errorMessage(queueActionError));
     } finally {
@@ -3973,21 +6232,58 @@ function ConversationPageInstance({
 
   async function steerQueued(item: QueuedTurnItem) {
     if (!thread?.activeTurnId || !thread.availableActions.steer) return;
+    const prompt = item.prompt?.trim();
+    const optimisticId = prompt ? `pending-steer-${Date.now()}` : undefined;
+    const optimistic =
+      prompt && optimisticId
+        ? appendOptimisticUserMessage(
+            threadRef.current ?? thread,
+            prompt,
+            optimisticId,
+            thread.activeTurnId,
+          )
+        : (threadRef.current ?? thread);
+    if (prompt) {
+      reserveSubmittedTurnUserAlias(remoteProjectionRef.current, thread.id, prompt);
+      threadRef.current = optimistic;
+      setThread(optimistic);
+    }
     setQueueBusyId(item.id);
     setQueueError("");
+    let accepted = false;
     try {
       const snapshot = await apiClient.steerQueued(thread.id, item.id, {
         expectedRevision: queueRevision,
         turnId: thread.activeTurnId,
       });
+      accepted = true;
       setQueue(snapshot.items);
       setQueueRevision(snapshot.revision);
       setActionStatus("steer-accepted");
       const updated = await apiClient.thread(thread.id);
-      threadRef.current = updated;
-      setThread(updated);
-      onThreadLoaded(updated);
+      const merged = mergeQueuedThreadRefresh(threadRef.current ?? optimistic, updated);
+      if (prompt) {
+        rememberSubmittedTurnUserAlias(remoteProjectionRef.current, merged, prompt);
+      }
+      threadRef.current = merged;
+      setThread(merged);
+      onThreadLoaded(merged);
     } catch (queueActionError) {
+      if (accepted && prompt) {
+        rememberSubmittedTurnUserAlias(
+          remoteProjectionRef.current,
+          threadRef.current ?? optimistic,
+          prompt,
+        );
+      } else if (!accepted && prompt && optimisticId) {
+        cancelSubmittedTurnUserAlias(remoteProjectionRef.current, thread.id, prompt);
+        const rolledBack = removeOptimisticConversationItem(
+          threadRef.current ?? optimistic,
+          optimisticId,
+        );
+        threadRef.current = rolledBack;
+        setThread(rolledBack);
+      }
       setQueueError(errorMessage(queueActionError));
     } finally {
       setQueueBusyId("");
@@ -4000,6 +6296,9 @@ function ConversationPageInstance({
     setActionError("");
     try {
       await apiClient.setThreadGoal(thread.id, { objective: goalDraft.trim() });
+      const result = await apiClient.threadGoal(thread.id);
+      setThreadGoal(result.goal ?? undefined);
+      setGoalDraft(result.goal?.objective ?? goalDraft.trim());
       setActionStatus("goal-saved");
       setComposerSheet("");
     } catch (goalError) {
@@ -4016,6 +6315,7 @@ function ConversationPageInstance({
     try {
       await apiClient.clearThreadGoal(thread.id);
       setGoalDraft("");
+      setThreadGoal(undefined);
       setActionStatus("goal-saved");
       setComposerSheet("");
     } catch (goalError) {
@@ -4047,16 +6347,44 @@ function ConversationPageInstance({
 
   async function stop() {
     if (!thread?.activeTurnId || !runtimeControlAvailable || interrupting) return;
+    const threadId = thread.id;
+    const turnId = thread.activeTurnId;
     setInterrupting(true);
     setActionError("");
     try {
-      await apiClient.interrupt(thread.id, thread.activeTurnId);
+      await apiClient.interrupt(threadId, turnId);
+      setInterruptRequestedTurnId(turnId);
       setActionStatus("turn-interrupted");
-      const confirmed = await apiClient.thread(thread.id);
-      threadRef.current = confirmed;
-      setThread(confirmed);
-      onThreadLoaded(confirmed);
+      const result = await pollInterruptTerminal(turnId, async () => {
+        const projectionGeneration = remoteProjectionRef.current.generation;
+        const control = await apiClient.threadShell(threadId);
+        if (currentIdRef.current !== threadId) return undefined;
+        const current = threadRef.current ?? thread;
+        const confirmed = threadControlSnapshotIsCurrent(
+          remoteProjectionRef.current,
+          control,
+          projectionGeneration,
+        )
+          ? mergeAuthoritativeThreadControl(current, control)
+          : current;
+        if (confirmed !== current) {
+          threadRef.current = confirmed;
+          setThread(confirmed);
+          onThreadLoaded(confirmed);
+        }
+        return confirmed.activeTurnId;
+      });
+      if (currentIdRef.current !== threadId) return;
+      setInterruptRequestedTurnId("");
+      if (result.state === "still-active") {
+        setActionError(
+          result.lastError === undefined
+            ? "停止请求已受理，但当前回复仍在运行；可再次停止，状态会继续自动同步。"
+            : `停止请求已受理，但状态确认失败；可再次停止，状态会继续自动同步：${errorMessage(result.lastError)}`,
+        );
+      }
     } catch (stopError) {
+      setInterruptRequestedTurnId("");
       setActionError(errorMessage(stopError));
     } finally {
       setInterrupting(false);
@@ -4154,9 +6482,11 @@ function ConversationPageInstance({
   const canCompose = canShowThreadComposer(thread, control.available);
   const currentApprovals = filterThreadApprovals(approvals, thread.id, thread.activeTurnId);
   const composerActions = composerActionVisibility(
-    running,
+    Boolean(thread.activeTurnId),
     thread.availableActions.interrupt,
     Boolean(draft.trim()),
+    Boolean(thread.activeTurnId && interruptRequestedTurnId === thread.activeTurnId),
+    control.available,
   );
   const canCompactNow =
     compactSupported &&
@@ -4178,6 +6508,13 @@ function ConversationPageInstance({
     ? approvalPolicyLabel(approvalPolicy)
     : "沿用设置";
   const selectedReviewerLabel = approvalReviewer ? approvalReviewerLabel(approvalReviewer) : "";
+  const selectedCollaborationMode = collaborationModes.find(
+    (mode) => mode.id === collaborationMode,
+  );
+  const selectedCollaborationModeLabel =
+    selectedCollaborationMode?.displayName ??
+    (collaborationMode ? runtimeOptionLabel(collaborationMode) : "标准");
+  const collaborationModeSupported = collaborationModes.some((mode) => mode.available);
   const quota = quotaPresentation(threadUsage, thread.model);
   const currentRuntimeDetails = [
     thread.model ?? "模型由 Codex 决定",
@@ -4207,6 +6544,43 @@ function ConversationPageInstance({
     thread.parentThreadId,
     thread.snapshotDelaySeconds,
   );
+  const composerPlaceholder =
+    running && deliveryMode === "queue"
+      ? "写下当前回复结束后要做的事…"
+      : running
+        ? thread.activeTurnId
+          ? "引导正在运行的回复…"
+          : "正在同步当前回复；文字会保留，也可先排队…"
+        : "说明接下来要做什么…";
+
+  function setComposerExpansion(expanded: boolean) {
+    composerExpandedRef.current = expanded;
+    setComposerExpanded(expanded);
+  }
+
+  function expandComposerToEnd() {
+    if (composerCollapseTimerRef.current !== undefined) {
+      window.clearTimeout(composerCollapseTimerRef.current);
+      composerCollapseTimerRef.current = undefined;
+    }
+    setComposerExpansion(true);
+    window.requestAnimationFrame(() => {
+      const control = composerTextareaRef.current;
+      if (control) focusComposerControlAtEnd(control);
+    });
+  }
+
+  function collapseComposerAfterBlur(container: HTMLElement) {
+    if (composerCollapseTimerRef.current !== undefined) {
+      window.clearTimeout(composerCollapseTimerRef.current);
+    }
+    composerCollapseTimerRef.current = window.setTimeout(() => {
+      composerCollapseTimerRef.current = undefined;
+      if (!container.contains(document.activeElement)) {
+        setComposerExpansion(false);
+      }
+    }, 0);
+  }
 
   function selectNextModel(modelId: string) {
     const selectedModel = models.find((model) => model.id === modelId);
@@ -4216,9 +6590,16 @@ function ConversationPageInstance({
         effort: normalizeReasoningEffortForModel(selectedModel, current.effort),
       }),
     );
+    productSettingsGenerationRef.current += 1;
     productSettingsDirtyRef.current = true;
     setServiceTier(null);
   }
+
+  const subagentHistoryNotice = subagentHistoryIntegrityNotice(subagentHistoryIntegrity);
+  const persistedHistoryNotice = persistedConversationHistoryNotice({
+    historyNextCursor,
+    persistedHistoryIntegrity: thread.persistedHistoryIntegrity,
+  });
 
   return (
     <div className="conversation-page" data-testid="thread-view">
@@ -4250,7 +6631,7 @@ function ConversationPageInstance({
           </div>
         </div>
         <div className="conversation-header__badges">
-          {subagents.length || subagentsError || subagentsNextCursor ? (
+          {subagents.length || subagentsError || subagentsNextCursor || subagentHistoryNotice ? (
             <button
               className="subagents-trigger"
               data-testid="subagents-open"
@@ -4540,6 +6921,17 @@ function ConversationPageInstance({
               </div>
             </div>
           ) : null}
+          {persistedHistoryNotice ? (
+            <div
+              aria-label="对话历史完整性"
+              aria-live="polite"
+              className="mini-empty"
+              data-testid="persisted-history-integrity"
+              role="status"
+            >
+              {persistedHistoryNotice}
+            </div>
+          ) : null}
           {hiddenItemCount > 0 || historyNextCursor ? (
             <button
               className="conversation-history-more"
@@ -4562,7 +6954,9 @@ function ConversationPageInstance({
             {...(thread.activeTurnId === undefined ? {} : { activeTurnId: thread.activeTurnId })}
             apiClient={apiClient}
             items={visibleItems}
+            key={presentationIdentity}
             online={online}
+            presentationIdentity={presentationIdentity}
             {...(thread.projectId === undefined ? {} : { projectId: thread.projectId })}
             showLivePhase={!isSnapshot && thread.state === "running"}
             subagents={subagents}
@@ -4589,14 +6983,13 @@ function ConversationPageInstance({
       </div>
       {!isSnapshot && canCompose ? (
         <div
-          className={`composer-shell${composerExpanded ? "" : " composer-shell--collapsed"}`}
+          className={`composer-shell${composerExpanded ? "" : " composer-shell--collapsed"}${
+            composerActions.showInterrupt ? " composer-shell--primary-interrupt" : ""
+          }${online ? "" : " composer-shell--offline"}`}
           onBlurCapture={(event) => {
-            const nextTarget = event.relatedTarget;
-            if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
-              setComposerExpanded(composerExpandedAfterIntent("blur"));
-            }
+            collapseComposerAfterBlur(event.currentTarget);
           }}
-          onFocusCapture={() => setComposerExpanded(composerExpandedAfterIntent("focus"))}
+          ref={composerShellRef}
         >
           <QueueShelf
             busyId={queueBusyId}
@@ -4628,7 +7021,7 @@ function ConversationPageInstance({
             </div>
           ) : null}
           <div className="composer">
-            {running || composerPlan ? (
+            {running || composerPlan || collaborationModeSupported || threadGoal ? (
               <div className="composer__context-bar">
                 {running ? (
                   <DeliveryModeSwitch
@@ -4636,6 +7029,35 @@ function ConversationPageInstance({
                     onChange={setDeliveryMode}
                     queueSupported={queueSupported}
                   />
+                ) : null}
+                {collaborationModeSupported ? (
+                  <button
+                    className="composer-mode-button"
+                    data-testid="composer-mode-open"
+                    onClick={() => setComposerSheet("plan")}
+                    type="button"
+                  >
+                    <Icon name="target" size={15} />
+                    <span>{selectedCollaborationModeLabel}</span>
+                    <Icon name="chevron-right" size={14} />
+                  </button>
+                ) : null}
+                {threadGoal ? (
+                  <button
+                    className="composer-goal-button"
+                    data-testid="composer-goal-open"
+                    onClick={() => setComposerSheet("goal")}
+                    title={threadGoal.objective}
+                    type="button"
+                  >
+                    <Icon name="target" size={15} />
+                    <span>{threadGoal.objective}</span>
+                    <small>
+                      {threadGoal.status === "active"
+                        ? "进行中"
+                        : runtimeOptionLabel(threadGoal.status)}
+                    </small>
+                  </button>
                 ) : null}
                 {composerPlan ? <PlanProgressControl plan={composerPlan} /> : null}
               </div>
@@ -4645,22 +7067,35 @@ function ConversationPageInstance({
                 running && deliveryMode === "queue" ? "排队到下一轮" : running ? "追加要求" : "回复"
               }
               data-testid="turn-composer"
-              disabled={!online}
-              onChange={(event) => setDraft(event.target.value)}
+              onFocus={() => {
+                if (!composerExpandedRef.current && !composerPointerActiveRef.current) {
+                  expandComposerToEnd();
+                }
+              }}
+              onClick={() => {
+                if (!composerExpandedRef.current) expandComposerToEnd();
+              }}
+              onChange={(event) => {
+                setDraftCopyState("idle");
+                setDraft(event.target.value);
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) void submit();
               }}
-              placeholder={
-                running && deliveryMode === "queue"
-                  ? "写下当前回复结束后要做的事…"
-                  : running
-                    ? thread.activeTurnId
-                      ? "引导正在运行的回复…"
-                      : "正在同步当前回复；文字会保留，也可先排队…"
-                    : "说明接下来要做什么…"
-              }
+              onPointerDown={() => {
+                composerPointerActiveRef.current = true;
+              }}
+              onPointerUp={() => {
+                composerPointerActiveRef.current = false;
+              }}
+              onPointerCancel={() => {
+                composerPointerActiveRef.current = false;
+              }}
+              placeholder={composerPlaceholder}
+              readOnly={composerDraftReadOnly(composerExpanded, online)}
+              ref={composerTextareaRef}
               rows={2}
-              value={draft}
+              value={composerExpanded ? draft : collapsedComposerText(draft)}
             />
             <AttachmentChips
               attachments={attachments}
@@ -4683,6 +7118,29 @@ function ConversationPageInstance({
                   variant="ghost"
                 />
               ) : null}
+              <Button
+                aria-label={
+                  draftCopyState === "copied"
+                    ? "输入框内容已复制"
+                    : draftCopyState === "error"
+                      ? "输入框内容复制失败"
+                      : "复制输入框内容"
+                }
+                data-copy-state={draftCopyState}
+                data-testid="draft-copy"
+                disabled={!draft}
+                icon={draftCopyState === "copied" ? "check" : "copy"}
+                onClick={() => void copyDraft()}
+                size="icon"
+                title={
+                  draftCopyState === "copied"
+                    ? "已复制"
+                    : draftCopyState === "error"
+                      ? "复制失败"
+                      : "复制输入框内容"
+                }
+                variant="ghost"
+              />
               <ComposerSettingsButton
                 disabled={
                   !thread.availableActions.changeModelNextTurn &&
@@ -4737,7 +7195,9 @@ function ConversationPageInstance({
                           : "发送"
                     }
                     data-testid={running ? "turn-steer-submit" : "turn-reply-submit"}
-                    disabled={!draft.trim() || !online || sending || interrupting}
+                    disabled={
+                      !draft.trim() || !online || !control.available || sending || interrupting
+                    }
                     icon="send"
                     onClick={() => void submit()}
                     size="icon"
@@ -4794,6 +7254,7 @@ function ConversationPageInstance({
         }
         onModel={selectNextModel}
         onServiceTier={(tier) => {
+          productSettingsGenerationRef.current += 1;
           productSettingsDirtyRef.current = true;
           setServiceTier(tier);
         }}
@@ -4815,15 +7276,18 @@ function ConversationPageInstance({
           })
         }
         onApprovalPolicy={(policy) => {
+          productSettingsGenerationRef.current += 1;
           productSettingsDirtyRef.current = true;
           setApprovalPolicy(policy);
         }}
         onApprovalReviewer={(reviewer) => {
+          productSettingsGenerationRef.current += 1;
           productSettingsDirtyRef.current = true;
           setApprovalReviewer(reviewer);
         }}
         onClose={() => setComposerSheet("")}
         onPermission={(profileId) => {
+          productSettingsGenerationRef.current += 1;
           productSettingsDirtyRef.current = true;
           setPermissionProfileId(profileId);
         }}
@@ -4857,6 +7321,7 @@ function ConversationPageInstance({
       />
       <GoalSheet
         busy={goalBusy}
+        hasGoal={Boolean(threadGoal)}
         onChange={setGoalDraft}
         onClear={() => void clearGoal()}
         onClose={() => setComposerSheet("")}
@@ -4867,6 +7332,7 @@ function ConversationPageInstance({
       <PlanModeSheet
         modes={collaborationModes}
         onChange={(mode) => {
+          productSettingsGenerationRef.current += 1;
           productSettingsDirtyRef.current = true;
           collaborationModeDirtyRef.current = true;
           setCollaborationMode(mode);
@@ -4882,6 +7348,11 @@ function ConversationPageInstance({
         open={showAgents}
         title={`子智能体 · ${subagents.length}`}
       >
+        {subagentHistoryNotice ? (
+          <div className="mini-empty" data-testid="subagent-history-integrity" role="status">
+            {subagentHistoryNotice}
+          </div>
+        ) : null}
         {subagents.length ? (
           <div className="subagent-list" data-testid="subagent-tree">
             {subagents.map((agent) => (
@@ -4896,7 +7367,7 @@ function ConversationPageInstance({
           <div className="mini-empty">当前没有子智能体</div>
         )}
         <PaginationFooter
-          completeLabel="已显示全部子智能体"
+          completeLabel={subagentHistoryPaginationCompleteLabel(subagentHistoryIntegrity)}
           error={subagentsError}
           hasMore={subagentsNextCursor !== undefined}
           label="加载更多子智能体"
@@ -4969,9 +7440,7 @@ function NewThreadPage({
     serviceTiersAvailable ? chooseServiceTier(defaultModel) : undefined,
   );
   const [collaboration, setCollaboration] = useState(
-    collaborationModes.find((mode) => mode.id === "auto" && mode.available)?.id ??
-      collaborationModes.find((mode) => mode.available)?.id ??
-      "",
+    chooseCollaborationMode(collaborationModes) ?? "",
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -5869,15 +8338,21 @@ function FilePreview({
   projectId,
   apiClient,
   onClose,
+  onEdit,
   online,
   embedded = false,
+  downloadLabel = "下载文件",
+  focusLine,
 }: {
   entry: FileEntry;
   projectId: string;
   apiClient: ApiClient;
   onClose?: () => void;
+  onEdit?: (content: string) => void;
   online: boolean;
   embedded?: boolean;
+  downloadLabel?: string;
+  focusLine?: number;
 }) {
   const requestKey = filePreviewRequestKey(projectId, entry.relativePath);
   const requestRef = useRef<FilePreviewRequest>({ generation: 1, requestKey });
@@ -5906,7 +8381,7 @@ function FilePreview({
         let nextText = "";
         if (
           result.contentType.startsWith("text/") ||
-          /\.(md|txt|json|ya?ml|tsx?|jsx?|css|html)$/i.test(entry.name)
+          /\.(md|txt|json|xml|ya?ml|tsx?|jsx?|css|html)$/i.test(entry.name)
         ) {
           nextText = await result.blob.text();
         } else if (
@@ -5968,6 +8443,12 @@ function FilePreview({
         ) : null}
       </header>
       <div className="file-preview__body">
+        {focusLine ? (
+          <div className="file-preview__location" data-testid="file-preview-location">
+            <Icon name="target" size={15} />
+            源文件第 {focusLine} 行
+          </div>
+        ) : null}
         {state === "loading" ? (
           <div className="preview-loading">
             <Skeleton />
@@ -5980,13 +8461,17 @@ function FilePreview({
         ) : null}
         {state === "ready" && text ? (
           isMarkdown ? (
-            <Markdown>{text}</Markdown>
+            <Markdown apiClient={apiClient} online={online} projectId={projectId}>
+              {text}
+            </Markdown>
           ) : (
             <pre className="code-preview">{text}</pre>
           )
         ) : null}
         {state === "ready" && url && contentType.startsWith("image/") ? (
-          <img alt={entry.name} src={url} />
+          <a className="file-preview__image-link" href={url} rel="noreferrer" target="_blank">
+            <img alt={entry.name} src={url} />
+          </a>
         ) : null}
         {state === "ready" && url && contentType === "application/pdf" ? (
           <iframe src={url} title={entry.name} />
@@ -6000,6 +8485,12 @@ function FilePreview({
         ) : null}
       </div>
       <footer>
+        {state === "ready" && text && onEdit ? (
+          <Button icon="edit" onClick={() => onEdit(text)}>
+            编辑文件
+          </Button>
+        ) : null}
+        {state === "ready" && text ? <CopyTextButton label="复制完整内容" text={text} /> : null}
         {online ? (
           <a
             className="ui-button ui-button--primary ui-button--regular"
@@ -6009,7 +8500,7 @@ function FilePreview({
             href={apiClient.downloadUrl(projectId, entry.relativePath)}
           >
             <Icon name="download" size={18} />
-            下载文件
+            {downloadLabel}
           </a>
         ) : (
           <Button disabled icon="wifi-off">
@@ -6021,8 +8512,205 @@ function FilePreview({
   );
 }
 
+type FileManagerOperation =
+  | { kind: "create-directory"; name: string }
+  | { kind: "create-file"; content: string; name: string }
+  | { kind: "edit-file"; content: string; entry: FileEntry }
+  | { kind: "rename"; entry: FileEntry; name: string }
+  | {
+      kind: "copy" | "move";
+      entry: FileEntry;
+      overwrite: boolean;
+      targetPath: string;
+      targetProjectId: string;
+    }
+  | { kind: "delete"; entry: FileEntry; permanent: boolean }
+  | {
+      kind: "overwrite-upload";
+      file: File;
+      remaining: File[];
+      targetPath: string;
+      targetProjectId: string;
+    };
+
+function fileManagerJoinPath(parent: string, name: string): string {
+  return [parent.replaceAll("\\", "/").replace(/\/+$/u, ""), name.replace(/^[/\\]+/u, "")]
+    .filter(Boolean)
+    .join("/");
+}
+
+function FileManagerOperationSheet({
+  busy,
+  error,
+  hostRoots,
+  onChange,
+  onClose,
+  onSubmit,
+  operation,
+}: {
+  busy: boolean;
+  error: string;
+  hostRoots: FileRoot[];
+  onChange: (operation: FileManagerOperation) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+  operation: FileManagerOperation | undefined;
+}) {
+  if (!operation) return null;
+  const title =
+    operation.kind === "create-directory"
+      ? "新建文件夹"
+      : operation.kind === "create-file"
+        ? "新建文本文件"
+        : operation.kind === "edit-file"
+          ? "编辑文件"
+          : operation.kind === "rename"
+            ? "重命名"
+            : operation.kind === "copy"
+              ? "复制到"
+              : operation.kind === "move"
+                ? "移动到"
+                : operation.kind === "delete"
+                  ? "删除确认"
+                  : "覆盖同名文件";
+  const submitLabel =
+    operation.kind === "delete"
+      ? operation.permanent
+        ? "永久删除"
+        : "移到回收站"
+      : operation.kind === "overwrite-upload"
+        ? "覆盖上传"
+        : title;
+  return (
+    <Sheet
+      description="操作由当前电脑的受管管理员文件服务执行；Windows 会回报实际结果。"
+      footer={
+        <>
+          <Button disabled={busy} onClick={onClose}>
+            取消
+          </Button>
+          <Button
+            disabled={busy}
+            onClick={onSubmit}
+            variant={operation.kind === "delete" && operation.permanent ? "danger" : "primary"}
+          >
+            {busy ? "处理中…" : submitLabel}
+          </Button>
+        </>
+      }
+      onClose={onClose}
+      open
+      title={title}
+    >
+      <div className="file-operation-form">
+        {operation.kind === "create-directory" ||
+        operation.kind === "create-file" ||
+        operation.kind === "rename" ? (
+          <label className="select-label">
+            <span>{operation.kind === "rename" ? "新名称" : "名称"}</span>
+            <input
+              autoFocus
+              onChange={(event) => onChange({ ...operation, name: event.target.value })}
+              placeholder={operation.kind === "create-directory" ? "新文件夹" : "文件名"}
+              value={operation.name}
+            />
+          </label>
+        ) : null}
+        {operation.kind === "create-file" || operation.kind === "edit-file" ? (
+          <label className="select-label">
+            <span>{operation.kind === "edit-file" ? operation.entry.name : "初始内容"}</span>
+            <textarea
+              onChange={(event) => onChange({ ...operation, content: event.target.value })}
+              placeholder={operation.kind === "edit-file" ? "文件内容" : "可以留空，稍后再编辑"}
+              rows={12}
+              value={operation.content}
+            />
+          </label>
+        ) : null}
+        {operation.kind === "copy" || operation.kind === "move" ? (
+          <>
+            <label className="select-label">
+              <span>目标磁盘</span>
+              <select
+                onChange={(event) =>
+                  onChange({ ...operation, targetProjectId: event.target.value })
+                }
+                value={operation.targetProjectId}
+              >
+                {hostRoots.map((root) => (
+                  <option key={root.id} value={root.id}>
+                    {root.name} · {root.rootLabel}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="select-label">
+              <span>目标路径（包含名称）</span>
+              <input
+                onChange={(event) => onChange({ ...operation, targetPath: event.target.value })}
+                placeholder="例如 Users/name/Documents/file.txt"
+                value={operation.targetPath}
+              />
+            </label>
+            <label className="file-operation-check">
+              <input
+                checked={operation.overwrite}
+                onChange={(event) => onChange({ ...operation, overwrite: event.target.checked })}
+                type="checkbox"
+              />
+              <span>目标存在时覆盖</span>
+            </label>
+          </>
+        ) : null}
+        {operation.kind === "delete" ? (
+          <div className="file-delete-options">
+            <button
+              className={!operation.permanent ? "is-selected" : ""}
+              onClick={() => onChange({ ...operation, permanent: false })}
+              type="button"
+            >
+              <Icon name="trash" size={18} />
+              <span>
+                <strong>移到回收站</strong>
+                <small>默认选择，可从 Windows 回收站恢复</small>
+              </span>
+              {!operation.permanent ? <Icon name="check" size={17} /> : null}
+            </button>
+            <button
+              className={operation.permanent ? "is-selected is-danger" : ""}
+              onClick={() => onChange({ ...operation, permanent: true })}
+              type="button"
+            >
+              <Icon name="alert" size={18} />
+              <span>
+                <strong>永久删除</strong>
+                <small>无法从回收站恢复；仅在明确需要时使用</small>
+              </span>
+              {operation.permanent ? <Icon name="check" size={17} /> : null}
+            </button>
+            <p>
+              即将删除：<strong>{operation.entry.name}</strong>
+            </p>
+          </div>
+        ) : null}
+        {operation.kind === "overwrite-upload" ? (
+          <Notice icon="alert" title="目标位置已有同名文件" tone="warning">
+            覆盖后原内容将被新上传的“{operation.file.name}”替换。
+          </Notice>
+        ) : null}
+        {error ? (
+          <div className="form-error" role="alert">
+            <Icon name="alert" size={16} />
+            {error}
+          </div>
+        ) : null}
+      </div>
+    </Sheet>
+  );
+}
+
 function FileBrowserPage({
-  projects,
+  projects: _projects,
   apiClient,
   online,
 }: {
@@ -6031,15 +8719,54 @@ function FileBrowserPage({
   online: boolean;
 }) {
   const { copy } = useUiLocale();
-  const selectableProjects = registeredProjects(projects);
-  const [projectId, setProjectId] = useState(selectableProjects[0]?.id ?? "");
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [hostRoots, setHostRoots] = useState<FileRoot[]>([]);
+  const [rootsLoaded, setRootsLoaded] = useState(false);
+  const [projectId, setProjectId] = useState("");
   const [path, setPath] = useState("");
   const [listing, setListing] = useState<FileListing>();
   const [selected, setSelected] = useState<FileEntry>();
+  const [actionEntry, setActionEntry] = useState<FileEntry>();
+  const [operation, setOperation] = useState<FileManagerOperation>();
+  const [operationBusy, setOperationBusy] = useState(false);
+  const [operationError, setOperationError] = useState("");
   const [query, setQuery] = useState("");
   const [state, setState] = useState<LoadState>("loading");
   const [error, setError] = useState("");
 
+  useEffect(() => {
+    if (!online) {
+      setRootsLoaded(true);
+      return;
+    }
+    let active = true;
+    void apiClient
+      .fileRoots()
+      .then((roots) => {
+        if (active) setHostRoots(roots.filter((root) => root.kind === "host"));
+      })
+      .catch(() => {
+        if (active) setHostRoots([]);
+      })
+      .finally(() => {
+        if (active) setRootsLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiClient, online]);
+
+  const roots = hostRoots;
+  const rootsKey = roots.map((root) => root.id).join("|");
+  useEffect(() => {
+    if (!rootsLoaded) return;
+    setProjectId((current) =>
+      current && roots.some((root) => root.id === current) ? current : (roots[0]?.id ?? ""),
+    );
+  }, [rootsKey, rootsLoaded]);
+
+  const currentRoot = roots.find((root) => root.id === projectId);
+  const canMutate = online && currentRoot !== undefined;
   const load = useCallback(async () => {
     if (!online) {
       setState((current) => (current === "loading" ? "ready" : current));
@@ -6064,6 +8791,123 @@ function FileBrowserPage({
     void load();
   }, [load]);
 
+  async function processUploads(
+    files: File[],
+    targetProjectId = projectId,
+    targetFolder = path,
+  ): Promise<void> {
+    if (!files.length || !targetProjectId) return;
+    setOperationBusy(true);
+    setOperationError("");
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index]!;
+      const targetPath = fileManagerJoinPath(targetFolder, file.name);
+      try {
+        await apiClient.writeHostFile(targetProjectId, targetPath, file);
+      } catch (uploadError) {
+        if (uploadError instanceof ApiRequestError && uploadError.code === "FILE_ALREADY_EXISTS") {
+          setOperation({
+            kind: "overwrite-upload",
+            file,
+            remaining: files.slice(index + 1),
+            targetPath,
+            targetProjectId,
+          });
+          setOperationBusy(false);
+          await load();
+          return;
+        }
+        setOperationError(errorMessage(uploadError));
+        setOperationBusy(false);
+        await load();
+        return;
+      }
+    }
+    setOperationBusy(false);
+    await load();
+  }
+
+  async function submitOperation() {
+    if (!operation || !projectId) return;
+    setOperationBusy(true);
+    setOperationError("");
+    let remainingUploads: File[] = [];
+    try {
+      switch (operation.kind) {
+        case "create-directory":
+          await apiClient.createFolder(projectId, fileManagerJoinPath(path, operation.name));
+          break;
+        case "create-file": {
+          const target = fileManagerJoinPath(path, operation.name);
+          await apiClient.writeHostFile(
+            projectId,
+            target,
+            new File([operation.content], operation.name, { type: "text/plain" }),
+          );
+          break;
+        }
+        case "edit-file":
+          await apiClient.writeHostFile(
+            projectId,
+            operation.entry.relativePath,
+            new File([operation.content], operation.entry.name, { type: "text/plain" }),
+            true,
+          );
+          break;
+        case "rename":
+          await apiClient.renameHostFile(projectId, operation.entry.relativePath, operation.name);
+          setSelected(undefined);
+          break;
+        case "copy":
+          await apiClient.copyHostFile({
+            overwrite: operation.overwrite,
+            sourcePath: operation.entry.relativePath,
+            sourceProjectId: projectId,
+            targetPath: operation.targetPath,
+            targetProjectId: operation.targetProjectId,
+          });
+          break;
+        case "move":
+          await apiClient.moveHostFile({
+            overwrite: operation.overwrite,
+            sourcePath: operation.entry.relativePath,
+            sourceProjectId: projectId,
+            targetPath: operation.targetPath,
+            targetProjectId: operation.targetProjectId,
+          });
+          setSelected(undefined);
+          break;
+        case "delete":
+          await apiClient.deleteHostFile(
+            projectId,
+            operation.entry.relativePath,
+            operation.permanent,
+          );
+          setSelected(undefined);
+          break;
+        case "overwrite-upload":
+          await apiClient.writeHostFile(
+            operation.targetProjectId,
+            operation.targetPath,
+            operation.file,
+            true,
+          );
+          remainingUploads = operation.remaining;
+          break;
+      }
+      setOperation(undefined);
+      await load();
+    } catch (operationFailure) {
+      setOperationError(errorMessage(operationFailure));
+      setOperationBusy(false);
+      return;
+    }
+    setOperationBusy(false);
+    if (remainingUploads.length) {
+      await processUploads(remainingUploads);
+    }
+  }
+
   const parts = path.split("/").filter(Boolean);
   const visible = (listing?.entries ?? []).filter((entry) =>
     entry.name.toLowerCase().includes(query.toLowerCase()),
@@ -6078,39 +8922,94 @@ function FileBrowserPage({
       >
         <div className="files-browser">
           <div className="page-heading">
-            <h1>{copy.projectFiles}</h1>
-            <p>{copy.projectFilesDescription}</p>
+            <h1>电脑文件</h1>
+            <p>浏览和管理这台电脑上的磁盘与文件；删除默认进入回收站。</p>
           </div>
           <label className="select-label project-select">
-            <span>{copy.currentProject}</span>
+            <span>位置</span>
             <select
-              disabled={!online}
+              disabled={!online || !rootsLoaded}
               onChange={(event) => {
                 setProjectId(event.target.value);
                 setPath("");
                 setSelected(undefined);
+                setActionEntry(undefined);
+                setOperation(undefined);
               }}
               value={projectId}
             >
-              {selectableProjects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name} · {project.rootLabel}
-                </option>
-              ))}
+              {hostRoots.length ? (
+                <optgroup label="这台电脑">
+                  {hostRoots.map((root) => (
+                    <option key={root.id} value={root.id}>
+                      {root.name} · {root.rootLabel}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
             </select>
           </label>
           {!online ? (
-            <Notice icon="wifi-off" title="离线时不能读取新文件" tone="danger">
-              已打开的内容可能仍保留在浏览器中。
+            <Notice icon="wifi-off" title="离线时不能读取或修改电脑文件" tone="danger">
+              已打开的内容仍可查看和复制；恢复连接后操作按钮会自动可用。
             </Notice>
           ) : null}
+          <div className="file-manager-actions" aria-label="文件操作">
+            <Button
+              disabled={!canMutate || operationBusy}
+              icon="paperclip"
+              onClick={() => uploadInputRef.current?.click()}
+              size="compact"
+            >
+              上传
+            </Button>
+            <Button
+              disabled={!canMutate || operationBusy}
+              icon="folder"
+              onClick={() => {
+                setOperationError("");
+                setOperation({ kind: "create-directory", name: "" });
+              }}
+              size="compact"
+            >
+              新建文件夹
+            </Button>
+            <Button
+              disabled={!canMutate || operationBusy}
+              icon="edit"
+              onClick={() => {
+                setOperationError("");
+                setOperation({ kind: "create-file", content: "", name: "" });
+              }}
+              size="compact"
+            >
+              新建文件
+            </Button>
+            <Button
+              aria-label="刷新"
+              disabled={!online || operationBusy}
+              icon="refresh"
+              onClick={() => void load()}
+              size="icon"
+              variant="ghost"
+            />
+            <input
+              hidden
+              multiple
+              onChange={(event) => {
+                const files = Array.from(event.target.files ?? []);
+                event.target.value = "";
+                void processUploads(files);
+              }}
+              ref={uploadInputRef}
+              type="file"
+            />
+          </div>
           <div className="file-toolbar">
             <div aria-label="当前路径" className="breadcrumbs">
               <button disabled={!online} onClick={() => setPath("")}>
                 <Icon name="folder" size={17} />
-                <span>
-                  {selectableProjects.find((project) => project.id === projectId)?.name ?? "项目"}
-                </span>
+                <span>{currentRoot?.name ?? "电脑"}</span>
               </button>
               {parts.map((part, index) => (
                 <Fragment key={`${part}-${index}`}>
@@ -6153,7 +9052,7 @@ function FileBrowserPage({
                 title="文件夹加载失败"
               />
             </Card>
-          ) : visible.length ? (
+          ) : visible.length || path ? (
             <Card className="file-list">
               {path ? (
                 <button disabled={!online} onClick={() => setPath(parts.slice(0, -1).join("/"))}>
@@ -6205,6 +9104,16 @@ function FileBrowserPage({
                       <Icon name="download" size={18} />
                     </a>
                   ) : null}
+                  {canMutate ? (
+                    <button
+                      aria-label={`管理 ${entry.name}`}
+                      className="file-entry-action"
+                      onClick={() => setActionEntry(entry)}
+                      type="button"
+                    >
+                      <Icon name="more" size={18} />
+                    </button>
+                  ) : null}
                 </div>
               ))}
             </Card>
@@ -6223,6 +9132,14 @@ function FileBrowserPage({
             apiClient={apiClient}
             entry={selected}
             onClose={() => setSelected(undefined)}
+            {...(canMutate
+              ? {
+                  onEdit: (content: string) => {
+                    setOperationError("");
+                    setOperation({ content, entry: selected, kind: "edit-file" });
+                  },
+                }
+              : {})}
             online={online}
             projectId={projectId}
           />
@@ -6230,10 +9147,99 @@ function FileBrowserPage({
           <aside className="file-preview-placeholder">
             <Icon name="file" size={26} />
             <strong>选择文件以预览</strong>
-            <span>支持文本、Markdown、图片和 PDF</span>
+            <span>支持完整文本复制、图片与 PDF 预览，以及原文件下载</span>
           </aside>
         )}
       </div>
+      <Sheet
+        description="这些操作由当前电脑的受管管理员文件服务执行。"
+        onClose={() => setActionEntry(undefined)}
+        open={actionEntry !== undefined}
+        title={actionEntry?.name ?? "文件操作"}
+      >
+        {actionEntry ? (
+          <div className="file-action-list">
+            {actionEntry.kind === "file" ? (
+              <Button
+                icon="file"
+                onClick={() => {
+                  setSelected(actionEntry);
+                  setActionEntry(undefined);
+                }}
+              >
+                预览
+              </Button>
+            ) : null}
+            <Button
+              icon="edit"
+              onClick={() => {
+                setOperationError("");
+                setOperation({ entry: actionEntry, kind: "rename", name: actionEntry.name });
+                setActionEntry(undefined);
+              }}
+            >
+              重命名
+            </Button>
+            <Button
+              icon="copy"
+              onClick={() => {
+                setOperationError("");
+                setOperation({
+                  entry: actionEntry,
+                  kind: "copy",
+                  overwrite: false,
+                  targetPath: actionEntry.relativePath,
+                  targetProjectId: projectId,
+                });
+                setActionEntry(undefined);
+              }}
+            >
+              复制到…
+            </Button>
+            <Button
+              icon="chevron-right"
+              onClick={() => {
+                setOperationError("");
+                setOperation({
+                  entry: actionEntry,
+                  kind: "move",
+                  overwrite: false,
+                  targetPath: actionEntry.relativePath,
+                  targetProjectId: projectId,
+                });
+                setActionEntry(undefined);
+              }}
+            >
+              移动到…
+            </Button>
+            <Button
+              icon="trash"
+              onClick={() => {
+                setOperationError("");
+                setOperation({ entry: actionEntry, kind: "delete", permanent: false });
+                setActionEntry(undefined);
+              }}
+              variant="danger"
+            >
+              删除…
+            </Button>
+          </div>
+        ) : null}
+      </Sheet>
+      <FileManagerOperationSheet
+        busy={operationBusy}
+        error={operationError}
+        hostRoots={hostRoots}
+        onChange={setOperation}
+        onClose={() => {
+          if (!operationBusy) {
+            setOperation(undefined);
+            setOperationError("");
+          }
+        }}
+        onSubmit={() => void submitOperation()}
+        operation={operation}
+      />
     </>
   );
 }
@@ -6716,6 +9722,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   const [error, setError] = useState("");
   const [online, setOnline] = useState(true);
   const [liveEvents, setLiveEvents] = useState<LiveEventEnvelope[]>([]);
+  const [eventSnapshotCursor, setEventSnapshotCursor] = useState<WorkspaceSnapshotEventCursor>();
   const [currentThread, setCurrentThread] = useState<ThreadDetail>();
   const [currentThreadUsage, setCurrentThreadUsage] = useState<UsageSnapshot>();
   const [subagents, setSubagents] = useState<SubagentSummary[]>([]);
@@ -6744,12 +9751,31 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   const archivedLoadedRef = useRef(false);
   const archivedInFlightRef = useRef(false);
   const locallyResolvedApprovalIdsRef = useRef(new Set<string>());
+  const dismissedApprovalIdsRef = useRef(new Set<string>());
   const isDesktop = useMediaQuery("(min-width: 1100px)");
   const runningThreadCount = data.threads.filter((thread) => thread.state === "running").length;
+  const eventThreadIdRef = useRef(eventThreadId);
+  eventThreadIdRef.current = eventThreadId;
+  const bootstrapEventCursor = workspaceBootstrapEventCursor(eventSnapshotCursor, eventThreadId);
+  const rememberSnapshotEventCursor = useCallback((threadId: string, cursor: string) => {
+    setEventSnapshotCursor((current) =>
+      retainWorkspaceSnapshotEventCursorForCurrentRoute(current, eventThreadIdRef, {
+        cursor,
+        threadId,
+      }),
+    );
+  }, []);
 
   useEffect(() => {
-    setSelectedApproval((current) => reconcileSelectedApproval(current, data.approvals));
-  }, [data.approvals]);
+    setSelectedApproval((current) =>
+      approvalForCurrentThread(
+        current,
+        data.approvals,
+        eventThreadId,
+        dismissedApprovalIdsRef.current,
+      ),
+    );
+  }, [data.approvals, eventThreadId]);
 
   useEffect(() => {
     const previousTitle = document.title;
@@ -6978,6 +10004,95 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
     }
   }
 
+  function applyAuthoritativeThreadLists(authoritative: AuthoritativeThreadLists) {
+    const currentReadback = mergeThreadListReadback(
+      threadsRef.current,
+      threadsNextCursorRef.current,
+      threadTailIdsRef.current,
+      authoritative.current,
+    );
+    const archivedReadback = mergeThreadListReadback(
+      archivedThreadsRef.current,
+      archivedNextCursorRef.current,
+      archivedTailIdsRef.current,
+      authoritative.archived,
+    );
+    const currentIds = new Set(currentReadback.items.map((item) => item.id));
+    const archivedIds = new Set(archivedReadback.items.map((item) => item.id));
+    const current = currentReadback.items.filter((item) => !archivedIds.has(item.id));
+    const archived = archivedReadback.items.filter((item) => !currentIds.has(item.id));
+
+    threadTailIdsRef.current = new Set(
+      [...currentReadback.loadedTailIds].filter((threadId) =>
+        current.some((thread) => thread.id === threadId),
+      ),
+    );
+    archivedTailIdsRef.current = new Set(
+      [...archivedReadback.loadedTailIds].filter((threadId) =>
+        archived.some((thread) => thread.id === threadId),
+      ),
+    );
+    threadsExtendedRef.current = threadTailIdsRef.current.size > 0;
+    archivedLoadedRef.current = true;
+    threadsRef.current = current;
+    archivedThreadsRef.current = archived;
+    threadsNextCursorRef.current = currentReadback.nextCursor;
+    archivedNextCursorRef.current = archivedReadback.nextCursor;
+    setData((workspace) => ({ ...workspace, threads: current }));
+    setArchivedThreads(archived);
+    setThreadsNextCursor(currentReadback.nextCursor);
+    setArchivedNextCursor(archivedReadback.nextCursor);
+    setThreadsMoreError("");
+    setThreadsMoreState("idle");
+    setArchivedError("");
+    setArchivedState("ready");
+  }
+
+  async function readConvergedThreadLists(
+    thread: ThreadSummary,
+    mutation: ThreadListMutation,
+  ): Promise<AuthoritativeThreadLists> {
+    const authoritative = await readAuthoritativeThreadLists(api, thread.id);
+    if (
+      !threadMutationMatchesAuthoritativeLists(authoritative, {
+        mutation,
+        threadId: thread.id,
+      })
+    ) {
+      throw new Error("电脑端列表尚未反映已提交的操作");
+    }
+    return authoritative;
+  }
+
+  async function mutateThreadList(
+    thread: ThreadSummary,
+    mutation: ThreadListMutation,
+    onCommitted: () => void,
+  ) {
+    return commitThenConvergeThreadLists({
+      apply: applyAuthoritativeThreadLists,
+      commit: async () => {
+        if (mutation.kind === "rename") {
+          await api.setThreadName(thread.id, mutation.name);
+        } else {
+          await api.setThreadArchived(thread.id, mutation.archived);
+        }
+      },
+      onCommitted,
+      read: () => readConvergedThreadLists(thread, mutation),
+    });
+  }
+
+  async function retryThreadListConvergence(
+    thread: ThreadSummary,
+    mutation: ThreadListMutation,
+  ): Promise<ThreadListRefreshResult> {
+    return convergeThreadLists({
+      apply: applyAuthoritativeThreadLists,
+      read: () => readConvergedThreadLists(thread, mutation),
+    });
+  }
+
   useEffect(() => {
     let timer: number | undefined;
     let disposed = false;
@@ -7008,7 +10123,9 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   }, [load]);
 
   useEffect(() => {
-    const unsubscribe = api.subscribe(
+    initialReplayComplete.current = false;
+    const unsubscribe = subscribeWorkspaceEventStream(
+      api,
       (event) => {
         const envelope = {
           deliveryId: ++liveDeliverySequence.current,
@@ -7059,7 +10176,8 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
         }
       },
       setOnline,
-      eventThreadId ? { threadId: eventThreadId } : undefined,
+      eventThreadId,
+      bootstrapEventCursor,
     );
     return () => {
       unsubscribe();
@@ -7069,7 +10187,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
         recoveryTimer.current = undefined;
       }
     };
-  }, [eventThreadId, load]);
+  }, [bootstrapEventCursor, eventThreadId, load]);
 
   async function logout() {
     await api.logout();
@@ -7082,6 +10200,16 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
       ...current,
       approvals: current.approvals.filter((approval) => approval.id !== id),
     }));
+  }
+
+  function openApproval(approval: ApprovalRequest) {
+    dismissedApprovalIdsRef.current.delete(approval.id);
+    setSelectedApproval(approval);
+  }
+
+  function closeApproval() {
+    if (selectedApproval) dismissedApprovalIdsRef.current.add(selectedApproval.id);
+    setSelectedApproval(undefined);
   }
 
   if (state === "loading") {
@@ -7126,10 +10254,12 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
                 moreState={threadsMoreState}
                 nextCursor={threadsNextCursor}
                 online={online}
-                onOpenApproval={setSelectedApproval}
+                onOpenApproval={openApproval}
                 onLoadArchived={() => void loadArchivedPage()}
                 onLoadMore={() => void loadMoreThreads()}
                 onLoadMoreArchived={() => void loadArchivedPage(archivedNextCursorRef.current)}
+                onThreadConvergenceRetry={retryThreadListConvergence}
+                onThreadMutation={mutateThreadList}
               />
             }
             path="/"
@@ -7144,7 +10274,8 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
                 collaborationModes={data.collaborationModes}
                 liveEvents={liveEvents}
                 models={data.models}
-                onOpenApproval={setSelectedApproval}
+                onOpenApproval={openApproval}
+                onSnapshotEventCursor={rememberSnapshotEventCursor}
                 onSubagentsLoaded={setSubagents}
                 onThreadLoaded={setCurrentThread}
                 onUsageLoaded={setCurrentThreadUsage}
@@ -7190,7 +10321,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
         <RightInspector
           approvals={data.approvals}
           currentThread={currentThread}
-          onOpenApproval={setSelectedApproval}
+          onOpenApproval={openApproval}
           subagents={subagents}
           threadUsage={currentThreadUsage}
           usage={data.usage}
@@ -7201,7 +10332,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
       <ApprovalSheet
         apiClient={api}
         approval={selectedApproval}
-        onClose={() => setSelectedApproval(undefined)}
+        onClose={closeApproval}
         onResolved={resolvedApproval}
         online={online}
       />

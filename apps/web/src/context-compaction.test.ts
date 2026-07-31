@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ThreadDetail } from "@codex-local-remote/contracts";
 
 import {
+  activeContextCompaction,
   applyContextCompactionEvents,
   beginContextCompactionRequest,
   canRequestContextCompaction,
@@ -137,6 +138,78 @@ describe("上下文压缩界面门禁", () => {
     expect(contextCompactionItemsForDisplay(superseded)).toEqual([
       expect.objectContaining({ id: "compact-stale", status: "complete" }),
       expect.objectContaining({ id: "new-user" }),
+    ]);
+  });
+
+  it("同一压缩周期出现终态后删除残留活动态且只保留一个永久记录", () => {
+    const duplicated: ThreadDetail = {
+      ...idleManagedThread,
+      activeTurnId: "turn-compact",
+      state: "running",
+      items: [
+        {
+          id: "compact-live-snapshot",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "running",
+          title: "压缩对话上下文",
+          turnId: "turn-compact",
+        },
+        {
+          id: "compact-terminal-snapshot",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+          turnId: "turn-compact",
+        },
+      ],
+      availableActions: { ...idleManagedThread.availableActions, reply: false, steer: true },
+    };
+
+    expect(activeContextCompaction(duplicated)).toBeUndefined();
+    expect(contextCompactionItemsForDisplay(duplicated)).toEqual([
+      expect.objectContaining({
+        id: "compact-terminal-snapshot",
+        operation: "context-compaction",
+        status: "complete",
+      }),
+    ]);
+  });
+
+  it("同一压缩轮次的终态即使先于残留 running 快照也只保留永久记录", () => {
+    const reversed: ThreadDetail = {
+      ...idleManagedThread,
+      activeTurnId: "turn-compact",
+      state: "running",
+      items: [
+        {
+          id: "compact-terminal-snapshot",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "complete",
+          title: "压缩对话上下文",
+          turnId: "turn-compact",
+        },
+        {
+          id: "compact-live-snapshot",
+          kind: "tool",
+          operation: "context-compaction",
+          status: "running",
+          title: "压缩对话上下文",
+          turnId: "turn-compact",
+        },
+      ],
+      availableActions: { ...idleManagedThread.availableActions, reply: false, steer: true },
+    };
+
+    expect(activeContextCompaction(reversed)).toBeUndefined();
+    expect(contextCompactionItemsForDisplay(reversed)).toEqual([
+      expect.objectContaining({
+        id: "compact-terminal-snapshot",
+        operation: "context-compaction",
+        status: "complete",
+      }),
     ]);
   });
 });

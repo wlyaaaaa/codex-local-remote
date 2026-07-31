@@ -76,12 +76,18 @@ export function PlanProgressControl({
 }: {
   plan: Extract<ConversationItem, { kind: "plan-progress" }>;
 }) {
+  const [open, setOpen] = useState(false);
   const firstUnfinishedStep = plan.steps.findIndex((step) => step.status !== "completed");
   const currentStep = firstUnfinishedStep >= 0 ? firstUnfinishedStep + 1 : plan.steps.length;
   const completedSteps = plan.steps.filter((step) => step.status === "completed").length;
 
   return (
-    <details className="composer-plan-progress" data-testid="composer-plan-progress">
+    <details
+      className="composer-plan-progress"
+      data-testid="composer-plan-progress"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+      open={open}
+    >
       <summary aria-label={`查看计划进度，第 ${currentStep}/${plan.steps.length} 步`}>
         <span className="composer-plan-progress__ring" aria-hidden="true">
           {currentStep}
@@ -99,6 +105,14 @@ export function PlanProgressControl({
               {completedSteps}/{plan.steps.length} 步已完成
             </small>
           </span>
+          <button
+            aria-label="关闭任务进度"
+            data-testid="composer-plan-progress-close"
+            onClick={() => setOpen(false)}
+            type="button"
+          >
+            <Icon name="close" size={15} />
+          </button>
         </header>
         {plan.explanation ? <p>{plan.explanation}</p> : null}
         <ol>
@@ -168,6 +182,8 @@ export function ComposerSettingsButton({
   const selected = models.find((option) => option.id === model);
   const displayedEffort = selected ? normalizeReasoningEffortForModel(selected, effort) : effort;
   const tier = serviceTiersSupported ? selectedTier(selected, serviceTier) : undefined;
+  const fastTier =
+    tier !== undefined && `${tier.id ?? ""} ${tier.label}`.toLocaleLowerCase().includes("fast");
   const detailedLabel = [
     selected ? modelComposerLabel(selected.displayName) : model,
     reasoningEffortLabel(displayedEffort),
@@ -193,6 +209,11 @@ export function ComposerSettingsButton({
         type="button"
       >
         <span className="next-turn-badge">下一轮</span>
+        {fastTier ? (
+          <span aria-label="Fast 加速已开启" className="composer-fast-indicator" title="Fast">
+            ⚡
+          </span>
+        ) : null}
         <span className="composer-settings-button__label">
           {compactLabel || "选择模型与思考等级"}
         </span>
@@ -520,6 +541,7 @@ export function ComposerToolsSheet({
 
 export function GoalSheet({
   busy,
+  hasGoal,
   onChange,
   onClear,
   onClose,
@@ -528,6 +550,7 @@ export function GoalSheet({
   value,
 }: {
   busy: boolean;
+  hasGoal: boolean;
   onChange: (value: string) => void;
   onClear: () => void;
   onClose: () => void;
@@ -541,11 +564,13 @@ export function GoalSheet({
       footer={
         <>
           <Button disabled={busy || !value.trim()} onClick={onSave} variant="primary">
-            保存目标
+            {hasGoal ? "保存修改" : "保存目标"}
           </Button>
-          <Button disabled={busy} onClick={onClear} variant="ghost">
-            清除
-          </Button>
+          {hasGoal ? (
+            <Button disabled={busy} onClick={onClear} variant="ghost">
+              删除目标
+            </Button>
+          ) : null}
         </>
       }
       onClose={onClose}

@@ -26,12 +26,18 @@ interface Fixture {
   upstream: RecordingWire;
 }
 
+const TEST_DESKTOP_LAUNCH_NONCE_DIGEST = "d".repeat(64);
+
 function attach(coordinator: BrokerCoordinator): Fixture {
   const downstream = new RecordingWire();
   const upstream = new RecordingWire();
   return {
     downstream,
-    pair: coordinator.attach({ downstream, upstream }),
+    pair: coordinator.attach({
+      desktopLaunchNonceDigest: TEST_DESKTOP_LAUNCH_NONCE_DIGEST,
+      downstream,
+      upstream,
+    }),
     upstream,
   };
 }

@@ -1,9 +1,17 @@
 {
   "name": "codex-local-remote",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "A polished, self-hosted mobile companion for Codex Desktop.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wlyaaaaa/codex-local-remote.git"
+  },
+  "homepage": "https://github.com/wlyaaaaa/codex-local-remote#readme",
+  "bugs": {
+    "url": "https://github.com/wlyaaaaa/codex-local-remote/issues"
+  },
   "type": "module",
   "packageManager": "pnpm@11.12.0",
   "engines": {

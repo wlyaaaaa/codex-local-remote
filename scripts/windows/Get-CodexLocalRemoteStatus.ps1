@@ -37,6 +37,24 @@ param(
 
 $ProgressPreference = 'SilentlyContinue'
 Import-Module (Join-Path $PSScriptRoot 'CodexLocalRemote.Windows.psm1') -Force
+$managedConfiguration = Get-CodexLocalRemoteManagedConfiguration -DataDir $DataDir
+if ($null -ne $managedConfiguration) {
+    if (-not $PSBoundParameters.ContainsKey('Port')) {
+        $Port = [int]$managedConfiguration.SidecarPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BrokerPort')) {
+        $BrokerPort = [int]$managedConfiguration.BrokerPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BrokerUpstreamPort')) {
+        $BrokerUpstreamPort = [int]$managedConfiguration.BrokerUpstreamPort
+    }
+    if (-not $PSBoundParameters.ContainsKey('BasePath')) {
+        $BasePath = [string]$managedConfiguration.BasePath
+    }
+    if (-not $PSBoundParameters.ContainsKey('TaskName')) {
+        $TaskName = [string]$managedConfiguration.TaskName
+    }
+}
 Assert-CanonicalBasePath -BasePath $BasePath
 if (-not [string]::IsNullOrWhiteSpace($LauncherShortcutPath) -and
     $env:CODEX_REMOTE_TEST_FIXTURE -cne '1') {
@@ -121,6 +139,44 @@ function Read-StatusJsonText {
     return Get-Content -LiteralPath $Path -Raw -Encoding utf8 -ErrorAction Stop
 }
 
+function Get-StatusUniqueCodexDesktopRootIdentityKey {
+    $roots = @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "Name = 'ChatGPT.exe'" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                [string]$_.CommandLine -notmatch '(?i)(?:^|\s)--type=' -and
+                -not [string]::IsNullOrWhiteSpace(
+                    [string]$_.ExecutablePath
+                )
+            }
+    )
+    if ($roots.Count -ne 1) {
+        return $null
+    }
+    $root = $roots[0]
+    try {
+        $creationIdentity = Get-ProcessCreationIdentity `
+            -CreationDate $root.CreationDate
+        $identityHandle = Open-ProcessIdentityHandle `
+            -ProcessId ([int]$root.ProcessId) `
+            -ExpectedCreationDateUtcTicks (
+                [long]$creationIdentity.CreationDateUtcTicks
+            )
+        try {
+            return Get-CodexDesktopOwnerRootIdentityKey `
+                -ProcessId ([int]$root.ProcessId) `
+                -StartTimeUtcTicks ([long]$identityHandle.StartTimeUtcTicks) `
+                -ExecutablePath ([string]$root.ExecutablePath)
+        } finally {
+            $identityHandle.Process.Dispose()
+        }
+    } catch {
+        return $null
+    }
+}
+
 function Get-StatusUserEnvironmentValueState {
     if ([string]::IsNullOrWhiteSpace($UserEnvironmentFixturePath)) {
         return Get-UserEnvironmentValueState -Name 'CODEX_APP_SERVER_WS_URL'
@@ -183,10 +239,37 @@ function Test-StatusPathEqual {
     }
 }
 
+function Get-StatusLauncherShortcutLinkFlags {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-StatusOrdinaryFile `
+        -Path $Path `
+        -MinimumBytes 76 `
+        -MaximumBytes 1048576)) {
+        throw 'The managed launcher shell link is not an ordinary bounded file.'
+    }
+    $stream = [System.IO.File]::Open(
+        [System.IO.Path]::GetFullPath($Path),
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $header = [byte[]]::new(24)
+        if ($stream.Read($header, 0, $header.Length) -ne $header.Length -or
+            [BitConverter]::ToUInt32($header, 0) -ne 76) {
+            throw 'The managed launcher shell link header is invalid.'
+        }
+        return [uint32][BitConverter]::ToUInt32($header, 20)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Get-StatusLauncherShortcutDefinition {
-    $resolvedInstallRoot = $effectiveInstallRoot
     $launcher = [System.IO.Path]::GetFullPath(
-        (Join-Path $resolvedInstallRoot 'scripts\windows\Launch-CodexWithRemote.ps1')
+        (Get-CodexLocalRemoteControlDispatcherPath `
+            -DataDir $resolvedDataDir)
     )
     $safeLaunchName = 'Codex Remote (' +
         (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
@@ -201,6 +284,8 @@ function Get-StatusLauncherShortcutDefinition {
     if ([System.IO.Path]::GetExtension($shortcut) -cne '.lnk') {
         throw "Managed launcher shortcut '$shortcut' must use the .lnk extension."
     }
+    $iconPath = Get-CodexLocalRemoteManagedDesktopIconPath `
+        -DataDir $resolvedDataDir
     $argumentValues = @(
         '-NoLogo',
         '-NoProfile',
@@ -211,12 +296,12 @@ function Get-StatusLauncherShortcutDefinition {
         'Bypass',
         '-File',
         $launcher,
+        '-Operation',
+        'Open',
         '-DataDir',
         $resolvedDataDir,
-        '-BrokerPort',
-        [string]$BrokerPort,
-        '-TaskName',
-        $TaskName
+        '-AllowDesktopRestart',
+        '-InteractiveShortcutFeedback'
     )
     return [pscustomobject]@{
         LauncherPath = $launcher
@@ -228,8 +313,11 @@ function Get-StatusLauncherShortcutDefinition {
                     ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
                 }
         ) -join ' '
-        WorkingDirectory = $resolvedInstallRoot
-        Description = "$safeLaunchName - Uses Remote when ready and otherwise starts Codex Desktop natively."
+        WorkingDirectory = $resolvedDataDir
+        Description = "$safeLaunchName - Explicitly opens Remote through the stable control dispatcher."
+        IconLocation = "$iconPath,0"
+        WindowStyle = 1
+        RunAsUser = $true
     }
 }
 
@@ -255,7 +343,20 @@ function Test-StatusLauncherShortcut {
             (Test-StatusPathEqual `
                 -Actual $shortcut.WorkingDirectory `
                 -Expected ([string]$Definition.WorkingDirectory)) -and
-            [string]$shortcut.Description -ceq [string]$Definition.Description
+            [string]$shortcut.Description -ceq [string]$Definition.Description -and
+            [int]$shortcut.WindowStyle -eq [int]$Definition.WindowStyle -and
+            (
+                (
+                    (Get-StatusLauncherShortcutLinkFlags `
+                        -Path ([string]$Definition.ShortcutPath)) `
+                        -band 0x00002000
+                ) -ne 0
+            ) -eq [bool]$Definition.RunAsUser -and
+            [string]::Equals(
+                [string]$shortcut.IconLocation,
+                [string]$Definition.IconLocation,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
         )
     } catch {
         return $false
@@ -649,8 +750,42 @@ if ($null -ne $task) {
             $taskOwnership = Test-ManagedStartupTask -Task $task -Expected $expectedTask
             $taskOwned = [bool]$taskOwnership.IsManaged
             if ($taskOwned) {
-                $taskRuntimeBinding = 'dynamic-v3'
+                $taskRuntimeBinding = 'desktop-owner-v5'
             } else {
+                $legacyHeadlessExpected =
+                    Get-LegacyHeadlessStartupTaskDefinitionV4 `
+                        -Definition $expectedTask
+                $legacyHeadlessV4 = Test-ManagedStartupTask `
+                    -Task $task `
+                    -Expected $legacyHeadlessExpected
+                if ($legacyHeadlessV4.IsManaged) {
+                    $taskOwned = $true
+                    $taskRuntimeBinding = 'headless-v4-update-required'
+                } else {
+                    $legacyDesktopOwnerExpected =
+                        Get-LegacyDesktopOwningStartupTaskDefinitionV3 `
+                            -Definition $expectedTask
+                    $legacyDesktopOwnerV3 = Test-ManagedStartupTask `
+                        -Task $task `
+                        -Expected $legacyDesktopOwnerExpected
+                    if ($legacyDesktopOwnerV3.IsManaged) {
+                        $taskOwned = $true
+                        $taskRuntimeBinding = 'dynamic-v3-update-required'
+                    } else {
+                        $preHeadlessExpected =
+                            Get-PreHeadlessConsoleStartupTaskDefinition `
+                                -Definition $legacyDesktopOwnerExpected
+                        $preHeadlessOwnership = Test-ManagedStartupTask `
+                            -Task $task `
+                            -Expected $preHeadlessExpected
+                        if ($preHeadlessOwnership.IsManaged) {
+                            $taskOwned = $true
+                            $taskRuntimeBinding = 'dynamic-v3-update-required'
+                        }
+                    }
+                }
+            }
+            if (-not $taskOwned) {
                 $actions = @($task.Actions)
                 if ($actions.Count -eq 1) {
                     $arguments = @(
@@ -695,7 +830,11 @@ if ($null -ne $task) {
         }
     }
 }
-$taskReady = $taskOwned -and $taskRunning
+$taskReady = (
+    $taskOwned -and
+    $taskRunning -and
+    $taskRuntimeBinding -ceq 'desktop-owner-v5'
+)
 $listenerPorts = @($Port, $BrokerPort, $BrokerUpstreamPort)
 $listenerSnapshotInitial = @(Get-StatusListenerSnapshot -LocalPorts $listenerPorts)
 $sidecarListeners = @(
@@ -783,6 +922,7 @@ if ($null -ne $brokerPid -and
 }
 $brokerProxyReady = $brokerLoopbackOnly -and $brokerOwned
 $brokerHealthReady = $false
+$brokerHealth = $null
 $desktopConnected = $false
 $sidecarConnected = $false
 $degraded = $true
@@ -853,6 +993,7 @@ $sidecarIdentityReady = $false
 $upstreamIdentityReady = $false
 $startupInvocationReady = $false
 $runtimeReceiptReady = $false
+$runtimeInvocationId = $null
 $brokerStatePath = Join-Path $resolvedDataDir 'app-server-broker.json'
 $startupStatusPath = Join-Path $resolvedDataDir 'startup-last.json'
 try {
@@ -1153,6 +1294,40 @@ try {
     $runtimeReceiptReady = $false
 }
 
+$desktopOwnerProofReady = $false
+if ($runtimeReceiptReady -and
+    $brokerHealthReady -and
+    $runtimeInvocationId -cmatch '^[0-9a-f]{32}$') {
+    try {
+        $desktopRootIdentityKey =
+            Get-StatusUniqueCodexDesktopRootIdentityKey
+        $desktopOwnerProof =
+            Read-CodexDesktopOwnerConnectionProof `
+                -DataDir $resolvedDataDir
+        $proofReadiness = $brokerHealth.PSObject.Copy()
+        $proofReadiness | Add-Member `
+            -NotePropertyName 'runtimeReceiptInvocationId' `
+            -NotePropertyValue $runtimeInvocationId `
+            -Force
+        $proofReadiness | Add-Member `
+            -NotePropertyName 'runtimeReceiptBrokerProcessId' `
+            -NotePropertyValue ([int]$brokerReceipt.Broker.ProcessId) `
+            -Force
+        $proofReadiness | Add-Member `
+            -NotePropertyName 'runtimeReceiptUpstreamProcessId' `
+            -NotePropertyValue ([int]$brokerReceipt.Upstream.ProcessId) `
+            -Force
+        $desktopOwnerProofReady =
+            Test-CodexDesktopOwnerConnectionProof `
+                -Readiness $proofReadiness `
+                -Proof $desktopOwnerProof `
+                -ExpectedRuntimeInvocationId $runtimeInvocationId `
+                -RootIdentityKey $desktopRootIdentityKey
+    } catch {
+        $desktopOwnerProofReady = $false
+    }
+}
+
 $desktopStdioPids = [System.Collections.Generic.List[int]]::new()
 foreach ($candidate in @(
     Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'" -ErrorAction SilentlyContinue |
@@ -1189,6 +1364,7 @@ foreach ($scope in @(
 $capabilityTokenReady = $false
 $launcherScriptReady = $false
 $launcherShortcutReady = $false
+$launcherIconReady = $false
 $launcherConfigured = $false
 $legacyPersistentOverrideBlocked = $false
 $legacyEnvironmentState = 'none'
@@ -1204,16 +1380,25 @@ try {
 }
 try {
     $launcherDefinition = Get-StatusLauncherShortcutDefinition
+    $launcherIconPath = Get-CodexLocalRemoteManagedDesktopIconPath `
+        -DataDir $resolvedDataDir
+    $launcherIconReady = Test-CodexLocalRemoteManagedDesktopIcon `
+        -Path $launcherIconPath
     $launcherScriptReady = Test-StatusOrdinaryFile `
         -Path ([string]$launcherDefinition.LauncherPath) `
         -MinimumBytes 128 `
         -MaximumBytes 1048576
     $launcherShortcutReady = Test-StatusLauncherShortcut `
         -Definition $launcherDefinition
-    $launcherConfigured = $launcherScriptReady -and $launcherShortcutReady
+    $launcherConfigured = (
+        $launcherScriptReady -and
+        $launcherShortcutReady -and
+        $launcherIconReady
+    )
 } catch {
     $launcherScriptReady = $false
     $launcherShortcutReady = $false
+    $launcherIconReady = $false
     $launcherConfigured = $false
 }
 try {
@@ -1264,14 +1449,24 @@ try {
 $launchMode = if ($legacyPersistentOverrideBlocked) {
     'blocked-persistent-user-override'
 } elseif ($launcherConfigured) {
-    'process-scoped-fail-open'
+    if ($desktopOwnerProofReady) {
+        'process-scoped-fail-open'
+    } else {
+        'process-scoped-pending-proof'
+    }
 } else {
     'native-only'
 }
 $desktopLaunchReceiptReady = $false
+$desktopLaunchReceiptVersion = $null
 $desktopLaunchStatus = 'not-recorded'
 $desktopLaunchRemoteEnabled = $null
 $desktopLaunchDecision = ''
+$desktopLaunchRemoteFailureStage = $null
+$desktopLaunchRemoteFailureCode = $null
+$desktopLaunchCorrelationId = $null
+$desktopLaunchFeedbackStatus = $null
+$desktopLaunchFeedbackFailureCode = $null
 $desktopLaunchRecordedAtUtc = $null
 try {
     $desktopLaunchReceiptPath = Join-Path `
@@ -1284,24 +1479,8 @@ try {
         $desktopLaunchReceipt = Read-StatusJsonText `
             -Path $desktopLaunchReceiptPath |
                 ConvertFrom-Json -Depth 10 -ErrorAction Stop
-        $desktopLaunchReceiptReady = (
-            (Test-StatusExactProperties `
-                -Value $desktopLaunchReceipt `
-                -Names @(
-                    'DesktopProcessId',
-                    'RecordedAtUtc',
-                    'RemoteDecision',
-                    'RemoteEnabled',
-                    'RemoteFallbackAttempts',
-                    'RemoteStopAttempts',
-                    'Signature',
-                    'Status',
-                    'Version'
-                )) -and
-            [string]$desktopLaunchReceipt.Signature -ceq
-                'codex-local-remote/desktop-launch/v1' -and
-            (Test-NonNegativeInteger -Value $desktopLaunchReceipt.Version) -and
-            [int]$desktopLaunchReceipt.Version -eq 1 -and
+        $desktopLaunchCommonReady = (
+            $desktopLaunchReceipt.Status -is [string] -and
             [string]$desktopLaunchReceipt.Status -cin @(
                 'already-running',
                 'launched-native',
@@ -1323,12 +1502,163 @@ try {
             (Test-StatusRecordedAtUtc `
                 -Value $desktopLaunchReceipt.RecordedAtUtc)
         )
+        $desktopLaunchV1Ready = (
+            (Test-StatusExactProperties `
+                -Value $desktopLaunchReceipt `
+                -Names @(
+                    'DesktopProcessId',
+                    'RecordedAtUtc',
+                    'RemoteDecision',
+                    'RemoteEnabled',
+                    'RemoteFallbackAttempts',
+                    'RemoteStopAttempts',
+                    'Signature',
+                    'Status',
+                    'Version'
+                )) -and
+            [string]$desktopLaunchReceipt.Signature -ceq
+                'codex-local-remote/desktop-launch/v1' -and
+            (Test-NonNegativeInteger -Value $desktopLaunchReceipt.Version) -and
+            [int]$desktopLaunchReceipt.Version -eq 1 -and
+            $desktopLaunchCommonReady
+        )
+        $desktopLaunchV2Ready = (
+            (Test-StatusExactProperties `
+                -Value $desktopLaunchReceipt `
+                -Names @(
+                    'CorrelationId',
+                    'DesktopProcessId',
+                    'FeedbackFailureCode',
+                    'FeedbackStatus',
+                    'RecordedAtUtc',
+                    'RemoteDecision',
+                    'RemoteEnabled',
+                    'RemoteFailureCode',
+                    'RemoteFailureStage',
+                    'RemoteFallbackAttempts',
+                    'RemoteStopAttempts',
+                    'Signature',
+                    'Status',
+                    'Version'
+                )) -and
+            [string]$desktopLaunchReceipt.Signature -ceq
+                'codex-local-remote/desktop-launch/v2' -and
+            (Test-NonNegativeInteger -Value $desktopLaunchReceipt.Version) -and
+            [int]$desktopLaunchReceipt.Version -eq 2 -and
+            $desktopLaunchCommonReady -and
+            $desktopLaunchReceipt.RemoteDecision -is [string] -and
+            [string]$desktopLaunchReceipt.RemoteDecision -cin @(
+                'broker-reports-desktop-connected',
+                'created-desktop-identity-unavailable',
+                'created-desktop-identity-unverified',
+                'existing-desktop-preserved',
+                'existing-desktop-takeover-identity-unverified',
+                'existing-desktop-takeover-runtime-unverified',
+                'existing-desktop-takeover-state-drifted',
+                'existing-native-desktop-relaunched-remote',
+                'remote-attach-failed-process-preserved',
+                'remote-attached',
+                'remote-attached-root-process-set-unverified',
+                'remote-attached-then-unverified-process-preserved',
+                'remote-broker-lost-before-attach',
+                'remote-desktop-exited-before-attach',
+                'remote-desktop-exited-before-identity',
+                'remote-desktop-launch-failed',
+                'remote-endpoint-unavailable',
+                'remote-health-check-failed',
+                'remote-not-ready',
+                'remote-ready',
+                'remote-start-failed'
+            ) -and
+            ($null -eq $desktopLaunchReceipt.RemoteFailureStage -or (
+                $desktopLaunchReceipt.RemoteFailureStage -is [string] -and
+                [string]$desktopLaunchReceipt.RemoteFailureStage -cin @(
+                    'remote-health-check',
+                    'runtime-handoff',
+                    'remote-readiness',
+                    'remote-endpoint',
+                    'desktop-start',
+                    'desktop-attach',
+                    'desktop-cleanup',
+                    'unexpected'
+                )
+            )) -and
+            ($null -eq $desktopLaunchReceipt.RemoteFailureCode -or (
+                $desktopLaunchReceipt.RemoteFailureCode -is [string] -and
+                [string]$desktopLaunchReceipt.RemoteFailureCode -cin @(
+                    'health-check-failed',
+                    'runtime-generation-unverified',
+                    'desktop-running',
+                    'handoff-request-invalid',
+                    'handoff-launch-denied',
+                    'handoff-launch-failed',
+                    'handoff-timeout',
+                    'handoff-result-invalid',
+                    'handoff-result-mismatch',
+                    'runtime-handoff-failed',
+                    'readiness-timeout',
+                    'endpoint-invalid',
+                    'desktop-start-failed',
+                    'desktop-attach-failed',
+                    'desktop-cleanup-failed',
+                    'unexpected'
+                )
+            )) -and
+            (($null -eq $desktopLaunchReceipt.RemoteFailureStage) -eq
+                ($null -eq $desktopLaunchReceipt.RemoteFailureCode)) -and
+            ($null -eq $desktopLaunchReceipt.CorrelationId -or (
+                $desktopLaunchReceipt.CorrelationId -is [string] -and
+                [string]$desktopLaunchReceipt.CorrelationId -cmatch
+                    '^[0-9a-f]{32}$'
+            )) -and
+            $desktopLaunchReceipt.FeedbackStatus -is [string] -and
+            [string]$desktopLaunchReceipt.FeedbackStatus -cin @(
+                'pending',
+                'rendered',
+                'render-failed',
+                'suppressed',
+                'filtered'
+            ) -and
+            ($null -eq $desktopLaunchReceipt.FeedbackFailureCode -or (
+                $desktopLaunchReceipt.FeedbackFailureCode -is [string] -and
+                [string]$desktopLaunchReceipt.FeedbackFailureCode -ceq
+                    'feedback-render-failed'
+            )) -and
+            (
+                (
+                    [string]$desktopLaunchReceipt.FeedbackStatus -ceq
+                        'render-failed' -and
+                    [string]$desktopLaunchReceipt.FeedbackFailureCode -ceq
+                        'feedback-render-failed'
+                ) -or (
+                    [string]$desktopLaunchReceipt.FeedbackStatus -cne
+                        'render-failed' -and
+                    $null -eq $desktopLaunchReceipt.FeedbackFailureCode
+                )
+            )
+        )
+        $desktopLaunchReceiptReady = (
+            $desktopLaunchV1Ready -or $desktopLaunchV2Ready
+        )
         if ($desktopLaunchReceiptReady) {
+            $desktopLaunchReceiptVersion = [int]$desktopLaunchReceipt.Version
             $desktopLaunchStatus = [string]$desktopLaunchReceipt.Status
             $desktopLaunchRemoteEnabled =
                 $desktopLaunchReceipt.RemoteEnabled
             $desktopLaunchDecision =
                 [string]$desktopLaunchReceipt.RemoteDecision
+            if ($desktopLaunchReceiptVersion -eq 2) {
+                $desktopLaunchRemoteFailureStage =
+                    $desktopLaunchReceipt.RemoteFailureStage
+                $desktopLaunchRemoteFailureCode =
+                    $desktopLaunchReceipt.RemoteFailureCode
+                $desktopLaunchCorrelationId =
+                    $desktopLaunchReceipt.CorrelationId
+                $desktopLaunchFeedbackStatus =
+                    [string]$desktopLaunchReceipt.FeedbackStatus
+                $desktopLaunchFeedbackFailureCode =
+                    $desktopLaunchReceipt.FeedbackFailureCode
+            }
             $desktopLaunchRecordedAtUtc = (
                 [DateTimeOffset]$desktopLaunchReceipt.RecordedAtUtc
             ).UtcDateTime.ToString('o')
@@ -1338,9 +1668,15 @@ try {
     }
 } catch {
     $desktopLaunchReceiptReady = $false
+    $desktopLaunchReceiptVersion = $null
     $desktopLaunchStatus = 'invalid'
     $desktopLaunchRemoteEnabled = $null
     $desktopLaunchDecision = ''
+    $desktopLaunchRemoteFailureStage = $null
+    $desktopLaunchRemoteFailureCode = $null
+    $desktopLaunchCorrelationId = $null
+    $desktopLaunchFeedbackStatus = $null
+    $desktopLaunchFeedbackFailureCode = $null
     $desktopLaunchRecordedAtUtc = $null
 }
 
@@ -1434,7 +1770,7 @@ $status = [pscustomobject]@{
         $routeMatches -and
         $brokerReady -and
         $runtimeReceiptReady -and
-        $desktopConnected -and
+        $desktopOwnerProofReady -and
         $sidecarConnected -and
         -not $degraded -and
         $unknownCount -eq 0 -and
@@ -1473,6 +1809,7 @@ $status = [pscustomobject]@{
     UpstreamIdentityReady = $upstreamIdentityReady
     StartupInvocationReady = $startupInvocationReady
     RuntimeReceiptReady = $runtimeReceiptReady
+    DesktopOwnerProofReady = $desktopOwnerProofReady
     ImmutableRuntimeReady = $immutableRuntimeReady
     RuntimeVersionId = if ($null -eq $currentRuntimePackage) {
         $null
@@ -1488,12 +1825,19 @@ $status = [pscustomobject]@{
     CapabilityTokenReady = $capabilityTokenReady
     LauncherScriptReady = $launcherScriptReady
     LauncherShortcutReady = $launcherShortcutReady
+    LauncherIconReady = $launcherIconReady
     LauncherConfigured = $launcherConfigured
     LaunchMode = $launchMode
     DesktopLaunchReceiptReady = $desktopLaunchReceiptReady
+    DesktopLaunchReceiptVersion = $desktopLaunchReceiptVersion
     DesktopLaunchStatus = $desktopLaunchStatus
     DesktopLaunchRemoteEnabled = $desktopLaunchRemoteEnabled
     DesktopLaunchDecision = $desktopLaunchDecision
+    DesktopLaunchRemoteFailureStage = $desktopLaunchRemoteFailureStage
+    DesktopLaunchRemoteFailureCode = $desktopLaunchRemoteFailureCode
+    DesktopLaunchCorrelationId = $desktopLaunchCorrelationId
+    DesktopLaunchFeedbackStatus = $desktopLaunchFeedbackStatus
+    DesktopLaunchFeedbackFailureCode = $desktopLaunchFeedbackFailureCode
     DesktopLaunchRecordedAtUtc = $desktopLaunchRecordedAtUtc
     LegacyPersistentOverrideBlocked = $legacyPersistentOverrideBlocked
     LegacyEnvironmentState = $legacyEnvironmentState

@@ -18,7 +18,9 @@ test.describe("不可信模型内容渲染", () => {
     await expect(message).toBeVisible();
     await expect(message.locator("script, iframe, object, embed")).toHaveCount(0);
     await expect(message.locator('a[href^="javascript:"]')).toHaveCount(0);
-    await expect(message.locator("svg")).toHaveCount(0);
+    // UI affordances such as the copy button use trusted inline icons. The
+    // untrusted Markdown body itself must never be able to inject an SVG.
+    await expect(message.locator(".markdown svg")).toHaveCount(0);
     await expect(
       page.evaluate(
         () => (window as Window & { __codexRemoteXssProbe?: boolean }).__codexRemoteXssProbe,

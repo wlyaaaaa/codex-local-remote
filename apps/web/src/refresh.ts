@@ -85,3 +85,16 @@ export function reconcileSelectedApproval(
   if (!selected) return undefined;
   return approvals.find((approval) => approval.id === selected.id);
 }
+
+export function approvalForCurrentThread(
+  selected: ApprovalRequest | undefined,
+  approvals: readonly ApprovalRequest[],
+  threadId: string | undefined,
+  dismissedIds: ReadonlySet<string>,
+): ApprovalRequest | undefined {
+  const reconciled = reconcileSelectedApproval(selected, approvals);
+  if (reconciled || !threadId) return reconciled;
+  return approvals.find(
+    (approval) => approval.threadId === threadId && !dismissedIds.has(approval.id),
+  );
+}

@@ -125,7 +125,7 @@ function New-ScheduledTaskSettingsSet {
         ExecutionTimeLimit = 'P3650D'
         MultipleInstances = [string]$MultipleInstances
         RestartCount = $RestartCount
-        RestartInterval = 'PT1M'
+        RestartInterval = [string]$RestartInterval
         StartWhenAvailable = [bool]$StartWhenAvailable
         Enabled = -not [bool]$Disable
         AllowDemandStart = -not [bool]$DisallowDemandStart
@@ -162,12 +162,17 @@ function Register-ScheduledTask {
     } else {
         'Ready'
     }
+    [object[]]$registeredTriggers = @()
+    if ($PSBoundParameters.ContainsKey('Trigger') -and
+        $null -ne $Trigger) {
+        $registeredTriggers = @($Trigger)
+    }
     $global:CodexRemoteSchedulerMockState.Task = [pscustomobject]@{
         TaskName = $TaskName
         TaskPath = $TaskPath
         Description = $Description
         Actions = @($Action)
-        Triggers = @($Trigger)
+        Triggers = $registeredTriggers
         Principal = $Principal
         Settings = $Settings
         State = $preservedState
@@ -236,6 +241,8 @@ if ($ExerciseFailOpenLifecycle) {
 }
 if ($Operation -eq 'register' -and -not $Start) {
     $parameters.NoStart = $true
+} elseif ($Operation -eq 'register' -and $Start) {
+    $parameters.StartRemoteNow = $true
 }
 if ($Operation -eq 'unregister') {
     $parameters.Confirm = $false

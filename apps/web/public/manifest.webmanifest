@@ -1,7 +1,7 @@
 {
   "name": "Codex Local Remote",
   "short_name": "Local Remote",
-  "description": "查看 Desktop 只读任务快照，并实时控制本机托管的 Codex 任务。",
+  "description": "远程控制 ChatGPT / Codex Desktop 任务，并管理当前 Windows 身份可访问的电脑文件。",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

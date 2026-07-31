@@ -33,10 +33,12 @@ describe("public-safety scanner", () => {
       "safe.txt": "mock.example.ts.net\nC:\\\\Users\\\\fixture\\\\AppData",
       "secret.txt": utf16,
       "path.json": `{"path":"C:${"\\\\Users\\\\ActualPerson\\\\private"}"}`,
+      "path-url.txt": `file:///D:${"/Users/ActualPerson/private"}`,
     });
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("AWS access key");
     expect(result.stderr).toContain("machine-specific Windows user path");
+    expect(result.stderr).toContain("path-url.txt:1 machine-specific Windows user path");
     expect(result.stderr).not.toContain("safe.txt");
   });
 
@@ -68,6 +70,21 @@ describe("public-safety scanner", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("real Funnel hostname");
     expect(result.stderr).not.toContain(".env.example");
+  });
+
+  it("rejects conversation identifiers and owner-local paths from public documentation", () => {
+    const result = scan({
+      "docs/acceptance.md": [
+        "task 00000000-0000-0000-0000-000000000042",
+        `evidence Q:${"/Personal/private.json"}`,
+      ].join("\n"),
+      "docs/example.md": "C:/Projects/sample/docs/example.md",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("conversation identifier in public documentation");
+    expect(result.stderr).toContain("owner-local Windows path");
+    expect(result.stderr).not.toContain("docs/example.md");
   });
 
   it("allows only explicitly reviewed product screenshots with a valid image signature", () => {
