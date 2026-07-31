@@ -113,7 +113,9 @@ $runtime = [pscustomobject]@{
 function Invoke-RemoteStateCase {
     param(
         [Parameter(Mandatory)]
-        [string]$Scenario
+        [string]$Scenario,
+
+        [switch]$AllowActiveTurns
     )
 
     $global:OnDemandRemoteStateScenario = $Scenario
@@ -198,7 +200,8 @@ function Invoke-RemoteStateCase {
 
     return Get-OnDemandRemoteState `
         -Runtime $runtime `
-        -BrokerPort 18791
+        -BrokerPort 18791 `
+        -AllowActiveTurns:$AllowActiveTurns
 }
 
 [pscustomobject][ordered]@{
@@ -208,6 +211,10 @@ function Invoke-RemoteStateCase {
         Invoke-RemoteStateCase -Scenario 'CurrentHandshakeUnpublished'
     CurrentUnsafeDetached =
         Invoke-RemoteStateCase -Scenario 'CurrentUnsafeDetached'
+    CurrentUnsafeDetachedAuthorized =
+        Invoke-RemoteStateCase `
+            -Scenario 'CurrentUnsafeDetached' `
+            -AllowActiveTurns
     CurrentBackground = Invoke-RemoteStateCase -Scenario 'CurrentBackground'
     PreviousSilent = Invoke-RemoteStateCase -Scenario 'PreviousSilent'
     PreviousWithSidecar =

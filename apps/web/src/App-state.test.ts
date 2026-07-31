@@ -577,6 +577,13 @@ describe("对话行操作", () => {
 });
 
 describe("持续目标首次加载", () => {
+  it("能力降级但目标接口仍可读时继续尝试回读现有目标", () => {
+    expect(helpers.shouldReadThreadGoal(undefined)).toBe(false);
+    expect(helpers.shouldReadThreadGoal({ goals: "unavailable" })).toBe(false);
+    expect(helpers.shouldReadThreadGoal({ goals: "degraded" })).toBe(true);
+    expect(helpers.shouldReadThreadGoal({ goals: "available" })).toBe(true);
+  });
+
   it("能力尚未就绪或临时读取失败时不锁死后续真实目标回读", () => {
     expect(helpers.shouldCommitThreadGoalLoad(false, undefined)).toBe(false);
     expect(helpers.shouldCommitThreadGoalLoad(false, { goal: null })).toBe(true);

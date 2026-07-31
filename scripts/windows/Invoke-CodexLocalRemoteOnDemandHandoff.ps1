@@ -616,7 +616,9 @@ function Get-OnDemandRemoteState {
 
         [Parameter(Mandatory)]
         [ValidateRange(1, 65535)]
-        [int]$BrokerPort
+        [int]$BrokerPort,
+
+        [switch]$AllowActiveTurns
     )
 
     $script:onDemandLastReadiness = $null
@@ -832,7 +834,8 @@ function Get-OnDemandRemoteState {
             # an otherwise exact live lease unverifiable.
             return 'ready'
         }
-        if ([int]$readiness.unsafeThreadCount -ne 0) {
+        if (-not $AllowActiveTurns -and
+            [int]$readiness.unsafeThreadCount -ne 0) {
             return 'unverified'
         }
         if ([bool]$readiness.appServerReady -and
@@ -1373,12 +1376,15 @@ function Get-OnDemandPreparedTransportSnapshot {
         [object]$Runtime,
 
         [Parameter(Mandatory)]
-        [object]$Configuration
+        [object]$Configuration,
+
+        [switch]$AllowActiveTurns
     )
 
     $remoteState = Get-OnDemandRemoteState `
         -Runtime $Runtime `
-        -BrokerPort ([int]$Configuration.BrokerPort)
+        -BrokerPort ([int]$Configuration.BrokerPort) `
+        -AllowActiveTurns:$AllowActiveTurns
     if ($remoteState -cne 'desktop-detached' -or
         $null -eq $script:onDemandLastReadiness) {
         throw (
@@ -1472,7 +1478,9 @@ function Prepare-OnDemandSelectedRemoteRuntime {
         [object]$DesktopRoot,
 
         [Parameter(Mandatory)]
-        [string]$DesktopExecutablePath
+        [string]$DesktopExecutablePath,
+
+        [switch]$AllowActiveTurns
     )
 
     $null =
@@ -1480,7 +1488,8 @@ function Prepare-OnDemandSelectedRemoteRuntime {
             -Runtime $Runtime `
             -Configuration $Configuration `
             -StartupTask $StartupTask `
-            -Name $Name
+            -Name $Name `
+            -AllowActiveTurns:$AllowActiveTurns
     $ownership =
         Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot `
             -DesktopExecutablePath $DesktopExecutablePath
@@ -1507,7 +1516,8 @@ function Prepare-OnDemandSelectedRemoteRuntime {
             -Runtime $Runtime `
             -Configuration $Configuration `
             -Name $Name `
-            -DesktopHandoffPreparation $preparation
+            -DesktopHandoffPreparation $preparation `
+            -AllowActiveTurns:$AllowActiveTurns
         $null = Wait-OnDemandTaskState `
             -Name $Name `
             -ExpectedState 'Running' `
@@ -1518,7 +1528,8 @@ function Prepare-OnDemandSelectedRemoteRuntime {
             Start-Sleep -Milliseconds 250
             $remoteState = Get-OnDemandRemoteState `
                 -Runtime $Runtime `
-                -BrokerPort ([int]$Configuration.BrokerPort)
+                -BrokerPort ([int]$Configuration.BrokerPort) `
+                -AllowActiveTurns:$AllowActiveTurns
             if ($remoteState -ceq 'desktop-detached') {
                 break
             }
@@ -1532,7 +1543,8 @@ function Prepare-OnDemandSelectedRemoteRuntime {
         $transport =
             Get-OnDemandPreparedTransportSnapshot `
                 -Runtime $Runtime `
-                -Configuration $Configuration
+                -Configuration $Configuration `
+                -AllowActiveTurns:$AllowActiveTurns
         return Set-CodexLocalRemoteDesktopHandoffPreparationReady `
             -DataDir $resolvedDataDir `
             -Preparation $preparation `
@@ -1711,7 +1723,9 @@ function Assert-OnDemandPreparedInfrastructureReadyForAttach {
         [object]$Configuration,
 
         [Parameter(Mandatory)]
-        [string]$Name
+        [string]$Name,
+
+        [switch]$AllowActiveTurns
     )
 
     $current =
@@ -1744,7 +1758,8 @@ function Assert-OnDemandPreparedInfrastructureReadyForAttach {
     $transport =
         Get-OnDemandPreparedTransportSnapshot `
             -Runtime $current `
-            -Configuration $Configuration
+            -Configuration $Configuration `
+            -AllowActiveTurns:$AllowActiveTurns
     if ([string]$transport.Readiness.runtimeInvocationId -cne
             [string]$currentPreparation.RuntimeInvocationId -or
         [int]$transport.Readiness.brokerProcessId -ne
@@ -1775,7 +1790,9 @@ function Assert-OnDemandPreparedInfrastructureStillExact {
         [object]$Configuration,
 
         [Parameter(Mandatory)]
-        [string]$Name
+        [string]$Name,
+
+        [switch]$AllowActiveTurns
     )
 
     $current =
@@ -1807,7 +1824,8 @@ function Assert-OnDemandPreparedInfrastructureStillExact {
     $transport =
         Get-OnDemandPreparedTransportSnapshot `
             -Runtime $current `
-            -Configuration $Configuration
+            -Configuration $Configuration `
+            -AllowActiveTurns:$AllowActiveTurns
     if ([string]$transport.Readiness.runtimeInvocationId -cne
             [string]$currentPreparation.RuntimeInvocationId -or
         [int]$transport.Readiness.brokerProcessId -ne
@@ -1841,7 +1859,9 @@ function Invoke-OnDemandPreparedAttach {
         [string]$Name,
 
         [Parameter(Mandatory)]
-        [string]$DesktopExecutablePath
+        [string]$DesktopExecutablePath,
+
+        [switch]$AllowActiveTurns
     )
 
     $preClose =
@@ -1849,7 +1869,8 @@ function Invoke-OnDemandPreparedAttach {
             -Preparation $Preparation `
             -Runtime $Runtime `
             -Configuration $Configuration `
-            -Name $Name
+            -Name $Name `
+            -AllowActiveTurns:$AllowActiveTurns
     $attaching =
         Set-CodexLocalRemoteDesktopHandoffPreparationAttaching `
             -DataDir $resolvedDataDir `
@@ -1863,7 +1884,8 @@ function Invoke-OnDemandPreparedAttach {
             -Preparation $attaching `
             -Runtime $preClose.Runtime `
             -Configuration $Configuration `
-            -Name $Name
+            -Name $Name `
+            -AllowActiveTurns:$AllowActiveTurns
     $script:preparedAttachIntent =
         New-CodexDesktopOwnerIntent `
             -DataDir $resolvedDataDir `
@@ -2649,7 +2671,8 @@ try {
                         -Preparation $desktopHandoffPreparation `
                         -Runtime $runtime `
                         -Configuration $configuration `
-                        -Name $TaskName
+                        -Name $TaskName `
+                        -AllowActiveTurns:$AllowDesktopRestart
             } catch {
                 $readyFailure = $_
                 try {
@@ -2693,7 +2716,8 @@ try {
                         -Runtime $runtime `
                         -Configuration $configuration `
                         -Name $TaskName `
-                        -DesktopExecutablePath $expectedDesktopPath
+                        -DesktopExecutablePath $expectedDesktopPath `
+                        -AllowActiveTurns:$AllowDesktopRestart
             } catch {
                 $preparedAttachCompensationHandled = $true
                 $null =
@@ -2954,14 +2978,16 @@ try {
                 -StartupTask $startupTask `
                 -Name $TaskName `
                 -DesktopRoot $desktopRoots[0] `
-                -DesktopExecutablePath $expectedDesktopPath
+                -DesktopExecutablePath $expectedDesktopPath `
+                -AllowActiveTurns:$AllowDesktopRestart
         try {
             $verifiedReady =
                 Assert-OnDemandPreparedInfrastructureReadyForAttach `
                     -Preparation $desktopHandoffPreparation `
                     -Runtime $runtime `
                     -Configuration $configuration `
-                    -Name $TaskName
+                    -Name $TaskName `
+                    -AllowActiveTurns:$AllowDesktopRestart
         } catch {
             $readyFailure = $_
             try {
@@ -3014,7 +3040,8 @@ try {
                     -Runtime $runtime `
                     -Configuration $configuration `
                     -Name $TaskName `
-                    -DesktopExecutablePath $expectedDesktopPath
+                    -DesktopExecutablePath $expectedDesktopPath `
+                    -AllowActiveTurns:$AllowDesktopRestart
         } catch {
             $preparedAttachCompensationHandled = $true
             $null =

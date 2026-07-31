@@ -139,6 +139,7 @@ describe("Windows native-default on-demand Remote contract", () => {
         CurrentDetached: "desktop-detached",
         CurrentHandshakeUnpublished: "unverified",
         CurrentUnsafeDetached: "unverified",
+        CurrentUnsafeDetachedAuthorized: "desktop-detached",
         CurrentBackground: "background-repairable",
         PreviousSilent: "runtime-transition",
         PreviousWithSidecar: "runtime-transition",
@@ -317,6 +318,22 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(prepareBody).toContain("Start-OnDemandSelectedRemoteRuntime `");
     expect(prepareBody).toContain("-DesktopHandoffPreparation $preparation");
     expect(handoff).not.toMatch(/\n\s*Start-ScheduledTask\s+`\s*\n\s*-TaskName \$TaskName/u);
+  });
+
+  it("uses explicit restart authority to prepare a native Desktop even with active turns", () => {
+    const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+    const prepareStart = handoff.indexOf("function Prepare-OnDemandSelectedRemoteRuntime");
+    const prepareEnd = handoff.indexOf("function Stop-OnDemandDesktopProcessGroup", prepareStart);
+    const prepareBody = handoff.slice(prepareStart, prepareEnd);
+    const nativePrepareStart = handoff.lastIndexOf("Prepare-OnDemandSelectedRemoteRuntime `");
+    const nativePrepareCall = handoff.slice(
+      nativePrepareStart,
+      handoff.indexOf("try {", nativePrepareStart),
+    );
+
+    expect(prepareBody).toContain("[switch]$AllowActiveTurns");
+    expect(prepareBody).toContain("-AllowActiveTurns:$AllowActiveTurns");
+    expect(nativePrepareCall).toContain("-AllowActiveTurns:$AllowDesktopRestart");
   });
 
   it("restores native Desktop when an authorized Open fails after closing it", () => {

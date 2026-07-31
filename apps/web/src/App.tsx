@@ -208,6 +208,7 @@ import {
 import {
   collaborationModeSetting,
   CODEX_DEFAULT_SERVICE_TIER,
+  composerCapabilityState,
   composerDeliveryDecision,
   composerFeatureSupported,
   filterThreadApprovals,
@@ -1030,6 +1031,10 @@ export function shouldCommitThreadGoalLoad(
   goalResult: { goal: ThreadGoal | null } | undefined,
 ): goalResult is { goal: ThreadGoal | null } {
   return !goalLoaded && goalResult !== undefined;
+}
+
+export function shouldReadThreadGoal(capabilities: ComposerCapabilities | undefined): boolean {
+  return composerCapabilityState(capabilities, "goal") !== "unavailable";
 }
 
 export function shouldShowConversationLoading(
@@ -4857,7 +4862,7 @@ function ConversationPageInstance({
   const collaborationModeDirtyRef = useRef(false);
   const remoteProjectionRef = useRef(createThreadRemoteEventProjectionState());
   const queueSupported = composerFeatureSupported(capabilities, "queue");
-  const goalSupported = composerFeatureSupported(capabilities, "goal");
+  const goalReadable = shouldReadThreadGoal(capabilities);
   const settingsUpdateSupported = composerFeatureSupported(capabilities, "settings");
   const serviceTiersSupported = composerFeatureSupported(capabilities, "serviceTiers");
   const compactSupported = composerFeatureSupported(capabilities, "compact");
@@ -4870,7 +4875,7 @@ function ConversationPageInstance({
   const runtimeControlAvailable = online && appServerReady(capabilities);
   const loadFeatureKey = [
     queueSupported,
-    goalSupported,
+    goalReadable,
     permissionProfilesCapability,
     approvalPoliciesCapability,
     approvalReviewersCapability,
@@ -4991,7 +4996,7 @@ function ConversationPageInstance({
                 snapshot: { threadId: id, revision: 0, items: [] as QueuedTurnItem[] },
                 error: "",
               });
-          const goalResultPromise = goalSupported
+          const goalResultPromise = goalReadable
             ? apiClient.threadGoal(id).catch(() => undefined)
             : Promise.resolve(undefined);
           const permissionProfileResultPromise = permissionProfilesCapability
@@ -5192,7 +5197,7 @@ function ConversationPageInstance({
     [
       apiClient,
       finishContextCompaction,
-      goalSupported,
+      goalReadable,
       id,
       models,
       onSubagentsLoaded,
