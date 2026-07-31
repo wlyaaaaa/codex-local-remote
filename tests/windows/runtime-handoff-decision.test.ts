@@ -146,11 +146,13 @@ windowsOnly("immutable runtime handoff decision", () => {
   it("reuses the current running generation and starts a stopped task", () => {
     expect(decide("Running", "current")).toBe("reuse");
     expect(decide("Ready", "active-receipt-missing")).toBe("start");
+    expect(decide("Ready", "stale-transition-receipt")).toBe("start");
   });
 
   it("does not silently reuse an unverified running generation", () => {
     expect(decide("Running", "active-receipt-missing")).toBe("block-unverified-generation");
     expect(decide("Running", "active-bootstrap-unverified")).toBe("block-unverified-generation");
+    expect(decide("Ready", "transition-process-unverified")).toBe("block-unverified-generation");
   });
 
   it("performs a required generation switch directly inside the elevated launcher", () => {

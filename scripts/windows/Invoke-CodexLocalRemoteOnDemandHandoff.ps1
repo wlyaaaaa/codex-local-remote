@@ -1221,7 +1221,8 @@ function Assert-OnDemandSelectedRemoteRuntimeActivationPreflight {
     if ($postDrainDecision -ceq 'start') {
         if ([string]$generation.Status -cnotin @(
             'active-receipt-missing',
-            'current'
+            'current',
+            'stale-transition-receipt'
         )) {
             throw (
                 "Remote activation preflight cannot start from generation " +

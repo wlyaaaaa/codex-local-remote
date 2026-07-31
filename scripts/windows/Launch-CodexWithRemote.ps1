@@ -545,6 +545,95 @@ function Get-CodexLocalRemoteActiveBootstrapEvidence {
     }
 }
 
+function Get-CodexLocalRemoteReceiptProcessLiveness {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Receipt,
+
+        [AllowNull()]
+        [scriptblock]$GetProcessIdentityStateAction
+    )
+
+    foreach ($property in @('Bootstrap', 'Broker', 'Upstream')) {
+        if ($null -eq $Receipt.PSObject.Properties[$property] -or
+            $null -eq $Receipt.$property) {
+            return 'unknown'
+        }
+    }
+    $sidecarIdentity = if ($null -eq
+        $Receipt.PSObject.Properties['Sidecar']) {
+        $null
+    } else {
+        $Receipt.Sidecar
+    }
+    $identities = @(
+        $Receipt.Bootstrap,
+        $Receipt.Broker,
+        $sidecarIdentity,
+        $Receipt.Upstream
+    ) | Where-Object { $null -ne $_ }
+    if ($identities.Count -lt 3) {
+        return 'unknown'
+    }
+    $identityStateAction = if ($null -ne $GetProcessIdentityStateAction) {
+        $GetProcessIdentityStateAction
+    } else {
+        {
+            param([Parameter(Mandatory)][object]$Identity)
+
+            $process = Get-Process `
+                -Id ([int]$Identity.ProcessId) `
+                -ErrorAction SilentlyContinue
+            if ($null -eq $process) {
+                return 'absent'
+            }
+            try {
+                $process.Refresh()
+                if ($process.HasExited) {
+                    return 'absent'
+                }
+                if ($process.StartTime.ToUniversalTime().Ticks -eq
+                    [long]$Identity.ProcessStartTimeUtcTicks) {
+                    return 'live'
+                }
+                return 'absent'
+            } catch {
+                return 'unknown'
+            } finally {
+                $process.Dispose()
+            }
+        }
+    }
+
+    $unknownObserved = $false
+    foreach ($identity in $identities) {
+        if ($null -eq $identity.PSObject.Properties['ProcessId'] -or
+            $null -eq $identity.PSObject.Properties[
+                'ProcessStartTimeUtcTicks'
+            ] -or
+            -not (Test-NonNegativeInteger -Value $identity.ProcessId) -or
+            [decimal]$identity.ProcessId -le 0 -or
+            -not (Test-NonNegativeInteger `
+                -Value $identity.ProcessStartTimeUtcTicks) -or
+            [decimal]$identity.ProcessStartTimeUtcTicks -le 0) {
+            return 'unknown'
+        }
+        $identityState = try {
+            [string](& $identityStateAction $identity)
+        } catch {
+            'unknown'
+        }
+        if ($identityState -ceq 'live') {
+            return 'live'
+        }
+        if ($identityState -cne 'absent') {
+            $unknownObserved = $true
+        }
+    }
+    return $(if ($unknownObserved) { 'unknown' } else { 'absent' })
+}
+
 function Get-CodexLocalRemoteRuntimeGenerationStatus {
     [CmdletBinding()]
     param(
@@ -698,6 +787,24 @@ function Get-CodexLocalRemoteRuntimeGenerationStatus {
         -RuntimeRoot $activeRoot
     if (-not $activeValidation.IsValid) {
         throw "The active immutable runtime is invalid: $($activeValidation.Reason)."
+    }
+    $processLiveness =
+        Get-CodexLocalRemoteReceiptProcessLiveness -Receipt $state
+    if ($processLiveness -ceq 'absent') {
+        return [pscustomobject]@{
+            Status = 'stale-transition-receipt'
+            SelectedRoot = [string]$selected.CurrentRoot
+            ActiveRoot = $activeRoot
+            Receipt = $state
+        }
+    }
+    if ($processLiveness -cne 'live') {
+        return [pscustomobject]@{
+            Status = 'transition-process-unverified'
+            SelectedRoot = [string]$selected.CurrentRoot
+            ActiveRoot = $activeRoot
+            Receipt = $state
+        }
     }
     return [pscustomobject]@{
         Status = 'transition-required'
@@ -907,7 +1014,8 @@ function Get-CodexLocalRemoteRuntimeHandoffDecision {
     }
     if ($GenerationStatus -cin @(
         'registered-task-unverified',
-        'active-bootstrap-unverified'
+        'active-bootstrap-unverified',
+        'transition-process-unverified'
     )) {
         return 'block-unverified-generation'
     }

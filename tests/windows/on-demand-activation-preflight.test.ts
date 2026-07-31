@@ -73,6 +73,13 @@ describe("Windows on-demand activation preflight", () => {
           Failure:
             "Remote activation preflight cannot start from generation 'missing-selected-runtime'.",
         },
+        StaleTransitionStart: {
+          Passed: true,
+          GenerationStatus: "stale-transition-receipt",
+          SidecarConnected: null,
+          UnknownCount: 0,
+          UnsafeThreadCount: 0,
+        },
         MutationCalls: 0,
       });
     } finally {

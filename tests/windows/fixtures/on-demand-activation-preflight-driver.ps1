@@ -40,7 +40,8 @@ function Get-CodexLocalRemoteRuntimeGenerationStatus {
 
     if ($global:CodexLocalRemotePreflightFixtureScenario -cin @(
         'ForeignListenerStart',
-        'MissingSelectedStart'
+        'MissingSelectedStart',
+        'StaleTransitionStart'
     )) {
         return [pscustomobject]@{
             Status = if (
@@ -48,6 +49,11 @@ function Get-CodexLocalRemoteRuntimeGenerationStatus {
                 'MissingSelectedStart'
             ) {
                 'missing-selected-runtime'
+            } elseif (
+                $global:CodexLocalRemotePreflightFixtureScenario -ceq
+                'StaleTransitionStart'
+            ) {
+                'stale-transition-receipt'
             } else {
                 'active-receipt-missing'
             }
@@ -80,7 +86,8 @@ function Get-CodexLocalRemoteRuntimeHandoffDecision {
 
     if ($GenerationStatus -cin @(
         'active-receipt-missing',
-        'missing-selected-runtime'
+        'missing-selected-runtime',
+        'stale-transition-receipt'
     )) {
         return 'start'
     }
@@ -238,9 +245,13 @@ function Invoke-ActivationPreflightCase {
         return [pscustomobject]@{
             Passed = $true
             GenerationStatus = [string]$generation.Status
-            SidecarConnected =
+            SidecarConnected = if ($null -eq
+                $global:CodexLocalRemotePreflightFixtureReadiness) {
+                $null
+            } else {
                 [bool]$global:CodexLocalRemotePreflightFixtureReadiness.
                     sidecarConnected
+            }
             UnknownCount =
                 [int]$global:CodexLocalRemotePreflightFixtureReadiness.
                     unknownCount
@@ -269,6 +280,8 @@ function Invoke-ActivationPreflightCase {
         -Scenario 'ForeignListenerStart'
     MissingSelectedStart = Invoke-ActivationPreflightCase `
         -Scenario 'MissingSelectedStart'
+    StaleTransitionStart = Invoke-ActivationPreflightCase `
+        -Scenario 'StaleTransitionStart'
     MutationCalls =
         $global:CodexLocalRemotePreflightFixtureMutationCalls
 } | ConvertTo-Json -Depth 5 -Compress
