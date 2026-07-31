@@ -1332,7 +1332,9 @@ function Assert-CodexLocalRemoteRuntimeHandoffReadiness {
         [string]$Phase,
 
         [Parameter(Mandatory)]
-        [bool]$ExpectedSidecarConnected
+        [bool]$ExpectedSidecarConnected,
+
+        [switch]$AllowActiveTurns
     )
 
     $requiredProperties = @(
@@ -1372,7 +1374,8 @@ function Assert-CodexLocalRemoteRuntimeHandoffReadiness {
         [decimal]$Readiness.unknownCount -ne 0 -or
         -not (Test-NonNegativeInteger `
             -Value $Readiness.unsafeThreadCount) -or
-        [decimal]$Readiness.unsafeThreadCount -ne 0 -or
+        (-not $AllowActiveTurns -and
+            [decimal]$Readiness.unsafeThreadCount -ne 0) -or
         [string]$Readiness.runtimeInvocationId -cnotmatch
             '^[0-9a-f]{32}$' -or
         -not (Test-NonNegativeInteger `
@@ -1412,7 +1415,9 @@ function Assert-CodexLocalRemoteRuntimeHandoffBarrier {
         [bool]$ExpectedSidecarConnected,
 
         [AllowNull()]
-        [object]$DesktopHandoffPreparation
+        [object]$DesktopHandoffPreparation,
+
+        [switch]$AllowActiveTurns
     )
 
     $null = Assert-CodexLocalRemoteDesktopHandoffProcessGate `
@@ -1432,7 +1437,8 @@ function Assert-CodexLocalRemoteRuntimeHandoffBarrier {
         -Readiness $readiness `
         -ExpectedGeneration $ExpectedGeneration `
         -Phase $Phase `
-        -ExpectedSidecarConnected $ExpectedSidecarConnected
+        -ExpectedSidecarConnected $ExpectedSidecarConnected `
+        -AllowActiveTurns:$AllowActiveTurns
 }
 
 function Wait-CodexLocalRemoteSidecarDisconnectedBounded {
@@ -1452,7 +1458,9 @@ function Wait-CodexLocalRemoteSidecarDisconnectedBounded {
         [object]$DesktopHandoffPreparation,
 
         [ValidateRange(1, 60)]
-        [int]$TimeoutSeconds = 15
+        [int]$TimeoutSeconds = 15,
+
+        [switch]$AllowActiveTurns
     )
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -1490,7 +1498,8 @@ function Wait-CodexLocalRemoteSidecarDisconnectedBounded {
                 -Phase 'sidecar-disconnect-wait' `
                 -ExpectedSidecarConnected (
                     [bool]$readiness.sidecarConnected
-                )
+                ) `
+                -AllowActiveTurns:$AllowActiveTurns
         if (-not [bool]$readiness.sidecarConnected) {
             return $readiness
         }
@@ -2733,7 +2742,9 @@ function Switch-CodexLocalRemoteRuntimeGeneration {
         [int]$TimeoutSeconds = 15,
 
         [ValidateRange(90, 300)]
-        [int]$RuntimeReadyTimeoutSeconds = 120
+        [int]$RuntimeReadyTimeoutSeconds = 120,
+
+        [switch]$AllowActiveTurns
     )
 
     if ([string]$Generation.Status -ceq 'activation-required') {
@@ -2803,7 +2814,8 @@ function Switch-CodexLocalRemoteRuntimeGeneration {
         -ExpectedSidecarConnected (
             [bool]$initialReadinessObservation.sidecarConnected
         ) `
-        -DesktopHandoffPreparation $DesktopHandoffPreparation
+        -DesktopHandoffPreparation $DesktopHandoffPreparation `
+        -AllowActiveTurns:$AllowActiveTurns
     $rollbackPlan = Get-CodexLocalRemoteRuntimeRollbackPlan `
         -Name $Name `
         -Generation $Generation `
@@ -2838,7 +2850,8 @@ function Switch-CodexLocalRemoteRuntimeGeneration {
                 -ExpectedSidecarConnected (
                     [bool]$postTaskStopObservation.sidecarConnected
                 ) `
-                -DesktopHandoffPreparation $DesktopHandoffPreparation
+                -DesktopHandoffPreparation $DesktopHandoffPreparation `
+                -AllowActiveTurns:$AllowActiveTurns
         if ([bool]$postTaskStopReadiness.sidecarConnected) {
             $null = & $sidecarStop `
                 -NodePath $nodePath `
@@ -2859,7 +2872,8 @@ function Switch-CodexLocalRemoteRuntimeGeneration {
                 -ManagedDataDir $ManagedDataDir `
                 -ManagedBrokerPort $ManagedBrokerPort `
                 -DesktopHandoffPreparation $DesktopHandoffPreparation `
-                -TimeoutSeconds $TimeoutSeconds
+                -TimeoutSeconds $TimeoutSeconds `
+                -AllowActiveTurns:$AllowActiveTurns
         } else {
             Assert-CodexLocalRemoteRuntimeHandoffBarrier `
                 -ExpectedGeneration $Generation `
@@ -2867,7 +2881,8 @@ function Switch-CodexLocalRemoteRuntimeGeneration {
                 -ManagedBrokerPort $ManagedBrokerPort `
                 -Phase 'post-stop' `
                 -ExpectedSidecarConnected $false `
-                -DesktopHandoffPreparation $DesktopHandoffPreparation
+                -DesktopHandoffPreparation $DesktopHandoffPreparation `
+                -AllowActiveTurns:$AllowActiveTurns
         }
         if ([string]$postStopReadiness.runtimeInvocationId -cne
                 [string]$initialReadiness.runtimeInvocationId -or
@@ -2893,14 +2908,19 @@ function Switch-CodexLocalRemoteRuntimeGeneration {
             -ManagedDataDir $ManagedDataDir `
             -Phase 'before-broker-stop' `
             -DesktopHandoffPreparation $DesktopHandoffPreparation
-        $null = & $brokerStop `
-            -CodexPath ([string]$Generation.Receipt.CodexPath) `
-            -NodePath $nodePath `
-            -InstallRoot $activeRoot `
-            -DataDir $ManagedDataDir `
-            -BrokerPort $ManagedBrokerPort `
-            -BrokerUpstreamPort $ManagedBrokerUpstreamPort `
-            -Confirm:$false
+        $brokerStopParameters = @{
+            CodexPath = [string]$Generation.Receipt.CodexPath
+            NodePath = $nodePath
+            InstallRoot = $activeRoot
+            DataDir = $ManagedDataDir
+            BrokerPort = $ManagedBrokerPort
+            BrokerUpstreamPort = $ManagedBrokerUpstreamPort
+            Confirm = $false
+        }
+        if ($AllowActiveTurns) {
+            $brokerStopParameters.AllowActiveTurns = $true
+        }
+        $null = & $brokerStop @brokerStopParameters
         $null = Assert-CodexLocalRemoteDesktopHandoffProcessGate `
             -ManagedDataDir $ManagedDataDir `
             -Phase 'before-selected-task-start' `
@@ -3619,7 +3639,9 @@ function Start-CodexLocalRemoteRegisteredTask {
         [string]$ExpectedSelectedManifestSha256 = '',
 
         [AllowNull()]
-        [object]$DesktopHandoffPreparation
+        [object]$DesktopHandoffPreparation,
+
+        [switch]$AllowActiveTurns
     )
 
     $selectedRuntime = $null
@@ -3709,7 +3731,8 @@ function Start-CodexLocalRemoteRegisteredTask {
                 -ManagedBrokerPort $ManagedBrokerPort `
                 -ManagedBrokerUpstreamPort $ManagedBrokerUpstreamPort `
                 -ManagedBasePath $ManagedBasePath `
-                -DesktopHandoffPreparation $DesktopHandoffPreparation
+                -DesktopHandoffPreparation $DesktopHandoffPreparation `
+                -AllowActiveTurns:$AllowActiveTurns
         } catch {
             throw (New-CodexRemoteFailureException `
                 -Stage 'runtime-handoff' `

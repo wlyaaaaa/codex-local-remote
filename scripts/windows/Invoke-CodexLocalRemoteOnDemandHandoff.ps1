@@ -35,6 +35,9 @@ param(
     [ValidatePattern('^[a-f0-9]{32}$')]
     [string]$ExpectedDesiredModeIntentId,
 
+    [Parameter(DontShow)]
+    [switch]$NativeDesktopAlreadyClosedForOpen,
+
     [switch]$AllowDesktopRestart
 )
 
@@ -42,6 +45,13 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 if ($Operation -cne 'Open' -and $AllowDesktopRestart) {
     throw 'AllowDesktopRestart is valid only for an explicit Open operation.'
+}
+if ($NativeDesktopAlreadyClosedForOpen -and
+    ($Operation -cne 'Open' -or -not $AllowDesktopRestart)) {
+    throw (
+        'NativeDesktopAlreadyClosedForOpen is valid only for one ' +
+        'authorized Open operation.'
+    )
 }
 $expectedSelectionArguments = @(
     -not [string]::IsNullOrWhiteSpace($ExpectedSelectedVersionId),
@@ -58,7 +68,7 @@ $statusPath = Join-Path $resolvedDataDir 'on-demand-handoff-last.json'
 $script:onDemandLastReadiness = $null
 $runtime = $null
 $expectedDesktopPath = $null
-$nativeDesktopWasClosedForOpen = $false
+$nativeDesktopWasClosedForOpen = [bool]$NativeDesktopAlreadyClosedForOpen
 $remoteTaskStartAttemptedForOpen = $false
 $desktopHandoffPreparation = $null
 $preparedAttachCompensationHandled = $false
@@ -195,6 +205,9 @@ function Get-OnDemandHandoffDecision {
         }
         if (-not $AllowDesktopRestart) {
             return 'deferred-handoff-authorization-required'
+        }
+        if ($DesktopRootCount -eq 0) {
+            return 'start-without-desktop-restart'
         }
         return 'defer-runtime-handoff'
     }
@@ -796,6 +809,13 @@ function Get-OnDemandRemoteState {
                 [bool]$readiness.appServerReady -and
                 -not [bool]$readiness.desktopConnected -and
                 -not [bool]$readiness.degraded -and
+                [int]$readiness.unsafeThreadCount -gt 0) {
+                return 'runtime-transition-busy'
+            }
+            if ([string]$readiness.status -ceq 'ready' -and
+                [bool]$readiness.appServerReady -and
+                -not [bool]$readiness.desktopConnected -and
+                -not [bool]$readiness.degraded -and
                 [int]$readiness.unsafeThreadCount -eq 0) {
                 return 'runtime-transition'
             }
@@ -1155,7 +1175,9 @@ function Assert-OnDemandSelectedRemoteRuntimeActivationPreflight {
         [object]$StartupTask,
 
         [Parameter(Mandatory)]
-        [string]$Name
+        [string]$Name,
+
+        [switch]$AllowActiveTurns
     )
 
     $launcherPath = Join-Path `
@@ -1267,7 +1289,8 @@ function Assert-OnDemandSelectedRemoteRuntimeActivationPreflight {
         -not (Test-NonNegativeInteger -Value $readiness.unknownCount) -or
         [int]$readiness.unknownCount -ne 0 -or
         -not (Test-NonNegativeInteger -Value $readiness.unsafeThreadCount) -or
-        [int]$readiness.unsafeThreadCount -ne 0 -or
+        (-not $AllowActiveTurns -and
+            [int]$readiness.unsafeThreadCount -ne 0) -or
         [string]$readiness.runtimeInvocationId -cne
             [string]$generation.Receipt.RuntimeInvocationId -or
         [int]$readiness.brokerProcessId -ne
@@ -1295,7 +1318,9 @@ function Start-OnDemandSelectedRemoteRuntime {
         [string]$Name,
 
         [AllowNull()]
-        [object]$DesktopHandoffPreparation
+        [object]$DesktopHandoffPreparation,
+
+        [switch]$AllowActiveTurns
     )
 
     $launcherPath = Join-Path `
@@ -1336,7 +1361,8 @@ function Start-OnDemandSelectedRemoteRuntime {
         -ExpectedSelectedManifestSha256 (
             [string]$Runtime.CurrentManifestSha256
         ) `
-        -DesktopHandoffPreparation $DesktopHandoffPreparation
+        -DesktopHandoffPreparation $DesktopHandoffPreparation `
+        -AllowActiveTurns:$AllowActiveTurns
 }
 
 function Get-OnDemandPreparedTransportSnapshot {
@@ -2410,6 +2436,12 @@ try {
     } else {
         'unverified'
     }
+    $allowActiveRuntimeRestart = (
+        $Operation -ceq 'Open' -and
+        $AllowDesktopRestart -and
+        $remoteState -ceq 'runtime-transition-busy' -and
+        $desktopRoots.Count -eq 0
+    )
     $decision = Get-OnDemandHandoffDecision `
         -TaskState ([string]$startupTask.State) `
         -RemoteState $remoteState `
@@ -3015,7 +3047,8 @@ try {
             -Runtime $runtime `
             -Configuration $configuration `
             -StartupTask $startupTask `
-            -Name $TaskName
+            -Name $TaskName `
+            -AllowActiveTurns:$allowActiveRuntimeRestart
     $null = Set-OnDemandOpenDesiredRemote -Runtime $runtime
     Write-OnDemandHandoffStatus `
         -Status 'running' `
@@ -3026,7 +3059,8 @@ try {
         -Runtime $runtime `
         -Configuration $configuration `
         -Name $TaskName `
-        -DesktopHandoffPreparation $null
+        -DesktopHandoffPreparation $null `
+        -AllowActiveTurns:$allowActiveRuntimeRestart
     $startupTask = Wait-OnDemandTaskState `
         -Name $TaskName `
         -ExpectedState 'Running' `

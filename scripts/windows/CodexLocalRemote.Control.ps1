@@ -13,6 +13,9 @@ param(
     [ValidatePattern('^[a-f0-9]{32}$')]
     [string]$ExpectedDesiredModeIntentId,
 
+    [Parameter(DontShow)]
+    [switch]$NativeDesktopAlreadyClosedForOpen,
+
     [switch]$InteractiveShortcutFeedback
 )
 
@@ -28,6 +31,13 @@ if (-not [string]::IsNullOrWhiteSpace(
     throw (
         'ExpectedDesiredModeIntentId is valid only for one authorized ' +
         'Open operation.'
+    )
+}
+if ($NativeDesktopAlreadyClosedForOpen -and
+    ($Operation -cne 'Open' -or -not $AllowDesktopRestart)) {
+    throw (
+        'NativeDesktopAlreadyClosedForOpen is valid only for one ' +
+        'authorized Open operation.'
     )
 }
 
@@ -364,6 +374,9 @@ try {
     )) {
         $deferredIntentArguments['ExpectedDesiredModeIntentId'] =
             $ExpectedDesiredModeIntentId
+    }
+    if ($NativeDesktopAlreadyClosedForOpen) {
+        $deferredIntentArguments['NativeDesktopAlreadyClosedForOpen'] = $true
     }
     $operationResult = @(
     switch ($Operation) {

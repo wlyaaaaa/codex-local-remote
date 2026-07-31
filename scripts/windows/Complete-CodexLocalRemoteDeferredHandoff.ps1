@@ -675,6 +675,43 @@ function Assert-DeferredHandoffDesktopStopped {
     )
 }
 
+function Stop-DeferredHandoffDesktopImmediately {
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 60)]
+        [int]$TimeoutSeconds = 20
+    )
+
+    foreach ($desktop in @(Get-DeferredHandoffDesktopProcesses)) {
+        $process = Get-Process `
+            -Id ([int]$desktop.ProcessId) `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $process) {
+            try {
+                if ($process.MainWindowHandle -ne 0) {
+                    $null = $process.CloseMainWindow()
+                }
+            } finally {
+                $process.Dispose()
+            }
+        }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        Start-Sleep -Milliseconds 250
+        $remaining = @(Get-DeferredHandoffDesktopProcesses)
+    } while ($remaining.Count -gt 0 -and
+        [DateTime]::UtcNow -lt $deadline)
+    foreach ($desktop in $remaining) {
+        Stop-Process `
+            -Id ([int]$desktop.ProcessId) `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 250
+    Assert-DeferredHandoffDesktopStopped
+}
+
 function Assert-DeferredHandoffNaturalLaunchBarrier {
     [CmdletBinding()]
     param(
@@ -877,6 +914,98 @@ if (-not $DefinitionOnly) {
                 ExpectedVersionId = $expectedVersionId
                 WorkerClaimId = $workerClaimId
             }
+        if ($InvokeInstalledControl -and -not $WaitForNaturalDesktopExit) {
+            Write-DeferredHandoffReceipt `
+                -Path $receiptPath `
+                -Status 'switching' `
+                -Message (
+                    'Explicit restart authority accepted; restarting the ' +
+                    'product immediately even while turns are active.'
+                ) `
+                -SelectedRoot $selectedRoot `
+                -Extra @{
+                    DesiredModeIntentId = $ExpectedDesiredModeIntentId
+                    ExpectedVersionId = $expectedVersionId
+                    Mode = 'authorized-active-restart'
+                    WorkerClaimId = $workerClaimId
+                }
+            Stop-DeferredHandoffDesktopImmediately `
+                -TimeoutSeconds $DesktopShutdownTimeoutSeconds
+            Start-Sleep -Seconds $DisconnectDelaySeconds
+            $controlPath = Join-Path `
+                $resolvedDataDir `
+                'control\CodexLocalRemote.Control.ps1'
+            if (-not (Test-Path -LiteralPath $controlPath -PathType Leaf)) {
+                throw 'The stable installed Remote control dispatcher is missing.'
+            }
+            $operationResult = @(
+                & $controlPath `
+                    -Operation Open `
+                    -DataDir $resolvedDataDir `
+                    -AllowDesktopRestart `
+                    -NativeDesktopAlreadyClosedForOpen `
+                    -ExpectedDesiredModeIntentId (
+                        $ExpectedDesiredModeIntentId
+                    )
+            )
+            if ($operationResult.Count -ne 1 -or
+                [string]$operationResult[0].Status -cnotin @(
+                    'ready',
+                    'repaired',
+                    'already-active'
+                ) -or
+                [string]$operationResult[0].RemoteState -cne 'ready') {
+                throw (
+                    'The immediate installed control operation did not ' +
+                    'adopt one ready selected runtime.'
+                )
+            }
+            $localReady = Get-ReadyStatusCode `
+                -Url (
+                    'http://127.0.0.1:' +
+                    [string]$managedConfiguration.SidecarPort +
+                    [string]$managedConfiguration.BasePath +
+                    '/api/v1/ready'
+                )
+            $publicReady = if ([string]::IsNullOrWhiteSpace(
+                $PublicReadyUrl
+            )) {
+                $null
+            } else {
+                Get-ReadyStatusCode -Url $PublicReadyUrl
+            }
+            if ($localReady -ne 200 -or
+                ($null -ne $publicReady -and $publicReady -ne 200)) {
+                throw (
+                    'The immediate installed control operation did not ' +
+                    'pass its configured readiness checks.'
+                )
+            }
+            Write-DeferredHandoffReceipt `
+                -Path $receiptPath `
+                -Status 'verified' `
+                -Message (
+                    'The stable dispatcher immediately adopted the selected ' +
+                    'runtime while prior turns were active.'
+                ) `
+                -SelectedRoot $selectedRoot `
+                -Extra @{
+                    ExpectedVersionId = $expectedVersionId
+                    Mode = 'authorized-active-restart'
+                    OperationStatus =
+                        [string]$operationResult[0].Status
+                    LocalReady = $localReady
+                    PublicReady = $publicReady
+                }
+            [pscustomobject]@{
+                Status = 'verified'
+                SelectedRoot = $selectedRoot
+                LocalReady = $localReady
+                PublicReady = $publicReady
+                ReceiptPath = $receiptPath
+            }
+            return
+        }
         $idleDeadline = [DateTime]::UtcNow.AddMinutes(
             $IdleWaitTimeoutMinutes
         )

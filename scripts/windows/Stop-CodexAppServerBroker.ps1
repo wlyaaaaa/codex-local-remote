@@ -13,7 +13,9 @@ param(
     [int]$BrokerPort = 18791,
 
     [ValidateRange(1, 65535)]
-    [int]$BrokerUpstreamPort = 18792
+    [int]$BrokerUpstreamPort = 18792,
+
+    [switch]$AllowActiveTurns
 )
 
 $ErrorActionPreference = 'Stop'
@@ -322,7 +324,8 @@ if ($null -ne $brokerTarget) {
     if ([bool]$readiness.sidecarConnected) {
         throw 'The Codex Remote Sidecar is connected to the shared Broker. Stop only the Sidecar first and verify that every remote turn has finished.'
     }
-    if ([int]$readiness.unsafeThreadCount -gt 0) {
+    if ([int]$readiness.unsafeThreadCount -gt 0 -and
+        -not $AllowActiveTurns) {
         throw 'At least one turn lifecycle is active, pending, or unknown. The shared Broker was preserved to avoid losing a task.'
     }
 }

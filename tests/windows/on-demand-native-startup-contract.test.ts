@@ -71,6 +71,7 @@ describe("Windows native-default on-demand Remote contract", () => {
       TransitionNativeWithAuthority: "handoff-native-desktop-once",
       BusyTransitionWithoutAuthority: "deferred-handoff-authorization-required",
       BusyTransitionWithAuthority: "defer-runtime-handoff",
+      BusyTransitionHeadlessWithAuthority: "start-without-desktop-restart",
       TransitionHeadless: "start-without-desktop-restart",
       TransitionAmbiguousRoots: "blocked-ambiguous-desktop-roots",
       TransitionOrphanStdio: "blocked-independent-stdio",
@@ -146,7 +147,7 @@ describe("Windows native-default on-demand Remote contract", () => {
         PreviousDegraded: "unverified",
         PreviousDesktopConnected: "unverified",
         PreviousUnknown: "unverified",
-        PreviousUnsafe: "unverified",
+        PreviousUnsafe: "runtime-transition-busy",
         PreviousManifestMismatch: "unverified",
         Unrelated: "unverified",
       });

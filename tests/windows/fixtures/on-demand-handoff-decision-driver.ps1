@@ -118,6 +118,12 @@ $cases = [ordered]@{
         -DesktopRootCount 1 `
         -IndependentStdioCount 0 `
         -AllowDesktopRestart:$true
+    BusyTransitionHeadlessWithAuthority = Get-OnDemandHandoffDecision `
+        -TaskState 'Running' `
+        -RemoteState 'runtime-transition-busy' `
+        -DesktopRootCount 0 `
+        -IndependentStdioCount 0 `
+        -AllowDesktopRestart:$true
     TransitionHeadless = Get-OnDemandHandoffDecision `
         -TaskState 'Running' `
         -RemoteState 'runtime-transition' `
