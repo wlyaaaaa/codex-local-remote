@@ -1,17 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { expectNoHorizontalOverflow } from "./helpers.js";
-import {
-  openSharedThread,
-  runtimeModels,
-  runtimePermissionProfiles,
-  SharedRuntime,
-} from "./shared-runtime.js";
-
-function dynamicIdPattern(value: string): RegExp {
-  const parts = value.split(/[-_]+/u).map((part) => part.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
-  return new RegExp(parts.join("[\\s_-]+"), "iu");
-}
+import { openSharedThread, runtimeModels, SharedRuntime } from "./shared-runtime.js";
 
 test.beforeEach(({ browser: _browser }, testInfo) => {
   test.skip(
@@ -353,7 +343,7 @@ test.describe("412×915 动态复杂态 UI", () => {
     }
   });
 
-  test("超长工作记录默认紧凑，展开后顺序、详情和最终回答均完整可用", async ({ browser }) => {
+  test("超长工作记录隐藏历史思考，操作详情和最终回答仍完整可用", async ({ browser }) => {
     const runtime = new SharedRuntime({ longWorkLog: true });
     const mobile = await browser.newContext({
       colorScheme: "light",
@@ -369,27 +359,22 @@ test.describe("412×915 动态复杂态 UI", () => {
       const toggle = workLog.getByRole("button", { name: /工作记录/u }).first();
 
       await expect(workLog).toHaveCount(1);
-      await expect(toggle).toHaveAttribute("aria-expanded", "false");
+      await expect(toggle).toHaveAttribute("aria-expanded", "true");
       await expect(page.getByText("先确认真实历史基线", { exact: true })).toHaveCount(0);
       await expect(page.getByText("完整工作记录之后的最终回答。", { exact: true })).toBeVisible();
       await expectNoHorizontalOverflow(page);
 
-      await toggle.click();
-      await expect(toggle).toHaveAttribute("aria-expanded", "true");
-      await expect(page.getByText("先确认真实历史基线", { exact: true })).toBeVisible();
-      await expect(page.getByText("正在核对长对话顺序", { exact: true })).toBeVisible();
+      await expect(page.getByText("先确认真实历史基线", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("正在核对长对话顺序", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("已完成合并并验证无重复", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("准备给出最终结果", { exact: true })).toHaveCount(0);
       await expect(page.getByText("历史完整性检查", { exact: true })).toBeVisible();
 
       const expandedTextOrder = await workLog.locator(".work-log__items").evaluate((element) => {
         const text = element.textContent ?? "";
-        return [
-          "先确认真实历史基线",
-          "正在核对长对话顺序",
-          "编辑了 1 个文件 · 运行了 1 个命令",
-          "历史完整性检查",
-          "已完成合并并验证无重复",
-          "准备给出最终结果",
-        ].map((value) => text.indexOf(value));
+        return ["编辑了 1 个文件 · 运行了 1 个命令", "历史完整性检查"].map((value) =>
+          text.indexOf(value),
+        );
       });
       expect(expandedTextOrder.every((index) => index >= 0)).toBe(true);
       expect(expandedTextOrder).toEqual([...expandedTextOrder].sort((a, b) => a - b));
@@ -519,7 +504,7 @@ test.describe("412×915 动态复杂态 UI", () => {
     }
   });
 
-  test("工具、运行时模型与思考、权限、复杂队列和多审批均清晰可操作", async ({ browser }) => {
+  test("工具、运行时模型与思考、复杂队列和多审批均清晰可操作", async ({ browser }) => {
     test.setTimeout(60_000);
     const runtime = new SharedRuntime({ complexState: true });
     const mobile = await browser.newContext({
@@ -563,6 +548,21 @@ test.describe("412×915 动态复杂态 UI", () => {
         await expect(approvalSheet).toHaveCount(0);
       });
 
+      await test.step("目标独占输入器顶行，不与发送方式和计划挤在一行", async () => {
+        await page.getByTestId("turn-composer").click();
+        const goalRow = page.locator(".composer__goal-row");
+        const controlRow = page.locator(".composer__context-bar");
+        await expect(goalRow.getByTestId("composer-goal-open")).toBeVisible();
+        await expect(controlRow).toBeVisible();
+        const [goalBox, controlBox] = await Promise.all([
+          goalRow.boundingBox(),
+          controlRow.boundingBox(),
+        ]);
+        expect((goalBox?.y ?? 0) + (goalBox?.height ?? 0)).toBeLessThanOrEqual(
+          (controlBox?.y ?? 0) + 1,
+        );
+      });
+
       await test.step("设置抽屉动态读取模型、思考和速度，不绑定固定版本", async () => {
         await page.getByTestId("turn-composer").click();
         await page.getByTestId("composer-settings-open").click();
@@ -584,45 +584,9 @@ test.describe("412×915 动态复杂态 UI", () => {
           .toBe(dynamicEffort);
       });
 
-      await test.step("权限、请求时机和审批人均使用运行时目录并权威回读", async () => {
+      await test.step("对话内不常驻权限与审批设置按钮，真实审批请求仍保留", async () => {
         await page.getByTestId("turn-composer").click();
-        await page.getByTestId("composer-permission-open").click();
-        const permissionSheet = page.getByRole("dialog");
-        await expect(permissionSheet).toBeVisible();
-        await expect(permissionSheet.getByRole("heading", { name: /权限/u }).first()).toBeVisible();
-        for (const profile of runtimePermissionProfiles) {
-          await expect(
-            permissionSheet.getByRole("button", {
-              name: dynamicIdPattern(profile.id),
-            }),
-          ).toBeVisible();
-        }
-        const targetProfile = permissionSheet.getByRole("button", {
-          name: dynamicIdPattern(runtimePermissionProfiles.at(-1)!.id),
-        });
-        await targetProfile.click();
-        await permissionSheet.getByTestId("approval-policy-never").click();
-        await permissionSheet.getByTestId("approval-reviewer-guardian_subagent").click();
-        const applyPermission = permissionSheet.getByRole("button", { name: /应用.*下一轮/u });
-        if (await applyPermission.isVisible().catch(() => false)) {
-          await applyPermission.click();
-        }
-        await expect
-          .poll(() => runtime.settingsUpdates.at(-1)?.["permissionProfileId"])
-          .toBe(runtimePermissionProfiles.at(-1)!.id);
-        await expect.poll(() => runtime.settingsUpdates.at(-1)?.["approvalPolicy"]).toBe("never");
-        await expect
-          .poll(() => runtime.settingsUpdates.at(-1)?.["approvalsReviewer"])
-          .toBe("guardian_subagent");
-        await expect(permissionSheet).toBeHidden();
-
-        await page.getByTestId("turn-composer").click();
-        await page.getByTestId("composer-permission-open").click();
-        await expect(page.getByTestId("approval-policy-never")).toHaveClass(/is-selected/u);
-        await expect(page.getByTestId("approval-reviewer-guardian_subagent")).toHaveClass(
-          /is-selected/u,
-        );
-        await page.getByRole("dialog").getByRole("button", { name: "关闭", exact: true }).click();
+        await expect(page.getByTestId("composer-permission-open")).toHaveCount(0);
       });
 
       await test.step("加号工具菜单显示运行时支持的动态工具", async () => {

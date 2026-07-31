@@ -149,7 +149,11 @@ import {
 } from "./conversation-presentation";
 import { fileChangeStatusLabel, toolFallbackSummary } from "./terminal-display";
 import { DiffView } from "./DiffView";
-import { encodeLocalFileHrefForMarkdown, localFileReferenceFromHref } from "./file-link";
+import {
+  encodeLocalFileHrefForMarkdown,
+  historyReferenceProjectId,
+  localFileReferenceFromHref,
+} from "./file-link";
 import {
   localeCopy,
   readUiLocale,
@@ -193,13 +197,13 @@ import {
 import { threadLocationLabelForDisplay, threadTitleForDisplay } from "./thread-title";
 import { UserMessageText } from "./UserMessageText";
 import {
+  ComposerContextRows,
   ComposerSettingsButton,
   ComposerSettingsSheet,
   ComposerToolsSheet,
   DeliveryModeSwitch,
   GoalSheet,
   InlineDecisionStack,
-  PermissionButton,
   PlanProgressControl,
   PlanModeSheet,
   QueueShelf,
@@ -3150,8 +3154,9 @@ function AttachmentThumbnail({
     let objectUrl = "";
     setState("loading");
     setUrl("");
+    const sourceProjectId = historyReferenceProjectId(projectId, attachment.path);
     void apiClient
-      .resolveFile(projectId, attachment.path)
+      .resolveFile(sourceProjectId, attachment.path)
       .then(async (entry) => {
         const result = await apiClient.preview(entry.projectId, entry.relativePath);
         if (!result.contentType.startsWith("image/")) {
@@ -3281,7 +3286,10 @@ const MessageItem = memo(function MessageItem({
   }
 
   function openAttachment(attachment: ConversationAttachment) {
-    const request = attachmentRequests.begin(filePreviewRequestKey(projectId, attachment.path));
+    const sourceProjectId = historyReferenceProjectId(projectId, attachment.path);
+    const request = attachmentRequests.begin(
+      filePreviewRequestKey(sourceProjectId, attachment.path),
+    );
     setAttachmentSelection(attachment);
     setAttachmentEntry(undefined);
     setAttachmentError("");
@@ -3292,7 +3300,7 @@ const MessageItem = memo(function MessageItem({
     }
     setAttachmentLoading(true);
     void apiClient
-      .resolveFile(projectId, attachment.path)
+      .resolveFile(sourceProjectId, attachment.path)
       .then((entry) => {
         if (attachmentRequests.isCurrent(request)) setAttachmentEntry(entry);
       })
@@ -6538,16 +6546,6 @@ function ConversationPageInstance({
     composerFeatureSupported(capabilities, "goal") ||
     composerFeatureSupported(capabilities, "plan") ||
     compactSupported;
-  const selectedPermission =
-    permissionProfiles.find((profile) => profile.id === permissionProfileId) ??
-    permissionProfiles[0];
-  const selectedPermissionLabel = selectedPermission
-    ? permissionProfileLabel(selectedPermission.id)
-    : "权限";
-  const selectedApprovalPolicyLabel = approvalPolicy
-    ? approvalPolicyLabel(approvalPolicy)
-    : "沿用设置";
-  const selectedReviewerLabel = approvalReviewer ? approvalReviewerLabel(approvalReviewer) : "";
   const selectedCollaborationMode = collaborationModes.find(
     (mode) => mode.id === collaborationMode,
   );
@@ -7063,28 +7061,35 @@ function ConversationPageInstance({
             </div>
           ) : null}
           <div className="composer">
-            {running || composerPlan || collaborationModeSupported || threadGoal ? (
-              <div className="composer__context-bar">
-                {running ? (
-                  <DeliveryModeSwitch
-                    mode={deliveryMode}
-                    onChange={setDeliveryMode}
-                    queueSupported={queueSupported}
-                  />
-                ) : null}
-                {collaborationModeSupported ? (
-                  <button
-                    className="composer-mode-button"
-                    data-testid="composer-mode-open"
-                    onClick={() => setComposerSheet("plan")}
-                    type="button"
-                  >
-                    <Icon name="target" size={15} />
-                    <span>{selectedCollaborationModeLabel}</span>
-                    <Icon name="chevron-right" size={14} />
-                  </button>
-                ) : null}
-                {threadGoal ? (
+            <ComposerContextRows
+              controls={
+                running || composerPlan || collaborationModeSupported ? (
+                  <>
+                    {running ? (
+                      <DeliveryModeSwitch
+                        mode={deliveryMode}
+                        onChange={setDeliveryMode}
+                        queueSupported={queueSupported}
+                      />
+                    ) : null}
+                    {collaborationModeSupported ? (
+                      <button
+                        className="composer-mode-button"
+                        data-testid="composer-mode-open"
+                        onClick={() => setComposerSheet("plan")}
+                        type="button"
+                      >
+                        <Icon name="target" size={15} />
+                        <span>{selectedCollaborationModeLabel}</span>
+                        <Icon name="chevron-right" size={14} />
+                      </button>
+                    ) : null}
+                    {composerPlan ? <PlanProgressControl plan={composerPlan} /> : null}
+                  </>
+                ) : undefined
+              }
+              goal={
+                threadGoal ? (
                   <button
                     className="composer-goal-button"
                     data-testid="composer-goal-open"
@@ -7100,10 +7105,9 @@ function ConversationPageInstance({
                         : runtimeOptionLabel(threadGoal.status)}
                     </small>
                   </button>
-                ) : null}
-                {composerPlan ? <PlanProgressControl plan={composerPlan} /> : null}
-              </div>
-            ) : null}
+                ) : undefined
+              }
+            />
             <textarea
               aria-label={
                 running && deliveryMode === "queue" ? "排队到下一轮" : running ? "追加要求" : "回复"
@@ -7199,20 +7203,6 @@ function ConversationPageInstance({
                 serviceTier={serviceTiersSupported ? serviceTier : null}
                 serviceTiersSupported={serviceTiersSupported}
               />
-              {permissionProfilesSupported ||
-              approvalPoliciesSupported ||
-              approvalReviewersSupported ? (
-                <PermissionButton
-                  label={[
-                    selectedPermissionLabel,
-                    selectedApprovalPolicyLabel,
-                    selectedReviewerLabel,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                  onOpen={() => setComposerSheet("permission")}
-                />
-              ) : null}
               <div className="composer__actions">
                 {composerActions.showInterrupt ? (
                   <Button

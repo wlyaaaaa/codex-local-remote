@@ -337,7 +337,7 @@ describe("conversation presentation", () => {
     });
   });
 
-  it("renders only the latest active reasoning while retaining the complete finished history", () => {
+  it("renders only the latest active reasoning and hides all finished reasoning history", () => {
     const items: ConversationItem[] = [
       { id: "user-start", kind: "user-message", text: "开始", turnId: "turn-live" },
       {
@@ -375,9 +375,11 @@ describe("conversation presentation", () => {
       "command",
       "reasoning-after-steer-2",
     ]);
-    expect(conversationContentItems(items).map((item) => item.id)).toEqual(
-      items.map((item) => item.id),
-    );
+    expect(conversationContentItems(items).map((item) => item.id)).toEqual([
+      "user-start",
+      "user-steer",
+      "command",
+    ]);
   });
 
   it("uses the real running operation instead of claiming that every active turn is thinking", () => {
@@ -465,7 +467,7 @@ describe("conversation presentation", () => {
     ).toBeUndefined();
   });
 
-  it("keeps the complete commentary chain after a turn completes", () => {
+  it("hides commentary output after a turn completes and keeps the final answer", () => {
     const items: ConversationItem[] = [
       {
         id: "commentary-1",
@@ -490,15 +492,11 @@ describe("conversation presentation", () => {
       },
     ];
 
-    expect(conversationContentItems(items).map((item) => item.id)).toEqual([
-      "commentary-1",
-      "commentary-2",
-      "final",
-    ]);
+    expect(conversationContentItems(items).map((item) => item.id)).toEqual(["final"]);
     expect(currentLivePhase(items, undefined)).toBeUndefined();
   });
 
-  it("keeps every commentary update while showing only the latest active reasoning", () => {
+  it("shows only the latest real active reasoning and never commentary output as thought", () => {
     const items: ConversationItem[] = [
       { id: "user", kind: "user-message", text: "开始", turnId: "turn-live" },
       {
@@ -537,17 +535,9 @@ describe("conversation presentation", () => {
 
     expect(conversationContentItems(items, "turn-live").map((item) => item.id)).toEqual([
       "user",
-      "commentary-1",
-      "commentary-2",
       "reasoning-2",
     ]);
-    expect(conversationContentItems(items).map((item) => item.id)).toEqual([
-      "user",
-      "reasoning-1",
-      "commentary-1",
-      "commentary-2",
-      "reasoning-2",
-    ]);
+    expect(conversationContentItems(items).map((item) => item.id)).toEqual(["user"]);
     expect(latestPlanProgress(items)?.id).toBe("plan");
     expect(currentLivePhase(items, "turn-live")).toBeUndefined();
   });
@@ -610,7 +600,7 @@ describe("conversation presentation", () => {
     ]);
   });
 
-  it("does not repeat a visible commentary message as a live phase", () => {
+  it("hides commentary output and does not repeat it as a live phase", () => {
     const items: ConversationItem[] = [
       { id: "user", kind: "user-message", text: "开始", turnId: "turn-live" },
       {
@@ -622,10 +612,7 @@ describe("conversation presentation", () => {
       },
     ];
 
-    expect(conversationContentItems(items, "turn-live").map((item) => item.id)).toEqual([
-      "user",
-      "commentary",
-    ]);
+    expect(conversationContentItems(items, "turn-live").map((item) => item.id)).toEqual(["user"]);
     expect(currentLivePhase(items, "turn-live")).toBeUndefined();
   });
 });

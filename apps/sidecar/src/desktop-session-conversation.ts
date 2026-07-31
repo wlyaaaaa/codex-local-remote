@@ -7,7 +7,7 @@ import type {
   ConversationItem,
   ThreadSettingsInput,
 } from "@codex-local-remote/contracts";
-import { isCodexInternalContextEnvelope } from "@codex-local-remote/domain";
+import { isCodexInternalContextEnvelope, stripCodexUiDirectives } from "@codex-local-remote/domain";
 
 const DEFAULT_READ_CHUNK_BYTES = 256 * 1024;
 const DEFAULT_MAX_JSON_LINE_BYTES = 32 * 1024 * 1024;
@@ -467,7 +467,7 @@ class PersistedConversationProjection {
   #acceptAssistantMessage(payload: Record<string, unknown>, createdAt: string | undefined): void {
     const id = asString(payload.id);
     if (id === undefined) return;
-    const text = messageText(payload.content, "output_text");
+    const text = stripCodexUiDirectives(messageText(payload.content, "output_text"));
     if (text.length === 0) return;
     const metadata = asRecord(payload.internal_chat_message_metadata_passthrough);
     const turnId = asString(metadata.turn_id);

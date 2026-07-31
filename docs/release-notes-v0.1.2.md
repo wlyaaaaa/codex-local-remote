@@ -15,11 +15,12 @@ remain unchanged.
 
 > Publication integrity: this source is eligible for `v0.1.2` only after it is
 > sealed as an immutable runtime and that exact runtime passes live adoption.
-> The current source tree passes formatting, lint, type checking, all 1565
+> The sealed `fa50e18` base passed formatting, lint, type checking, all 1565
 > tests across 106 files, the production build and a public-safety scan of 351
-> files. It is not by itself live-adoption evidence. Neither source evidence nor
-> focused suites replaces real `remote-connected`, public readiness,
-> same-thread/same-turn four-surface or sleep/resume validation.
+> files. The bounded presentation delta after that seal is verified separately
+> by its focused suites, affected-package type checks/builds and public scan; it
+> does not claim a second full-suite run. Source evidence alone is not
+> live-adoption evidence.
 
 ## Highlights
 
@@ -266,15 +267,16 @@ and Broker/app-server loss fails closed.
 - Stabilizes ordering across live events, persisted history, context compaction
   and upward pagination.
 - Groups reasoning, progress, tools, file changes and child-agent activity into
-  a reversible Work Log. The latest active segment stays expanded even after
-  crossing the long-work threshold and shows only the newest public reasoning
-  summary; completed history restores the full reasoning timeline. Completed
-  long work mounts a compact headline and count by default, while final answers,
+  a reversible Work Log. Only the newest real public reasoning summary from the
+  active turn is shown; historical reasoning and commentary output stay hidden.
+  Tool, file and child-agent records remain reversible, while final answers,
   user messages and image activity remain first-class conversation content.
 - Makes the composer a deterministic collapsed/expanded state machine, keeps
   send and Stop visible with many attachments, keeps offline drafts editable
   while remote mutations remain disabled, and restores the caret and bottom
-  anchor.
+  anchor. An active goal occupies its own full-width row above delivery mode and
+  plan progress. The conversation composer no longer carries a persistent
+  permission/approval settings button; real approval requests remain actionable.
 - Adds a three-second SSE offline grace so a short native or fetch-stream
   reconnect does not flash an offline banner or gray the composer. A sustained
   disconnect still fails closed for every remote mutation.
@@ -300,7 +302,12 @@ and Broker/app-server loss fails closed.
   diagnostics instead of fake controls.
 - Adds bounded preview, download or copy actions for attachments, local file
   references, images, command output, prompts, final answers, drafts and task
-  identifiers.
+  identifiers. Absolute attachment paths from persisted history use the
+  authenticated host-file resolver, so existing Codex temporary images are not
+  misclassified as files outside the thread project.
+- Removes standalone Codex UI directives such as `::git-stage{...}` and
+  `::git-commit{...}` from projected assistant answers while preserving literal
+  examples inside fenced code blocks.
 - Adds an accessible action menu for top-level threads: rename, copy ID,
   archive and restore. Renames and archive changes use protected idempotent
   requests. Archival stays disabled until active work stops and durably

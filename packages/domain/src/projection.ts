@@ -44,10 +44,32 @@ export interface RemoteEventDraft {
 
 const CODEX_INTERNAL_CONTEXT_ENVELOPE =
   /^<codex_internal_context(?:\s+[^<>]*?)?>[\s\S]*<\/codex_internal_context>$/u;
+const CODEX_UI_DIRECTIVE_LINE =
+  /^[\t ]*::(?:code-comment|created-thread|git-(?:commit|create-branch|create-pr|push|stage))\{[^\r\n]*\}[\t ]*$/u;
 
 export function isCodexInternalContextEnvelope(text: string): boolean {
   const candidate = text.trim();
   return candidate.length > 0 && CODEX_INTERNAL_CONTEXT_ENVELOPE.test(candidate);
+}
+
+export function stripCodexUiDirectives(text: string): string {
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  let fence: "`" | "~" | undefined;
+  const visibleLines: string[] = [];
+  for (const line of text.split(/\r?\n/u)) {
+    const fenceMatch = /^[\t ]*(`{3,}|~{3,})/u.exec(line);
+    if (fenceMatch) {
+      const marker = fenceMatch[1]?.[0];
+      if (marker === "`" || marker === "~") {
+        fence = fence === undefined ? marker : fence === marker ? undefined : fence;
+      }
+      visibleLines.push(line);
+      continue;
+    }
+    if (fence === undefined && CODEX_UI_DIRECTIVE_LINE.test(line)) continue;
+    visibleLines.push(line);
+  }
+  return visibleLines.join(newline).trim();
 }
 
 export function projectThreadSummary(
@@ -205,7 +227,9 @@ export function projectThreadItem(
           ];
     }
     case "agentMessage": {
-      const text = asNonEmptyString(rawItem.text);
+      const rawText = asNonEmptyString(rawItem.text);
+      const text =
+        rawText === undefined ? undefined : asNonEmptyString(stripCodexUiDirectives(rawText));
       const phase =
         rawItem.phase === "commentary" || rawItem.phase === "final_answer"
           ? rawItem.phase

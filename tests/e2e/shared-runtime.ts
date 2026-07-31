@@ -205,6 +205,16 @@ export class SharedRuntime {
       },
     };
     if (complexState) {
+      const goalTimestamp = now();
+      this.goal = {
+        threadId: this.thread.id,
+        objective: "完成移动端复杂状态验收并交付",
+        status: "active",
+        tokensUsed: 3,
+        timeUsedSeconds: 90,
+        createdAt: goalTimestamp,
+        updatedAt: goalTimestamp,
+      };
       this.thread.items.push(
         {
           id: "shared-plan-question",

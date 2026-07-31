@@ -5,6 +5,7 @@ import {
   projectThreadDetail,
   projectThreadItem,
   projectThreadSummary,
+  stripCodexUiDirectives,
 } from "./projection.js";
 
 const rawThread = {
@@ -173,6 +174,25 @@ describe("thread projection", () => {
         text: "# 实施计划\n\n1. 先验证\n2. 再执行",
       },
     ]);
+  });
+
+  it("removes standalone Codex UI directives from assistant answers but preserves examples", () => {
+    const answer = [
+      "已经完成。",
+      "",
+      '::git-stage{cwd="V:\\\\Personal\\\\Projects\\\\sample"}',
+      '::git-commit{cwd="V:\\\\Personal\\\\Projects\\\\sample"}',
+    ].join("\n");
+
+    expect(stripCodexUiDirectives(answer)).toBe("已经完成。");
+    expect(
+      stripCodexUiDirectives(
+        ["示例：", "```text", '::git-stage{cwd="V:\\\\sample"}', "```"].join("\n"),
+      ),
+    ).toContain('::git-stage{cwd="V:\\\\sample"}');
+    expect(
+      projectThreadItem({ id: "answer-with-directives", type: "agentMessage", text: answer }),
+    ).toEqual([{ id: "answer-with-directives", kind: "assistant-message", text: "已经完成。" }]);
   });
 
   it("renders legacy percent-encoded Markdown titles as readable text", () => {

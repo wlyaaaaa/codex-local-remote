@@ -1,10 +1,9 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type {
   ApprovalRequest,
   CollaborationModeOption,
   ConversationItem,
   ModelOption,
-  PermissionProfileOption,
   QueuedTurnItem,
   ReasoningEffort,
   ThreadGoalStatus,
@@ -37,6 +36,22 @@ export function reasoningEffortLabel(effort: ReasoningEffort | undefined): strin
 }
 
 export type ComposerDestination = "steer" | "queue";
+
+export function ComposerContextRows({
+  controls,
+  goal,
+}: {
+  controls?: ReactNode;
+  goal?: ReactNode;
+}) {
+  if (!controls && !goal) return null;
+  return (
+    <div className="composer__context">
+      {goal ? <div className="composer__goal-row">{goal}</div> : null}
+      {controls ? <div className="composer__context-bar">{controls}</div> : null}
+    </div>
+  );
+}
 
 export function DeliveryModeSwitch({
   mode,
@@ -399,68 +414,6 @@ export function ComposerSettingsSheet({
           </div>
         </div>
       ) : null}
-    </Sheet>
-  );
-}
-
-export function PermissionButton({
-  disabled,
-  label,
-  onOpen,
-}: {
-  disabled?: boolean;
-  label: string;
-  onOpen: () => void;
-}) {
-  return (
-    <button
-      aria-label={`下一轮权限：${label}`}
-      className="composer-permission-button"
-      data-testid="composer-permission-open"
-      disabled={disabled}
-      onClick={onOpen}
-      type="button"
-    >
-      <Icon name="shield" size={18} />
-    </button>
-  );
-}
-
-export function PermissionSheet({
-  onChange,
-  onClose,
-  open,
-  profiles,
-  value,
-}: {
-  onChange: (id: string) => void;
-  onClose: () => void;
-  open: boolean;
-  profiles: PermissionProfileOption[];
-  value: string;
-}) {
-  return (
-    <Sheet
-      description="权限只影响下一轮；当前正在执行的操作仍按原权限继续。"
-      onClose={onClose}
-      open={open}
-      title="下一轮权限"
-    >
-      <div className="composer-option-list">
-        {profiles.map((profile) => (
-          <OptionButton
-            active={profile.id === value}
-            {...(profile.description ? { description: profile.description } : {})}
-            disabled={!profile.allowed}
-            key={profile.id}
-            label={profile.id.replace(/[_-]+/gu, " ")}
-            onClick={() => {
-              onChange(profile.id);
-              onClose();
-            }}
-          />
-        ))}
-      </div>
     </Sheet>
   );
 }

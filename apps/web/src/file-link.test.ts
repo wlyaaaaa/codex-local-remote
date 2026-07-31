@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   encodeLocalFileHrefForMarkdown,
+  historyReferenceProjectId,
   localFilePathFromHref,
   localFileReferenceFromHref,
 } from "./file-link";
@@ -50,5 +51,16 @@ describe("localFilePathFromHref", () => {
     expect(encodeLocalFileHrefForMarkdown("docs/guide.md:12")).toBeTruthy();
     expect(encodeLocalFileHrefForMarkdown("javascript:alert(1)")).toBeUndefined();
     expect(encodeLocalFileHrefForMarkdown("https://example.com/readme.md")).toBeUndefined();
+  });
+
+  it("lets absolute history attachments use the host-file resolver instead of a thread project", () => {
+    expect(
+      historyReferenceProjectId(
+        "project-1",
+        "C:/Users/example/AppData/Local/Temp/codex-clipboard-proof.png",
+      ),
+    ).toBeUndefined();
+    expect(historyReferenceProjectId("project-1", "\\\\server\\share\\proof.png")).toBeUndefined();
+    expect(historyReferenceProjectId("project-1", "docs/proof.png")).toBe("project-1");
   });
 });

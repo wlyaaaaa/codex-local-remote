@@ -5,12 +5,23 @@ const TEXT_LOCATION_SUFFIX = /:(\d+)(?::(\d+))?$/;
 const GITHUB_LINE_FRAGMENT = /#L(\d+)(?:C(\d+))?$/i;
 const URI_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const WINDOWS_ABSOLUTE_PATH = /^\/?[a-z]:[\\/]/i;
+const WINDOWS_UNC_PATH = /^\\\\[^\\/]+[\\/][^\\/]+/u;
 const LOCAL_MARKDOWN_HREF_PREFIX = "/__codex_local_file__/";
 
 export interface LocalFileReference {
   path: string;
   line?: number;
   column?: number;
+}
+
+export function historyReferenceProjectId(
+  projectId: string | undefined,
+  sourcePath: string,
+): string | undefined {
+  const source = sourcePath.trim();
+  return WINDOWS_ABSOLUTE_PATH.test(source) || WINDOWS_UNC_PATH.test(source)
+    ? undefined
+    : projectId;
 }
 
 export function encodeLocalFileHrefForMarkdown(href: string): string | undefined {

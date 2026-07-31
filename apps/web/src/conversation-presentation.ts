@@ -171,16 +171,19 @@ export function conversationContentItems(
     if (item.kind === "plan-progress") {
       return false;
     }
-    if (
-      item.kind === "reasoning-summary" &&
-      activeTurnId !== undefined &&
-      (item.turnId === activeTurnId ||
-        (item.turnId === undefined && latestUserIndex >= 0 && index > latestUserIndex))
-    ) {
-      return item.id === activeReasoningId;
+    if (item.kind === "reasoning-summary") {
+      return (
+        item.id === activeReasoningId &&
+        activeTurnId !== undefined &&
+        (item.turnId === activeTurnId ||
+          (item.turnId === undefined && latestUserIndex >= 0 && index > latestUserIndex))
+      );
     }
     if (item.kind !== "assistant-message") {
       return true;
+    }
+    if (item.phase === "commentary") {
+      return false;
     }
     const formalPlan = items.find(
       (candidate): candidate is Extract<ConversationItem, { kind: "formal-plan" }> =>

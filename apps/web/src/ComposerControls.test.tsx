@@ -10,6 +10,7 @@ import {
   ComposerSettingsButton,
   ComposerSettingsSheet,
   ComposerToolsSheet,
+  ComposerContextRows,
   DeliveryModeSwitch,
   GoalSheet,
   InlineDecisionStack,
@@ -31,6 +32,20 @@ const model: ModelOption = {
 };
 
 describe("composer 组件结构", () => {
+  it("目标独占上方一行，发送方式与计划位于下方控制行", () => {
+    const html = renderToStaticMarkup(
+      <ComposerContextRows
+        controls={<span data-testid="controls">发送方式与计划</span>}
+        goal={<button data-testid="goal">进行中的目标</button>}
+      />,
+    );
+
+    expect(html).toContain('class="composer__goal-row"');
+    expect(html).toContain('class="composer__context-bar"');
+    expect(html.indexOf('data-testid="goal"')).toBeLessThan(html.indexOf('data-testid="controls"'));
+    expect(html).not.toMatch(/composer__context-bar[^>]*>[^<]*<button[^>]*data-testid="goal"/u);
+  });
+
   it("设置按钮同时显示完整短模型名、思考等级与速度", () => {
     const html = renderToStaticMarkup(
       <ComposerSettingsButton

@@ -345,6 +345,31 @@ describe("DesktopSessionConversationReader", () => {
     expect(items.map((item) => item.id)).not.toContain("internal-only");
   });
 
+  it("does not expose standalone Codex UI directives from persisted assistant answers", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeFile(
+      sessionPath,
+      `${persistedMessage(
+        "assistant-directives",
+        "assistant",
+        [
+          "已经完成。",
+          "",
+          '::git-stage{cwd="V:\\\\Personal\\\\Projects\\\\sample"}',
+          '::git-commit{cwd="V:\\\\Personal\\\\Projects\\\\sample"}',
+        ].join("\n"),
+      )}\n`,
+      "utf8",
+    );
+
+    const reader = new DesktopSessionConversationReader();
+    const items = await reader.read({ codexHome, sessionPath, threadId: THREAD_ID });
+
+    expect(items).toMatchObject([
+      { id: "assistant-directives", kind: "assistant-message", text: "已经完成。" },
+    ]);
+  });
+
   it("streams the complete session instead of dropping messages before the old 8 MiB tail", async () => {
     const { codexHome, sessionPath } = await fixture();
     const message = (id: string, role: "user" | "assistant", text: string) =>
