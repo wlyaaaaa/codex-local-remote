@@ -10,6 +10,11 @@ param(
         'damaged-repair',
         'stable-new',
         'no-active-pending-new',
+        'no-active-pending-supersede',
+        'no-active-pending-supersede-mismatch',
+        'no-active-current-only-supersede',
+        'no-active-same-supersede',
+        'active-pending-supersede',
         'no-active-current-only-new',
         'repair-without-active'
     )]
@@ -29,6 +34,7 @@ $case = switch ($Mode) {
             Previous = $a
             Candidate = $c
             Repair = $null
+            Supersede = $null
         }
     }
     'pending-same' {
@@ -38,6 +44,7 @@ $case = switch ($Mode) {
             Previous = $a
             Candidate = $b
             Repair = $null
+            Supersede = $null
         }
     }
     'damaged-repair' {
@@ -47,6 +54,7 @@ $case = switch ($Mode) {
             Previous = $b
             Candidate = $d
             Repair = $a
+            Supersede = $null
         }
     }
     'stable-new' {
@@ -56,6 +64,7 @@ $case = switch ($Mode) {
             Previous = $b
             Candidate = $d
             Repair = $null
+            Supersede = $null
         }
     }
     'no-active-pending-new' {
@@ -65,6 +74,57 @@ $case = switch ($Mode) {
             Previous = $a
             Candidate = $c
             Repair = $null
+            Supersede = $null
+        }
+    }
+    'no-active-pending-supersede' {
+        @{
+            Active = $null
+            Current = $b
+            Previous = $a
+            Candidate = $c
+            Repair = $null
+            Supersede = $b
+        }
+    }
+    'no-active-pending-supersede-mismatch' {
+        @{
+            Active = $null
+            Current = $b
+            Previous = $a
+            Candidate = $c
+            Repair = $null
+            Supersede = $a
+        }
+    }
+    'no-active-current-only-supersede' {
+        @{
+            Active = $null
+            Current = $b
+            Previous = $null
+            Candidate = $c
+            Repair = $null
+            Supersede = $b
+        }
+    }
+    'no-active-same-supersede' {
+        @{
+            Active = $null
+            Current = $b
+            Previous = $a
+            Candidate = $b
+            Repair = $null
+            Supersede = $b
+        }
+    }
+    'active-pending-supersede' {
+        @{
+            Active = $a
+            Current = $b
+            Previous = $a
+            Candidate = $c
+            Repair = $null
+            Supersede = $b
         }
     }
     'no-active-current-only-new' {
@@ -74,6 +134,7 @@ $case = switch ($Mode) {
             Previous = $null
             Candidate = $c
             Repair = $null
+            Supersede = $null
         }
     }
     default {
@@ -83,6 +144,7 @@ $case = switch ($Mode) {
             Previous = $b
             Candidate = $d
             Repair = $a
+            Supersede = $null
         }
     }
 }
@@ -114,7 +176,8 @@ $result = Resolve-RegistrationPendingRuntimeAction `
     -CurrentVersionId $case.Current `
     -PreviousVersionId $case.Previous `
     -CandidateVersionId $case.Candidate `
-    -RepairActiveVersionId $case.Repair
+    -RepairActiveVersionId $case.Repair `
+    -SupersedeOfflineSelectedVersionId $case.Supersede
 
 [pscustomobject]@{
     Mode = $Mode

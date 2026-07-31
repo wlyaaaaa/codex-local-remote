@@ -32,6 +32,10 @@ param(
     [string]$RepairPendingRuntimeFromActiveVersionId,
 
     [Parameter(DontShow)]
+    [ValidatePattern('^[a-f0-9]{64}$')]
+    [string]$SupersedeOfflineSelectedRuntimeVersionId,
+
+    [Parameter(DontShow)]
     [switch]$SkipEnvironmentConfiguration,
 
     [Parameter(DontShow)]
@@ -78,6 +82,26 @@ if (-not [string]::IsNullOrWhiteSpace(
         $RepairPendingRuntimeFromActiveVersionId
     ) -and $StartRemoteNow) {
     throw 'RepairPendingRuntimeFromActiveVersionId cannot start Remote.'
+}
+if (-not [string]::IsNullOrWhiteSpace(
+        $RepairPendingRuntimeFromActiveVersionId
+    ) -and -not [string]::IsNullOrWhiteSpace(
+        $SupersedeOfflineSelectedRuntimeVersionId
+    )) {
+    throw (
+        'RepairPendingRuntimeFromActiveVersionId and ' +
+        'SupersedeOfflineSelectedRuntimeVersionId are mutually exclusive.'
+    )
+}
+if (-not [string]::IsNullOrWhiteSpace(
+        $SupersedeOfflineSelectedRuntimeVersionId
+    ) -and $StartRemoteNow) {
+    throw 'SupersedeOfflineSelectedRuntimeVersionId cannot start Remote.'
+}
+if (-not [string]::IsNullOrWhiteSpace(
+        $SupersedeOfflineSelectedRuntimeVersionId
+    ) -and -not $NoStart) {
+    throw 'SupersedeOfflineSelectedRuntimeVersionId requires NoStart.'
 }
 if ($NoStart -and $StartRemoteNow) {
     throw 'NoStart and StartRemoteNow are mutually exclusive.'
@@ -2553,14 +2577,34 @@ function Resolve-RegistrationPendingRuntimeAction {
         [string]$CandidateVersionId,
 
         [AllowNull()]
-        [string]$RepairActiveVersionId
+        [string]$RepairActiveVersionId,
+
+        [AllowNull()]
+        [string]$SupersedeOfflineSelectedVersionId
     )
 
+    if (-not [string]::IsNullOrWhiteSpace($RepairActiveVersionId) -and
+        -not [string]::IsNullOrWhiteSpace(
+            $SupersedeOfflineSelectedVersionId
+        )) {
+        return [pscustomobject]@{
+            Action = 'block'
+            Reason = 'repair and offline supersession are mutually exclusive'
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($CurrentVersionId)) {
         if (-not [string]::IsNullOrWhiteSpace($RepairActiveVersionId)) {
             return [pscustomobject]@{
                 Action = 'block'
                 Reason = 'repair requires an existing selected runtime pointer'
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace(
+            $SupersedeOfflineSelectedVersionId
+        )) {
+            return [pscustomobject]@{
+                Action = 'block'
+                Reason = 'offline supersession requires an existing selected runtime pointer'
             }
         }
         return [pscustomobject]@{
@@ -2573,6 +2617,32 @@ function Resolve-RegistrationPendingRuntimeAction {
             return [pscustomobject]@{
                 Action = 'block'
                 Reason = 'repair requires one live exact active runtime'
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace(
+            $SupersedeOfflineSelectedVersionId
+        )) {
+            if ($SupersedeOfflineSelectedVersionId -cne $CurrentVersionId) {
+                return [pscustomobject]@{
+                    Action = 'block'
+                    Reason = 'requested offline supersession runtime does not match the selected runtime'
+                }
+            }
+            if ($CandidateVersionId -ceq $CurrentVersionId) {
+                return [pscustomobject]@{
+                    Action = 'block'
+                    Reason = 'offline supersession requires a different candidate runtime'
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($PreviousVersionId)) {
+                return [pscustomobject]@{
+                    Action = 'block'
+                    Reason = 'offline supersession requires a rollback ancestor'
+                }
+            }
+            return [pscustomobject]@{
+                Action = 'supersede-offline-selected'
+                Reason = 'supersede the exact offline selected runtime while preserving its rollback ancestor'
             }
         }
         if ($CandidateVersionId -ceq $CurrentVersionId) {
@@ -2588,6 +2658,14 @@ function Resolve-RegistrationPendingRuntimeAction {
             } else {
                 'an offline selected runtime with a rollback ancestor may still be pending'
             }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace(
+        $SupersedeOfflineSelectedVersionId
+    )) {
+        return [pscustomobject]@{
+            Action = 'block'
+            Reason = 'offline supersession requires no live active runtime'
         }
     }
     if ($ActiveVersionId -ceq $CurrentVersionId) {
@@ -2994,6 +3072,64 @@ function Get-RegistrationRepairTaskEvidence {
         Xml = $taskXml
         XmlSha256 = $taskXmlSha256
     }
+}
+
+function Assert-RegistrationOfflineSelectedSupersession {
+    param(
+        [Parameter(Mandatory)]
+        [object]$SelectedPointer,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$ExpectedVersionId
+    )
+
+    if ([string]$SelectedPointer.CurrentVersionId -cne $ExpectedVersionId -or
+        [string]$SelectedPointer.PreviousVersionId -cnotmatch
+            '^[a-f0-9]{64}$' -or
+        [string]$SelectedPointer.PreviousVersionId -ceq $ExpectedVersionId) {
+        throw (
+            'Offline selected runtime supersession requires the exact ' +
+            'selected runtime and one distinct rollback ancestor.'
+        )
+    }
+    if ($null -ne (Get-RegistrationActiveRuntimeEvidence)) {
+        throw 'Offline selected runtime supersession requires no live active runtime.'
+    }
+    $desiredMode = Get-CodexLocalRemoteDesiredMode `
+        -DataDir $expected.DataDir
+    if ([string]$desiredMode.Mode -cne 'Native') {
+        throw 'Offline selected runtime supersession requires Native desired mode.'
+    }
+    $taskEvidence = Get-RegistrationRepairTaskEvidence `
+        -Pointer $SelectedPointer
+    if ([string]$taskEvidence.State -cne 'Ready') {
+        throw 'Offline selected runtime supersession requires the selected task to be Ready.'
+    }
+
+    $freshPointer = Get-CodexLocalRemoteCurrentRuntime `
+        -DataDir $expected.DataDir
+    if (-not (Test-RegistrationRuntimePointerSnapshot `
+        -Actual $freshPointer `
+        -Expected $SelectedPointer)) {
+        throw 'The selected runtime pointer changed during offline supersession admission.'
+    }
+    $freshTaskEvidence = Get-RegistrationRepairTaskEvidence `
+        -Pointer $freshPointer
+    if ([string]$freshTaskEvidence.State -cne 'Ready' -or
+        [string]$freshTaskEvidence.XmlSha256 -cne
+            [string]$taskEvidence.XmlSha256) {
+        throw 'The selected task changed during offline supersession admission.'
+    }
+    $freshDesiredMode = Get-CodexLocalRemoteDesiredMode `
+        -DataDir $expected.DataDir
+    if ([string]$freshDesiredMode.Mode -cne 'Native') {
+        throw 'Native desired mode changed during offline supersession admission.'
+    }
+    if ($null -ne (Get-RegistrationActiveRuntimeEvidence)) {
+        throw 'A live active runtime appeared during offline supersession admission.'
+    }
+    return $freshPointer
 }
 
 function Repair-RegistrationPendingRuntimeFromActive {
@@ -3471,7 +3607,10 @@ function Invoke-RegistrationPendingRuntimeGate {
         [object]$CandidateRuntime,
 
         [AllowNull()]
-        [string]$RepairActiveVersionId
+        [string]$RepairActiveVersionId,
+
+        [AllowNull()]
+        [string]$SupersedeOfflineSelectedVersionId
     )
 
     $pointer = Get-CodexLocalRemoteCurrentRuntime `
@@ -3494,12 +3633,20 @@ function Invoke-RegistrationPendingRuntimeGate {
             [string]$pointer.PreviousVersionId
         }) `
         -CandidateVersionId ([string]$CandidateRuntime.VersionId) `
-        -RepairActiveVersionId $RepairActiveVersionId
+        -RepairActiveVersionId $RepairActiveVersionId `
+        -SupersedeOfflineSelectedVersionId (
+            $SupersedeOfflineSelectedVersionId
+        )
     if ([string]$action.Action -ceq 'block') {
         throw (
             'Pending immutable runtime admission blocked before mutation: ' +
             [string]$action.Reason + '.'
         )
+    }
+    if ([string]$action.Action -ceq 'supersede-offline-selected') {
+        $pointer = Assert-RegistrationOfflineSelectedSupersession `
+            -SelectedPointer $pointer `
+            -ExpectedVersionId $SupersedeOfflineSelectedVersionId
     }
     return [pscustomobject]@{
         Action = [string]$action.Action
@@ -3523,6 +3670,9 @@ if ($useImmutableRuntime) {
         -CandidateRuntime $runtimePlan `
         -RepairActiveVersionId (
             $RepairPendingRuntimeFromActiveVersionId
+        ) `
+        -SupersedeOfflineSelectedVersionId (
+            $SupersedeOfflineSelectedRuntimeVersionId
         )
     if ([string]$registrationPendingGate.Action -ceq 'repair-active') {
         if (-not $PSCmdlet.ShouldProcess(
@@ -3544,7 +3694,8 @@ if ($useImmutableRuntime) {
         $activeRuntimeBefore = $repairedPointer
         $registrationPendingGate = Invoke-RegistrationPendingRuntimeGate `
             -CandidateRuntime $runtimePlan `
-            -RepairActiveVersionId $null
+            -RepairActiveVersionId $null `
+            -SupersedeOfflineSelectedVersionId $null
         if ([string]$registrationPendingGate.Action -cne 'continue' -or
             -not (Test-RegistrationActiveRuntimeSnapshot `
                 -Actual $registrationPendingGate.ActiveRuntime `
@@ -3556,9 +3707,11 @@ if ($useImmutableRuntime) {
         }
     }
 } elseif (-not [string]::IsNullOrWhiteSpace(
-    $RepairPendingRuntimeFromActiveVersionId
-)) {
-    throw 'Pending runtime repair requires immutable runtime registration.'
+        $RepairPendingRuntimeFromActiveVersionId
+    ) -or -not [string]::IsNullOrWhiteSpace(
+        $SupersedeOfflineSelectedRuntimeVersionId
+    )) {
+    throw 'Pending runtime recovery requires immutable runtime registration.'
 }
 
 $existing = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
@@ -3938,6 +4091,29 @@ if ($ownership.Kind -cin @(
                 -ExpectedTaskState 'managed'
         } else {
             $null
+        }
+        if ($useImmutableRuntime -and
+            $null -ne $registrationPendingGate -and
+            [string]$registrationPendingGate.Action -ceq
+                'supersede-offline-selected') {
+            $authorizedPointer =
+                Assert-RegistrationOfflineSelectedSupersession `
+                    -SelectedPointer $registrationPendingGate.Pointer `
+                    -ExpectedVersionId (
+                        $SupersedeOfflineSelectedRuntimeVersionId
+                    )
+            if (-not [bool]$runtimeBindingBaseline.PointerPresent -or
+                -not (Test-RegistrationRuntimePointerSnapshot `
+                    -Actual $runtimeBindingBaseline.Pointer `
+                    -Expected $authorizedPointer) -or
+                [string]$runtimeBindingBaseline.TaskXmlSha256 -cne
+                    [string]$authorizedPointer.CurrentTaskDefinitionSha256) {
+                throw (
+                    'The task and selected runtime binding changed before ' +
+                    'offline supersession transaction admission.'
+                )
+            }
+            $registrationPendingGate.Pointer = $authorizedPointer
         }
         if (-not $SkipEnvironmentConfiguration) {
             Assert-ManagedLauncherShortcutOwnership `

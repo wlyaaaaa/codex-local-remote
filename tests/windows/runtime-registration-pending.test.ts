@@ -72,6 +72,11 @@ windowsOnly("Windows pending runtime registration gate", () => {
     ["damaged-repair", "repair-active"],
     ["stable-new", "continue"],
     ["no-active-pending-new", "block"],
+    ["no-active-pending-supersede", "supersede-offline-selected"],
+    ["no-active-pending-supersede-mismatch", "block"],
+    ["no-active-current-only-supersede", "block"],
+    ["no-active-same-supersede", "block"],
+    ["active-pending-supersede", "block"],
     ["no-active-current-only-new", "block"],
     ["repair-without-active", "block"],
   ])("resolves %s before registration mutation", (mode, expectedAction) => {
@@ -113,6 +118,49 @@ windowsOnly("Windows pending runtime registration gate", () => {
     expect(secondGate).toBeLessThan(
       source.indexOf("Install-CodexLocalRemoteRuntimeVersion", secondGate),
     );
+  });
+
+  it("requires an exact explicit offline selected supersession before registration writes", () => {
+    const source = readFileSync(registration, "utf8");
+    expect(source).toMatch(
+      /\[Parameter\(DontShow\)\]\s+\[ValidatePattern\('\^\[a-f0-9\]\{64\}\$'\)\]\s+\[string\]\$SupersedeOfflineSelectedRuntimeVersionId/u,
+    );
+    expect(source).toContain("SupersedeOfflineSelectedRuntimeVersionId cannot start Remote");
+    const gate = source.indexOf("Invoke-RegistrationPendingRuntimeGate");
+    const mutation = source.indexOf("$existing = Get-ScheduledTask", gate);
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(mutation).toBeGreaterThan(gate);
+    expect(source.slice(gate, mutation)).toContain(
+      "Assert-RegistrationOfflineSelectedSupersession",
+    );
+
+    const assertionStart = source.indexOf(
+      "function Assert-RegistrationOfflineSelectedSupersession",
+    );
+    const gateDefinition = source.indexOf(
+      "function Invoke-RegistrationPendingRuntimeGate",
+      assertionStart,
+    );
+    expect(assertionStart).toBeGreaterThanOrEqual(0);
+    expect(gateDefinition).toBeGreaterThan(assertionStart);
+    const assertion = source.slice(assertionStart, gateDefinition);
+    expect(assertion).toContain("Get-RegistrationRepairTaskEvidence");
+    expect(assertion).toContain("Get-CodexLocalRemoteDesiredMode");
+    expect(assertion).toContain("Test-RegistrationRuntimePointerSnapshot");
+    expect(
+      assertion.match(/Get-RegistrationActiveRuntimeEvidence/gu)?.length,
+    ).toBeGreaterThanOrEqual(2);
+
+    const shouldProcess = source.indexOf("if ($PSCmdlet.ShouldProcess(", mutation);
+    const baseline = source.indexOf("$runtimeBindingBaseline =", shouldProcess);
+    const firstMutation = source.indexOf("Protect-CodexLocalRemoteDataDirectory", baseline);
+    expect(shouldProcess).toBeGreaterThan(mutation);
+    expect(baseline).toBeGreaterThan(shouldProcess);
+    expect(firstMutation).toBeGreaterThan(baseline);
+    const finalAdmission = source.slice(baseline, firstMutation);
+    expect(finalAdmission).toContain("Assert-RegistrationOfflineSelectedSupersession");
+    expect(finalAdmission).toContain("Test-RegistrationRuntimePointerSnapshot");
+    expect(finalAdmission).toContain("TaskXmlSha256");
   });
 
   it("heals the proved A/C/B state to active A before the next registration", () => {
