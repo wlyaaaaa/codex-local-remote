@@ -141,4 +141,16 @@ describe("Windows fail-open startup contract", () => {
     expect(start).toContain("$listeners = @(Get-BrokerListeners)");
     expect(start).not.toMatch(/\$listeners\s*=\s*Get-(?:Broker|Upstream)Listeners\b/u);
   });
+
+  it("ignores a stable stopped Broker receipt whose packaged Codex runtime no longer exists", () => {
+    const start = windowsScript("Start-CodexLocalRemote.ps1");
+    const discoveryStart = start.indexOf("function Get-ActiveRuntimeDiscoveryReceipt");
+    const discoveryEnd = start.indexOf("function Resolve-NewCodexDesktopRuntime", discoveryStart);
+    const discovery = start.slice(discoveryStart, discoveryEnd);
+
+    expect(discovery).toContain("$activeCodexPathUnavailable");
+    expect(discovery).toContain("$brokerRawAfter");
+    expect(discovery).toContain("if ($brokerRawBefore -cne $brokerRawAfter)");
+    expect(discovery).toContain("return $null");
+  });
 });

@@ -552,12 +552,35 @@ function Get-CodexLocalRemoteReceiptProcessLiveness {
         [object]$Receipt,
 
         [AllowNull()]
-        [scriptblock]$GetProcessIdentityStateAction
+        [scriptblock]$GetProcessIdentityStateAction,
+
+        [switch]$AllowIncompleteBrokerReadyReceipt,
+
+        [int[]]$ManagedPorts = @(),
+
+        [AllowNull()]
+        [scriptblock]$GetListenerCountAction
     )
 
-    foreach ($property in @('Bootstrap', 'Broker', 'Upstream')) {
-        if ($null -eq $Receipt.PSObject.Properties[$property] -or
-            $null -eq $Receipt.$property) {
+    $missingMandatoryIdentity = @(
+        @('Bootstrap', 'Broker', 'Upstream') |
+            Where-Object {
+                $null -eq $Receipt.PSObject.Properties[$_] -or
+                $null -eq $Receipt.$_
+            }
+    ).Count -gt 0
+    if ($missingMandatoryIdentity) {
+        if (-not $AllowIncompleteBrokerReadyReceipt -or
+            $null -eq $Receipt.PSObject.Properties['Status'] -or
+            [string]$Receipt.Status -cne 'broker-ready' -or
+            $null -eq $Receipt.PSObject.Properties['RuntimeInvocationId'] -or
+            [string]$Receipt.RuntimeInvocationId -cnotmatch '^[0-9a-f]{32}$' -or
+            $null -eq $Receipt.PSObject.Properties['ProcessId'] -or
+            $null -eq $Receipt.PSObject.Properties['Bootstrap'] -or
+            $null -eq $Receipt.Bootstrap -or
+            $null -eq $Receipt.PSObject.Properties['Broker'] -or
+            $null -eq $Receipt.Broker -or
+            [int]$Receipt.ProcessId -ne [int]$Receipt.Broker.ProcessId) {
             return 'unknown'
         }
     }
@@ -573,7 +596,7 @@ function Get-CodexLocalRemoteReceiptProcessLiveness {
         $sidecarIdentity,
         $Receipt.Upstream
     ) | Where-Object { $null -ne $_ }
-    if ($identities.Count -lt 3) {
+    if ($identities.Count -lt $(if ($missingMandatoryIdentity) { 2 } else { 3 })) {
         return 'unknown'
     }
     $identityStateAction = if ($null -ne $GetProcessIdentityStateAction) {
@@ -612,6 +635,13 @@ function Get-CodexLocalRemoteReceiptProcessLiveness {
             $null -eq $identity.PSObject.Properties[
                 'ProcessStartTimeUtcTicks'
             ] -or
+            ($missingMandatoryIdentity -and (
+                $null -eq $identity.PSObject.Properties[
+                    'RuntimeInvocationId'
+                ] -or
+                [string]$identity.RuntimeInvocationId -cne
+                    [string]$Receipt.RuntimeInvocationId
+            )) -or
             -not (Test-NonNegativeInteger -Value $identity.ProcessId) -or
             [decimal]$identity.ProcessId -le 0 -or
             -not (Test-NonNegativeInteger `
@@ -631,7 +661,49 @@ function Get-CodexLocalRemoteReceiptProcessLiveness {
             $unknownObserved = $true
         }
     }
-    return $(if ($unknownObserved) { 'unknown' } else { 'absent' })
+    if ($unknownObserved) {
+        return 'unknown'
+    }
+    if ($missingMandatoryIdentity) {
+        $ports = @($ManagedPorts | Select-Object -Unique)
+        if ($ports.Count -ne 3 -or @(
+            $ports | Where-Object { $_ -lt 1 -or $_ -gt 65535 }
+        ).Count -gt 0) {
+            return 'unknown'
+        }
+        $listenerCountAction = if ($null -ne $GetListenerCountAction) {
+            $GetListenerCountAction
+        } else {
+            {
+                param([Parameter(Mandatory)][int]$Port)
+
+                return @(
+                    Get-NetTCPConnection `
+                        -State Listen `
+                        -LocalPort $Port `
+                        -ErrorAction Stop
+                ).Count
+            }
+        }
+        foreach ($port in $ports) {
+            $listenerCount = try {
+                & $listenerCountAction ([int]$port)
+            } catch {
+                if ($_.FullyQualifiedErrorId -ceq
+                        'CmdletizationQuery_NotFound,Get-NetTCPConnection' -and
+                    [string]$_.CategoryInfo.Category -ceq 'ObjectNotFound') {
+                    0
+                } else {
+                    -1
+                }
+            }
+            if (-not (Test-NonNegativeInteger -Value $listenerCount) -or
+                [decimal]$listenerCount -ne 0) {
+                return 'unknown'
+            }
+        }
+    }
+    return 'absent'
 }
 
 function Get-CodexLocalRemoteRuntimeGenerationStatus {
@@ -789,7 +861,14 @@ function Get-CodexLocalRemoteRuntimeGenerationStatus {
         throw "The active immutable runtime is invalid: $($activeValidation.Reason)."
     }
     $processLiveness =
-        Get-CodexLocalRemoteReceiptProcessLiveness -Receipt $state
+        Get-CodexLocalRemoteReceiptProcessLiveness `
+            -Receipt $state `
+            -AllowIncompleteBrokerReadyReceipt `
+            -ManagedPorts @(
+                [int]$SidecarPort,
+                [int]$BrokerPort,
+                [int]$BrokerUpstreamPort
+            )
     if ($processLiveness -ceq 'absent') {
         return [pscustomobject]@{
             Status = 'stale-transition-receipt'

@@ -225,8 +225,20 @@ function Get-ActiveRuntimeDiscoveryReceipt {
         throw 'The active Broker receipt does not identify one managed Codex runtime.'
     }
     $activeCodexPath = [System.IO.Path]::GetFullPath([string]$broker.CodexPath)
-    if (-not (Test-Path -LiteralPath $activeCodexPath -PathType Leaf)) {
-        throw "The active Broker runtime file is unavailable at '$activeCodexPath'."
+    $activeCodexPathUnavailable =
+        -not (Test-Path -LiteralPath $activeCodexPath -PathType Leaf)
+    if ($activeCodexPathUnavailable) {
+        $brokerRawAfter =
+            Get-Content -LiteralPath $activeBrokerPath -Raw -Encoding utf8
+        if ($brokerRawBefore -cne $brokerRawAfter) {
+            throw 'The active Broker receipt changed during runtime recovery.'
+        }
+        # The generation gate separately proves that the prior task is stopped,
+        # every recorded process identity is absent, and all managed listeners
+        # are empty. Treat a now-uninstalled packaged Codex path as stale here;
+        # any live listener still fails closed later because no reusable runtime
+        # receipt is returned.
+        return $null
     }
     $activeCodexItem = Get-Item -LiteralPath $activeCodexPath -Force
     if ($activeCodexItem.PSIsContainer -or

@@ -77,6 +77,44 @@ $missingMandatory = [pscustomobject]@{
     Sidecar = $null
     Upstream = $receipt.Upstream
 }
+$incompleteBrokerReady = [pscustomobject]@{
+    Status = 'broker-ready'
+    RuntimeInvocationId = '0123456789abcdef0123456789abcdef'
+    ProcessId = 12
+    Bootstrap = [pscustomobject]@{
+        RuntimeInvocationId = '0123456789abcdef0123456789abcdef'
+        ProcessId = 11
+        ProcessStartTimeUtcTicks = 638000000000000011
+    }
+    Broker = [pscustomobject]@{
+        RuntimeInvocationId = '0123456789abcdef0123456789abcdef'
+        ProcessId = 12
+        ProcessStartTimeUtcTicks = 638000000000000012
+    }
+    Sidecar = $null
+    Upstream = $null
+}
+$noListeners = {
+    param([int]$Port)
+    $null = $Port
+    return 0
+}
+$oneManagedListener = {
+    param([int]$Port)
+    return $(if ($Port -eq 18791) { 1 } else { 0 })
+}
+$noListenerNotFound = {
+    param([int]$Port)
+    $errorRecord = [System.Management.Automation.ErrorRecord]::new(
+        [System.Management.Automation.ItemNotFoundException]::new(
+            "No matching listener exists on port $Port."
+        ),
+        'CmdletizationQuery_NotFound,Get-NetTCPConnection',
+        [System.Management.Automation.ErrorCategory]::ObjectNotFound,
+        $Port
+    )
+    Write-Error -ErrorRecord $errorRecord -ErrorAction Stop
+}
 
 [pscustomobject]@{
     AllAbsent = Get-CodexLocalRemoteReceiptProcessLiveness `
@@ -91,4 +129,32 @@ $missingMandatory = [pscustomobject]@{
     MissingMandatory = Get-CodexLocalRemoteReceiptProcessLiveness `
         -Receipt $missingMandatory `
         -GetProcessIdentityStateAction $allAbsent
+    IncompleteBrokerReadyAbsent =
+        Get-CodexLocalRemoteReceiptProcessLiveness `
+            -Receipt $incompleteBrokerReady `
+            -GetProcessIdentityStateAction $allAbsent `
+            -AllowIncompleteBrokerReadyReceipt `
+            -ManagedPorts @(18790, 18791, 18795) `
+            -GetListenerCountAction $noListeners
+    IncompleteBrokerReadyListener =
+        Get-CodexLocalRemoteReceiptProcessLiveness `
+            -Receipt $incompleteBrokerReady `
+            -GetProcessIdentityStateAction $allAbsent `
+            -AllowIncompleteBrokerReadyReceipt `
+            -ManagedPorts @(18790, 18791, 18795) `
+            -GetListenerCountAction $oneManagedListener
+    IncompleteBrokerReadyNotFound =
+        Get-CodexLocalRemoteReceiptProcessLiveness `
+            -Receipt $incompleteBrokerReady `
+            -GetProcessIdentityStateAction $allAbsent `
+            -AllowIncompleteBrokerReadyReceipt `
+            -ManagedPorts @(18790, 18791, 18795) `
+            -GetListenerCountAction $noListenerNotFound
+    IncompleteBrokerReadyLive =
+        Get-CodexLocalRemoteReceiptProcessLiveness `
+            -Receipt $incompleteBrokerReady `
+            -GetProcessIdentityStateAction $brokerLive `
+            -AllowIncompleteBrokerReadyReceipt `
+            -ManagedPorts @(18790, 18791, 18795) `
+            -GetListenerCountAction $noListeners
 } | ConvertTo-Json -Compress
