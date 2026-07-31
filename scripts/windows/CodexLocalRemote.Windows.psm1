@@ -2982,6 +2982,87 @@ function Get-CodexLocalRemoteDesktopHandoffPreparationPath {
     )
 }
 
+function Select-CodexLocalRemoteNativeDesktopRootCandidates {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Candidates,
+
+        [Parameter(Mandatory)]
+        [string]$DesktopExecutablePath
+    )
+
+    $expectedDesktopPath =
+        [System.IO.Path]::GetFullPath($DesktopExecutablePath)
+    $exactRootProcessIds =
+        [Collections.Generic.HashSet[int]]::new()
+    foreach ($candidate in $Candidates) {
+        $commandLine = [string]$candidate.CommandLine
+        $executablePath = [string]$candidate.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($commandLine) -or
+            $commandLine -match '(?i)(?:^|\s)--type=' -or
+            [string]::IsNullOrWhiteSpace($executablePath)) {
+            continue
+        }
+        try {
+            $resolvedExecutablePath =
+                [System.IO.Path]::GetFullPath($executablePath)
+        } catch {
+            continue
+        }
+        if ([string]::Equals(
+            $resolvedExecutablePath,
+            $expectedDesktopPath,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            $null = $exactRootProcessIds.Add(
+                [int]$candidate.ProcessId
+            )
+        }
+    }
+
+    foreach ($candidate in $Candidates) {
+        $commandLine = [string]$candidate.CommandLine
+        if ($commandLine -match '(?i)(?:^|\s)--type=') {
+            continue
+        }
+        $isMetadataEmptyChildOfExactRoot = (
+            [string]::IsNullOrWhiteSpace($commandLine) -and
+            [string]::IsNullOrWhiteSpace(
+                [string]$candidate.ExecutablePath
+            ) -and
+            $exactRootProcessIds.Contains(
+                [int]$candidate.ParentProcessId
+            )
+        )
+        if ($isMetadataEmptyChildOfExactRoot) {
+            continue
+        }
+        $candidate
+    }
+}
+
+function Get-CodexLocalRemoteNativeDesktopRootCandidates {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DesktopExecutablePath
+    )
+
+    $candidates = @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "Name = 'ChatGPT.exe'" `
+            -ErrorAction Stop
+    )
+    return @(
+        Select-CodexLocalRemoteNativeDesktopRootCandidates `
+            -Candidates $candidates `
+            -DesktopExecutablePath $DesktopExecutablePath
+    )
+}
+
 function Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot {
     [CmdletBinding()]
     param(
@@ -2997,14 +3078,8 @@ function Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot {
             'resources\codex.exe')
     )
     $allDesktopRoots = @(
-        Get-CimInstance `
-            Win32_Process `
-            -Filter "Name = 'ChatGPT.exe'" `
-            -ErrorAction Stop |
-            Where-Object {
-                [string]$_.CommandLine -notmatch
-                    '(?i)(?:^|\s)--type='
-            }
+        Get-CodexLocalRemoteNativeDesktopRootCandidates `
+            -DesktopExecutablePath $expectedDesktopPath
     )
     if ($allDesktopRoots.Count -ne 1) {
         throw (
@@ -7682,6 +7757,8 @@ Export-ModuleMember -Function @(
     'Get-ManagedBootstrapProcessContract',
     'Test-IndependentDesktopAppServer',
     'Get-CodexLocalRemoteDesktopHandoffPreparationPath',
+    'Select-CodexLocalRemoteNativeDesktopRootCandidates',
+    'Get-CodexLocalRemoteNativeDesktopRootCandidates',
     'Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot',
     'Read-CodexLocalRemoteDesktopHandoffPreparation',
     'New-CodexLocalRemoteDesktopHandoffPreparation',

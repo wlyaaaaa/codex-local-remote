@@ -168,6 +168,12 @@ function Get-CimInstance {
     return @()
 }
 
+function Get-CodexLocalRemoteNativeDesktopRootCandidates {
+    param([string]$DesktopExecutablePath)
+    $null = $DesktopExecutablePath
+    return @($script:fixtureState.DesktopRoots)
+}
+
 function Assert-OnDemandDesktopRootExecutable {
     param(
         [object]$DesktopRoot,
@@ -519,6 +525,16 @@ function Get-CimInstance {
         }
     }
     return @()
+}
+
+function Get-CodexLocalRemoteNativeDesktopRootCandidates {
+    param([string]$DesktopExecutablePath)
+    $null = $DesktopExecutablePath
+    return @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "Name = 'ChatGPT.exe'"
+    )
 }
 
 function Get-NetTCPConnection {

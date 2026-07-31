@@ -20,6 +20,8 @@ if ($parseErrors.Count -ne 0) {
 }
 foreach ($functionName in @(
     'Get-CodexLocalRemoteDesktopHandoffPreparationPath',
+    'Select-CodexLocalRemoteNativeDesktopRootCandidates',
+    'Get-CodexLocalRemoteNativeDesktopRootCandidates',
     'Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot',
     'Read-CodexLocalRemoteDesktopHandoffPreparation',
     'New-CodexLocalRemoteDesktopHandoffPreparation',

@@ -60,6 +60,12 @@ function Get-CimInstance {
     return @($script:fixtureState.Roots)
 }
 
+function Get-CodexLocalRemoteNativeDesktopRootCandidates {
+    param([string]$DesktopExecutablePath)
+    $null = $DesktopExecutablePath
+    return @($script:fixtureState.Roots)
+}
+
 function Assert-OnDemandDesktopRootExecutable {
     param(
         [object]$DesktopRoot,

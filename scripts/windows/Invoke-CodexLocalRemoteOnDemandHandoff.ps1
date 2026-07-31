@@ -954,14 +954,8 @@ function Wait-OnDemandDesktopDrain {
         [DateTime]::UtcNow.AddSeconds($DesktopDrainTimeoutSeconds)
     do {
         $remainingDesktopRoots = @(
-            Get-CimInstance `
-                Win32_Process `
-                -Filter "Name = 'ChatGPT.exe'" `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    [string]$_.CommandLine -notmatch
-                        '(?i)(?:^|\s)--type='
-                }
+            Get-CodexLocalRemoteNativeDesktopRootCandidates `
+                -DesktopExecutablePath $expectedDesktopPath
         )
         $remainingIndependentAppServers =
             @(Get-OnDemandIndependentStdioProcesses)
@@ -1965,14 +1959,8 @@ function Invoke-OnDemandPreparedAttachCompensation {
         -RuntimeVersionId ([string]$Runtime.CurrentVersionId) `
         -RuntimeRoot ([string]$Runtime.CurrentRoot)
     $desktopRoots = @(
-        Get-CimInstance `
-            Win32_Process `
-            -Filter "Name = 'ChatGPT.exe'" `
-            -ErrorAction Stop |
-            Where-Object {
-                [string]$_.CommandLine -notmatch
-                    '(?i)(?:^|\s)--type='
-            }
+        Get-CodexLocalRemoteNativeDesktopRootCandidates `
+            -DesktopExecutablePath $DesktopExecutablePath
     )
     if ($desktopRoots.Count -gt 1) {
         throw 'Prepared attach compensation found ambiguous Desktop roots.'
@@ -2012,14 +2000,8 @@ function Invoke-OnDemandPreparedAttachCompensation {
                 -DesktopRoot $desktopRoots[0] `
                 -ExpectedDesktopPath $DesktopExecutablePath
             $desktopRoots = @(
-                Get-CimInstance `
-                    Win32_Process `
-                    -Filter "Name = 'ChatGPT.exe'" `
-                    -ErrorAction Stop |
-                    Where-Object {
-                        [string]$_.CommandLine -notmatch
-                            '(?i)(?:^|\s)--type='
-                    }
+                Get-CodexLocalRemoteNativeDesktopRootCandidates `
+                    -DesktopExecutablePath $DesktopExecutablePath
             )
             if ($desktopRoots.Count -ne 0) {
                 throw (
@@ -2038,14 +2020,8 @@ function Invoke-OnDemandPreparedAttachCompensation {
         do {
             Start-Sleep -Milliseconds 250
             $desktopRoots = @(
-                Get-CimInstance `
-                    Win32_Process `
-                    -Filter "Name = 'ChatGPT.exe'" `
-                    -ErrorAction Stop |
-                    Where-Object {
-                        [string]$_.CommandLine -notmatch
-                            '(?i)(?:^|\s)--type='
-                    }
+                Get-CodexLocalRemoteNativeDesktopRootCandidates `
+                    -DesktopExecutablePath $DesktopExecutablePath
             )
             if ($desktopRoots.Count -eq 1) {
                 Assert-OnDemandDesktopRootExecutable `
@@ -2190,14 +2166,8 @@ function Invoke-OnDemandOpenCompensation {
     }
 
     $desktopRoots = @(
-        Get-CimInstance `
-            Win32_Process `
-            -Filter "Name = 'ChatGPT.exe'" `
-            -ErrorAction Stop |
-            Where-Object {
-                [string]$_.CommandLine -notmatch
-                    '(?i)(?:^|\s)--type='
-            }
+        Get-CodexLocalRemoteNativeDesktopRootCandidates `
+            -DesktopExecutablePath $DesktopExecutablePath
     )
     if ($desktopRoots.Count -gt 1) {
         throw (
@@ -2440,14 +2410,8 @@ try {
         [string]$packageRuntime.DesktopExecutablePath
     )
     $desktopRoots = @(
-        Get-CimInstance `
-            Win32_Process `
-            -Filter "Name = 'ChatGPT.exe'" `
-            -ErrorAction Stop |
-            Where-Object {
-                [string]$_.CommandLine -notmatch
-                    '(?i)(?:^|\s)--type='
-            }
+        Get-CodexLocalRemoteNativeDesktopRootCandidates `
+            -DesktopExecutablePath $expectedDesktopPath
     )
     $independentAppServers = @(Get-OnDemandIndependentStdioProcesses)
     $remoteState = if ([string]$startupTask.State -ceq 'Running') {
