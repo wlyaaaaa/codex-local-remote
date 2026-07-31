@@ -13,6 +13,7 @@ import {
   appServerUpstreamTokenFilePath,
   assertHighEntropyCapabilityToken,
   buildCodexAppServerArgs,
+  DEFAULT_BROKER_APP_SERVER_STARTUP_TIMEOUT_MS,
   formatCodexAppServerListenEndpoint,
   startBroker,
 } from "./runtime.js";
@@ -29,6 +30,10 @@ afterEach(async () => {
 });
 
 describe("startBroker", () => {
+  it("allows a bounded slow Codex app-server cold start", () => {
+    expect(DEFAULT_BROKER_APP_SERVER_STARTUP_TIMEOUT_MS).toBe(60_000);
+  });
+
   it("uses the strict ws://IP:PORT syntax accepted by codex app-server", () => {
     expect(formatCodexAppServerListenEndpoint("127.0.0.1", 18_792)).toBe("ws://127.0.0.1:18792");
   });

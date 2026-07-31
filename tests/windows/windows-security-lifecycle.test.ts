@@ -10,6 +10,11 @@ function windowsScript(name: string) {
 }
 
 describe("Windows capability and lifecycle safety contract", () => {
+  it("gives the Broker listener more time than its bounded app-server cold start", () => {
+    const start = windowsScript("Start-CodexLocalRemote.ps1");
+    expect(start).toContain("[int]$BrokerStartupTimeoutSeconds = 75");
+  });
+
   it("passes only the fixed token file path to the broker and never writes the token to state", () => {
     const start = windowsScript("Start-CodexLocalRemote.ps1");
     expect(start).toContain("'--capability-token-file'");

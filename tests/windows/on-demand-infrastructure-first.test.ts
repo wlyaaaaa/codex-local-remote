@@ -62,6 +62,22 @@ describe("Windows infrastructure-first on-demand handoff", () => {
     );
   });
 
+  it("fails fast when the selected startup task exits before preparation", () => {
+    const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+    const prepare = functionBlock(
+      handoff,
+      "Prepare-OnDemandSelectedRemoteRuntime",
+      "Stop-OnDemandDesktopProcessGroup",
+    );
+    const remoteState = prepare.indexOf("$remoteState = Get-OnDemandRemoteState");
+    const taskRefresh = prepare.indexOf("Get-ScheduledTask `", remoteState);
+    const earlyExit = prepare.indexOf("'preparation completed.'", taskRefresh);
+
+    expect(remoteState).toBeGreaterThanOrEqual(0);
+    expect(taskRefresh).toBeGreaterThan(remoteState);
+    expect(earlyExit).toBeGreaterThan(taskRefresh);
+  });
+
   it("keeps the post-close path attach-only", () => {
     const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
     const attachOnly = functionBlock(

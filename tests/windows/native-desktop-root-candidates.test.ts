@@ -5,31 +5,14 @@ import { describe, expect, it } from "vitest";
 
 const windowsOnly = process.platform === "win32" ? describe : describe.skip;
 const repositoryRoot = resolve(import.meta.dirname, "..", "..");
-const modulePath = join(
-  repositoryRoot,
-  "scripts",
-  "windows",
-  "CodexLocalRemote.Windows.psm1",
-);
-const driver = join(
-  import.meta.dirname,
-  "fixtures",
-  "native-desktop-root-candidates-driver.ps1",
-);
+const modulePath = join(repositoryRoot, "scripts", "windows", "CodexLocalRemote.Windows.psm1");
+const driver = join(import.meta.dirname, "fixtures", "native-desktop-root-candidates-driver.ps1");
 
 windowsOnly("Windows native Desktop root classification", () => {
   it("ignores only metadata-empty transient children of an exact root", () => {
     const result = spawnSync(
       "pwsh",
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-File",
-        driver,
-        "-ModulePath",
-        modulePath,
-      ],
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", driver, "-ModulePath", modulePath],
       { cwd: repositoryRoot, encoding: "utf8" },
     );
 

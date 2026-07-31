@@ -1527,6 +1527,16 @@ function Prepare-OnDemandSelectedRemoteRuntime {
             if ($remoteState -ceq 'desktop-detached') {
                 break
             }
+            $observedTask = Get-ScheduledTask `
+                -TaskName $Name `
+                -TaskPath '\' `
+                -ErrorAction Stop
+            if ([string]$observedTask.State -cne 'Running') {
+                throw (
+                    'Selected immutable runtime startup task exited before ' +
+                    'preparation completed.'
+                )
+            }
         } while ([DateTime]::UtcNow -lt $readyDeadline)
         if ($remoteState -cne 'desktop-detached') {
             throw (

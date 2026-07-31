@@ -20,8 +20,8 @@ param(
 
     [string]$BasePath = '/codex-remote',
 
-    [ValidateRange(1, 60)]
-    [int]$BrokerStartupTimeoutSeconds = 15,
+    [ValidateRange(1, 300)]
+    [int]$BrokerStartupTimeoutSeconds = 75,
 
     [ValidateRange(1, 60)]
     [int]$SidecarHandshakeTimeoutSeconds = 60,

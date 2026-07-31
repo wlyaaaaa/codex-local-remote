@@ -77,7 +77,7 @@ export const DEFAULT_BROKER_MAX_FRAME_BYTES = 128 * 1024 * 1024;
 export const DEFAULT_BROKER_HEARTBEAT_INTERVAL_MS = 30_000;
 export const DEFAULT_BROKER_HEARTBEAT_DEADLINE_MS = 30_000;
 export const DEFAULT_BROKER_HEARTBEAT_RESUME_TOLERANCE_MS = 5_000;
-const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
+export const DEFAULT_BROKER_APP_SERVER_STARTUP_TIMEOUT_MS = 60_000;
 const STARTUP_PROBE_TIMEOUT_MS = 500;
 const MIN_CAPABILITY_TOKEN_LENGTH = 43;
 const MIN_CAPABILITY_TOKEN_UNIQUE_CHARACTERS = 12;
@@ -333,7 +333,7 @@ export async function launchCodexAppServer(
         endpoint,
         upstreamCapabilityToken,
         child,
-        options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
+        options.startupTimeoutMs ?? DEFAULT_BROKER_APP_SERVER_STARTUP_TIMEOUT_MS,
         () => startupError,
       );
     } finally {
