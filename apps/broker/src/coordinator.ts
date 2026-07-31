@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+
 import { LoadedThreadRegistry } from "./loaded-thread-registry.js";
 import {
   ThreadLifecycleArbiter,
@@ -31,6 +33,7 @@ export interface BrokerCoordinatorOptions {
   maxFrameBytes?: number;
   resumeRetryDelaysMs?: number[];
   sleep?: (delayMs: number) => Promise<void>;
+  unsafeRevalidationMinIntervalMs?: number;
 }
 
 export interface BrokerCoordinatorSnapshot {
@@ -103,6 +106,7 @@ const DEFAULT_HIDDEN_TIMEOUT_MS = 10_000;
 const DEFAULT_BACKFILL_RETRY_DELAYS_MS = [250, 1_000, 5_000];
 const DEFAULT_MAX_BACKFILL_CONCURRENCY = 16;
 const DEFAULT_RESUME_RETRY_DELAYS_MS = [20, 50, 100, 250, 500, 1_000];
+const DEFAULT_UNSAFE_REVALIDATION_MIN_INTERVAL_MS = 15_000;
 const DEFAULT_THREAD_TITLE = "New Codex task";
 const DEFAULT_LOADED_THREAD_PAGE_LIMIT = 100;
 const LOADED_THREAD_CURSOR_PREFIX = "clr-loaded-v1.";
@@ -133,10 +137,13 @@ export class BrokerCoordinator {
   readonly #resumeRetryDelaysMs: number[];
   readonly #sleep: (delayMs: number) => Promise<void>;
   readonly #threadParents = new Map<string, string | undefined>();
+  readonly #unsafeRevalidationMinIntervalMs: number;
   #nextConnectionId = 1;
   #convergenceInFlight: Promise<void> | undefined;
   #convergenceRequested = false;
+  #lastUnsafeRevalidationAtMs = Number.NEGATIVE_INFINITY;
   #stopped = false;
+  #unsafeRevalidationInFlight: Promise<void> | undefined;
 
   constructor(options: BrokerCoordinatorOptions = {}) {
     this.#backfillRetryDelaysMs = [
@@ -150,11 +157,17 @@ export class BrokerCoordinator {
       ...(options.resumeRetryDelaysMs ?? DEFAULT_RESUME_RETRY_DELAYS_MS),
     ];
     this.#sleep = options.sleep ?? sleep;
+    this.#unsafeRevalidationMinIntervalMs =
+      options.unsafeRevalidationMinIntervalMs ?? DEFAULT_UNSAFE_REVALIDATION_MIN_INTERVAL_MS;
     assertPositiveInteger(this.#maxFrameBytes, "maxFrameBytes");
     assertPositiveInteger(this.#maxBackfillConcurrency, "maxBackfillConcurrency");
     assertPositiveInteger(this.#hiddenRequestTimeoutMs, "hiddenRequestTimeoutMs");
     assertRetryDelays(this.#backfillRetryDelaysMs, "backfillRetryDelaysMs");
     assertRetryDelays(this.#resumeRetryDelaysMs, "resumeRetryDelaysMs");
+    assertNonNegativeInteger(
+      this.#unsafeRevalidationMinIntervalMs,
+      "unsafeRevalidationMinIntervalMs",
+    );
   }
 
   attach(options: AttachPairOptions): BrokerPair {
@@ -199,6 +212,51 @@ export class BrokerCoordinator {
 
   unsafeThreadCount(): number {
     return this.#lifecycle.unsafeThreadCount();
+  }
+
+  revalidateUnsafeThreads(): Promise<void> {
+    if (this.#stopped || this.#unsafeRevalidationInFlight) {
+      return this.#unsafeRevalidationInFlight ?? Promise.resolve();
+    }
+    const unsafeThreadIds = this.#lifecycle.unsafeThreadIds();
+    if (unsafeThreadIds.length === 0) {
+      return Promise.resolve();
+    }
+    const now = performance.now();
+    if (now - this.#lastUnsafeRevalidationAtMs < this.#unsafeRevalidationMinIntervalMs) {
+      return Promise.resolve();
+    }
+    const connections = this.#initializedConnections();
+    const source =
+      connections.find((connection) => connection.role === "desktop") ?? connections[0];
+    if (!source) {
+      return Promise.resolve();
+    }
+    this.#lastUnsafeRevalidationAtMs = now;
+    let nextIndex = 0;
+    const run = Promise.all(
+      Array.from(
+        { length: Math.min(this.#maxBackfillConcurrency, unsafeThreadIds.length) },
+        async () => {
+          for (;;) {
+            const threadId = unsafeThreadIds[nextIndex++];
+            if (threadId === undefined) return;
+            try {
+              await source.inspectThreadState(threadId);
+            } catch {
+              // A failed or racing read remains unsafe and is retried by a later probe.
+            }
+          }
+        },
+      ),
+    ).then(() => undefined);
+    const tracked = run.finally(() => {
+      if (this.#unsafeRevalidationInFlight === tracked) {
+        this.#unsafeRevalidationInFlight = undefined;
+      }
+    });
+    this.#unsafeRevalidationInFlight = tracked;
+    return tracked;
   }
 
   stop(): void {
@@ -1840,6 +1898,12 @@ function asError(value: unknown): Error {
 function assertPositiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new TypeError(`${name} 必须是正整数`);
+  }
+}
+
+function assertNonNegativeInteger(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative integer`);
   }
 }
 

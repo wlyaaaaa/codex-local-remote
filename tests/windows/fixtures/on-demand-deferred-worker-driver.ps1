@@ -56,10 +56,18 @@ $script:workerState = [pscustomobject]@{
     Active = $false
     ClaimValid = $false
 }
+$script:injectWorkerStateReadFailure = $false
+$script:workerStartedForFailure = $false
+$script:killedProcesses = 0
+$script:waitForExitCalls = 0
 $script:releaseMismatchedWorkerAfterReads = 0
 $script:startCalls = [Collections.Generic.List[object]]::new()
 
 function Get-OnDemandDeferredHandoffWorkerState {
+    if ($script:injectWorkerStateReadFailure -and
+        $script:workerStartedForFailure) {
+        throw 'fixture worker claim read failed'
+    }
     if ($script:workerState.Active -and
         $script:releaseMismatchedWorkerAfterReads -gt 0) {
         $script:releaseMismatchedWorkerAfterReads--
@@ -93,6 +101,9 @@ function Start-Process {
         RedirectStandardError = $RedirectStandardError
         PassThru = [bool]$PassThru
     })
+    if ($script:injectWorkerStateReadFailure) {
+        $script:workerStartedForFailure = $true
+    }
     $script:workerState = [pscustomobject]@{
         Active = $true
         ClaimValid = $true
@@ -106,6 +117,15 @@ function Start-Process {
         HasExited = $false
     }
     $process | Add-Member -MemberType ScriptMethod -Name Refresh -Value {}
+    $process | Add-Member -MemberType ScriptMethod -Name Kill -Value {
+        $script:killedProcesses++
+        $this.HasExited = $true
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        param([int]$TimeoutMilliseconds)
+        $script:waitForExitCalls++
+        return $TimeoutMilliseconds -eq 5000
+    }
     $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
     return $process
 }
@@ -176,6 +196,21 @@ $superseded = Start-OnDemandDeferredRuntimeHandoff `
     -Configuration $configuration `
     -Name 'Codex Local Remote' `
     -DesiredModeIntentId $desiredModeIntentId
+$script:workerState = [pscustomobject]@{
+    Active = $false
+    ClaimValid = $false
+}
+$script:injectWorkerStateReadFailure = $true
+$workerAdmissionFailureCaught = $false
+try {
+    $null = Start-OnDemandDeferredRuntimeHandoff `
+        -Runtime $runtime `
+        -Configuration $configuration `
+        -Name 'Codex Local Remote' `
+        -DesiredModeIntentId $desiredModeIntentId
+} catch {
+    $workerAdmissionFailureCaught = $true
+}
 
 [pscustomobject]@{
     Fresh = $fresh
@@ -186,6 +221,9 @@ $superseded = Start-OnDemandDeferredRuntimeHandoff `
     CreatedDesiredMode = $createdDesiredMode
     CreatedDesiredModeWasCreated = $createdDesiredModeWasCreated
     DesiredModeSetCalls = $script:desiredModeSetCalls
+    WorkerAdmissionFailureCaught = $workerAdmissionFailureCaught
+    KilledProcesses = $script:killedProcesses
+    WaitForExitCalls = $script:waitForExitCalls
     StartCalls = @($script:startCalls)
     RuntimeVersionId = $runtimeVersionId
     RuntimeRoot = $runtimeRoot

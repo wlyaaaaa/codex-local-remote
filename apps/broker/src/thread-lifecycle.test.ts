@@ -142,10 +142,12 @@ describe("ThreadLifecycleArbiter", () => {
     arbiter.observeStatus("unknown-thread", "unknown");
 
     expect(arbiter.unsafeThreadCount()).toBe(2);
+    expect(arbiter.unsafeThreadIds()).toEqual(["active-thread", "unknown-thread"]);
 
     arbiter.observeStatus("active-thread", "idle");
     arbiter.observeStatus("unknown-thread", "idle");
     expect(arbiter.unsafeThreadCount()).toBe(0);
+    expect(arbiter.unsafeThreadIds()).toEqual([]);
   });
 
   it("blocks turn starts for an atomically reserved archive tree", async () => {

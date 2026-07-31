@@ -213,6 +213,7 @@ describe("Windows native-default on-demand Remote contract", () => {
         DesiredModeSetCalls: number;
         Existing: { AlreadyActive: boolean; ProcessId: number };
         Fresh: { AlreadyActive: boolean; ProcessId: number; ProcessStartTimeUtcTicks: number };
+        KilledProcesses: number;
         ReusedDesiredMode: { IntentId: string };
         ReusedDesiredModeWasCreated: boolean;
         Superseded: {
@@ -230,6 +231,8 @@ describe("Windows native-default on-demand Remote contract", () => {
           WindowStyle: string;
           WorkingDirectory: string;
         }>;
+        WaitForExitCalls: number;
+        WorkerAdmissionFailureCaught: boolean;
       };
 
       expect(receipt.Fresh.AlreadyActive).toBe(false);
@@ -243,7 +246,10 @@ describe("Windows native-default on-demand Remote contract", () => {
       expect(receipt.CreatedDesiredMode.IntentId).toBe("d".repeat(32));
       expect(receipt.CreatedDesiredModeWasCreated).toBe(true);
       expect(receipt.DesiredModeSetCalls).toBe(1);
-      expect(receipt.StartCalls).toHaveLength(2);
+      expect(receipt.WorkerAdmissionFailureCaught).toBe(true);
+      expect(receipt.KilledProcesses).toBe(1);
+      expect(receipt.WaitForExitCalls).toBe(1);
+      expect(receipt.StartCalls).toHaveLength(3);
       const call = receipt.StartCalls[0];
       expect(call.WindowStyle).toBe("Hidden");
       expect(call.PassThru).toBe(true);
@@ -261,6 +267,9 @@ describe("Windows native-default on-demand Remote contract", () => {
       );
 
       const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+      expect(handoff).toContain("$claimWait.Elapsed -lt [TimeSpan]::FromSeconds(30)");
+      expect(handoff).toContain("$worker.Kill()");
+      expect(handoff).toContain("$worker.WaitForExit(5000)");
       const deferStart = handoff.indexOf("if ($decision -ceq 'defer-runtime-handoff')");
       const deferEnd = handoff.indexOf("-Status 'restart-deferred'", deferStart);
       const deferBlock = handoff.slice(deferStart, deferEnd);

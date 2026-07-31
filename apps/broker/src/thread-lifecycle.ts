@@ -319,11 +319,15 @@ export class ThreadLifecycleArbiter {
   }
 
   unsafeThreadCount(): number {
+    return this.unsafeThreadIds().length;
+  }
+
+  unsafeThreadIds(): string[] {
     const unsafeThreadIds = new Set(this.#archiveEntries.keys());
     for (const [threadId, entry] of this.#entries) {
       if (entry.phase !== "idle") unsafeThreadIds.add(threadId);
     }
-    return unsafeThreadIds.size;
+    return [...unsafeThreadIds].sort((left, right) => left.localeCompare(right, "en-US"));
   }
 
   clear(): void {

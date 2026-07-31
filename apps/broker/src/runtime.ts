@@ -137,14 +137,17 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
   let ready = true;
   let stopped = false;
   const activePairs = new Set<BrokerPair>();
-  const server = createHealthServer(() => ({
-    appServerReady: ready && !stopped,
-    brokerProcessId: process.pid,
-    ...coordinator.snapshot(),
-    runtimeInvocationId,
-    unsafeThreadCount: coordinator.unsafeThreadCount(),
-    upstreamProcessId: owned.processId,
-  }));
+  const server = createHealthServer(() => {
+    void coordinator.revalidateUnsafeThreads();
+    return {
+      appServerReady: ready && !stopped,
+      brokerProcessId: process.pid,
+      ...coordinator.snapshot(),
+      runtimeInvocationId,
+      unsafeThreadCount: coordinator.unsafeThreadCount(),
+      upstreamProcessId: owned.processId,
+    };
+  });
   const webSocketServer = new WebSocketServer({
     maxPayload: maxFrameBytes,
     noServer: true,

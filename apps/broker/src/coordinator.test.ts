@@ -1435,6 +1435,87 @@ describe("BrokerCoordinator subscription barrier", () => {
 
     expect(unsafeAfterDelayedResume).toBe(0);
   });
+
+  it("revalidates stale unsafe lifecycle entries with an authoritative thread read", async () => {
+    const coordinator = new BrokerCoordinator({ unsafeRevalidationMinIntervalMs: 0 });
+    const desktop = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "thread-stale-active",
+          turn: { id: "turn-stale-active" },
+        },
+      }),
+    );
+    expect(coordinator.unsafeThreadCount()).toBe(1);
+
+    const beforeRead = desktop.upstream.sent.length;
+    const revalidation = coordinator.revalidateUnsafeThreads();
+    const read = await nextHiddenRequest(desktop, "thread/read", beforeRead);
+    expect((read.params as { threadId?: unknown } | undefined)?.threadId).toBe(
+      "thread-stale-active",
+    );
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        id: read.id,
+        result: {
+          thread: {
+            id: "thread-stale-active",
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    await revalidation;
+
+    expect(coordinator.unsafeThreadCount()).toBe(0);
+    coordinator.stop();
+  });
+
+  it("does not let unsafe revalidation overwrite a newer active turn", async () => {
+    const coordinator = new BrokerCoordinator({ unsafeRevalidationMinIntervalMs: 0 });
+    const desktop = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "thread-revalidation-race",
+          turn: { id: "turn-before-read" },
+        },
+      }),
+    );
+
+    const beforeRead = desktop.upstream.sent.length;
+    const revalidation = coordinator.revalidateUnsafeThreads();
+    const read = await nextHiddenRequest(desktop, "thread/read", beforeRead);
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "thread-revalidation-race",
+          turn: { id: "turn-after-read" },
+        },
+      }),
+    );
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        id: read.id,
+        result: {
+          thread: {
+            id: "thread-revalidation-race",
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    await revalidation;
+
+    expect(coordinator.unsafeThreadCount()).toBe(1);
+    coordinator.stop();
+  });
 });
 
 describe("BrokerCoordinator client identity and readiness", () => {

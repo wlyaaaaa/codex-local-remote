@@ -546,7 +546,7 @@ function Start-OnDemandDeferredRuntimeHandoff {
                 -Runtime $Runtime `
                 -DesiredModeIntentId $DesiredModeIntentId
         } while (-not $workerClaimed -and
-            $claimWait.Elapsed -lt [TimeSpan]::FromSeconds(5))
+            $claimWait.Elapsed -lt [TimeSpan]::FromSeconds(30))
         if (-not $workerClaimed) {
             throw 'The deferred handoff worker did not claim its singleton mutex.'
         }
@@ -555,6 +555,19 @@ function Start-OnDemandDeferredRuntimeHandoff {
             ProcessId = [int]$worker.Id
             ProcessStartTimeUtcTicks = [long]$workerStartTimeUtcTicks
         }
+    } catch {
+        if ($null -ne $worker) {
+            try {
+                $worker.Refresh()
+                if (-not $worker.HasExited) {
+                    $worker.Kill()
+                    $null = $worker.WaitForExit(5000)
+                }
+            } catch {
+                # Preserve the worker admission failure.
+            }
+        }
+        throw
     } finally {
         if ($null -ne $worker) {
             $worker.Dispose()
