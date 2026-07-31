@@ -1025,6 +1025,13 @@ export function shouldSeedThreadFromLateSummary(
   return currentThreadId === undefined && routeSeedId === undefined && summaryId !== undefined;
 }
 
+export function shouldCommitThreadGoalLoad(
+  goalLoaded: boolean,
+  goalResult: { goal: ThreadGoal | null } | undefined,
+): goalResult is { goal: ThreadGoal | null } {
+  return !goalLoaded && goalResult !== undefined;
+}
+
 export function shouldShowConversationLoading(
   detailProjectionReady: boolean,
   _visibleItemCount: number,
@@ -5146,7 +5153,7 @@ function ConversationPageInstance({
           }
           setApprovalPolicies(approvalPolicyResult);
           setApprovalReviewers(approvalReviewerResult);
-          if (!goalLoadedRef.current) {
+          if (shouldCommitThreadGoalLoad(goalLoadedRef.current, goalResult)) {
             setGoalDraft(goalResult?.goal?.objective ?? "");
             setThreadGoal(goalResult?.goal ?? undefined);
             goalLoadedRef.current = true;

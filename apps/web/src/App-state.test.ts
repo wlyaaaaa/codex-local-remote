@@ -576,6 +576,27 @@ describe("对话行操作", () => {
   });
 });
 
+describe("持续目标首次加载", () => {
+  it("能力尚未就绪或临时读取失败时不锁死后续真实目标回读", () => {
+    expect(helpers.shouldCommitThreadGoalLoad(false, undefined)).toBe(false);
+    expect(helpers.shouldCommitThreadGoalLoad(false, { goal: null })).toBe(true);
+    expect(
+      helpers.shouldCommitThreadGoalLoad(false, {
+        goal: {
+          threadId: "thread-goal",
+          objective: "完成真实目标",
+          status: "active",
+          tokensUsed: 1,
+          timeUsedSeconds: 2,
+          createdAt: "2026-07-31T00:00:00.000Z",
+          updatedAt: "2026-07-31T00:00:01.000Z",
+        },
+      }),
+    ).toBe(true);
+    expect(helpers.shouldCommitThreadGoalLoad(true, { goal: null })).toBe(false);
+  });
+});
+
 describe("文件预览请求状态", () => {
   it("从文本切到图片或二进制时立即原子清空旧派生状态", () => {
     const textKey = helpers.filePreviewRequestKey("project-a", "notes/readme.md");
