@@ -123,6 +123,10 @@ function createService(
       threadId: string,
       sessionPath?: string,
     ) => Promise<ThreadSettingsInput | undefined>;
+    readPersistedThreadHead?: (
+      threadId: string,
+      sessionPath?: string,
+    ) => Promise<{ activeTurnId?: string; sourceBytes: number } | undefined>;
     persistManagedThread?: (
       threadId: string,
       options: { desktopNotificationPending: boolean },
@@ -189,6 +193,9 @@ function createService(
     ...(options.readPersistedRuntimeSettings === undefined
       ? {}
       : { readPersistedRuntimeSettings: options.readPersistedRuntimeSettings }),
+    ...(options.readPersistedThreadHead === undefined
+      ? {}
+      : { readPersistedThreadHead: options.readPersistedThreadHead }),
     ...(options.persistManagedThread === undefined
       ? {}
       : { persistManagedThread: options.persistManagedThread }),
@@ -665,6 +672,7 @@ describe("CodexDomainService", () => {
       objective: "继续完成真实验收",
       tokenBudget: 50_000,
     });
+    await service.setThreadGoal("thread-goal", { status: "paused" });
     await service.clearThreadGoal("thread-goal");
     expect(calls).toContainEqual({
       method: "thread/goal/set",
@@ -672,6 +680,13 @@ describe("CodexDomainService", () => {
         objective: "继续完成真实验收",
         threadId: "thread-goal",
         tokenBudget: 50_000,
+      },
+    });
+    expect(calls).toContainEqual({
+      method: "thread/goal/set",
+      params: {
+        status: "paused",
+        threadId: "thread-goal",
       },
     });
     expect(calls.at(-1)).toEqual({
@@ -3142,6 +3157,71 @@ describe("CodexDomainService", () => {
       state: "running",
     });
     expect(detail.activeTurnId).toBeUndefined();
+  });
+
+  it("recovers control from a bounded persisted head and bypasses paginated history for a huge active goal", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const desktopThread = {
+      ...threadFixture,
+      id: "desktop-huge-goal",
+      path: "C:\\sessions\\rollout-desktop-huge-goal.jsonl",
+      status: { activeFlags: [], type: "active" },
+      turns: [],
+    };
+    const readPersistedConversationItems = vi.fn(async () => [
+      {
+        id: "persisted-recent",
+        kind: "assistant-message" as const,
+        text: "最近的有界历史",
+        turnId: "tail-active-turn",
+      },
+    ]);
+    const readPersistedThreadHead = vi.fn(async () => ({
+      activeTurnId: "tail-active-turn",
+      sourceBytes: 1_985_428_985,
+    }));
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/resume" || method === "thread/read") {
+          return { thread: desktopThread };
+        }
+        if (method === "turn/steer") return { turnId: "tail-active-turn" };
+        if (method === "turn/interrupt") return {};
+        if (method === "thread/items/list" || method === "thread/turns/list") {
+          throw new Error("huge rollout history must stay off the control path");
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: [desktopThread.id],
+        protocolCatalog: { clientMethods: ["thread/items/list", "thread/turns/list"] },
+        readPersistedConversationItems,
+        readPersistedThreadHead,
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await expect(
+      service.getThread(desktopThread.id, { includeTurns: false }),
+    ).resolves.toMatchObject({
+      activeTurnId: "tail-active-turn",
+      availableActions: { interrupt: true, reply: false, steer: true },
+      state: "running",
+    });
+    const detail = await service.getThread(desktopThread.id);
+    expect(detail.items).toContainEqual(
+      expect.objectContaining({ id: "persisted-recent", turnId: "tail-active-turn" }),
+    );
+    await expect(
+      service.steerTurn(desktopThread.id, "tail-active-turn", "继续当前目标"),
+    ).resolves.toMatchObject({ state: "running", turnId: "tail-active-turn" });
+    expect(calls.some((call) => call.method === "thread/items/list")).toBe(false);
+    expect(calls.some((call) => call.method === "thread/turns/list")).toBe(false);
+    expect(readPersistedThreadHead).toHaveBeenCalled();
   });
 
   it.each([undefined, false] as const)(

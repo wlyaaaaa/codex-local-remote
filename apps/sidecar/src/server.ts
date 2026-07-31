@@ -1569,12 +1569,23 @@ function parseThreadSettingsInput(value: unknown): ThreadSettingsInput {
 
 function parseSetThreadGoalInput(value: unknown): SetThreadGoalInput {
   const body = asRecord(value);
+  const objective = Object.hasOwn(body, "objective")
+    ? requireString(body.objective, "请输入目标")
+    : undefined;
+  const status = Object.hasOwn(body, "status") ? body.status : undefined;
+  if (status !== undefined && !isThreadGoalStatus(status)) {
+    throw new ProductHttpError("INVALID_INPUT", "目标状态无效", 400);
+  }
   const tokenBudget = optionalInteger(body.tokenBudget);
   if (Object.hasOwn(body, "tokenBudget") && (tokenBudget === undefined || tokenBudget <= 0)) {
     throw new ProductHttpError("INVALID_INPUT", "目标额度必须是正整数", 400);
   }
+  if (objective === undefined && status === undefined && tokenBudget === undefined) {
+    throw new ProductHttpError("INVALID_INPUT", "目标修改不能为空", 400);
+  }
   return {
-    objective: requireString(body.objective, "请输入目标"),
+    ...(objective === undefined ? {} : { objective }),
+    ...(status === undefined ? {} : { status }),
     ...(tokenBudget === undefined ? {} : { tokenBudget }),
   };
 }
@@ -1816,6 +1827,17 @@ function requireBoolean(value: unknown, message: string): boolean {
 function isReasoningEffort(value: unknown): value is NonNullable<SendTurnInput["reasoningEffort"]> {
   return (
     typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 64
+  );
+}
+
+function isThreadGoalStatus(value: unknown): value is NonNullable<SetThreadGoalInput["status"]> {
+  return (
+    value === "active" ||
+    value === "paused" ||
+    value === "blocked" ||
+    value === "usageLimited" ||
+    value === "budgetLimited" ||
+    value === "complete"
   );
 }
 

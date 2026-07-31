@@ -1668,14 +1668,16 @@ class DemoApiClient implements ApiClient {
 
   async setThreadGoal(threadId: string, input: SetThreadGoalInput) {
     const timestamp = new Date().toISOString();
+    const existing = this.goalsByThread.get(threadId);
+    const tokenBudget = input.tokenBudget ?? existing?.tokenBudget;
     const goal: ThreadGoal = {
       threadId,
-      objective: input.objective,
-      status: "active",
-      ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
-      tokensUsed: 0,
-      timeUsedSeconds: 0,
-      createdAt: this.goalsByThread.get(threadId)?.createdAt ?? timestamp,
+      objective: input.objective ?? existing?.objective ?? "持续完成当前任务",
+      status: input.status ?? existing?.status ?? "active",
+      ...(tokenBudget === undefined ? {} : { tokenBudget }),
+      tokensUsed: existing?.tokensUsed ?? 0,
+      timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
+      createdAt: existing?.createdAt ?? timestamp,
       updatedAt: timestamp,
     };
     this.goalsByThread.set(threadId, goal);

@@ -331,10 +331,18 @@ export interface ThreadSettingsInput {
   collaborationMode?: string | null;
 }
 
+export type ThreadGoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited"
+  | "complete";
+
 export interface ThreadGoal {
   threadId: string;
   objective: string;
-  status: string;
+  status: ThreadGoalStatus;
   tokenBudget?: number;
   tokensUsed: number;
   timeUsedSeconds: number;
@@ -343,7 +351,8 @@ export interface ThreadGoal {
 }
 
 export interface SetThreadGoalInput {
-  objective: string;
+  objective?: string;
+  status?: ThreadGoalStatus;
   tokenBudget?: number;
 }
 

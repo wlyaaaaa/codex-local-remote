@@ -26,6 +26,7 @@ import type {
   SubagentSummary,
   ThreadDetail,
   ThreadGoal,
+  ThreadGoalStatus,
   ThreadSettingsInput,
   ThreadSummary,
   UsageCredits,
@@ -55,6 +56,7 @@ const MAX_THREAD_NAME_LENGTH = 200;
 const ARCHIVE_CLEANUP_RETRY_DELAYS_MS = [0, 25, 100] as const;
 const SHARED_THREAD_RESUME_DELAYS_MS = [0, 25, 100, 250, 500, 1_000] as const;
 const SHARED_INVENTORY_FAST_PATH_MS = 250;
+const MAX_APP_SERVER_HISTORY_SESSION_BYTES = 64 * 1024 * 1024;
 
 export interface AppServerGateway {
   request<T = unknown>(method: string, params?: unknown): Promise<T>;
@@ -136,6 +138,11 @@ interface SubagentSnapshotDiscovery {
 interface ThreadHistoryReadDiagnostic {
   observedCount: number;
   status: "exhausted" | "more-available";
+}
+
+export interface PersistedThreadHead {
+  activeTurnId?: string;
+  sourceBytes: number;
 }
 
 export class DomainError extends Error {
@@ -269,6 +276,10 @@ export interface CodexDomainServiceOptions {
     threadId: string,
     sessionPath?: string,
   ) => Promise<ThreadSettingsInput | undefined>;
+  readPersistedThreadHead?: (
+    threadId: string,
+    sessionPath?: string,
+  ) => Promise<PersistedThreadHead | undefined>;
   persistManagedThread?: (
     threadId: string,
     options: { desktopNotificationPending: boolean },
@@ -372,6 +383,9 @@ export class CodexDomainService {
   readonly #readPersistedRuntimeSettings:
     | ((threadId: string, sessionPath?: string) => Promise<ThreadSettingsInput | undefined>)
     | undefined;
+  readonly #readPersistedThreadHead:
+    | ((threadId: string, sessionPath?: string) => Promise<PersistedThreadHead | undefined>)
+    | undefined;
   readonly #threadsAwaitingInitialTurnCompletion = new Set<string>();
   readonly #turnStartsCompletedBeforeResponse = new Map<string, Set<string>>();
   readonly #turnStartTerminalStatusesBeforeResponse = new Map<
@@ -424,6 +438,7 @@ export class CodexDomainService {
     this.#readPersistedUsageContext = options.readPersistedUsageContext;
     this.#readPersistedConversationItems = options.readPersistedConversationItems;
     this.#readPersistedRuntimeSettings = options.readPersistedRuntimeSettings;
+    this.#readPersistedThreadHead = options.readPersistedThreadHead;
     this.#resolveLocalInputReference = options.resolveLocalInputReference;
     this.#resolveRegisteredProjectRoot = options.resolveRegisteredProjectRoot;
     this.#sharedAppServer = options.sharedAppServer === true;
@@ -1016,11 +1031,31 @@ export class CodexDomainService {
         return this.#withControlState(restored);
       }
     }
-    const response = await this.#readThreadForDisplay(
-      threadId,
-      options.includeTurns !== false,
-      options.historyCursor,
-    );
+    let persistedThreadHead: PersistedThreadHead | undefined;
+    let response: Record<string, unknown>;
+    if (
+      this.#sharedAppServer &&
+      this.#readPersistedThreadHead !== undefined &&
+      options.historyCursor === undefined
+    ) {
+      const shellResponse = await this.#readThreadForDisplay(threadId, false);
+      const shellThread = asRecord(shellResponse.thread);
+      const shellSessionPath = asString(shellThread.path) ?? asString(shellResponse.path);
+      persistedThreadHead = await this.#readPersistedThreadHeadSafely(threadId, shellSessionPath);
+      const bypassAppServerHistory =
+        options.includeTurns !== false &&
+        (persistedThreadHead?.sourceBytes ?? 0) >= MAX_APP_SERVER_HISTORY_SESSION_BYTES;
+      response =
+        options.includeTurns === false || bypassAppServerHistory
+          ? shellResponse
+          : await this.#readThreadForDisplay(threadId, true, undefined, shellResponse);
+    } else {
+      response = await this.#readThreadForDisplay(
+        threadId,
+        options.includeTurns !== false,
+        options.historyCursor,
+      );
+    }
     const thread = asRecord(response.thread);
     if (!asString(thread.id)) {
       throw new DomainError("THREAD_NOT_FOUND", "找不到这个对话", 404);
@@ -1082,7 +1117,7 @@ export class CodexDomainService {
       void this.#notifyManagedThreadAfterInitialTurn(threadId);
     }
     if (this.#sharedAppServer) {
-      detail = await this.#recoverSharedActiveTurn(detail);
+      detail = await this.#recoverSharedActiveTurn(detail, sessionPath, persistedThreadHead);
       this.#markExistingActiveTurnUncontrollable(detail);
     }
     return this.#withControlState(detail);
@@ -1092,8 +1127,10 @@ export class CodexDomainService {
     threadId: string,
     includeTurns: boolean,
     historyCursor?: string,
+    suppliedShell?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     if (!includeTurns) {
+      if (suppliedShell !== undefined) return suppliedShell;
       return asRecord(
         await this.#gateway.request("thread/read", {
           includeTurns: false,
@@ -1108,10 +1145,11 @@ export class CodexDomainService {
     ) {
       try {
         const [shellResult, itemsResult, turnsResult] = await Promise.all([
-          this.#gateway.request("thread/read", {
-            includeTurns: false,
-            threadId,
-          }),
+          suppliedShell ??
+            this.#gateway.request("thread/read", {
+              includeTurns: false,
+              threadId,
+            }),
           this.#gateway.request("thread/items/list", {
             ...(historyCursor === undefined ? {} : { cursor: historyCursor }),
             limit: 160,
@@ -1192,10 +1230,11 @@ export class CodexDomainService {
 
     try {
       const [shellResult, turnsResult] = await Promise.all([
-        this.#gateway.request("thread/read", {
-          includeTurns: false,
-          threadId,
-        }),
+        suppliedShell ??
+          this.#gateway.request("thread/read", {
+            includeTurns: false,
+            threadId,
+          }),
         this.#gateway.request("thread/turns/list", {
           itemsView: "full",
           limit: 12,
@@ -1831,17 +1870,26 @@ export class CodexDomainService {
   async setThreadGoal(threadId: string, input: SetThreadGoalInput): Promise<void> {
     await this.#prepareManagedThread(threadId);
     await this.#requireAuthorizedThreadProjectRoot(threadId);
-    const objective = requireNonEmpty(input.objective, "目标");
+    const objective =
+      input.objective === undefined ? undefined : requireNonEmpty(input.objective, "目标");
+    const status = input.status;
+    if (status !== undefined && !isThreadGoalStatus(status)) {
+      throw new DomainError("INVALID_INPUT", "目标状态无效", 400);
+    }
     if (
       input.tokenBudget !== undefined &&
       (!Number.isSafeInteger(input.tokenBudget) || input.tokenBudget <= 0)
     ) {
       throw new DomainError("INVALID_INPUT", "目标额度必须是正整数", 400);
     }
+    if (objective === undefined && status === undefined && input.tokenBudget === undefined) {
+      throw new DomainError("INVALID_INPUT", "目标修改不能为空", 400);
+    }
     try {
       await this.#gateway.request("thread/goal/set", {
         threadId,
-        objective,
+        ...(objective === undefined ? {} : { objective }),
+        ...(status === undefined ? {} : { status }),
         ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
       });
     } catch {
@@ -3083,7 +3131,10 @@ export class CodexDomainService {
       ...(projectId === undefined ? {} : { projectId }),
     });
     this.#restoredThreadsNeedingRefresh.delete(threadId);
-    detail = await this.#recoverSharedActiveTurn(detail);
+    detail = await this.#recoverSharedActiveTurn(
+      detail,
+      asString(thread.path) ?? asString(response.path),
+    );
     this.#markExistingActiveTurnUncontrollable(detail);
     if (isInitialTurnSafelyTerminal(thread)) {
       void this.#notifyManagedThreadAfterInitialTurn(threadId);
@@ -3091,7 +3142,11 @@ export class CodexDomainService {
     return detail;
   }
 
-  async #recoverSharedActiveTurn(detail: ThreadDetail): Promise<ThreadDetail> {
+  async #recoverSharedActiveTurn(
+    detail: ThreadDetail,
+    sessionPath?: string,
+    suppliedPersistedHead?: PersistedThreadHead,
+  ): Promise<ThreadDetail> {
     if (
       !this.#sharedAppServer ||
       detail.activeTurnId !== undefined ||
@@ -3102,7 +3157,12 @@ export class CodexDomainService {
     }
 
     let turnId = this.#activeTurns.get(detail.id);
-    if (turnId === undefined) {
+    const persistedHead =
+      suppliedPersistedHead ?? (await this.#readPersistedThreadHeadSafely(detail.id, sessionPath));
+    turnId ??= persistedHead?.activeTurnId;
+    const appServerHistoryUnsafe =
+      (persistedHead?.sourceBytes ?? 0) >= MAX_APP_SERVER_HISTORY_SESSION_BYTES;
+    if (turnId === undefined && !appServerHistoryUnsafe) {
       try {
         const response = asRecord(
           await this.#gateway.request("thread/turns/list", {
@@ -3136,6 +3196,26 @@ export class CodexDomainService {
         steer: true,
       },
     };
+  }
+
+  async #readPersistedThreadHeadSafely(
+    threadId: string,
+    sessionPath?: string,
+  ): Promise<PersistedThreadHead | undefined> {
+    if (this.#readPersistedThreadHead === undefined) return undefined;
+    try {
+      const head = await this.#readPersistedThreadHead(threadId, sessionPath);
+      if (head === undefined) return undefined;
+      const sourceBytes = asSafeUnsignedInteger(head.sourceBytes);
+      const activeTurnId = boundedPlainString(head.activeTurnId, 512);
+      if (sourceBytes === undefined) return undefined;
+      return {
+        ...(activeTurnId === undefined ? {} : { activeTurnId }),
+        sourceBytes,
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   #markExistingActiveTurnUncontrollable(detail: ThreadDetail): void {
@@ -4369,7 +4449,7 @@ function projectThreadGoal(value: unknown, expectedThreadId: string): ThreadGoal
   const goal = asRecord(value);
   const threadId = asString(goal.threadId);
   const objective = boundedPlainString(goal.objective, 16_384);
-  const status = boundedPlainString(goal.status, 128);
+  const status = isThreadGoalStatus(goal.status) ? goal.status : undefined;
   const tokensUsed = asSafeUnsignedInteger(goal.tokensUsed);
   const timeUsedSeconds = asSafeUnsignedInteger(goal.timeUsedSeconds);
   const createdAt = protocolTimestamp(goal.createdAt);
@@ -4400,6 +4480,17 @@ function projectThreadGoal(value: unknown, expectedThreadId: string): ThreadGoal
     updatedAt,
     ...(tokenBudget === undefined ? {} : { tokenBudget }),
   };
+}
+
+function isThreadGoalStatus(value: unknown): value is ThreadGoalStatus {
+  return (
+    value === "active" ||
+    value === "paused" ||
+    value === "blocked" ||
+    value === "usageLimited" ||
+    value === "budgetLimited" ||
+    value === "complete"
+  );
 }
 
 function protocolTimestamp(value: unknown): string | undefined {

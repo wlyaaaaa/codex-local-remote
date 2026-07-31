@@ -670,14 +670,16 @@ export class SharedRuntime {
       if (segments[2] === "goal" && method === "PUT") {
         const input = request.postDataJSON() as SetThreadGoalInput;
         const timestamp = now();
+        const existing = this.goal;
+        const tokenBudget = input.tokenBudget ?? existing?.tokenBudget;
         this.goal = {
           threadId: this.thread.id,
-          objective: input.objective,
-          status: "active",
-          ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
-          tokensUsed: 0,
-          timeUsedSeconds: 0,
-          createdAt: this.goal?.createdAt ?? timestamp,
+          objective: input.objective ?? existing?.objective ?? "持续完成当前任务",
+          status: input.status ?? existing?.status ?? "active",
+          ...(tokenBudget === undefined ? {} : { tokenBudget }),
+          tokensUsed: existing?.tokensUsed ?? 0,
+          timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
+          createdAt: existing?.createdAt ?? timestamp,
           updatedAt: timestamp,
         };
         this.goalUpdates.push(structuredClone(input));

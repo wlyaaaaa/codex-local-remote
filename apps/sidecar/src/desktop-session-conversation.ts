@@ -49,6 +49,11 @@ export interface DesktopSessionConversationReadResult {
   items: ConversationItem[];
 }
 
+export interface DesktopSessionControlHead {
+  activeTurnId?: string;
+  sourceBytes: number;
+}
+
 interface ResolvedReaderOptions {
   maxJsonLineBytes: number;
   maxProjectedItems: number;
@@ -201,6 +206,31 @@ export class DesktopSessionConversationReader {
       size: metadata.size,
     });
     return runtimeSettings === undefined ? undefined : structuredClone(runtimeSettings);
+  }
+
+  async readControlHead(
+    input: DesktopSessionConversationInput,
+  ): Promise<DesktopSessionControlHead | undefined> {
+    const location = await resolveSessionLocation(input);
+    if (location === undefined) return undefined;
+    let metadata: BigIntStats;
+    try {
+      metadata = await lstat(location.path, { bigint: true });
+    } catch {
+      return undefined;
+    }
+    const sourceBytes = Number(metadata.size);
+    if (!Number.isSafeInteger(sourceBytes) || sourceBytes < 0) return undefined;
+    let tail = await readStableTailLines(location.path, location.sessionsRoot);
+    if (!tail.stable) {
+      tail = await readStableTailLines(location.path, location.sessionsRoot);
+    }
+    if (!tail.stable) return { sourceBytes };
+    const activeTurnId = projectPersistedActiveTurnId(tail.lines);
+    return {
+      ...(activeTurnId === undefined ? {} : { activeTurnId }),
+      sourceBytes,
+    };
   }
 
   async #readSnapshot(
@@ -921,6 +951,22 @@ function projectPersistedRuntimeSettings(
     if (record.type !== "turn_context") continue;
     const settings = projectTurnContextSettings(asRecord(record.payload));
     if (settings !== undefined) latest = settings;
+  }
+  return latest;
+}
+
+function projectPersistedActiveTurnId(lines: readonly string[]): string | undefined {
+  let latest: string | undefined;
+  for (const line of lines) {
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const record = asRecord(value);
+    const turnId = persistedTurnId(asRecord(record.payload));
+    if (turnId !== undefined) latest = turnId;
   }
   return latest;
 }

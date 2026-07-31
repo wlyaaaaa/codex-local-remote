@@ -231,7 +231,7 @@ describe("composer 组件结构", () => {
     expect(html).not.toContain("压缩上下文");
   });
 
-  it("已有目标只提供运行时真实支持的修改和删除，不伪造暂停能力", () => {
+  it("已有目标提供运行时真实支持的暂停和继续能力", () => {
     const html = renderToStaticMarkup(
       <GoalSheet
         busy={false}
@@ -240,15 +240,32 @@ describe("composer 组件结构", () => {
         onClear={() => undefined}
         onClose={() => undefined}
         onSave={() => undefined}
+        onStatusChange={() => undefined}
         open
+        status="active"
         value="完成候选版本"
       />,
     );
 
     expect(html).toContain("保存修改");
     expect(html).toContain("删除目标");
-    expect(html).not.toContain("暂停目标");
-    expect(html).not.toContain("继续目标");
+    expect(html).toContain("暂停目标");
+
+    const pausedHtml = renderToStaticMarkup(
+      <GoalSheet
+        busy={false}
+        hasGoal
+        onChange={() => undefined}
+        onClear={() => undefined}
+        onClose={() => undefined}
+        onSave={() => undefined}
+        onStatusChange={() => undefined}
+        open
+        status="paused"
+        value="完成候选版本"
+      />,
+    );
+    expect(pausedHtml).toContain("继续目标");
   });
 
   it("当前线程的结构化问题固定显示在对话内", () => {

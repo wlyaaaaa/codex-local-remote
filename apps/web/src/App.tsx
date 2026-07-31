@@ -4792,7 +4792,14 @@ function ConversationPageInstance({
   const [historyMoreState, setHistoryMoreState] = useState<MoreState>("idle");
   const [actionError, setActionError] = useState("");
   const [actionStatus, setActionStatus] = useState<
-    "steer-accepted" | "turn-interrupted" | "turn-queued" | "settings-applied" | "goal-saved" | ""
+    | "steer-accepted"
+    | "turn-interrupted"
+    | "turn-queued"
+    | "settings-applied"
+    | "goal-saved"
+    | "goal-paused"
+    | "goal-resumed"
+    | ""
   >("");
   const [compactionRequestState, setCompactionRequestState] =
     useState<ContextCompactionRequestState>("idle");
@@ -6325,6 +6332,24 @@ function ConversationPageInstance({
     }
   }
 
+  async function setGoalStatus(status: "active" | "paused") {
+    if (!thread || !threadGoal || goalBusy) return;
+    setGoalBusy(true);
+    setActionError("");
+    try {
+      await apiClient.setThreadGoal(thread.id, { status });
+      const result = await apiClient.threadGoal(thread.id);
+      setThreadGoal(result.goal ?? undefined);
+      setGoalDraft(result.goal?.objective ?? goalDraft);
+      setActionStatus(status === "paused" ? "goal-paused" : "goal-resumed");
+      setComposerSheet("");
+    } catch (goalError) {
+      setActionError(errorMessage(goalError));
+    } finally {
+      setGoalBusy(false);
+    }
+  }
+
   async function resumeHistoryThread() {
     if (!thread || thread.mode !== "desktop-snapshot" || !runtimeControlAvailable || resumeBusy) {
       return;
@@ -6539,6 +6564,8 @@ function ConversationPageInstance({
         ? "下一轮设置已同步"
         : "下一轮设置已保存，将在发送时应用",
     "goal-saved": goalDraft.trim() ? "任务目标已保存" : "任务目标已清除",
+    "goal-paused": "任务目标已暂停",
+    "goal-resumed": "任务目标已继续",
   } as const;
   const snapshotPresentation = desktopSnapshotPresentation(
     thread.parentThreadId,
@@ -7326,7 +7353,9 @@ function ConversationPageInstance({
         onClear={() => void clearGoal()}
         onClose={() => setComposerSheet("")}
         onSave={() => void saveGoal()}
+        onStatusChange={(status) => void setGoalStatus(status)}
         open={composerSheet === "goal"}
+        {...(threadGoal?.status === undefined ? {} : { status: threadGoal.status })}
         value={goalDraft}
       />
       <PlanModeSheet

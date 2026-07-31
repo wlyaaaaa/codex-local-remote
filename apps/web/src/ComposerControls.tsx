@@ -7,6 +7,7 @@ import type {
   PermissionProfileOption,
   QueuedTurnItem,
   ReasoningEffort,
+  ThreadGoalStatus,
 } from "@codex-local-remote/contracts";
 import { Button, Icon, Sheet, type IconName } from "@codex-local-remote/ui";
 import {
@@ -546,7 +547,9 @@ export function GoalSheet({
   onClear,
   onClose,
   onSave,
+  onStatusChange,
   open,
+  status,
   value,
 }: {
   busy: boolean;
@@ -555,7 +558,9 @@ export function GoalSheet({
   onClear: () => void;
   onClose: () => void;
   onSave: () => void;
+  onStatusChange: (status: "active" | "paused") => void;
   open: boolean;
+  status?: ThreadGoalStatus;
   value: string;
 }) {
   return (
@@ -566,6 +571,15 @@ export function GoalSheet({
           <Button disabled={busy || !value.trim()} onClick={onSave} variant="primary">
             {hasGoal ? "保存修改" : "保存目标"}
           </Button>
+          {hasGoal && (status === "active" || status === "paused") ? (
+            <Button
+              disabled={busy}
+              onClick={() => onStatusChange(status === "active" ? "paused" : "active")}
+              variant="ghost"
+            >
+              {status === "active" ? "暂停目标" : "继续目标"}
+            </Button>
+          ) : null}
           {hasGoal ? (
             <Button disabled={busy} onClick={onClear} variant="ghost">
               删除目标

@@ -44,6 +44,25 @@ describe("DesktopSessionConversationReader", () => {
     return { codexHome, sessionPath };
   }
 
+  it("recovers the latest active turn from a bounded tail after a multi-megabyte prefix", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const prefix = `${"x".repeat(9 * 1024 * 1024)}\n`;
+    await writeFile(
+      sessionPath,
+      `${prefix}${JSON.stringify({
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "turn_context",
+        payload: { turn_id: "tail-active-turn" },
+      })}\n`,
+      "utf8",
+    );
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.activeTurnId).toBe("tail-active-turn");
+    expect(head?.sourceBytes).toBeGreaterThan(8 * 1024 * 1024);
+  });
+
   it("restores answered plan questions and the formal plan in event order", async () => {
     const { codexHome, sessionPath } = await fixture();
     await writeFile(

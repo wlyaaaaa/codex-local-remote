@@ -1497,6 +1497,17 @@ describe("sidecar REST surface", () => {
       tokenBudget: 50_000,
     });
 
+    const pauseGoal = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/goal",
+      headers: { ...mutationHeaders, "idempotency-key": "goal-pause-dynamic-1" },
+      payload: { status: "paused" },
+    });
+    expect(pauseGoal.statusCode).toBe(204);
+    expect(fixture.domain.setThreadGoal).toHaveBeenCalledWith("thread-new", {
+      status: "paused",
+    });
+
     const clearGoal = await fixture.app.inject({
       method: "DELETE",
       url: "/codex-remote/api/v1/threads/thread-new/goal",

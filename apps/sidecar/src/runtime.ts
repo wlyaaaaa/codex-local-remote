@@ -259,6 +259,16 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
             threadId,
           });
     },
+    readPersistedThreadHead: async (threadId, sessionPath) => {
+      const codexHome = supervisor.snapshot().codexHome;
+      return codexHome === undefined
+        ? undefined
+        : await desktopSessionConversation.readControlHead({
+            codexHome,
+            ...(sessionPath === undefined ? {} : { sessionPath }),
+            threadId,
+          });
+    },
     readPersistedUsageContext: async (threadId, sessionPath) => {
       const codexHome = supervisor.snapshot().codexHome;
       return codexHome === undefined
