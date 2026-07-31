@@ -1516,6 +1516,62 @@ describe("BrokerCoordinator subscription barrier", () => {
     expect(coordinator.unsafeThreadCount()).toBe(1);
     coordinator.stop();
   });
+
+  it("lets one temporary Sidecar resume reconcile stale state in an older Broker", async () => {
+    const coordinator = new BrokerCoordinator();
+    const desktop = attach(coordinator);
+    await initialize(desktop, "desktop");
+    await desktop.pair.receiveUpstream(
+      JSON.stringify({
+        method: "turn/started",
+        params: {
+          threadId: "thread-bootstrap-stale",
+          turn: { id: "turn-bootstrap-stale" },
+        },
+      }),
+    );
+    expect(coordinator.unsafeThreadCount()).toBe(1);
+
+    const reconciler = attach(coordinator);
+    await initializeWithLoadedThreads(reconciler, "sidecar", ["thread-bootstrap-stale"]);
+    const upstreamBeforeResume = reconciler.upstream.sent.length;
+    const reconcileResume = reconciler.pair.receiveDownstream(
+      JSON.stringify({
+        id: "reconcile-resume",
+        method: "thread/resume",
+        params: { threadId: "thread-bootstrap-stale" },
+      }),
+    );
+    const resume = await nextHiddenRequest(reconciler, "thread/resume", upstreamBeforeResume);
+    expect((resume.params as { threadId?: unknown } | undefined)?.threadId).toBe(
+      "thread-bootstrap-stale",
+    );
+    await reconciler.pair.receiveUpstream(
+      JSON.stringify({
+        id: resume.id,
+        result: {
+          thread: {
+            id: "thread-bootstrap-stale",
+            status: { type: "idle" },
+          },
+        },
+      }),
+    );
+    await reconcileResume;
+
+    await vi.waitFor(() => {
+      expect(
+        reconciler.downstream.sent.map(parseRecord).some((message) => {
+          return message.id === "reconcile-resume" && "result" in message;
+        }),
+      ).toBe(true);
+    });
+
+    await vi.waitFor(() => {
+      expect(coordinator.unsafeThreadCount()).toBe(0);
+    });
+    coordinator.stop();
+  });
 });
 
 describe("BrokerCoordinator client identity and readiness", () => {

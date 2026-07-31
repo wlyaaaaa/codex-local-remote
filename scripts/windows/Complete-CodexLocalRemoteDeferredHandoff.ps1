@@ -498,6 +498,86 @@ function Get-DeferredHandoffBrokerSnapshot {
     }
 }
 
+function Invoke-DeferredHandoffBrokerLifecycleReconciliation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 65535)]
+        [int]$Port,
+
+        [ValidateRange(10, 120)]
+        [int]$TimeoutSeconds = 45
+    )
+
+    $brokerCliPath = Join-Path `
+        ([System.IO.Path]::GetFullPath($RuntimeRoot)) `
+        'apps\broker\dist\cli.js'
+    if (-not (Test-Path -LiteralPath $brokerCliPath -PathType Leaf)) {
+        throw 'The selected runtime lacks the lifecycle reconciler.'
+    }
+    try {
+        $nodePath = (Get-Command `
+            node.exe `
+            -CommandType Application `
+            -ErrorAction Stop |
+            Select-Object -First 1).Source
+        $rawOutput = @(
+            & $nodePath `
+                $brokerCliPath `
+                'reconcile' `
+                '--data-dir' `
+                ([System.IO.Path]::GetFullPath($DataDir)) `
+                '--port' `
+                ([string]$Port) `
+                '--timeout-ms' `
+                ([string]($TimeoutSeconds * 1000)) `
+                2>$null
+        )
+        $exitCode = $LASTEXITCODE
+    } catch {
+        throw 'Broker lifecycle reconciliation could not be started.'
+    }
+    if ($exitCode -ne 0) {
+        throw 'Broker lifecycle reconciliation did not complete.'
+    }
+    $lines = @(
+        $rawOutput |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($lines.Count -eq 0) {
+        throw 'Broker lifecycle reconciliation returned no receipt.'
+    }
+    try {
+        $receipt = $lines[-1] |
+            ConvertFrom-Json -Depth 10 -DateKind String -ErrorAction Stop
+    } catch {
+        throw 'Broker lifecycle reconciliation returned an invalid receipt.'
+    }
+    if ([string]$receipt.Signature -cne
+            'codex-local-remote/broker-lifecycle-reconciliation/v1' -or
+        [int]$receipt.Version -ne 1 -or
+        [string]$receipt.Status -cne 'reconciled' -or
+        $receipt.HasMore -isnot [bool] -or
+        [bool]$receipt.HasMore -or
+        -not (Test-NonNegativeInteger -Value $receipt.ObservedThreadCount) -or
+        -not (Test-NonNegativeInteger -Value $receipt.ResumedThreadCount) -or
+        [int64]$receipt.ResumedThreadCount -ne
+            [int64]$receipt.ObservedThreadCount) {
+        throw 'Broker lifecycle reconciliation receipt failed validation.'
+    }
+    return [pscustomobject]@{
+        ObservedThreadCount = [int]$receipt.ObservedThreadCount
+        ResumedThreadCount = [int]$receipt.ResumedThreadCount
+    }
+}
+
 function Get-DeferredHandoffDesktopProcesses {
     [CmdletBinding()]
     param()
@@ -801,6 +881,8 @@ if (-not $DefinitionOnly) {
             $IdleWaitTimeoutMinutes
         )
         $decision = 'wait-broker'
+        $reconciliationAttempts = 0
+        $nextReconciliationAtUtc = [DateTime]::MinValue
         do {
             if ($InvokeInstalledControl -and
                 -not (Test-DeferredHandoffCurrentDesiredModeIntent `
@@ -833,6 +915,26 @@ if (-not $DefinitionOnly) {
                 -DesktopProcessCount $desktopProcessCount `
                 -SidecarConnected $broker.SidecarConnected `
                 -UnsafeThreadCount $broker.UnsafeThreadCount
+            if ($decision -ceq 'wait-turns' -and
+                $InvokeInstalledControl -and
+                $broker.DesktopConnected -and
+                $broker.SidecarConnected -and
+                $reconciliationAttempts -lt 3 -and
+                [DateTime]::UtcNow -ge $nextReconciliationAtUtc) {
+                $reconciliationAttempts += 1
+                $nextReconciliationAtUtc = [DateTime]::UtcNow.AddSeconds(30)
+                try {
+                    $null =
+                        Invoke-DeferredHandoffBrokerLifecycleReconciliation `
+                            -RuntimeRoot $selectedRoot `
+                            -DataDir $resolvedDataDir `
+                            -Port $BrokerPort
+                    $reconciliationAttempts = 3
+                } catch {
+                    # Fail closed: the authoritative idle decision remains with
+                    # Broker readiness, and a bounded later attempt may retry.
+                }
+            }
             if ($decision -notin @('wait-broker', 'wait-turns')) {
                 break
             }

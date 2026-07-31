@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@codex-local-remote/app-server-client": "workspace:*",
     "ws": "8.21.1"
   },
   "devDependencies": {

@@ -335,6 +335,9 @@ windowsOnly("deferred handoff worker identity guards", () => {
     const waitBlock = source.slice(waitStart, waitEnd);
     expect(waitBlock).toContain("Test-DeferredHandoffCurrentDesiredModeIntent");
     expect(waitBlock).toContain("-Status 'cancelled'");
+    expect(waitBlock).toContain("Invoke-DeferredHandoffBrokerLifecycleReconciliation");
+    expect(waitBlock).toContain("$reconciliationAttempts -lt 3");
+    expect(source).toContain("'reconcile'");
     expect(source).toContain("ProcessStartTimeUtcTicks =");
   });
 

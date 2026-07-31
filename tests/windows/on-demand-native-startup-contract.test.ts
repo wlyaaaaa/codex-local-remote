@@ -169,6 +169,11 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(handoff).toContain("WorkerAlreadyActive");
     expect(handoff).toContain("ExpectedDesiredModeIntentId");
 
+    const deferredWorker = windowsScript("Complete-CodexLocalRemoteDeferredHandoff.ps1");
+    expect(deferredWorker).toContain("Invoke-DeferredHandoffBrokerLifecycleReconciliation");
+    expect(deferredWorker).toContain("'reconcile'");
+    expect(deferredWorker).toContain("$reconciliationAttempts -lt 3");
+
     const stateStart = handoff.indexOf("function Get-OnDemandDeferredHandoffWorkerState");
     const stateEnd = handoff.indexOf(
       "function Test-OnDemandDeferredHandoffWorkerMatches",

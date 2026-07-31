@@ -60,6 +60,31 @@ describe("parseBrokerCli", () => {
       ]),
     ).toThrow("absolute");
   });
+
+  it("parses the bounded loopback lifecycle reconciliation command", () => {
+    expect(
+      parseBrokerCli([
+        "reconcile",
+        "--data-dir",
+        "C:\\CodexRemote",
+        "--port",
+        "18791",
+        "--timeout-ms",
+        "30000",
+      ]),
+    ).toEqual({
+      command: "reconcile",
+      dataDir: "C:\\CodexRemote",
+      port: 18791,
+      timeoutMs: 30000,
+    });
+  });
+
+  it("requires an absolute DataDir for lifecycle reconciliation", () => {
+    expect(() =>
+      parseBrokerCli(["reconcile", "--data-dir", "relative", "--port", "18791"]),
+    ).toThrow("absolute");
+  });
 });
 
 describe("readCapabilityTokenFile", () => {
