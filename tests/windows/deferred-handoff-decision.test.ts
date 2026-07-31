@@ -256,6 +256,22 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
     expect(strictAssertion).toBeGreaterThan(disconnectDelay);
     expect(launch).toBeGreaterThan(strictAssertion);
   });
+
+  it("lets the detached installed control own the prepared Desktop stop and attach", () => {
+    const source = readFileSync(scriptPath, "utf8");
+    const immediateBranchStart = source.indexOf(
+      "if ($InvokeInstalledControl -and -not $WaitForNaturalDesktopExit)",
+    );
+    const immediateBranchEnd = source.indexOf("$idleDeadline =", immediateBranchStart);
+    const immediateBranch = source.slice(immediateBranchStart, immediateBranchEnd);
+
+    expect(immediateBranchStart).toBeGreaterThan(-1);
+    expect(immediateBranchEnd).toBeGreaterThan(immediateBranchStart);
+    expect(immediateBranch).toContain("& $controlPath");
+    expect(immediateBranch).toContain("-AllowDesktopRestart");
+    expect(immediateBranch).not.toContain("Stop-DeferredHandoffDesktopImmediately");
+    expect(immediateBranch).not.toContain("-NativeDesktopAlreadyClosedForOpen");
+  });
 });
 
 windowsOnly("deferred immutable runtime natural-exit handoff", () => {

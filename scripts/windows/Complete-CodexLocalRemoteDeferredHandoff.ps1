@@ -929,9 +929,6 @@ if (-not $DefinitionOnly) {
                     Mode = 'authorized-active-restart'
                     WorkerClaimId = $workerClaimId
                 }
-            Stop-DeferredHandoffDesktopImmediately `
-                -TimeoutSeconds $DesktopShutdownTimeoutSeconds
-            Start-Sleep -Seconds $DisconnectDelaySeconds
             $controlPath = Join-Path `
                 $resolvedDataDir `
                 'control\CodexLocalRemote.Control.ps1'
@@ -943,7 +940,6 @@ if (-not $DefinitionOnly) {
                     -Operation Open `
                     -DataDir $resolvedDataDir `
                     -AllowDesktopRestart `
-                    -NativeDesktopAlreadyClosedForOpen `
                     -ExpectedDesiredModeIntentId (
                         $ExpectedDesiredModeIntentId
                     )
