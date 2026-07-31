@@ -12,6 +12,18 @@ const scriptPath = join(
   "windows",
   "Complete-CodexLocalRemoteDeferredHandoff.ps1",
 );
+const onDemandScriptPath = join(
+  repositoryRoot,
+  "scripts",
+  "windows",
+  "Invoke-CodexLocalRemoteOnDemandHandoff.ps1",
+);
+const controlScriptPath = join(
+  repositoryRoot,
+  "scripts",
+  "windows",
+  "CodexLocalRemote.Control.ps1",
+);
 const driverPath = join(import.meta.dirname, "fixtures", "deferred-handoff-decision-driver.ps1");
 const safetyDriverPath = join(
   import.meta.dirname,
@@ -27,6 +39,11 @@ const workerGuardDriverPath = join(
   import.meta.dirname,
   "fixtures",
   "deferred-handoff-worker-guard-driver.ps1",
+);
+const immediateRestartDriverPath = join(
+  import.meta.dirname,
+  "fixtures",
+  "on-demand-immediate-restart-driver.ps1",
 );
 
 function inspectSafety(mode: "cim-error" | "desktop-remains"): {
@@ -166,6 +183,59 @@ function inspectWorkerGuard(
   };
 }
 
+function inspectImmediateRestart(
+  mode:
+    | "barrier-current"
+    | "barrier-cancelled"
+    | "barrier-superseded"
+    | "stop-exact"
+    | "stop-empty-path"
+    | "stop-wrong-path"
+    | "stop-identity-drift",
+): {
+  CloseCalls: number;
+  CompensationCalls: number;
+  DesiredModeReadCalls: number;
+  DrainCalls: number;
+  Error: string;
+  IdentityOpenCalls: number;
+  NativeDesktopWasClosed: boolean;
+  OpenContinuationCalls: number;
+  StopCalls: number;
+  WaitCalls: number;
+  Succeeded: boolean;
+} {
+  const result = spawnSync(
+    "pwsh",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-File",
+      immediateRestartDriverPath,
+      "-ScriptPath",
+      onDemandScriptPath,
+      "-Mode",
+      mode,
+    ],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+  expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+  return JSON.parse(result.stdout) as {
+    CloseCalls: number;
+    CompensationCalls: number;
+    DesiredModeReadCalls: number;
+    DrainCalls: number;
+    Error: string;
+    IdentityOpenCalls: number;
+    NativeDesktopWasClosed: boolean;
+    OpenContinuationCalls: number;
+    StopCalls: number;
+    WaitCalls: number;
+    Succeeded: boolean;
+  };
+}
+
 windowsOnly("deferred immutable runtime handoff decision", () => {
   it("waits while any broker-observed thread is unsafe", () => {
     expect(
@@ -257,8 +327,10 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
     expect(launch).toBeGreaterThan(strictAssertion);
   });
 
-  it("lets the detached installed control own the prepared Desktop stop and attach", () => {
+  it("delegates the immediate restart barrier to the locked installed control", () => {
     const source = readFileSync(scriptPath, "utf8");
+    const onDemand = readFileSync(onDemandScriptPath, "utf8");
+    const control = readFileSync(controlScriptPath, "utf8");
     const immediateBranchStart = source.indexOf(
       "if ($InvokeInstalledControl -and -not $WaitForNaturalDesktopExit)",
     );
@@ -269,8 +341,76 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
     expect(immediateBranchEnd).toBeGreaterThan(immediateBranchStart);
     expect(immediateBranch).toContain("& $controlPath");
     expect(immediateBranch).toContain("-AllowDesktopRestart");
+    expect(immediateBranch).toContain("-ImmediateAuthorizedDesktopRestartForOpen");
     expect(immediateBranch).not.toContain("Stop-DeferredHandoffDesktopImmediately");
-    expect(immediateBranch).not.toContain("-NativeDesktopAlreadyClosedForOpen");
+    expect(immediateBranch).not.toContain("Start-Sleep -Seconds $DisconnectDelaySeconds");
+    expect(control).toContain("ImmediateAuthorizedDesktopRestartForOpen");
+    expect(onDemand).toContain("Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier");
+
+    const mutexAcquire = onDemand.indexOf("$controlMutex.WaitOne");
+    const restartBarrier = onDemand.lastIndexOf(
+      "Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier",
+    );
+    const mutexRelease = onDemand.lastIndexOf("$controlMutex.ReleaseMutex");
+    expect(mutexAcquire).toBeGreaterThan(-1);
+    expect(restartBarrier).toBeGreaterThan(mutexAcquire);
+    expect(mutexRelease).toBeGreaterThan(restartBarrier);
+  });
+
+  it("serializes intent, exact Desktop stop, task drain, and installed Open", () => {
+    expect(inspectImmediateRestart("barrier-cancelled")).toMatchObject({
+      CompensationCalls: 0,
+      DesiredModeReadCalls: 1,
+      DrainCalls: 0,
+      NativeDesktopWasClosed: false,
+      OpenContinuationCalls: 0,
+      StopCalls: 0,
+      WaitCalls: 0,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("barrier-current")).toMatchObject({
+      CompensationCalls: 0,
+      DesiredModeReadCalls: 2,
+      DrainCalls: 1,
+      NativeDesktopWasClosed: true,
+      OpenContinuationCalls: 1,
+      StopCalls: 1,
+      WaitCalls: 1,
+      Succeeded: true,
+    });
+    expect(inspectImmediateRestart("barrier-superseded")).toMatchObject({
+      CompensationCalls: 1,
+      DesiredModeReadCalls: 2,
+      DrainCalls: 1,
+      NativeDesktopWasClosed: true,
+      OpenContinuationCalls: 0,
+      StopCalls: 1,
+      WaitCalls: 1,
+      Succeeded: false,
+    });
+  });
+
+  it("stops only one exact package Desktop identity and fails closed on ambiguity or PID drift", () => {
+    expect(inspectImmediateRestart("stop-exact")).toMatchObject({
+      CloseCalls: 1,
+      IdentityOpenCalls: 1,
+      Succeeded: true,
+    });
+    expect(inspectImmediateRestart("stop-empty-path")).toMatchObject({
+      CloseCalls: 0,
+      IdentityOpenCalls: 0,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("stop-wrong-path")).toMatchObject({
+      CloseCalls: 0,
+      IdentityOpenCalls: 0,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("stop-identity-drift")).toMatchObject({
+      CloseCalls: 0,
+      IdentityOpenCalls: 1,
+      Succeeded: false,
+    });
   });
 });
 

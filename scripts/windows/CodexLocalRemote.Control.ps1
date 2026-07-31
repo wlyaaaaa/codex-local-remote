@@ -14,7 +14,7 @@ param(
     [string]$ExpectedDesiredModeIntentId,
 
     [Parameter(DontShow)]
-    [switch]$NativeDesktopAlreadyClosedForOpen,
+    [switch]$ImmediateAuthorizedDesktopRestartForOpen,
 
     [switch]$InteractiveShortcutFeedback
 )
@@ -33,11 +33,13 @@ if (-not [string]::IsNullOrWhiteSpace(
         'Open operation.'
     )
 }
-if ($NativeDesktopAlreadyClosedForOpen -and
-    ($Operation -cne 'Open' -or -not $AllowDesktopRestart)) {
+if ($ImmediateAuthorizedDesktopRestartForOpen -and
+    ($Operation -cne 'Open' -or
+        -not $AllowDesktopRestart -or
+        [string]::IsNullOrWhiteSpace($ExpectedDesiredModeIntentId))) {
     throw (
-        'NativeDesktopAlreadyClosedForOpen is valid only for one ' +
-        'authorized Open operation.'
+        'ImmediateAuthorizedDesktopRestartForOpen is valid only for one ' +
+        'authorized deferred Open operation with an exact desired-mode intent.'
     )
 }
 
@@ -375,8 +377,10 @@ try {
         $deferredIntentArguments['ExpectedDesiredModeIntentId'] =
             $ExpectedDesiredModeIntentId
     }
-    if ($NativeDesktopAlreadyClosedForOpen) {
-        $deferredIntentArguments['NativeDesktopAlreadyClosedForOpen'] = $true
+    if ($ImmediateAuthorizedDesktopRestartForOpen) {
+        $deferredIntentArguments[
+            'ImmediateAuthorizedDesktopRestartForOpen'
+        ] = $true
     }
     $operationResult = @(
     switch ($Operation) {

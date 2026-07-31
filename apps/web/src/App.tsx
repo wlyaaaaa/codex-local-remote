@@ -238,7 +238,10 @@ import {
 } from "./conversation-window";
 import { reduceRuntimeNotice, type RuntimeNotice } from "./runtime-notice";
 import { dismissNotice, noticeDismissalKey, readNoticeDismissal } from "./notice-dismissal";
-import { workspaceLoadFailurePolicy } from "./workspace-recovery";
+import {
+  retainLastKnownDiagnosticSnapshot,
+  workspaceLoadFailurePolicy,
+} from "./workspace-recovery";
 import { copyPlainText } from "./clipboard";
 import {
   rejectedApprovalReviewerId,
@@ -9933,15 +9936,15 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
             setArchivedState("ready");
           }
           threadsRef.current = threads;
-          setData({
+          setData((current) => ({
             projects,
             models,
             collaborationModes,
             threads,
             usage,
-            diagnostics,
+            diagnostics: retainLastKnownDiagnosticSnapshot(diagnostics, current.diagnostics),
             approvals: approvalReconciliation.approvals,
-          });
+          }));
           workspaceReadyRef.current = true;
           setState("ready");
           setError("");

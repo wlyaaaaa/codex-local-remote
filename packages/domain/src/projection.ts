@@ -42,6 +42,14 @@ export interface RemoteEventDraft {
   turnId?: string;
 }
 
+const CODEX_INTERNAL_CONTEXT_ENVELOPE =
+  /^<codex_internal_context(?:\s+[^<>]*?)?>[\s\S]*<\/codex_internal_context>$/u;
+
+export function isCodexInternalContextEnvelope(text: string): boolean {
+  const candidate = text.trim();
+  return candidate.length > 0 && CODEX_INTERNAL_CONTEXT_ENVELOPE.test(candidate);
+}
+
 export function projectThreadSummary(
   rawThread: unknown,
   options: ThreadProjectionOptions,
@@ -166,6 +174,7 @@ export function projectThreadItem(
         .map((item) => asNonEmptyString(item.text))
         .filter((item): item is string => item !== undefined)
         .join("\n");
+      const visibleText = isCodexInternalContextEnvelope(text) ? "" : text;
       const attachments = content.flatMap((item) => {
         if (item.type !== "localImage" && item.type !== "mention") {
           return [];
@@ -183,13 +192,13 @@ export function projectThreadItem(
           },
         ];
       });
-      return text.length === 0 && attachments.length === 0
+      return visibleText.length === 0 && attachments.length === 0
         ? []
         : [
             {
               id,
               kind: "user-message",
-              text,
+              text: visibleText,
               ...(attachments.length === 0 ? {} : { attachments }),
               ...timestamp,
             },

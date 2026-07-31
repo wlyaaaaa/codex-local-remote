@@ -12,6 +12,7 @@ $script:BrokerCapabilityTokenName = 'broker-capability.token'
 $script:DataDirectoryOwnerSignature = 'codex-local-remote/data-directory-owner/v1'
 $script:DataDirectoryOwnerMarkerName = '.codex-local-remote-data-owner.json'
 $script:DataDirectoryOwnerMarkerMaxBytes = 4096
+$script:DataDirectoryProtectionCache = @{}
 $script:CodexDesktopPackageName = 'OpenAI.Codex'
 $script:CodexDesktopPublisherId = '2p2nqsd0c76g0'
 $script:LegacyDataDirectoryFiles = @(
@@ -1756,6 +1757,59 @@ function Repair-CodexLocalRemoteDataDirectoryAcl {
     }
 }
 
+function Set-CodexLocalRemoteDataDirectoryProtectionCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$InstanceId
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $script:DataDirectoryProtectionCache[
+        $resolvedDataDir.ToUpperInvariant()
+    ] = [pscustomobject]@{
+        InstanceId = $InstanceId
+    }
+}
+
+function Test-CodexLocalRemoteDataDirectoryProtectionCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedInstanceId
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $cacheKey = $resolvedDataDir.ToUpperInvariant()
+    if (-not $script:DataDirectoryProtectionCache.ContainsKey($cacheKey)) {
+        return $false
+    }
+    $cached = $script:DataDirectoryProtectionCache[$cacheKey]
+    if ([string]$cached.InstanceId -cne $ExpectedInstanceId) {
+        $script:DataDirectoryProtectionCache.Remove($cacheKey)
+        return $false
+    }
+    try {
+        $bounded =
+            Assert-CodexLocalRemoteDataDirectoryStartupProtection `
+                -DataDir $resolvedDataDir
+        if ([string]$bounded.InstanceId -cne $ExpectedInstanceId) {
+            $script:DataDirectoryProtectionCache.Remove($cacheKey)
+            return $false
+        }
+    } catch {
+        $script:DataDirectoryProtectionCache.Remove($cacheKey)
+        return $false
+    }
+    return $true
+}
+
 function Protect-CodexLocalRemoteDataDirectory {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
@@ -1765,12 +1819,26 @@ function Protect-CodexLocalRemoteDataDirectory {
 
     $plan = Get-CodexLocalRemoteDataDirectoryOwnershipPlan -DataDir $DataDir
     $resolvedDataDir = $plan.DataDir
-    $aclContext = Get-CodexLocalRemoteDataAclContext
+    $aclContext = $null
     if ($plan.Action -ceq 'owned') {
+        if (Test-CodexLocalRemoteDataDirectoryProtectionCache `
+            -DataDir $resolvedDataDir `
+            -ExpectedInstanceId ([string]$plan.InstanceId)) {
+            return [pscustomobject]@{
+                Status = 'already-protected'
+                DataDir = $resolvedDataDir
+                MarkerPath = $plan.MarkerPath
+                InstanceId = $plan.InstanceId
+            }
+        }
+        $aclContext = Get-CodexLocalRemoteDataAclContext
         try {
             if (Test-CodexLocalRemoteDataAclTree `
                 -DataDir $resolvedDataDir `
                 -AclContext $aclContext) {
+                Set-CodexLocalRemoteDataDirectoryProtectionCache `
+                    -DataDir $resolvedDataDir `
+                    -InstanceId ([string]$plan.InstanceId)
                 return [pscustomobject]@{
                     Status = 'already-protected'
                     DataDir = $resolvedDataDir
@@ -1800,6 +1868,10 @@ function Protect-CodexLocalRemoteDataDirectory {
             DataDir = $resolvedDataDir
             MarkerPath = $plan.MarkerPath
         }
+    }
+
+    if ($null -eq $aclContext) {
+        $aclContext = Get-CodexLocalRemoteDataAclContext
     }
 
     if (-not $PSCmdlet.ShouldProcess(
@@ -1851,6 +1923,9 @@ function Protect-CodexLocalRemoteDataDirectory {
         Repair-CodexLocalRemoteDataDirectoryAcl `
             -DataDir $resolvedDataDir `
             -AclContext $aclContext
+        Set-CodexLocalRemoteDataDirectoryProtectionCache `
+            -DataDir $resolvedDataDir `
+            -InstanceId ([string]$marker.InstanceId)
     } catch {
         throw "Failed to protect managed data directory '$resolvedDataDir'; refusing to write token, environment, or runtime state. $($_.Exception.Message)"
     }

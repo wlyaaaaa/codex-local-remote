@@ -2,7 +2,7 @@
 
 > 这是本项目唯一的活跃缺陷与验收清单。聊天中的新发现必须先并入这里，再实现、验证和关闭。
 >
-> 最后更新：2026-07-30（UTC+8）
+> 最后更新：2026-08-01（UTC+8）
 
 ## 2026-07-30 最近 50 条用户反馈收敛（当前最高优先级）
 
@@ -38,6 +38,13 @@
   owner 时，才允许外部控制器受控重开 Desktop 至多一次。dispatcher 与
   `Open` 状态转换/补偿测试已通过；固定全局 skill 尚待随 clean commit 安装，
   真实幂等与采用仍待现场。
+- [~] **受权立即重启不再分裂成两个锁窗口**：detached worker 只把 exact
+  pointer/manifest/desired-mode intent 交给 stable dispatcher；dispatcher 在同一
+  DataDir control mutex 内完成 intent 前置回读、精确 package path + PID/creation
+  identity 停止、task `Ready` drain、intent 后置回读和 installed `Open`。取消意图
+  为零 stop，post-stop supersession 进入原生补偿；空路径、同名外部进程及 PID
+  creation drift 均失败关闭。24/24 定向行为测试和完整仓库测试通过；用户明确把
+  新路径的真实重启耗时/现场采用留到后续验收，本轮不触碰当前 Desktop。
 - [~] **“关闭远程”不破坏当前任务**：立即关闭公网入口并清除远程意图，不重启
   Desktop。已经通过 Broker 工作的当前 Desktop 可安全运行到自然退出；下一次
   普通启动回到原生。若将来要求立刻把当前进程也改成原生，必须另获明确的
@@ -92,6 +99,14 @@
 - [~] Desktop/Web 停止后必须最终从停止按钮收敛回可发送状态。候选已有控制不可用
   时隐藏停止入口、精确不可重试 error 投影失败终态等定向修复，仍需同 owner
   真实时序验收。
+- [~] 公网 SSE 仍在线时，单次可选 diagnostics 轮询失败不得把输入器误置灰；
+  现在仅在 30 秒内保留最后一次已验证 app-server capability，过期/畸形快照仍
+  fail closed，usage 读取失败仍显示不可读而不保留旧值。79/79 Web 状态回归与
+  当前公网无发送草稿验收通过；新源码尚未以 Desktop 重启方式采用。
+- [~] 公网验收发现保留的 `<codex_internal_context source="goal">` 信封可能被当作
+  用户消息显示。候选现已在 app-server 实时投影和 Desktop 持久历史两条链路仅
+  隐藏“整条消息就是保留信封”的记录，不影响用户引用该标签，也不会吞掉真实附件；
+  60/60 定向回归通过。当前运行链尚未热采用此修复，因此现场状态仍保持待验。
 - [~] “Desktop 看似持续思考、手机未见消息”继续作为疑似高优先级问题，不凭一次
   观察宣称稳定复现、P0 或已修复；必须对比活动 turn、持久历史、SSE 序列和
   两端终态后定级。
@@ -124,14 +139,11 @@ blocked`，再继续后台工作。
       background-only repair、失败补偿、并发调用、Codex package 更新、Windows
       重启与睡眠恢复后的默认原生行为。
 - [~] 当前工作树完成定向验证、独立逆向审查、格式/类型/构建及公开内容扫描；
-  最终候选只执行一轮完整 `pnpm check`；若它暴露真实失败，只允许根因修复后的
-  一次闭环复验，不得盲目反复全测。2026-07-30 最终源码树的闭环
-  `pnpm check` 已新鲜通过：99/99 测试文件、1509/1509 项测试、production
-  build 及 335 文件公开安全扫描全部 PASS。首次全量在 1508/1509 通过后只
-  暴露一项既有 Windows shell-link 升级测试的并发超时；该项定向复现稳定在
-  约 5.5–6.5 秒，故只把测试自身预算从 15 秒调整为 30 秒，未改变产品代码或
-  生产 attach/readiness 时限，随后一次完整闭环复验全部通过。文档收口后的
-  独立 `check:public` 也对同一 335 文件最终树 PASS，最终独立终审仍待完成。
+  2026-08-01 新鲜闭环 `pnpm check` 已通过：106/106 测试文件、1565/1565 项
+  测试、production build 及 351 文件公开安全扫描全部 PASS。此前两次闭环分别
+  在格式检查和一个过窄的 TypeScript 测试夹具推断处提前停止；只修正测试格式/
+  类型后，一次完整闭环通过。新增内部上下文过滤后的完整闭环和 embedded
+  `check:public` 已再次通过；最终独立终审仍待 final commit 复核。
 - [ ] 从 clean commit 以 `-NoStart` 安装不可变 v0.1.2，确认安装动作没有启停
       Desktop/Broker/Sidecar，固定 dispatcher 与当前 manifest/receipt 一致。
 - [~] 两次针对修复前候选的真实 `-NoStart` 登记均被 Windows 计划任务架构拒绝；

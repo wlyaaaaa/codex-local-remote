@@ -301,6 +301,50 @@ describe("DesktopSessionConversationReader", () => {
     expect(items.map((item) => item.id)).not.toContain("host-injected-user-2");
   });
 
+  it("does not let an internal goal envelope replace or create a persisted user message", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const internalContext = [
+      '<codex_internal_context source="goal">',
+      "The following goal is active.",
+      "</codex_internal_context>",
+    ].join("\n");
+    const message = (id: string, role: "user" | "assistant", text: string, turnId: string) =>
+      JSON.stringify({
+        timestamp: "2026-07-28T03:25:00.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          id,
+          role,
+          content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        },
+      });
+    await writeFile(
+      sessionPath,
+      [
+        message("actual-user", "user", "继续完成验收", "turn-visible"),
+        message("internal-after-user", "user", internalContext, "turn-visible"),
+        message("assistant-visible", "assistant", "继续验收。", "turn-visible"),
+        message("internal-only", "user", internalContext, "turn-internal-only"),
+        message("assistant-after-internal", "assistant", "后台继续。", "turn-internal-only"),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const reader = new DesktopSessionConversationReader();
+    const items = await reader.read({ codexHome, sessionPath, threadId: THREAD_ID });
+
+    expect(items).toMatchObject([
+      { id: "actual-user", kind: "user-message", text: "继续完成验收" },
+      { id: "assistant-visible", kind: "assistant-message", text: "继续验收。" },
+      { id: "assistant-after-internal", kind: "assistant-message", text: "后台继续。" },
+    ]);
+    expect(items.map((item) => item.id)).not.toContain("internal-after-user");
+    expect(items.map((item) => item.id)).not.toContain("internal-only");
+  });
+
   it("streams the complete session instead of dropping messages before the old 8 MiB tail", async () => {
     const { codexHome, sessionPath } = await fixture();
     const message = (id: string, role: "user" | "assistant", text: string) =>

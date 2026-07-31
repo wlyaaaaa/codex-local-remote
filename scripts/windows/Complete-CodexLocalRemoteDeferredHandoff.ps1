@@ -940,6 +940,7 @@ if (-not $DefinitionOnly) {
                     -Operation Open `
                     -DataDir $resolvedDataDir `
                     -AllowDesktopRestart `
+                    -ImmediateAuthorizedDesktopRestartForOpen `
                     -ExpectedDesiredModeIntentId (
                         $ExpectedDesiredModeIntentId
                     )

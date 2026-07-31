@@ -111,6 +111,54 @@ describe("thread projection", () => {
     ]);
   });
 
+  it("hides standalone Codex internal-context envelopes without hiding user discussion", () => {
+    const internalContext = [
+      '<codex_internal_context source="goal">',
+      "The following goal is active.",
+      "</codex_internal_context>",
+    ].join("\n");
+
+    expect(
+      projectThreadItem({
+        id: "internal-goal-context",
+        type: "userMessage",
+        content: [{ type: "text", text: `  ${internalContext}\n` }],
+      }),
+    ).toEqual([]);
+
+    expect(
+      projectThreadItem({
+        id: "user-discusses-internal-context",
+        type: "userMessage",
+        content: [{ type: "text", text: `请解释这个标签：${internalContext}` }],
+      }),
+    ).toMatchObject([
+      {
+        id: "user-discusses-internal-context",
+        kind: "user-message",
+        text: `请解释这个标签：${internalContext}`,
+      },
+    ]);
+
+    expect(
+      projectThreadItem({
+        id: "internal-context-with-attachment",
+        type: "userMessage",
+        content: [
+          { type: "text", text: internalContext },
+          { type: "mention", path: "C:\\uploads\\proof.txt" },
+        ],
+      }),
+    ).toEqual([
+      {
+        attachments: [{ kind: "file", name: "proof.txt", path: "C:\\uploads\\proof.txt" }],
+        id: "internal-context-with-attachment",
+        kind: "user-message",
+        text: "",
+      },
+    ]);
+  });
+
   it("keeps formal plans distinct from transient reasoning", () => {
     expect(
       projectThreadItem({

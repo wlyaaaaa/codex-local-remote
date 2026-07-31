@@ -7,6 +7,7 @@ import type {
   ConversationItem,
   ThreadSettingsInput,
 } from "@codex-local-remote/contracts";
+import { isCodexInternalContextEnvelope } from "@codex-local-remote/domain";
 
 const DEFAULT_READ_CHUNK_BYTES = 256 * 1024;
 const DEFAULT_MAX_JSON_LINE_BYTES = 32 * 1024 * 1024;
@@ -441,13 +442,15 @@ class PersistedConversationProjection {
   #acceptUserMessage(payload: Record<string, unknown>, createdAt: string | undefined): void {
     const id = asString(payload.id);
     if (id === undefined) return;
+    const text = messageText(payload.content, "input_text");
+    if (isCodexInternalContextEnvelope(text)) return;
     const metadata = asRecord(payload.internal_chat_message_metadata_passthrough);
     const turnId = asString(metadata.turn_id);
     const next: PendingUserMessage = {
       attachments: [],
       ...(createdAt === undefined ? {} : { createdAt }),
       id,
-      text: messageText(payload.content, "input_text"),
+      text,
       ...(turnId === undefined ? {} : { turnId }),
     };
     if (
@@ -499,7 +502,13 @@ class PersistedConversationProjection {
     const pending = this.#pendingUser;
     if (pending === undefined) return;
     const eventText = asString(payload.message);
-    if (pending.text.length === 0 && eventText !== undefined) pending.text = eventText;
+    if (
+      pending.text.length === 0 &&
+      eventText !== undefined &&
+      !isCodexInternalContextEnvelope(eventText)
+    ) {
+      pending.text = eventText;
+    }
 
     const candidates: Array<{ kind: ConversationAttachment["kind"]; value: unknown }> = [
       ...asStringArray(payload.local_images).map((value) => ({ kind: "image" as const, value })),

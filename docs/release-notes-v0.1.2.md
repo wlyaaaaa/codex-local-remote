@@ -15,9 +15,9 @@ remain unchanged.
 
 > Publication integrity: this source is eligible for `v0.1.2` only after it is
 > sealed as an immutable runtime and that exact runtime passes live adoption.
-> The current source tree passes formatting, lint, type checking, all 1509
-> tests across 99 files, the production build and a public-safety scan of 335
-> files. It is not yet live-adoption evidence. Neither source evidence nor
+> The current source tree passes formatting, lint, type checking, all 1565
+> tests across 106 files, the production build and a public-safety scan of 351
+> files. It is not by itself live-adoption evidence. Neither source evidence nor
 > focused suites replaces real `remote-connected`, public readiness,
 > same-thread/same-turn four-surface or sleep/resume validation.
 
@@ -38,13 +38,16 @@ remain unchanged.
   explicitly authorized, bounded Desktop handoff occur.
 - When one verified previous generation is still serving active turns, an
   authorized `Open` queues exactly one hidden worker and returns
-  `restart-deferred` without taking the product offline. The worker waits for a
-  Broker-confirmed idle state, then re-enters the stable dispatcher with the
-  exact selected runtime and desired-mode intent; a `Close` or superseding
-  intent cancels the stale handoff before any restart. Existing workers are
-  reused only when their live PID/start-time claim, intent, runtime version and
-  path all match; a later `Open` therefore cannot be swallowed by a revoked
-  waiter.
+  `restart-deferred` so the controller survives Desktop exit. The worker only
+  re-enters the stable dispatcher with the exact selected pointer, manifest and
+  desired-mode intent. Inside one DataDir control-mutex critical section, that
+  dispatcher rechecks the intent, closes only one exact package Desktop root
+  through its PID plus creation identity, waits for the exact startup task to
+  become `Ready`, rechecks the intent and continues the installed `Open`.
+  `Close` cannot interleave between shutdown and adoption, and a cancelled
+  intent causes zero Desktop stops. Existing workers are reused only when their
+  live PID/start-time claim, intent, runtime version and path all match; a later
+  `Open` therefore cannot be swallowed by a revoked waiter.
 - Makes `Close` clear public Remote intent and stop the exact Sidecar without
   reopening Desktop. An already attached Desktop may keep its exact Broker and
   app-server owner until natural exit; the next ordinary launch is native.
@@ -236,6 +239,10 @@ and Broker/app-server loss fails closed.
   questions and child-agent lifecycle records remain in their original order.
   Encrypted reasoning, secret answers, collaboration polling and unknown tool
   parameters remain suppressed.
+- Suppresses a standalone `<codex_internal_context>...</codex_internal_context>`
+  host envelope in both app-server projections and persisted Desktop history,
+  while preserving ordinary user text that quotes or discusses that reserved
+  tag and preserving any real attachment carried beside it.
 - Verifies one stable file snapshot, retries exactly once when either a recent
   or complete JSONL read grows, and fails closed if the writer continues
   changing it.
@@ -271,6 +278,11 @@ and Broker/app-server loss fails closed.
 - Adds a three-second SSE offline grace so a short native or fetch-stream
   reconnect does not flash an offline banner or gray the composer. A sustained
   disconnect still fails closed for every remote mutation.
+- Keeps the last verified app-server capability for at most 30 seconds when one
+  optional diagnostics refresh fails, so a healthy SSE connection does not
+  gray the composer because of a single polling error. Expired or malformed
+  diagnostics still fail closed, and account usage is never retained through a
+  failed refresh.
 - Keeps an exact live Broker lease usable when only the package/startup receipt
   is temporarily stale or unverifiable; missing/invalid receipts and any real
   Broker, Desktop, Sidecar or core capability failure still fail closed.
@@ -332,6 +344,13 @@ administrator token: the scheduled-task coordinator creates it from the same
 user's medium-integrity Explorer primary token in the same interactive session.
 The task remains `Interactive` / `Highest` while it owns an explicit Remote
 lease; neither component runs as `LocalSystem`.
+
+Registration still performs one complete owner-marker, ACL and descendant
+reparse-boundary verification before trusting a DataDir. Later protection calls
+in that same short-lived registration process may reuse the result only while
+the exact owner marker, root ACL and immediate reparse boundary still pass. This
+removes repeated full-tree ACL verification and per-item ACL reads without
+weakening the first verification or a later process's checks.
 
 ## Compatibility and prerequisites
 
@@ -437,27 +456,36 @@ covers the one-time snapshot-cursor subscription handoff, overlap de-duplication
 and the stale-route callback race, so a late detail response from task A cannot
 replace task B's already-bound cursor.
 
-The final current-tree `pnpm check` passed formatting, lint, type checking,
-99/99 test files with 1509/1509 tests, the production build and the embedded
-public-safety scan of 335 files. The first full run after the on-demand
-generation fix had 1508/1509 tests pass; one existing Windows shell-link
-upgrade case exceeded the shared 15-second test budget only under full
-parallel load. The isolated case completed repeatedly in about 5.5–6.5
-seconds. Its per-case budget is now 30 seconds to cover Windows COM contention,
-without changing product code or the production 15-second attach and
-120-second runtime-readiness bounds. The immediate full closure run then
-passed all 1509 tests. A standalone public-safety scan remains a release-commit
-gate after document closeout.
+The 2026-08-01 current-tree `pnpm check` passed formatting, lint, type checking,
+106/106 test files with 1565/1565 tests, the production build and the embedded
+public-safety scan of 351 files. Earlier closure attempts stopped before product
+tests on two formatting findings and one over-narrow TypeScript test-fixture
+inference; after those test-only corrections, one complete closure run passed.
+A standalone public-safety scan remains a release-commit gate after document
+closeout.
 
-The final delta review also closed two release-blocking edge cases. Failed
+The final delta review also closed release-blocking edge cases. Failed
 `Open` compensation can stop a just-started task only when exact-generation
 readiness proves it idle; otherwise it preserves the running generation,
 Remote intent and a structured recovery intent. Thread rename, archive and
 restore readback now traverses both current and archived lists with a bounded
 cursor walk, requires proof of absence from the other list, and preserves
-already-loaded list tails. Focused verification passed 84/84 tests plus
-PowerShell AST and Web type checking; the independent source re-review found
-no remaining P0/P1.
+already-loaded list tails. The immediate restart barrier now keeps desired-mode
+validation, exact package/creation-identity shutdown, task drain and installed
+Open under one control mutex; focused verification covers pre-stop cancellation,
+post-stop supersession, empty or foreign executable paths and PID/creation
+drift. The Web diagnostics grace is covered through the real composer control
+decision rather than only a generic snapshot helper. PowerShell AST, focused
+tests and the complete suite pass. The public acceptance discovery that exposed
+a Codex internal-context envelope as a user message is now covered by both live
+projection and persisted-history regressions; final independent source re-review
+remains required after this delta.
+
+The owner explicitly deferred a new real cold-restart timing run for this final
+restart-path delta to later field acceptance. This closeout did not stop or
+restart the running Desktop. The existing live public lease supplied functional
+Web evidence, but it must not be cited as live proof of the new locked restart
+barrier or its timing.
 
 Two real `-NoStart` attempts against the pre-fix candidate were rejected by
 Windows Task Scheduler without adopting a partial generation. Both attempts
@@ -501,10 +529,12 @@ immutable candidate:
    an isolated temporary directory.
 
 Repository automation cannot replace these live receipts. The user-designated
-independent final audit must report PASS after the live checks. Only then may a
-clean tree be normal-pushed to `main` and the `v0.1.2` tag and GitHub Release be
-created. The release tag, GitHub Release and `main` must all resolve to the same
-commit.
+independent final audit must report PASS or an explicit evidence BLOCK against
+the final commit. For this candidate, the owner explicitly permits the new cold
+restart timing/barrier field run to remain deferred and will validate it later;
+no release record may represent that deferred item as passed. All non-waived
+gates must pass before a tag is created. The release tag, GitHub Release and
+`main` must all resolve to the same commit.
 
 ## Known limitations
 

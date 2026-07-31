@@ -233,6 +233,24 @@ describe("Windows capability and lifecycle safety contract", () => {
     );
   });
 
+  it("reuses one verified full-tree protection result inside a registration process", () => {
+    const module = windowsScript("CodexLocalRemote.Windows.psm1");
+    const cacheStart = module.indexOf("function Test-CodexLocalRemoteDataDirectoryProtectionCache");
+    const protectStart = module.indexOf("function Protect-CodexLocalRemoteDataDirectory");
+    const protectEnd = module.indexOf("\nfunction Test-BrokerCapabilityToken", protectStart);
+    const cache = module.slice(cacheStart, protectStart);
+    const protect = module.slice(protectStart, protectEnd);
+
+    expect(cacheStart).toBeGreaterThan(-1);
+    expect(cache).toContain("Assert-CodexLocalRemoteDataDirectoryStartupProtection");
+    expect(cache).toContain("ExpectedInstanceId");
+    expect(protect).toContain("Test-CodexLocalRemoteDataDirectoryProtectionCache");
+    expect(protect).toContain("Set-CodexLocalRemoteDataDirectoryProtectionCache");
+    expect(protect.indexOf("Test-CodexLocalRemoteDataDirectoryProtectionCache")).toBeLessThan(
+      protect.indexOf("Test-CodexLocalRemoteDataAclTree"),
+    );
+  });
+
   it("ignores disappearing managed atomic-write files without weakening reparse checks", () => {
     const module = windowsScript("CodexLocalRemote.Windows.psm1");
     const enumerationStart = module.indexOf("function Get-CodexLocalRemoteDataDirectoryItems");

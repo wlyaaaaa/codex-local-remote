@@ -3,6 +3,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { RemoteEvent, ThreadDetail, ThreadSummary } from "@codex-local-remote/contracts";
 import type * as AppStateModule from "./App";
 import { applyThreadRemoteEvents, createThreadRemoteEventProjectionState } from "./live-thread";
+import {
+  DIAGNOSTICS_LAST_KNOWN_TTL_MS,
+  retainLastKnownDiagnosticSnapshot,
+} from "./workspace-recovery";
 
 type AppStateHelpers = typeof AppStateModule;
 
@@ -1539,6 +1543,29 @@ describe("Desktop 运行时健康门禁", () => {
     expect(helpers.conversationControlState(true, { appServer: "available" }, true)).toEqual({
       available: false,
       reason: "先把这项历史任务接入 Desktop，才能继续操作",
+    });
+  });
+
+  it("诊断接口单次抖动不把已连通的输入器置灰，但过期快照必须失效", () => {
+    const generatedAt = Date.parse("2026-07-31T12:00:00.000Z");
+    const previous = {
+      generatedAt: new Date(generatedAt).toISOString(),
+      capabilities: { appServer: "available" as const },
+    };
+    const withinGrace = retainLastKnownDiagnosticSnapshot(undefined, previous, generatedAt + 1_000);
+    const expired = retainLastKnownDiagnosticSnapshot(
+      undefined,
+      previous,
+      generatedAt + DIAGNOSTICS_LAST_KNOWN_TTL_MS + 1,
+    );
+
+    expect(helpers.conversationControlState(true, withinGrace?.capabilities, false)).toEqual({
+      available: true,
+      reason: "",
+    });
+    expect(helpers.conversationControlState(true, expired?.capabilities, false)).toEqual({
+      available: false,
+      reason: "Codex 运行时兼容性待确认",
     });
   });
 

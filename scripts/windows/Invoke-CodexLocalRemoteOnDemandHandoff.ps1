@@ -36,7 +36,7 @@ param(
     [string]$ExpectedDesiredModeIntentId,
 
     [Parameter(DontShow)]
-    [switch]$NativeDesktopAlreadyClosedForOpen,
+    [switch]$ImmediateAuthorizedDesktopRestartForOpen,
 
     [switch]$AllowDesktopRestart
 )
@@ -46,11 +46,13 @@ $ProgressPreference = 'SilentlyContinue'
 if ($Operation -cne 'Open' -and $AllowDesktopRestart) {
     throw 'AllowDesktopRestart is valid only for an explicit Open operation.'
 }
-if ($NativeDesktopAlreadyClosedForOpen -and
-    ($Operation -cne 'Open' -or -not $AllowDesktopRestart)) {
+if ($ImmediateAuthorizedDesktopRestartForOpen -and
+    ($Operation -cne 'Open' -or
+        -not $AllowDesktopRestart -or
+        [string]::IsNullOrWhiteSpace($ExpectedDesiredModeIntentId))) {
     throw (
-        'NativeDesktopAlreadyClosedForOpen is valid only for one ' +
-        'authorized Open operation.'
+        'ImmediateAuthorizedDesktopRestartForOpen is valid only for one ' +
+        'authorized deferred Open operation with an exact desired-mode intent.'
     )
 }
 $expectedSelectionArguments = @(
@@ -68,7 +70,7 @@ $statusPath = Join-Path $resolvedDataDir 'on-demand-handoff-last.json'
 $script:onDemandLastReadiness = $null
 $runtime = $null
 $expectedDesktopPath = $null
-$nativeDesktopWasClosedForOpen = [bool]$NativeDesktopAlreadyClosedForOpen
+$nativeDesktopWasClosedForOpen = $false
 $remoteTaskStartAttemptedForOpen = $false
 $desktopHandoffPreparation = $null
 $preparedAttachCompensationHandled = $false
@@ -1019,6 +1021,31 @@ function Test-OnDemandRuntimePathEqual {
     } catch {
         return $false
     }
+}
+
+function Test-OnDemandDeferredOpenIntent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$DesiredMode,
+
+        [Parameter(Mandatory)]
+        [object]$Runtime,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{32}$')]
+        [string]$ExpectedIntentId
+    )
+
+    return (
+        [string]$DesiredMode.Mode -ceq 'Remote' -and
+        [string]$DesiredMode.IntentId -ceq $ExpectedIntentId -and
+        [string]$DesiredMode.RuntimeVersionId -ceq
+            [string]$Runtime.CurrentVersionId -and
+        (Test-OnDemandRuntimePathEqual `
+            -Left ([string]$DesiredMode.RuntimeRoot) `
+            -Right ([string]$Runtime.CurrentRoot))
+    )
 }
 
 function Test-OnDemandRuntimeIdentity {
@@ -2081,7 +2108,9 @@ function Invoke-OnDemandOpenCompensation {
         [Parameter(Mandatory)]
         [string]$DesktopExecutablePath,
 
-        [bool]$TaskStartAttempted
+        [bool]$TaskStartAttempted,
+
+        [string]$DeferredIntentId
     )
 
     $taskStopped = $false
@@ -2175,6 +2204,31 @@ function Invoke-OnDemandOpenCompensation {
         }
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($DeferredIntentId)) {
+        if ($DeferredIntentId -cnotmatch '^[a-f0-9]{32}$') {
+            throw 'Deferred Open compensation received an invalid intent identity.'
+        }
+        $compensationDesiredMode =
+            Get-CodexLocalRemoteDesiredMode -DataDir $resolvedDataDir
+        if (Test-OnDemandDeferredOpenIntent `
+            -DesiredMode $compensationDesiredMode `
+            -Runtime $Runtime `
+            -ExpectedIntentId $DeferredIntentId) {
+            $null = Set-CodexLocalRemoteDesiredMode `
+                -DataDir $resolvedDataDir `
+                -Mode Native `
+                -RuntimeVersionId (
+                    [string]$compensationRuntime.CurrentVersionId
+                ) `
+                -RuntimeRoot ([string]$compensationRuntime.CurrentRoot)
+        } elseif ([string]$compensationDesiredMode.Mode -cne 'Native') {
+            throw (
+                'Deferred Open compensation found a newer non-Native ' +
+                'desired-mode intent and refused to overwrite it.'
+            )
+        }
+    }
+
     $desktopRoots = @(
         Get-CodexLocalRemoteNativeDesktopRootCandidates `
             -DesktopExecutablePath $DesktopExecutablePath
@@ -2229,7 +2283,7 @@ function Wait-OnDemandTaskState {
         [ValidateSet('Ready', 'Running')]
         [string]$ExpectedState,
 
-        [ValidateRange(1, 60)]
+        [ValidateRange(1, 180)]
         [int]$TimeoutSeconds = 20
     )
 
@@ -2245,6 +2299,87 @@ function Wait-OnDemandTaskState {
         }
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Remote startup task did not enter ${ExpectedState}: $($task.State)"
+}
+
+function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Runtime,
+
+        [Parameter(Mandatory)]
+        [object]$StartupTask,
+
+        [Parameter(Mandatory)]
+        [object[]]$DesktopRoots,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$IndependentStdioProcesses,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedDesktopPath,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{32}$')]
+        [string]$ExpectedIntentId,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [ValidateRange(1, 180)]
+        [int]$TaskDrainTimeoutSeconds = 120
+    )
+
+    if ([string]$StartupTask.State -cnotin @('Ready', 'Running')) {
+        throw (
+            'The deferred Desktop restart barrier requires one exact ' +
+            "Ready or Running startup task, not '$($StartupTask.State)'."
+        )
+    }
+    if ($DesktopRoots.Count -ne 1) {
+        throw (
+            'The deferred Desktop restart barrier requires exactly one ' +
+            "verified package root, found $($DesktopRoots.Count)."
+        )
+    }
+    if ($IndependentStdioProcesses.Count -ne 0) {
+        throw (
+            'The deferred Desktop restart barrier found an independent ' +
+            'stdio app-server and refused to change Desktop ownership.'
+        )
+    }
+    $desiredModeBeforeStop =
+        Get-CodexLocalRemoteDesiredMode -DataDir $resolvedDataDir
+    if (-not (Test-OnDemandDeferredOpenIntent `
+        -DesiredMode $desiredModeBeforeStop `
+        -Runtime $Runtime `
+        -ExpectedIntentId $ExpectedIntentId)) {
+        throw 'The deferred Open authorization was cancelled before Desktop shutdown.'
+    }
+
+    # The caller already owns the per-DataDir OnDemandControl mutex. Keep the
+    # exact intent check, package-identity stop, task drain, and subsequent
+    # installed Open in that same outer critical section.
+    $script:nativeDesktopWasClosedForOpen = $true
+    Stop-OnDemandDesktopRoot `
+        -DesktopRoot $DesktopRoots[0] `
+        -ExpectedDesktopPath $ExpectedDesktopPath
+    Wait-OnDemandDesktopDrain
+    $readyTask = Wait-OnDemandTaskState `
+        -Name $Name `
+        -ExpectedState 'Ready' `
+        -TimeoutSeconds $TaskDrainTimeoutSeconds
+
+    $desiredModeAfterStop =
+        Get-CodexLocalRemoteDesiredMode -DataDir $resolvedDataDir
+    if (-not (Test-OnDemandDeferredOpenIntent `
+        -DesiredMode $desiredModeAfterStop `
+        -Runtime $Runtime `
+        -ExpectedIntentId $ExpectedIntentId)) {
+        throw 'The deferred Open authorization was cancelled during Desktop shutdown.'
+    }
+    return $readyTask
 }
 
 function Set-OnDemandOpenDesiredRemote {
@@ -2391,20 +2526,10 @@ try {
                 'authorized Open operation.'
             )
         }
-        if ([string]$currentDesiredMode.Mode -cne 'Remote' -or
-            [string]$currentDesiredMode.IntentId -cne
-                $ExpectedDesiredModeIntentId -or
-            [string]$currentDesiredMode.RuntimeVersionId -cne
-                [string]$runtime.CurrentVersionId -or
-            -not [string]::Equals(
-                [System.IO.Path]::GetFullPath(
-                    [string]$currentDesiredMode.RuntimeRoot
-                ),
-                [System.IO.Path]::GetFullPath(
-                    [string]$runtime.CurrentRoot
-                ),
-                [System.StringComparison]::OrdinalIgnoreCase
-            )) {
+        if (-not (Test-OnDemandDeferredOpenIntent `
+            -DesiredMode $currentDesiredMode `
+            -Runtime $runtime `
+            -ExpectedIntentId $ExpectedDesiredModeIntentId)) {
             throw 'The deferred Open authorization was cancelled or superseded.'
         }
     }
@@ -2424,6 +2549,30 @@ try {
             -DesktopExecutablePath $expectedDesktopPath
     )
     $independentAppServers = @(Get-OnDemandIndependentStdioProcesses)
+    if ($ImmediateAuthorizedDesktopRestartForOpen) {
+        $startupTask =
+            Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier `
+                -Runtime $runtime `
+                -StartupTask $startupTask `
+                -DesktopRoots $desktopRoots `
+                -IndependentStdioProcesses $independentAppServers `
+                -ExpectedDesktopPath $expectedDesktopPath `
+                -ExpectedIntentId $ExpectedDesiredModeIntentId `
+                -Name $TaskName `
+                -TaskDrainTimeoutSeconds $ReadyWaitSeconds
+        $desktopRoots = @(
+            Get-CodexLocalRemoteNativeDesktopRootCandidates `
+                -DesktopExecutablePath $expectedDesktopPath
+        )
+        $independentAppServers = @(Get-OnDemandIndependentStdioProcesses)
+        if ($desktopRoots.Count -ne 0 -or
+            $independentAppServers.Count -ne 0) {
+            throw (
+                'Desktop ownership reappeared after the immediate restart ' +
+                'barrier; refusing to start a competing Remote generation.'
+            )
+        }
+    }
     $remoteState = if ([string]$startupTask.State -ceq 'Running') {
         Get-OnDemandRemoteState `
             -Runtime $runtime `
@@ -3119,9 +3268,10 @@ try {
                 Invoke-OnDemandOpenCompensation `
                 -Runtime $runtime `
                 -Name $TaskName `
-                -BrokerPort ([int]$configuration.BrokerPort) `
-                -DesktopExecutablePath $expectedDesktopPath `
-                -TaskStartAttempted $remoteTaskStartAttemptedForOpen
+                 -BrokerPort ([int]$configuration.BrokerPort) `
+                 -DesktopExecutablePath $expectedDesktopPath `
+                 -TaskStartAttempted $remoteTaskStartAttemptedForOpen `
+                 -DeferredIntentId $ExpectedDesiredModeIntentId
             $nativeModeConfirmedAfterFailure = (
                 ([string]$openFailureCompensation.Status -ceq
                     'native-restored' -and
