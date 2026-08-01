@@ -142,6 +142,42 @@ $cases = [ordered]@{
         -DesktopRootCount 0 `
         -IndependentStdioCount 1 `
         -AllowDesktopRestart:$true
+    RunningReadyCompatible = Get-OnDemandHandoffDecision `
+        -TaskState 'Running' `
+        -RemoteState 'ready-compatible' `
+        -DesktopRootCount 1 `
+        -IndependentStdioCount 0 `
+        -AllowDesktopRestart:$false
+    RunningSupervisorRepairable = Get-OnDemandHandoffDecision `
+        -TaskState 'Running' `
+        -RemoteState 'supervisor-repairable' `
+        -DesktopRootCount 1 `
+        -IndependentStdioCount 0 `
+        -AllowDesktopRestart:$false
+    ReadyCompatibleResumeWithoutAuthority = Get-OnDemandHandoffDecision `
+        -TaskState 'Ready' `
+        -RemoteState 'supervisor-repairable' `
+        -DesktopRootCount 1 `
+        -IndependentStdioCount 0 `
+        -AllowDesktopRestart:$false
+    ReadyCompatibleResumeWithAuthority = Get-OnDemandHandoffDecision `
+        -TaskState 'Ready' `
+        -RemoteState 'supervisor-repairable' `
+        -DesktopRootCount 1 `
+        -IndependentStdioCount 0 `
+        -AllowDesktopRestart:$true
+    ReadyCompatibleResumeAmbiguous = Get-OnDemandHandoffDecision `
+        -TaskState 'Ready' `
+        -RemoteState 'supervisor-repairable' `
+        -DesktopRootCount 2 `
+        -IndependentStdioCount 0 `
+        -AllowDesktopRestart:$true
+    ReadyCompatibleResumeOrphanStdio = Get-OnDemandHandoffDecision `
+        -TaskState 'Ready' `
+        -RemoteState 'supervisor-repairable' `
+        -DesktopRootCount 1 `
+        -IndependentStdioCount 1 `
+        -AllowDesktopRestart:$true
     BackgroundOnly = Get-OnDemandHandoffDecision `
         -TaskState 'Ready' `
         -RemoteState 'inactive' `

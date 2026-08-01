@@ -76,6 +76,7 @@ $expectedDesktopPath = $null
 $nativeDesktopWasClosedForOpen = $false
 $remoteTaskStartAttemptedForOpen = $false
 $desktopHandoffPreparation = $null
+$compatibleSupervisorResumeProof = $null
 $preparedAttachCompensationHandled = $false
 $script:preparedAttachIntent = $null
 $script:desiredModeBeforeOpen = $null
@@ -136,8 +137,10 @@ function Get-OnDemandHandoffDecision {
         [ValidateSet(
             'inactive',
             'ready',
+            'ready-compatible',
             'desktop-detached',
             'background-repairable',
+            'supervisor-repairable',
             'runtime-transition',
             'runtime-transition-busy',
             'unverified'
@@ -161,6 +164,14 @@ function Get-OnDemandHandoffDecision {
     }
     if ($TaskState -ceq 'Running' -and $RemoteState -ceq 'ready') {
         return 'remote-lease-active'
+    }
+    if ($TaskState -ceq 'Running' -and
+        $RemoteState -ceq 'ready-compatible') {
+        return 'remote-lease-active'
+    }
+    if ($TaskState -ceq 'Running' -and
+        $RemoteState -ceq 'supervisor-repairable') {
+        return 'wait-background-recovery'
     }
     if ($TaskState -ceq 'Running' -and
         $RemoteState -ceq 'background-repairable') {
@@ -236,6 +247,18 @@ function Get-OnDemandHandoffDecision {
     }
     if ($TaskState -cne 'Ready') {
         return 'blocked-task-state'
+    }
+    if ($RemoteState -ceq 'supervisor-repairable') {
+        if ($DesktopRootCount -gt 1) {
+            return 'blocked-ambiguous-desktop-roots'
+        }
+        if ($IndependentStdioCount -gt 0) {
+            return 'blocked-independent-stdio'
+        }
+        if ($DesktopRootCount -eq 1) {
+            return 'resume-compatible-supervisor'
+        }
+        return 'blocked-runtime-unverified'
     }
     if ($DesktopRootCount -gt 1) {
         return 'blocked-ambiguous-desktop-roots'
@@ -625,7 +648,9 @@ function Get-OnDemandRemoteState {
 
         [switch]$AllowActiveTurns,
 
-        [switch]$AllowNativePreviousDesktop
+        [switch]$AllowNativePreviousDesktop,
+
+        [switch]$AllowCompatibleSupervisorResume
     )
 
     $script:onDemandLastReadiness = $null
@@ -798,6 +823,98 @@ function Get-OnDemandRemoteState {
         }
         $script:onDemandLastReadiness = $readiness
         if ($previousGeneration) {
+            $supervisorResumeTransport = (
+                -not [bool]$readiness.sidecarConnected -and
+                [string]$readiness.status -ceq 'ready' -and
+                [bool]$readiness.appServerReady -and
+                [bool]$readiness.desktopConnected -and
+                -not [bool]$readiness.degraded
+            )
+            $hasSupervisorAdoptionClaim = (
+                $receipt.SupervisorOnlyAdoptedPreviousBroker -is
+                    [bool] -and
+                [bool]$receipt.SupervisorOnlyAdoptedPreviousBroker
+            )
+            if ($AllowCompatibleSupervisorResume -and
+                ($supervisorResumeTransport -or
+                    $hasSupervisorAdoptionClaim)) {
+                $payloadCompatibility =
+                    Test-CodexLocalRemoteBrokerPayloadCompatibility `
+                        -CurrentRuntimeRoot ([string]$Runtime.CurrentRoot) `
+                        -CurrentVersionId (
+                            [string]$Runtime.CurrentVersionId
+                        ) `
+                        -CurrentManifestSha256 (
+                            [string]$Runtime.CurrentManifestSha256
+                        ) `
+                        -ActiveRuntimeRoot $activeBrokerRuntimeRoot `
+                        -ActiveVersionId $activeBrokerVersionId `
+                        -ActiveManifestSha256 (
+                            [string]$Runtime.PreviousManifestSha256
+                        )
+                if ($null -eq $payloadCompatibility -or
+                    -not [bool]$payloadCompatibility.IsCompatible) {
+                    return 'unverified'
+                }
+                $adoptedPreviousBroker = (
+                    $hasSupervisorAdoptionClaim -and
+                    [string]$receipt.SupervisorRuntimeVersionId -ceq
+                        [string]$Runtime.CurrentVersionId -and
+                    [string]$receipt.SupervisorRuntimeManifestSha256 -ceq
+                        [string]$Runtime.CurrentManifestSha256 -and
+                    [string]::Equals(
+                        [System.IO.Path]::GetFullPath(
+                            [string]$receipt.SupervisorRuntimeRoot
+                        ),
+                        [System.IO.Path]::GetFullPath(
+                            [string]$Runtime.CurrentRoot
+                        ),
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    ) -and
+                    [string]$receipt.SidecarRuntimeVersionId -ceq
+                        [string]$Runtime.CurrentVersionId -and
+                    [string]$receipt.SidecarRuntimeManifestSha256 -ceq
+                        [string]$Runtime.CurrentManifestSha256 -and
+                    [string]::Equals(
+                        [System.IO.Path]::GetFullPath(
+                            [string]$receipt.SidecarRuntimeRoot
+                        ),
+                        [System.IO.Path]::GetFullPath(
+                            [string]$Runtime.CurrentRoot
+                        ),
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    ) -and
+                    [string]$receipt.BrokerRuntimeVersionId -ceq
+                        [string]$Runtime.PreviousVersionId -and
+                    [string]$receipt.BrokerRuntimeManifestSha256 -ceq
+                        [string]$Runtime.PreviousManifestSha256 -and
+                    [string]::Equals(
+                        [System.IO.Path]::GetFullPath(
+                            [string]$receipt.BrokerRuntimeRoot
+                        ),
+                        [System.IO.Path]::GetFullPath(
+                            [string]$Runtime.PreviousRoot
+                        ),
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                )
+                if ($hasSupervisorAdoptionClaim -and
+                    -not $adoptedPreviousBroker) {
+                    return 'unverified'
+                }
+                if ($adoptedPreviousBroker -and
+                    [string]$receipt.Status -ceq 'ready' -and
+                    [string]$readiness.status -ceq 'ready' -and
+                    [bool]$readiness.appServerReady -and
+                    [bool]$readiness.desktopConnected -and
+                    [bool]$readiness.sidecarConnected -and
+                    -not [bool]$readiness.degraded) {
+                    return 'ready-compatible'
+                }
+                if ($supervisorResumeTransport) {
+                    return 'supervisor-repairable'
+                }
+            }
             # Native mode intentionally has no Sidecar. With exact explicit
             # restart authority, keep this on the infrastructure-first prepared
             # attach path even when the old Broker still reports active turns.
@@ -1385,6 +1502,9 @@ function Start-OnDemandSelectedRemoteRuntime {
         [AllowNull()]
         [object]$DesktopHandoffPreparation,
 
+        [AllowNull()]
+        [object]$CompatibleSupervisorResumeProof,
+
         [switch]$AllowActiveTurns
     )
 
@@ -1427,6 +1547,9 @@ function Start-OnDemandSelectedRemoteRuntime {
             [string]$Runtime.CurrentManifestSha256
         ) `
         -DesktopHandoffPreparation $DesktopHandoffPreparation `
+        -CompatibleSupervisorResumeProof (
+            $CompatibleSupervisorResumeProof
+        ) `
         -AllowActiveTurns:$AllowActiveTurns
 }
 
@@ -2620,14 +2743,27 @@ try {
         $AllowDesktopRestart -and
         [string]$currentDesiredMode.Mode -ceq 'Native'
     )
+    $allowCompatibleSupervisorResume = (
+        $Operation -cin @('Open', 'Status')
+    )
     $remoteState = if ([string]$startupTask.State -ceq 'Running') {
         Get-OnDemandRemoteState `
             -Runtime $runtime `
             -BrokerPort ([int]$configuration.BrokerPort) `
             -AllowActiveTurns:($Operation -ceq 'Open' -and $AllowDesktopRestart) `
-            -AllowNativePreviousDesktop:$allowNativePreviousDesktop
+            -AllowNativePreviousDesktop:$allowNativePreviousDesktop `
+            -AllowCompatibleSupervisorResume:(
+                $allowCompatibleSupervisorResume
+            )
     } elseif ([string]$startupTask.State -ceq 'Ready') {
-        'inactive'
+        if ($allowCompatibleSupervisorResume) {
+            Get-OnDemandRemoteState `
+                -Runtime $runtime `
+                -BrokerPort ([int]$configuration.BrokerPort) `
+                -AllowCompatibleSupervisorResume
+        } else {
+            'inactive'
+        }
     } else {
         'unverified'
     }
@@ -2648,15 +2784,18 @@ try {
     if ($Operation -ceq 'Status') {
         $status = if ([string]$startupTask.State -ceq 'Queued') {
             'pending'
-        } elseif ([string]$startupTask.State -ceq 'Ready') {
-            'inactive'
+        } elseif ($remoteState -ceq 'ready-compatible') {
+            'active'
         } elseif ($remoteState -ceq 'ready') {
             'active'
         } elseif ($remoteState -cin @(
             'desktop-detached',
-            'background-repairable'
+            'background-repairable',
+            'supervisor-repairable'
         )) {
             'degraded'
+        } elseif ([string]$startupTask.State -ceq 'Ready') {
+            'inactive'
         } elseif ($remoteState -ceq 'runtime-transition') {
             'pending'
         } elseif ($remoteState -ceq 'runtime-transition-busy') {
@@ -2957,12 +3096,16 @@ try {
             Start-Sleep -Milliseconds 250
             $remoteState = Get-OnDemandRemoteState `
                 -Runtime $runtime `
-                -BrokerPort ([int]$configuration.BrokerPort)
-            if ($remoteState -cne 'background-repairable') {
+                -BrokerPort ([int]$configuration.BrokerPort) `
+                -AllowCompatibleSupervisorResume
+            if ($remoteState -cnotin @(
+                'background-repairable',
+                'supervisor-repairable'
+            )) {
                 break
             }
         } while ([DateTime]::UtcNow -lt $recoveryDeadline)
-        if ($remoteState -ceq 'ready') {
+        if ($remoteState -cin @('ready', 'ready-compatible')) {
             Write-OnDemandHandoffStatus `
                 -Status 'repaired' `
                 -Stage 'background-recovery' `
@@ -3117,7 +3260,8 @@ try {
     if ($decision -cnotin @(
         'handoff-native-desktop-once',
         'start-without-desktop-restart',
-        'desktop-restart-authorization-required'
+        'desktop-restart-authorization-required',
+        'resume-compatible-supervisor'
     )) {
         throw "Remote activation has no safe path for decision '$decision'."
     }
@@ -3136,7 +3280,38 @@ try {
     $runtime =
         Assert-OnDemandSelectedRuntimeUnchanged `
             -ExpectedRuntime $runtime
-    if ($desktopRoots.Count -eq 1) {
+    if ($decision -ceq 'resume-compatible-supervisor') {
+        $launcherPath = Join-Path `
+            ([string]$runtime.CurrentRoot) `
+            'scripts\windows\Launch-CodexWithRemote.ps1'
+        if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
+            throw 'The selected runtime has no compatible supervisor activator.'
+        }
+        . $launcherPath `
+            -DataDir $resolvedDataDir `
+            -SidecarPort ([int]$configuration.SidecarPort) `
+            -BrokerPort ([int]$configuration.BrokerPort) `
+            -BrokerUpstreamPort ([int]$configuration.BrokerUpstreamPort) `
+            -BasePath ([string]$configuration.BasePath) `
+            -TaskName $TaskName `
+            -DefinitionOnly
+        if ($null -eq (Get-Command `
+            -Name 'Assert-CodexLocalRemoteCompatibleSupervisorResume' `
+            -CommandType Function `
+            -ErrorAction SilentlyContinue)) {
+            throw 'The selected runtime has no compatible supervisor proof gate.'
+        }
+        $compatibleSupervisorResumeProof =
+            Assert-CodexLocalRemoteCompatibleSupervisorResume `
+                -SelectedRuntime $runtime `
+                -TaskState ([string]$startupTask.State) `
+                -TaskName $TaskName `
+                -ManagedDataDir $resolvedDataDir `
+                -ManagedSidecarPort ([int]$configuration.SidecarPort) `
+                -ManagedBrokerPort ([int]$configuration.BrokerPort)
+    }
+    if ($desktopRoots.Count -eq 1 -and
+        $decision -cne 'resume-compatible-supervisor') {
         Write-OnDemandHandoffStatus `
             -Status 'running' `
             -Stage 'infrastructure-preparation' `
@@ -3243,13 +3418,15 @@ try {
         return
     }
 
-    $null =
-        Assert-OnDemandSelectedRemoteRuntimeActivationPreflight `
-            -Runtime $runtime `
-            -Configuration $configuration `
-            -StartupTask $startupTask `
-            -Name $TaskName `
-            -AllowActiveTurns:$allowActiveRuntimeRestart
+    if ($decision -cne 'resume-compatible-supervisor') {
+        $null =
+            Assert-OnDemandSelectedRemoteRuntimeActivationPreflight `
+                -Runtime $runtime `
+                -Configuration $configuration `
+                -StartupTask $startupTask `
+                -Name $TaskName `
+                -AllowActiveTurns:$allowActiveRuntimeRestart
+    }
     $null = Set-OnDemandOpenDesiredRemote -Runtime $runtime
     Write-OnDemandHandoffStatus `
         -Status 'running' `
@@ -3261,6 +3438,9 @@ try {
         -Configuration $configuration `
         -Name $TaskName `
         -DesktopHandoffPreparation $null `
+        -CompatibleSupervisorResumeProof (
+            $compatibleSupervisorResumeProof
+        ) `
         -AllowActiveTurns:$allowActiveRuntimeRestart
     $startupTask = Wait-OnDemandTaskState `
         -Name $TaskName `
@@ -3272,18 +3452,30 @@ try {
         Start-Sleep -Milliseconds 250
         $remoteState = Get-OnDemandRemoteState `
             -Runtime $runtime `
-            -BrokerPort ([int]$configuration.BrokerPort)
-        if ($remoteState -ceq 'ready') {
+            -BrokerPort ([int]$configuration.BrokerPort) `
+            -AllowCompatibleSupervisorResume:(
+                $decision -ceq 'resume-compatible-supervisor'
+            )
+        if ($remoteState -cin @('ready', 'ready-compatible')) {
             break
         }
     } while ([DateTime]::UtcNow -lt $readyDeadline)
 
-    $startStatus = if ($remoteState -ceq 'ready') {
-        'ready'
+    $startStatus = if ($remoteState -cin @(
+        'ready',
+        'ready-compatible'
+    )) {
+        if ($decision -ceq 'resume-compatible-supervisor') {
+            'repaired'
+        } else {
+            'ready'
+        }
     } else {
         'pending'
     }
-    $startMessage = if ($remoteState -ceq 'ready') {
+    $startMessage = if ($remoteState -ceq 'ready-compatible') {
+        'The current supervisor and Sidecar resumed the exact compatible Broker without restarting Desktop.'
+    } elseif ($remoteState -ceq 'ready') {
         'Broker, Desktop, and Sidecar reached one verified Remote lease.'
     } else {
         "The demand-start task is Running, but Remote readiness remains '$remoteState'."

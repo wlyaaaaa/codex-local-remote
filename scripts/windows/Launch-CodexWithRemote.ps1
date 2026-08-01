@@ -3793,6 +3793,303 @@ function Start-CodexLocalRemotePackageRefreshWorker {
     }
 }
 
+function Assert-CodexLocalRemoteCompatibleSupervisorResume {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$SelectedRuntime,
+
+        [Parameter(Mandatory)]
+        [string]$TaskState,
+
+        [Parameter(Mandatory)]
+        [string]$TaskName,
+
+        [Parameter(Mandatory)]
+        [string]$ManagedDataDir,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 65535)]
+        [int]$ManagedSidecarPort,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 65535)]
+        [int]$ManagedBrokerPort
+    )
+
+    if ($TaskState -cne 'Ready') {
+        throw (
+            'Compatible supervisor resume requires one Ready task.'
+        )
+    }
+    $desktopPackage = Resolve-CodexDesktopPackageStatusIdentity
+    $desktopExecutablePath = [System.IO.Path]::GetFullPath(
+        [string]$desktopPackage.DesktopExecutablePath
+    )
+    $desktopRoots = @(
+        Get-CodexLocalRemoteNativeDesktopRootCandidates `
+            -DesktopExecutablePath $desktopExecutablePath
+    )
+    if ($desktopRoots.Count -ne 1) {
+        throw 'Compatible supervisor resume requires one exact Desktop root.'
+    }
+    $desktopProcessIdentity = @(
+        foreach ($desktopProcess in @(
+            $desktopRoots | Sort-Object ProcessId
+        )) {
+            if (-not (Test-NonNegativeInteger `
+                    -Value $desktopProcess.ProcessId) -or
+                [int]$desktopProcess.ProcessId -lt 1 -or
+                [string]::IsNullOrWhiteSpace(
+                    [string]$desktopProcess.CreationDate
+                )) {
+                throw 'Compatible supervisor resume Desktop identity is incomplete.'
+            }
+            $creationIdentity = Get-ProcessCreationIdentity `
+                -CreationDate ([string]$desktopProcess.CreationDate)
+            '{0}:{1}' -f (
+                [int]$desktopProcess.ProcessId
+            ), (
+                [long]$creationIdentity.CreationDateUtcTicks
+            )
+        }
+    ) -join ';'
+    $taskXml = [string](
+        Export-ScheduledTask `
+            -TaskName $TaskName `
+            -TaskPath '\' `
+            -ErrorAction Stop
+    )
+    $taskDefinitionSha256 = Get-StringSha256 -Value $taskXml
+    if (-not [bool]$SelectedRuntime.HasCurrentTaskDefinition -or
+        [string]$SelectedRuntime.CurrentTaskDefinitionTaskName -cne
+            $TaskName -or
+        [string]$SelectedRuntime.CurrentTaskDefinitionRuntimeVersionId -cne
+            [string]$SelectedRuntime.CurrentVersionId -or
+        -not (Test-CodexLocalRemotePathEqual `
+            -Left (
+                [string]$SelectedRuntime.CurrentTaskDefinitionRuntimeRoot
+            ) `
+            -Right ([string]$SelectedRuntime.CurrentRoot)) -or
+        [string]$SelectedRuntime.CurrentTaskDefinitionSha256 -cne
+            $taskDefinitionSha256) {
+        throw 'Compatible supervisor resume task binding drifted.'
+    }
+    foreach ($property in @(
+        'CurrentVersionId',
+        'CurrentRoot',
+        'CurrentManifestSha256',
+        'PreviousVersionId',
+        'PreviousRoot',
+        'PreviousManifestSha256'
+    )) {
+        if ($null -eq $SelectedRuntime.PSObject.Properties[$property]) {
+            throw "Compatible supervisor resume runtime lacks '$property'."
+        }
+    }
+    if ([string]$SelectedRuntime.CurrentVersionId -cnotmatch '^[a-f0-9]{64}$' -or
+        [string]$SelectedRuntime.CurrentManifestSha256 -cnotmatch
+            '^[a-f0-9]{64}$' -or
+        [string]$SelectedRuntime.PreviousVersionId -cnotmatch
+            '^[a-f0-9]{64}$' -or
+        [string]$SelectedRuntime.PreviousManifestSha256 -cnotmatch
+            '^[a-f0-9]{64}$') {
+        throw 'Compatible supervisor resume runtime identity is invalid.'
+    }
+
+    $generation = Get-CodexLocalRemoteRuntimeGenerationStatus `
+        -ManagedDataDir $ManagedDataDir
+    if ([string]$generation.Status -cne 'transition-required' -or
+        $null -eq $generation.Receipt -or
+        -not (Test-CodexLocalRemotePathEqual `
+            -Left ([string]$generation.SelectedRoot) `
+            -Right ([string]$SelectedRuntime.CurrentRoot)) -or
+        -not (Test-CodexLocalRemotePathEqual `
+            -Left ([string]$generation.ActiveRoot) `
+            -Right ([string]$SelectedRuntime.PreviousRoot))) {
+        throw (
+            'Compatible supervisor resume requires the exact selected and ' +
+            'previous managed generations.'
+        )
+    }
+    $activeVersionId = Split-Path -Leaf (
+        [System.IO.Path]::GetFullPath([string]$generation.ActiveRoot)
+    )
+    if ($activeVersionId -cne [string]$SelectedRuntime.PreviousVersionId) {
+        throw 'Compatible supervisor resume active version is not Pointer.Previous.'
+    }
+    $payloadCompatibility =
+        Test-CodexLocalRemoteBrokerPayloadCompatibility `
+            -CurrentRuntimeRoot ([string]$SelectedRuntime.CurrentRoot) `
+            -CurrentVersionId ([string]$SelectedRuntime.CurrentVersionId) `
+            -CurrentManifestSha256 (
+                [string]$SelectedRuntime.CurrentManifestSha256
+            ) `
+            -ActiveRuntimeRoot ([string]$generation.ActiveRoot) `
+            -ActiveVersionId $activeVersionId `
+            -ActiveManifestSha256 (
+                [string]$SelectedRuntime.PreviousManifestSha256
+            )
+    if ($null -eq $payloadCompatibility -or
+        -not [bool]$payloadCompatibility.IsCompatible) {
+        throw 'Compatible supervisor resume Broker payload is not byte-identical.'
+    }
+
+    $readiness = Get-CodexLocalRemoteReadinessSnapshot `
+        -Port $ManagedBrokerPort
+    foreach ($property in @(
+        'status',
+        'appServerReady',
+        'desktopConnected',
+        'sidecarConnected',
+        'degraded',
+        'unknownCount',
+        'unsafeThreadCount',
+        'runtimeInvocationId',
+        'brokerProcessId',
+        'upstreamProcessId'
+    )) {
+        if ($null -eq $readiness -or
+            $null -eq $readiness.PSObject.Properties[$property]) {
+            throw "Compatible supervisor resume readiness lacks '$property'."
+        }
+    }
+    $receipt = $generation.Receipt
+    if ([string]$readiness.status -cne 'ready' -or
+        $readiness.appServerReady -isnot [bool] -or
+        -not [bool]$readiness.appServerReady -or
+        $readiness.desktopConnected -isnot [bool] -or
+        -not [bool]$readiness.desktopConnected -or
+        $readiness.sidecarConnected -isnot [bool] -or
+        [bool]$readiness.sidecarConnected -or
+        $readiness.degraded -isnot [bool] -or
+        [bool]$readiness.degraded -or
+        -not (Test-NonNegativeInteger -Value $readiness.unknownCount) -or
+        [int]$readiness.unknownCount -ne 0 -or
+        -not (Test-NonNegativeInteger -Value $readiness.unsafeThreadCount) -or
+        [string]$readiness.runtimeInvocationId -cne
+            [string]$receipt.RuntimeInvocationId -or
+        [int]$readiness.brokerProcessId -ne [int]$receipt.ProcessId -or
+        [int]$readiness.upstreamProcessId -ne
+            [int]$receipt.Upstream.ProcessId) {
+        throw (
+            'Compatible supervisor resume readiness is not one exact ' +
+            'attached Broker without a Sidecar.'
+        )
+    }
+    $expectedBrokerCliPath = Join-Path `
+        ([string]$generation.ActiveRoot) `
+        'apps\broker\dist\cli.js'
+    if (-not (Test-CodexLocalRemotePathEqual `
+        -Left ([string]$receipt.BrokerCliPath) `
+        -Right $expectedBrokerCliPath)) {
+        throw 'Compatible supervisor resume receipt has a foreign Broker path.'
+    }
+
+    $staleSidecarProcessId = 0
+    if ($null -ne $receipt.Sidecar) {
+        if (-not (Test-NonNegativeInteger -Value $receipt.Sidecar.ProcessId) -or
+            [int]$receipt.Sidecar.ProcessId -lt 1) {
+            throw 'Compatible supervisor resume has an invalid stale Sidecar receipt.'
+        }
+        $staleSidecarProcessId = [int]$receipt.Sidecar.ProcessId
+        $staleSidecar = Get-CimInstance `
+            Win32_Process `
+            -Filter "ProcessId = $staleSidecarProcessId" `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $staleSidecar) {
+            throw 'Compatible supervisor resume found the recorded Sidecar PID alive.'
+        }
+    }
+    $sidecarListeners = @(
+        Get-CodexLocalRemoteTcpListenerSnapshot `
+            -LocalPorts @($ManagedSidecarPort)
+    )
+    if ($sidecarListeners.Count -ne 0) {
+        throw 'Compatible supervisor resume found the Sidecar port occupied.'
+    }
+    $preparationPath =
+        Get-CodexLocalRemoteDesktopHandoffPreparationPath `
+            -DataDir $ManagedDataDir
+    if (Test-Path -LiteralPath $preparationPath) {
+        throw 'Compatible supervisor resume found an active Desktop preparation.'
+    }
+
+    return [pscustomobject][ordered]@{
+        Signature =
+            'codex-local-remote/compatible-supervisor-resume-proof/v1'
+        Version = 1
+        Decision = 'resume-compatible-supervisor'
+        SelectedRuntimeVersionId =
+            [string]$SelectedRuntime.CurrentVersionId
+        SelectedRuntimeRoot =
+            [System.IO.Path]::GetFullPath(
+                [string]$SelectedRuntime.CurrentRoot
+            )
+        SelectedManifestSha256 =
+            [string]$SelectedRuntime.CurrentManifestSha256
+        ActiveRuntimeVersionId = $activeVersionId
+        ActiveRuntimeRoot =
+            [System.IO.Path]::GetFullPath([string]$generation.ActiveRoot)
+        ActiveManifestSha256 =
+            [string]$SelectedRuntime.PreviousManifestSha256
+        RuntimeInvocationId = [string]$readiness.runtimeInvocationId
+        BrokerProcessId = [int]$readiness.brokerProcessId
+        UpstreamProcessId = [int]$readiness.upstreamProcessId
+        DesktopProcessCount = $desktopRoots.Count
+        DesktopProcessIdentity = $desktopProcessIdentity
+        TaskDefinitionSha256 = $taskDefinitionSha256
+        UnsafeThreadCount = [int]$readiness.unsafeThreadCount
+        StaleSidecarProcessId = $staleSidecarProcessId
+        RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
+    }
+}
+
+function Test-CodexLocalRemoteCompatibleSupervisorResumeProof {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Expected,
+
+        [AllowNull()]
+        [object]$Current
+    )
+
+    if ($null -eq $Expected -or $null -eq $Current) {
+        return $false
+    }
+    foreach ($property in @(
+        'Signature',
+        'Version',
+        'Decision',
+        'SelectedRuntimeVersionId',
+        'SelectedRuntimeRoot',
+        'SelectedManifestSha256',
+        'ActiveRuntimeVersionId',
+        'ActiveRuntimeRoot',
+        'ActiveManifestSha256',
+        'RuntimeInvocationId',
+        'BrokerProcessId',
+        'UpstreamProcessId',
+        'DesktopProcessCount',
+        'DesktopProcessIdentity',
+        'TaskDefinitionSha256',
+        'StaleSidecarProcessId'
+    )) {
+        if ($null -eq $Expected.PSObject.Properties[$property] -or
+            $null -eq $Current.PSObject.Properties[$property] -or
+            [string]$Expected.$property -cne [string]$Current.$property) {
+            return $false
+        }
+    }
+    return (
+        [string]$Current.Signature -ceq
+            'codex-local-remote/compatible-supervisor-resume-proof/v1' -and
+        [int]$Current.Version -eq 1 -and
+        [string]$Current.Decision -ceq 'resume-compatible-supervisor'
+    )
+}
+
 function Start-CodexLocalRemoteRegisteredTask {
     [CmdletBinding()]
     param(
@@ -3828,6 +4125,9 @@ function Start-CodexLocalRemoteRegisteredTask {
 
         [AllowNull()]
         [object]$DesktopHandoffPreparation,
+
+        [AllowNull()]
+        [object]$CompatibleSupervisorResumeProof,
 
         [switch]$AllowActiveTurns
     )
@@ -3874,6 +4174,12 @@ function Start-CodexLocalRemoteRegisteredTask {
             -DesktopHandoffPreparation $DesktopHandoffPreparation
         $desktopProcessCount = 0
     }
+    if ($null -ne $CompatibleSupervisorResumeProof -and
+        $null -ne $DesktopHandoffPreparation) {
+        throw (New-CodexRemoteFailureException `
+            -Stage 'runtime-handoff' `
+            -Code 'runtime-generation-unverified')
+    }
     try {
         $task = Get-ScheduledTask `
             -TaskName $Name `
@@ -3904,6 +4210,31 @@ function Start-CodexLocalRemoteRegisteredTask {
         throw (New-CodexRemoteFailureException `
             -Stage 'runtime-handoff' `
             -Code 'runtime-generation-unverified')
+    }
+    if ($null -ne $CompatibleSupervisorResumeProof) {
+        try {
+            $currentResumeProof =
+                Assert-CodexLocalRemoteCompatibleSupervisorResume `
+                    -SelectedRuntime $selectedRuntime `
+                    -TaskState ([string]$task.State) `
+                    -TaskName $Name `
+                    -ManagedDataDir $ManagedDataDir `
+                    -ManagedSidecarPort $ManagedSidecarPort `
+                    -ManagedBrokerPort $ManagedBrokerPort
+            if (-not (
+                Test-CodexLocalRemoteCompatibleSupervisorResumeProof `
+                    -Expected $CompatibleSupervisorResumeProof `
+                    -Current $currentResumeProof
+            )) {
+                throw 'Compatible supervisor resume proof drifted.'
+            }
+            Start-CodexLocalRemoteScheduledTaskBounded -Name $Name
+            return
+        } catch {
+            throw (New-CodexRemoteFailureException `
+                -Stage 'runtime-handoff' `
+                -Code 'runtime-handoff-failed')
+        }
     }
     $decision = Get-CodexLocalRemoteRuntimeHandoffDecision `
         -TaskState ([string]$task.State) `

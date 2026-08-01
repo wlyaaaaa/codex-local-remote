@@ -82,6 +82,7 @@ $bootstrapInvocationId = [Guid]::NewGuid().ToString('N')
 $runtimeInvocationId = $null
 $bootstrapReceipt = $null
 $runtimeDiscovery = $null
+$activeBrokerRuntimeReceipt = $null
 $startupStage = 'preflight'
 
 function Protect-StartupStatusText {
@@ -175,7 +176,9 @@ function Write-BrokerRuntimeReceipt {
 
         [AllowNull()][object]$SidecarReceipt,
 
-        [AllowNull()][object]$UpstreamReceipt
+        [AllowNull()][object]$UpstreamReceipt,
+
+        [AllowNull()][object]$SidecarRuntimeBinding = $null
     )
 
     Write-AtomicJsonFile -Path $brokerStatePath -Value ([ordered]@{
@@ -195,6 +198,40 @@ function Write-BrokerRuntimeReceipt {
         BrokerCliPath = $brokerCli
         BrokerSidecarCompatibilityId =
             $brokerSidecarCompatibilityId
+        SupervisorRuntimeVersionId =
+            [string]$supervisorRuntimeIdentity.VersionId
+        SupervisorRuntimeRoot =
+            [string]$supervisorRuntimeIdentity.RuntimeRoot
+        SupervisorRuntimeManifestSha256 =
+            [string]$supervisorRuntimeIdentity.ManifestSha256
+        BrokerRuntimeVersionId =
+            [string]$activeBrokerRuntimeIdentity.VersionId
+        BrokerRuntimeRoot =
+            [string]$activeBrokerRuntimeIdentity.RuntimeRoot
+        BrokerRuntimeManifestSha256 =
+            [string]$activeBrokerRuntimeIdentity.ManifestSha256
+        SupervisorOnlyAdoptedPreviousBroker =
+            $brokerRuntimeAdoptedFromPrevious
+        SidecarRuntimeVersionId = if ($null -eq $SidecarReceipt -or
+            $null -eq $SidecarRuntimeBinding) {
+            $null
+        } else {
+            [string]$SidecarRuntimeBinding.VersionId
+        }
+        SidecarRuntimeRoot = if ($null -eq $SidecarReceipt -or
+            $null -eq $SidecarRuntimeBinding) {
+            $null
+        } else {
+            [string]$SidecarRuntimeBinding.RuntimeRoot
+        }
+        SidecarRuntimeManifestSha256 = if (
+            $null -eq $SidecarReceipt -or
+            $null -eq $SidecarRuntimeBinding
+        ) {
+            $null
+        } else {
+            [string]$SidecarRuntimeBinding.ManifestSha256
+        }
         CodexPath = $resolvedCodex
         CodexRuntime = $runtimeDiscovery
         StartedByThisInvocation = $startedBroker
@@ -310,6 +347,7 @@ function Get-ActiveRuntimeDiscoveryReceipt {
     if ($brokerRawBefore -cne $brokerRawAfter) {
         throw 'The active Broker receipt changed during runtime recovery.'
     }
+    $script:activeBrokerRuntimeReceipt = $broker
     return $receipt
 }
 
@@ -495,6 +533,32 @@ foreach ($requiredFile in @($resolvedNode, $brokerCli, $sidecarCli)) {
         throw "Required runtime file not found at '$requiredFile'."
     }
 }
+if ($null -eq $startupSelectedRuntime -or
+    [string]$startupSelectedRuntime.CurrentVersionId -cnotmatch
+        '^[0-9a-f]{64}$' -or
+    [string]$startupSelectedRuntime.CurrentManifestSha256 -cnotmatch
+        '^[0-9a-f]{64}$' -or
+    -not [string]::Equals(
+        [System.IO.Path]::GetFullPath(
+            [string]$startupSelectedRuntime.CurrentRoot
+        ),
+        $resolvedRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw 'Supervisor runtime is not the exact selected immutable generation.'
+}
+$supervisorRuntimeIdentity = [pscustomobject][ordered]@{
+    VersionId = [string]$startupSelectedRuntime.CurrentVersionId
+    RuntimeRoot = $resolvedRoot
+    ManifestSha256 =
+        [string]$startupSelectedRuntime.CurrentManifestSha256
+}
+$activeBrokerRuntimeIdentity = [pscustomobject][ordered]@{
+    VersionId = [string]$supervisorRuntimeIdentity.VersionId
+    RuntimeRoot = [string]$supervisorRuntimeIdentity.RuntimeRoot
+    ManifestSha256 = [string]$supervisorRuntimeIdentity.ManifestSha256
+}
+$brokerRuntimeAdoptedFromPrevious = $false
 $webSocketUrl = Get-BrokerCapabilityWebSocketUrl `
     -Port $BrokerPort `
     -TokenPath $capabilityTokenPath
@@ -536,6 +600,22 @@ function Get-BrokerListeners {
         @(
             Get-CodexLocalRemoteTcpListenerSnapshot `
                 -LocalPorts @($BrokerPort)
+        )
+    })
+}
+
+function Get-SidecarListeners {
+    return $(if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        @(
+            Get-NetTCPConnection `
+                -State Listen `
+                -LocalPort $SidecarPort `
+                -ErrorAction SilentlyContinue
+        )
+    } else {
+        @(
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts @($SidecarPort)
         )
     })
 }
@@ -1141,6 +1221,254 @@ function Get-SharedRuntimeDecision {
     return $decision
 }
 
+function Get-PreviousBrokerAdoptionBinding {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$CurrentRuntime,
+
+        [AllowNull()]
+        [object]$ActiveBrokerReceipt,
+
+        [AllowNull()]
+        [object]$Readiness,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$BrokerListenerProcessId,
+
+        [AllowNull()]
+        [object[]]$SidecarListeners
+    )
+
+    $reject = {
+        param([Parameter(Mandatory)][string]$Reason)
+        return [pscustomobject][ordered]@{
+            AdoptedFromPrevious = $false
+            Reason = $Reason
+            BrokerCliPath = $null
+            ActiveBrokerRuntime = $null
+            PayloadCompatibilityReason = $null
+        }
+    }
+    function Test-AdoptionPathEqual {
+        param(
+            [AllowNull()][object]$Left,
+            [AllowNull()][object]$Right
+        )
+        try {
+            return [string]::Equals(
+                [System.IO.Path]::GetFullPath([string]$Left),
+                [System.IO.Path]::GetFullPath([string]$Right),
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        } catch {
+            return $false
+        }
+    }
+
+    try {
+        if ($null -eq $CurrentRuntime -or
+            [string]$CurrentRuntime.CurrentVersionId -cnotmatch
+                '^[0-9a-f]{64}$' -or
+            [string]$CurrentRuntime.CurrentManifestSha256 -cnotmatch
+                '^[0-9a-f]{64}$' -or
+            [string]$CurrentRuntime.PreviousVersionId -cnotmatch
+                '^[0-9a-f]{64}$' -or
+            [string]$CurrentRuntime.PreviousManifestSha256 -cnotmatch
+                '^[0-9a-f]{64}$' -or
+            -not (Test-AdoptionPathEqual `
+                -Left $CurrentRuntime.CurrentRoot `
+                -Right $resolvedRoot) -or
+            (Test-AdoptionPathEqual `
+                -Left $CurrentRuntime.CurrentRoot `
+                -Right $CurrentRuntime.PreviousRoot)) {
+            return (& $reject `
+                'Current pointer does not identify one exact Previous runtime.')
+        }
+
+        $previousRoot = [System.IO.Path]::GetFullPath(
+            [string]$CurrentRuntime.PreviousRoot
+        )
+        $previousBrokerCli = [System.IO.Path]::GetFullPath(
+            (Join-Path $previousRoot 'apps\broker\dist\cli.js')
+        )
+        $previousRootPrefix =
+            [System.IO.Path]::TrimEndingDirectorySeparator($previousRoot) + '\'
+        if (-not $previousBrokerCli.StartsWith(
+                $previousRootPrefix,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            $null -eq $ActiveBrokerReceipt -or
+            [string]$ActiveBrokerReceipt.Signature -cne
+                'codex-local-remote/app-server-broker/v3' -or
+            [int]$ActiveBrokerReceipt.Version -ne 3 -or
+            [string]$ActiveBrokerReceipt.Status -cne 'ready' -or
+            -not (Test-AdoptionPathEqual `
+                -Left $ActiveBrokerReceipt.BrokerCliPath `
+                -Right $previousBrokerCli) -or
+            -not (Test-Path -LiteralPath $previousBrokerCli -PathType Leaf)) {
+            return (& $reject `
+                'Active receipt does not point to the exact Previous Broker path.')
+        }
+        $previousBrokerItem =
+            Get-Item -LiteralPath $previousBrokerCli -Force -ErrorAction Stop
+        if ($previousBrokerItem.PSIsContainer -or
+            ($previousBrokerItem.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return (& $reject `
+                'Active Previous Broker path is not one ordinary file.')
+        }
+
+        $payloadCompatibility =
+            Test-CodexLocalRemoteBrokerPayloadCompatibility `
+                -CurrentRuntimeRoot (
+                    [string]$CurrentRuntime.CurrentRoot
+                ) `
+                -CurrentVersionId (
+                    [string]$CurrentRuntime.CurrentVersionId
+                ) `
+                -CurrentManifestSha256 (
+                    [string]$CurrentRuntime.CurrentManifestSha256
+                ) `
+                -ActiveRuntimeRoot $previousRoot `
+                -ActiveVersionId (
+                    [string]$CurrentRuntime.PreviousVersionId
+                ) `
+                -ActiveManifestSha256 (
+                    [string]$CurrentRuntime.PreviousManifestSha256
+                )
+        if ($null -eq $payloadCompatibility -or
+            $payloadCompatibility.IsCompatible -isnot [bool] -or
+            -not [bool]$payloadCompatibility.IsCompatible) {
+            $payloadReason = if ($null -eq $payloadCompatibility) {
+                'missing compatibility evidence'
+            } else {
+                [string]$payloadCompatibility.Reason
+            }
+            return (& $reject `
+                "Broker payload closure is not byte-compatible: $payloadReason")
+        }
+
+        # In production, collect live client and listener evidence only after
+        # the comparatively expensive immutable-payload proof. Tests may inject
+        # exact snapshots without consulting real listeners or processes.
+        $effectiveReadiness = if (
+            $PSBoundParameters.ContainsKey('Readiness')
+        ) {
+            $Readiness
+        } else {
+            Get-BrokerReadinessSnapshot
+        }
+        $effectiveSidecarListeners = if (
+            $PSBoundParameters.ContainsKey('SidecarListeners')
+        ) {
+            $SidecarListeners
+        } else {
+            @(Get-SidecarListeners)
+        }
+        $readinessIsStrictPreviousBroker = (
+            $null -ne $effectiveReadiness -and
+            [string]$effectiveReadiness.status -ceq 'ready' -and
+            $effectiveReadiness.appServerReady -is [bool] -and
+            [bool]$effectiveReadiness.appServerReady -and
+            $effectiveReadiness.desktopConnected -is [bool] -and
+            [bool]$effectiveReadiness.desktopConnected -and
+            $effectiveReadiness.sidecarConnected -is [bool] -and
+            -not [bool]$effectiveReadiness.sidecarConnected -and
+            $effectiveReadiness.degraded -is [bool] -and
+            -not [bool]$effectiveReadiness.degraded -and
+            (Test-NonNegativeInteger `
+                -Value $effectiveReadiness.unknownCount) -and
+            [int]$effectiveReadiness.unknownCount -eq 0
+        )
+        if (-not $readinessIsStrictPreviousBroker) {
+            return (& $reject `
+                'Previous Broker readiness is not exact for Sidecar-free adoption.')
+        }
+
+        $receiptInvocationId =
+            [string]$ActiveBrokerReceipt.RuntimeInvocationId
+        if ($receiptInvocationId -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$effectiveReadiness.runtimeInvocationId -cne
+                $receiptInvocationId -or
+            [string]$ActiveBrokerReceipt.Broker.RuntimeInvocationId -cne
+                $receiptInvocationId -or
+            [string]$ActiveBrokerReceipt.Upstream.RuntimeInvocationId -cne
+                $receiptInvocationId -or
+            [string]$ActiveBrokerReceipt.Sidecar.RuntimeInvocationId -cne
+                $receiptInvocationId) {
+            return (& $reject `
+                'Broker runtime invocation identity drifted across receipt and readiness.')
+        }
+        if (-not (Test-NonNegativeInteger `
+                -Value $ActiveBrokerReceipt.ProcessId) -or
+            -not (Test-NonNegativeInteger `
+                -Value $ActiveBrokerReceipt.Broker.ProcessId) -or
+            -not (Test-NonNegativeInteger `
+                -Value $effectiveReadiness.brokerProcessId) -or
+            [int]$ActiveBrokerReceipt.ProcessId -ne
+                $BrokerListenerProcessId -or
+            [int]$ActiveBrokerReceipt.Broker.ProcessId -ne
+                $BrokerListenerProcessId -or
+            [int]$effectiveReadiness.brokerProcessId -ne
+                $BrokerListenerProcessId) {
+            return (& $reject `
+                'Broker identity drifted across listener, receipt, and readiness.')
+        }
+        if (-not (Test-NonNegativeInteger `
+                -Value $ActiveBrokerReceipt.Upstream.ProcessId) -or
+            -not (Test-NonNegativeInteger `
+                -Value $effectiveReadiness.upstreamProcessId) -or
+            [int]$ActiveBrokerReceipt.Upstream.ProcessId -ne
+                [int]$effectiveReadiness.upstreamProcessId) {
+            return (& $reject `
+                'Broker upstream identity drifted across receipt and readiness.')
+        }
+        if ([string]$ActiveBrokerReceipt.BrokerSidecarCompatibilityId -cne
+                $brokerSidecarCompatibilityId) {
+            return (& $reject `
+                'Broker and Current Sidecar compatibility identity drifted.')
+        }
+        if ($null -ne $effectiveSidecarListeners -and
+            @($effectiveSidecarListeners).Count -ne 0) {
+            return (& $reject 'Sidecar port is still occupied.')
+        }
+        if (-not (Test-NonNegativeInteger `
+                -Value $ActiveBrokerReceipt.Sidecar.ProcessId) -or
+            [int]$ActiveBrokerReceipt.Sidecar.ProcessId -lt 1) {
+            return (& $reject `
+                'Previous Sidecar receipt PID is missing or invalid.')
+        }
+        $oldSidecarProcess = Get-CimInstance `
+            -ClassName Win32_Process `
+            -Filter (
+                "ProcessId = $([int]$ActiveBrokerReceipt.Sidecar.ProcessId)"
+            ) `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $oldSidecarProcess) {
+            return (& $reject 'Previous Sidecar receipt PID is still alive.')
+        }
+
+        return [pscustomobject][ordered]@{
+            AdoptedFromPrevious = $true
+            Reason = 'exact-previous-broker-payload-adopted'
+            BrokerCliPath = $previousBrokerCli
+            ActiveBrokerRuntime = [pscustomobject][ordered]@{
+                VersionId = [string]$CurrentRuntime.PreviousVersionId
+                RuntimeRoot = $previousRoot
+                ManifestSha256 =
+                    [string]$CurrentRuntime.PreviousManifestSha256
+            }
+            PayloadCompatibilityReason =
+                [string]$payloadCompatibility.Reason
+        }
+    } catch {
+        return (& $reject `
+            "Previous Broker adoption evidence failed: $($_.Exception.Message)")
+    }
+}
+
 function Stop-ExactManagedBrokerAndOrphan {
     param(
         [AllowNull()]
@@ -1236,6 +1564,18 @@ if ($listenerPids.Count -eq 1) {
     if ($null -eq $runtimeDiscovery -or
         [string]::IsNullOrWhiteSpace($resolvedCodex)) {
         throw "TCP port $BrokerPort is occupied but no stable active runtime receipt is available; refusing to guess its Codex generation or start a second app-server."
+    }
+    $previousBrokerAdoption = Get-PreviousBrokerAdoptionBinding `
+        -CurrentRuntime $startupSelectedRuntime `
+        -ActiveBrokerReceipt $activeBrokerRuntimeReceipt `
+        -BrokerListenerProcessId ([int]$listenerPids[0])
+    if ([bool]$previousBrokerAdoption.AdoptedFromPrevious) {
+        $brokerCli = [System.IO.Path]::GetFullPath(
+            [string]$previousBrokerAdoption.BrokerCliPath
+        )
+        $activeBrokerRuntimeIdentity =
+            $previousBrokerAdoption.ActiveBrokerRuntime
+        $brokerRuntimeAdoptedFromPrevious = $true
     }
     $brokerProcess = Get-VerifiedManagedBroker -ProcessId ([int]$listenerPids[0])
     $brokerRuntimeSnapshot = Get-VerifiedBrokerRuntimeSnapshot `
@@ -1417,11 +1757,13 @@ if ($null -ne $initialUpstream) {
         $upstreamIdentityHandle.Process.Dispose()
     }
 }
-Write-BrokerRuntimeReceipt `
-    -Status 'broker-ready' `
-    -BrokerReceipt $brokerReceipt `
-    -SidecarReceipt $null `
-    -UpstreamReceipt $initialUpstreamReceipt
+if (-not $brokerRuntimeAdoptedFromPrevious) {
+    Write-BrokerRuntimeReceipt `
+        -Status 'broker-ready' `
+        -BrokerReceipt $brokerReceipt `
+        -SidecarReceipt $null `
+        -UpstreamReceipt $initialUpstreamReceipt
+}
 
 $startupStage = 'sidecar-start'
 Write-StartupStatus -Status 'starting'
@@ -1462,6 +1804,7 @@ function Get-VerifiedSidecarRuntimeBinding {
     return [pscustomobject]@{
         VersionId = [string]$Runtime.CurrentVersionId
         RuntimeRoot = $runtimeRoot
+        ManifestSha256 = [string]$Runtime.CurrentManifestSha256
         SidecarCli = $runtimeSidecarCli
         BrokerSidecarCompatibilityId =
             [string]$runtimeCheck.BrokerSidecarCompatibilityId
@@ -1704,7 +2047,8 @@ try {
         -Status 'ready' `
         -BrokerReceipt $brokerReceipt `
         -SidecarReceipt $sidecarReceipt `
-        -UpstreamReceipt $readyUpstreamReceipt
+        -UpstreamReceipt $readyUpstreamReceipt `
+        -SidecarRuntimeBinding $activeSidecarRuntimeBinding
 
     $initialDesktopLaunch = $null
     $desktopOwnerState = [pscustomobject]@{
@@ -2066,7 +2410,8 @@ try {
                     -Status 'ready' `
                     -BrokerReceipt $brokerReceipt `
                     -SidecarReceipt $sidecarReceipt `
-                    -UpstreamReceipt $recoveredUpstreamReceipt
+                    -UpstreamReceipt $recoveredUpstreamReceipt `
+                    -SidecarRuntimeBinding $activeSidecarRuntimeBinding
                 $sidecarRecoveryAttempt = 0
                 $nextSidecarRecoveryAt = [DateTime]::MinValue
                 $startupStage = 'supervising'
@@ -2226,7 +2571,8 @@ try {
                         -Status 'ready' `
                         -BrokerReceipt $brokerReceipt `
                         -SidecarReceipt $sidecarReceipt `
-                        -UpstreamReceipt $updatedUpstreamReceipt
+                        -UpstreamReceipt $updatedUpstreamReceipt `
+                        -SidecarRuntimeBinding $activeSidecarRuntimeBinding
                     if ([string]$sidecarUpdate.Status -ceq 'updated') {
                         $sidecarRuntimeUpdateAttempt = 0
                         $desktopOwnerRuntime =

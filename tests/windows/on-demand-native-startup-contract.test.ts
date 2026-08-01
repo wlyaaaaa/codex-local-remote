@@ -75,6 +75,12 @@ describe("Windows native-default on-demand Remote contract", () => {
       TransitionHeadless: "start-without-desktop-restart",
       TransitionAmbiguousRoots: "blocked-ambiguous-desktop-roots",
       TransitionOrphanStdio: "blocked-independent-stdio",
+      RunningReadyCompatible: "remote-lease-active",
+      RunningSupervisorRepairable: "wait-background-recovery",
+      ReadyCompatibleResumeWithoutAuthority: "resume-compatible-supervisor",
+      ReadyCompatibleResumeWithAuthority: "resume-compatible-supervisor",
+      ReadyCompatibleResumeAmbiguous: "blocked-ambiguous-desktop-roots",
+      ReadyCompatibleResumeOrphanStdio: "blocked-independent-stdio",
       BackgroundOnly: "start-without-desktop-restart",
       RestartRequired: "desktop-restart-authorization-required",
       RestartAuthorized: "handoff-native-desktop-once",
@@ -112,6 +118,23 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(handoff).not.toMatch(
       /if \(\$taskDecision -ceq 'remote-lease-active'\)[\s\S]{0,800}return/u,
     );
+  });
+
+  it("resumes one exact compatible orphaned supervisor without touching Desktop", () => {
+    const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+
+    expect(handoff).toContain("'supervisor-repairable'");
+    expect(handoff).toContain("'ready-compatible'");
+    expect(handoff).toContain("'resume-compatible-supervisor'");
+    expect(handoff).toContain("-AllowCompatibleSupervisorResume");
+    expect(handoff).toContain("-CompatibleSupervisorResumeProof");
+    expect(handoff).toMatch(
+      /\$desktopRoots\.Count -eq 1 -and\s+\$decision -cne\s+'resume-compatible-supervisor'/u,
+    );
+    expect(handoff).toMatch(
+      /\[string\]\$startupTask\.State -ceq 'Ready'[\s\S]{0,500}Get-OnDemandRemoteState/u,
+    );
+    expect(handoff).toMatch(/\$remoteState -ceq 'ready-compatible'[\s\S]{0,200}'active'/u);
   });
 
   it("classifies only one exact silent rollback ancestor as transitionable", () => {
@@ -154,6 +177,10 @@ describe("Windows native-default on-demand Remote contract", () => {
         PreviousUnsafeDesktopConnectedAuthorized: "background-repairable",
         PreviousUnknown: "unverified",
         PreviousUnsafe: "runtime-transition-busy",
+        PreviousSupervisorRepairable: "supervisor-repairable",
+        PreviousSupervisorRepairableUnsafe: "supervisor-repairable",
+        PreviousSupervisorPayloadMismatch: "unverified",
+        PreviousAdoptedCompatible: "ready-compatible",
         PreviousManifestMismatch: "unverified",
         Unrelated: "unverified",
       });

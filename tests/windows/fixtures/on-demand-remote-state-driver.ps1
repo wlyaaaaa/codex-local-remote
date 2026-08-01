@@ -88,6 +88,31 @@ function Test-CodexLocalRemoteRuntimeVersion {
     }
 }
 
+function Test-CodexLocalRemoteBrokerPayloadCompatibility {
+    param(
+        [string]$CurrentRuntimeRoot,
+        [string]$CurrentVersionId,
+        [string]$CurrentManifestSha256,
+        [string]$ActiveRuntimeRoot,
+        [string]$ActiveVersionId,
+        [string]$ActiveManifestSha256
+    )
+
+    $null = @(
+        $CurrentRuntimeRoot,
+        $CurrentVersionId,
+        $CurrentManifestSha256,
+        $ActiveRuntimeRoot,
+        $ActiveVersionId,
+        $ActiveManifestSha256
+    )
+    return [pscustomobject]@{
+        IsCompatible = $global:OnDemandRemoteStateScenario -cne
+            'PreviousSupervisorPayloadMismatch'
+        Reason = 'fixture'
+    }
+}
+
 function Invoke-RestMethod {
     param(
         [string]$Method,
@@ -133,7 +158,8 @@ function Invoke-RemoteStateCase {
         'CurrentUnsafeDetached',
         'PreviousWithSidecar',
         'PreviousActive',
-        'PreviousIdleActive'
+        'PreviousIdleActive',
+        'PreviousAdoptedCompatible'
     )
     $global:OnDemandRemoteStateReadiness = [pscustomobject]@{
         status = if ($Scenario -ceq 'CurrentDetached') {
@@ -147,7 +173,11 @@ function Invoke-RemoteStateCase {
             'PreviousDesktopConnected',
             'PreviousUnsafeDesktopConnected',
             'PreviousActive',
-            'PreviousIdleActive'
+            'PreviousIdleActive',
+            'PreviousSupervisorRepairable',
+            'PreviousSupervisorRepairableUnsafe',
+            'PreviousSupervisorPayloadMismatch',
+            'PreviousAdoptedCompatible'
         )
         sidecarConnected = $sidecarConnected
         degraded = $Scenario -cin @(
@@ -161,7 +191,9 @@ function Invoke-RemoteStateCase {
             'CurrentUnsafeBackground',
             'PreviousUnsafe',
             'PreviousUnsafeDesktopConnected',
-            'PreviousActive'
+            'PreviousActive',
+            'PreviousSupervisorRepairableUnsafe',
+            'PreviousAdoptedCompatible'
         )) {
             4
         } else {
@@ -194,11 +226,50 @@ function Invoke-RemoteStateCase {
                 ProcessId = 4103
                 ProcessStartTimeUtcTicks = 638000000000000000
             }
+        } elseif ($Scenario -cin @(
+            'PreviousSupervisorRepairable',
+            'PreviousSupervisorRepairableUnsafe',
+            'PreviousSupervisorPayloadMismatch'
+        )) {
+            [ordered]@{
+                RuntimeInvocationId = $runtimeInvocationId
+                ProcessId = 4999
+                ProcessStartTimeUtcTicks = 638000000000000000
+            }
         } else {
             $null
         }
         BrokerCliPath = Join-Path $activeRoot 'apps\broker\dist\cli.js'
         BrokerSidecarCompatibilityId = 'fixture-compatibility'
+        SupervisorRuntimeVersionId = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $currentVersionId } else { $null }
+        SupervisorRuntimeRoot = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $currentRoot } else { $null }
+        SupervisorRuntimeManifestSha256 = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $currentVersionId } else { $null }
+        SidecarRuntimeVersionId = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $currentVersionId } else { $null }
+        SidecarRuntimeRoot = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $currentRoot } else { $null }
+        SidecarRuntimeManifestSha256 = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $currentVersionId } else { $null }
+        BrokerRuntimeVersionId = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $previousVersionId } else { $null }
+        BrokerRuntimeRoot = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $previousRoot } else { $null }
+        BrokerRuntimeManifestSha256 = if (
+            $Scenario -ceq 'PreviousAdoptedCompatible'
+        ) { $previousVersionId } else { $null }
+        SupervisorOnlyAdoptedPreviousBroker =
+            ($Scenario -ceq 'PreviousAdoptedCompatible')
     } |
         ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
@@ -207,7 +278,13 @@ function Invoke-RemoteStateCase {
         -Runtime $runtime `
         -BrokerPort 18791 `
         -AllowActiveTurns:$AllowActiveTurns `
-        -AllowNativePreviousDesktop:$AllowNativePreviousDesktop
+        -AllowNativePreviousDesktop:$AllowNativePreviousDesktop `
+        -AllowCompatibleSupervisorResume:($Scenario -cin @(
+            'PreviousSupervisorRepairable',
+            'PreviousSupervisorRepairableUnsafe',
+            'PreviousSupervisorPayloadMismatch',
+            'PreviousAdoptedCompatible'
+        ))
 }
 
 [pscustomobject][ordered]@{
@@ -254,6 +331,14 @@ function Invoke-RemoteStateCase {
         Invoke-RemoteStateCase -Scenario 'PreviousUnknown'
     PreviousUnsafe =
         Invoke-RemoteStateCase -Scenario 'PreviousUnsafe'
+    PreviousSupervisorRepairable =
+        Invoke-RemoteStateCase -Scenario 'PreviousSupervisorRepairable'
+    PreviousSupervisorRepairableUnsafe =
+        Invoke-RemoteStateCase -Scenario 'PreviousSupervisorRepairableUnsafe'
+    PreviousSupervisorPayloadMismatch =
+        Invoke-RemoteStateCase -Scenario 'PreviousSupervisorPayloadMismatch'
+    PreviousAdoptedCompatible =
+        Invoke-RemoteStateCase -Scenario 'PreviousAdoptedCompatible'
     PreviousManifestMismatch =
         Invoke-RemoteStateCase -Scenario 'PreviousManifestMismatch'
     Unrelated = Invoke-RemoteStateCase -Scenario 'Unrelated'

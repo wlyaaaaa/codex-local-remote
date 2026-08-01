@@ -5370,6 +5370,423 @@ function Test-CodexLocalRemoteRuntimeVersion {
     }
 }
 
+function Invoke-CodexLocalRemoteRuntimeValidationSafe {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$VersionId
+    )
+
+    try {
+        $validation = Test-CodexLocalRemoteRuntimeVersion `
+            -RuntimeRoot $RuntimeRoot `
+            -ExpectedVersionId $VersionId
+        if ($null -ne $validation) {
+            return $validation
+        }
+        $reason = 'runtime validation returned no result'
+    } catch {
+        $reason = $_.Exception.Message
+    }
+    return [pscustomobject]@{
+        IsValid = $false
+        Reason = $reason
+        VersionId = $null
+        RuntimeRoot = $RuntimeRoot
+        ManifestPath = $null
+        ManifestSha256 = $null
+        BrokerSidecarCompatibilityId = $null
+        SourceCommit = $null
+        SourceDirty = $null
+    }
+}
+
+function New-CodexLocalRemoteBrokerPayloadRuntimeState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$VersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ManifestSha256
+    )
+
+    return [pscustomobject]@{
+        IsValid = $false
+        ValidationReason = $null
+        RuntimeRoot = $RuntimeRoot
+        VersionId = $VersionId
+        ManifestPath = $null
+        ManifestSha256 = $ManifestSha256
+        BrokerSidecarCompatibilityId = $null
+        PayloadSha256 = $null
+        PayloadFileCount = 0
+        PackageJson = $null
+        BrokerFiles = @()
+    }
+}
+
+function Read-CodexLocalRemoteStableBrokerPayloadManifest {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('current', 'active')]
+        [string]$Label,
+
+        [Parameter(Mandatory)]
+        [object]$Validation,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedManifestSha256,
+
+        [Parameter(Mandatory)]
+        [object]$State
+    )
+
+    try {
+        if ($ExpectedManifestSha256 -cnotmatch '^[a-f0-9]{64}$' -or
+            [string]$Validation.VersionId -cne $ExpectedVersionId) {
+            return [pscustomobject]@{
+                Succeeded = $false
+                Reason = "$Label-manifest-identity-mismatch"
+                State = $State
+            }
+        }
+
+        $manifestPath = [string]$Validation.ManifestPath
+        $stream = [System.IO.FileStream]::new(
+            $manifestPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read,
+            4096,
+            [System.IO.FileOptions]::SequentialScan
+        )
+        try {
+            if ($stream.Length -lt 32 -or $stream.Length -gt 16777216) {
+                throw 'runtime manifest is not a bounded file'
+            }
+            $bytes = [byte[]]::new([int]$stream.Length)
+            $offset = 0
+            while ($offset -lt $bytes.Length) {
+                $read = $stream.Read(
+                    $bytes,
+                    $offset,
+                    $bytes.Length - $offset
+                )
+                if ($read -le 0) {
+                    throw 'runtime manifest ended before its declared length'
+                }
+                $offset += $read
+            }
+            if ($stream.ReadByte() -ne -1) {
+                throw 'runtime manifest grew while it was being read'
+            }
+        } finally {
+            $stream.Dispose()
+        }
+
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $manifestSha256 = [System.BitConverter]::ToString(
+                $sha256.ComputeHash($bytes)
+            ).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
+        if ($manifestSha256 -cne $ExpectedManifestSha256 -or
+            $manifestSha256 -cne [string]$Validation.ManifestSha256) {
+            return [pscustomobject]@{
+                Succeeded = $false
+                Reason = "$Label-manifest-identity-mismatch"
+                State = $State
+            }
+        }
+
+        $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $manifestText = $utf8.GetString($bytes)
+        if ($manifestText.Length -gt 0 -and
+            $manifestText[0] -eq [char]0xfeff) {
+            $manifestText = $manifestText.Substring(1)
+        }
+        $manifest = $manifestText |
+            ConvertFrom-Json -Depth 50 -ErrorAction Stop
+        if ([string]$manifest.Signature -cne
+                'codex-local-remote/runtime-manifest/v1' -or
+            [int]$manifest.Version -ne 1 -or
+            [string]$manifest.VersionId -cne $ExpectedVersionId -or
+            [string]$manifest.BrokerSidecarCompatibilityId -cne
+                [string]$Validation.BrokerSidecarCompatibilityId) {
+            return [pscustomobject]@{
+                Succeeded = $false
+                Reason = "$Label-manifest-identity-mismatch"
+                State = $State
+            }
+        }
+
+        $packageEntries = @(
+            @($manifest.Files) |
+                Where-Object { [string]$_.Path -ceq 'package.json' }
+        )
+        $brokerEntries = @(
+            @($manifest.Files) |
+                Where-Object {
+                    [string]$_.Path -clike 'apps/broker/dist/*'
+                } |
+                Sort-Object Path
+        )
+        if ($packageEntries.Count -ne 1 -or $brokerEntries.Count -lt 1) {
+            return [pscustomobject]@{
+                Succeeded = $false
+                Reason = "$Label-broker-payload-incomplete"
+                State = $State
+            }
+        }
+        $payloadEntries = @(
+            @($packageEntries + $brokerEntries) |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        Path = [string]$_.Path
+                        Sha256 = [string]$_.Sha256
+                        Size = [long]$_.Size
+                    }
+                } |
+                Sort-Object Path
+        )
+        $payloadIdentity = [ordered]@{
+            Signature = 'codex-local-remote/broker-execution-payload/v1'
+            Files = $payloadEntries
+        }
+
+        $State.IsValid = $true
+        $State.ValidationReason = 'valid'
+        $State.RuntimeRoot = [string]$Validation.RuntimeRoot
+        $State.VersionId = [string]$Validation.VersionId
+        $State.ManifestPath = $manifestPath
+        $State.ManifestSha256 = $manifestSha256
+        $State.BrokerSidecarCompatibilityId =
+            [string]$manifest.BrokerSidecarCompatibilityId
+        $State.PayloadSha256 = Get-StringSha256 `
+            -Value (ConvertTo-CanonicalJson $payloadIdentity)
+        $State.PayloadFileCount = $payloadEntries.Count
+        $State.PackageJson = $payloadEntries |
+            Where-Object { [string]$_.Path -ceq 'package.json' } |
+            Select-Object -First 1
+        $State.BrokerFiles = @(
+            $payloadEntries |
+                Where-Object {
+                    [string]$_.Path -clike 'apps/broker/dist/*'
+                }
+        )
+        return [pscustomobject]@{
+            Succeeded = $true
+            Reason = 'valid'
+            State = $State
+        }
+    } catch {
+        $State.ValidationReason = $_.Exception.Message
+        return [pscustomobject]@{
+            Succeeded = $false
+            Reason = "$Label-manifest-read-failed"
+            State = $State
+        }
+    }
+}
+
+function Test-CodexLocalRemoteBrokerPayloadCompatibility {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CurrentRuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$CurrentVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$CurrentManifestSha256,
+
+        [Parameter(Mandatory)]
+        [string]$ActiveRuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ActiveVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ActiveManifestSha256
+    )
+
+    $currentState = New-CodexLocalRemoteBrokerPayloadRuntimeState `
+        -RuntimeRoot $CurrentRuntimeRoot `
+        -VersionId $CurrentVersionId `
+        -ManifestSha256 $CurrentManifestSha256
+    $activeState = New-CodexLocalRemoteBrokerPayloadRuntimeState `
+        -RuntimeRoot $ActiveRuntimeRoot `
+        -VersionId $ActiveVersionId `
+        -ManifestSha256 $ActiveManifestSha256
+    function New-CompatibilityResult {
+        param(
+            [Parameter(Mandatory)]
+            [bool]$IsCompatible,
+
+            [Parameter(Mandatory)]
+            [string]$Reason
+        )
+
+        return [pscustomobject]@{
+            Signature =
+                'codex-local-remote/broker-payload-compatibility/v1'
+            IsCompatible = $IsCompatible
+            Reason = $Reason
+            Current = $currentState
+            Active = $activeState
+        }
+    }
+
+    try {
+        # Validate both immutable roots before consulting either manifest for a
+        # compatibility decision. The safe wrapper converts path and read
+        # failures into ordinary incompatible results.
+        $currentValidation = Invoke-CodexLocalRemoteRuntimeValidationSafe `
+            -RuntimeRoot $CurrentRuntimeRoot `
+            -VersionId $CurrentVersionId
+        $activeValidation = Invoke-CodexLocalRemoteRuntimeValidationSafe `
+            -RuntimeRoot $ActiveRuntimeRoot `
+            -VersionId $ActiveVersionId
+        $currentState.IsValid = [bool]$currentValidation.IsValid
+        $activeState.IsValid = [bool]$activeValidation.IsValid
+        $currentState.ValidationReason = [string]$currentValidation.Reason
+        $activeState.ValidationReason = [string]$activeValidation.Reason
+        if (-not [bool]$currentValidation.IsValid) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'current-runtime-invalid'
+        }
+        if (-not [bool]$activeValidation.IsValid) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'active-runtime-invalid'
+        }
+
+        $currentSnapshot =
+            Read-CodexLocalRemoteStableBrokerPayloadManifest `
+                -Label 'current' `
+                -Validation $currentValidation `
+                -ExpectedVersionId $CurrentVersionId `
+                -ExpectedManifestSha256 $CurrentManifestSha256 `
+                -State $currentState
+        if (-not [bool]$currentSnapshot.Succeeded) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason ([string]$currentSnapshot.Reason)
+        }
+        $activeSnapshot =
+            Read-CodexLocalRemoteStableBrokerPayloadManifest `
+                -Label 'active' `
+                -Validation $activeValidation `
+                -ExpectedVersionId $ActiveVersionId `
+                -ExpectedManifestSha256 $ActiveManifestSha256 `
+                -State $activeState
+        if (-not [bool]$activeSnapshot.Succeeded) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason ([string]$activeSnapshot.Reason)
+        }
+
+        # Re-run the full validator after both stable reads. This catches file
+        # or manifest drift across the decision window instead of trusting a
+        # compatibility id or a previously read manifest in isolation.
+        $currentFinal = Invoke-CodexLocalRemoteRuntimeValidationSafe `
+            -RuntimeRoot $CurrentRuntimeRoot `
+            -VersionId $CurrentVersionId
+        $activeFinal = Invoke-CodexLocalRemoteRuntimeValidationSafe `
+            -RuntimeRoot $ActiveRuntimeRoot `
+            -VersionId $ActiveVersionId
+        if (-not [bool]$currentFinal.IsValid -or
+            [string]$currentFinal.ManifestSha256 -cne
+                $CurrentManifestSha256 -or
+            [string]$currentFinal.BrokerSidecarCompatibilityId -cne
+                [string]$currentState.BrokerSidecarCompatibilityId) {
+            $currentState.IsValid = $false
+            $currentState.ValidationReason =
+                'runtime changed during compatibility check'
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'current-runtime-changed'
+        }
+        if (-not [bool]$activeFinal.IsValid -or
+            [string]$activeFinal.ManifestSha256 -cne
+                $ActiveManifestSha256 -or
+            [string]$activeFinal.BrokerSidecarCompatibilityId -cne
+                [string]$activeState.BrokerSidecarCompatibilityId) {
+            $activeState.IsValid = $false
+            $activeState.ValidationReason =
+                'runtime changed during compatibility check'
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'active-runtime-changed'
+        }
+
+        if ([string]$currentState.BrokerSidecarCompatibilityId -cne
+            [string]$activeState.BrokerSidecarCompatibilityId) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'broker-sidecar-compatibility-mismatch'
+        }
+        if ([string]$currentState.PackageJson.Sha256 -cne
+                [string]$activeState.PackageJson.Sha256 -or
+            [long]$currentState.PackageJson.Size -ne
+                [long]$activeState.PackageJson.Size) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'package-json-mismatch'
+        }
+
+        $currentBrokerFiles = @($currentState.BrokerFiles)
+        $activeBrokerFiles = @($activeState.BrokerFiles)
+        if ($currentBrokerFiles.Count -ne $activeBrokerFiles.Count) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'broker-payload-file-set-mismatch'
+        }
+        for ($index = 0; $index -lt $currentBrokerFiles.Count; $index++) {
+            if ([string]$currentBrokerFiles[$index].Path -cne
+                [string]$activeBrokerFiles[$index].Path) {
+                return New-CompatibilityResult `
+                    -IsCompatible $false `
+                    -Reason 'broker-payload-file-set-mismatch'
+            }
+            if ([string]$currentBrokerFiles[$index].Sha256 -cne
+                    [string]$activeBrokerFiles[$index].Sha256 -or
+                [long]$currentBrokerFiles[$index].Size -ne
+                    [long]$activeBrokerFiles[$index].Size) {
+                return New-CompatibilityResult `
+                    -IsCompatible $false `
+                    -Reason 'broker-payload-content-mismatch'
+            }
+        }
+        if ([string]$currentState.PayloadSha256 -cne
+            [string]$activeState.PayloadSha256) {
+            return New-CompatibilityResult `
+                -IsCompatible $false `
+                -Reason 'broker-payload-content-mismatch'
+        }
+        return New-CompatibilityResult `
+            -IsCompatible $true `
+            -Reason 'compatible'
+    } catch {
+        $currentState.ValidationReason = $_.Exception.Message
+        return New-CompatibilityResult `
+            -IsCompatible $false `
+            -Reason 'compatibility-check-failed'
+    }
+}
+
 function Install-CodexLocalRemoteRuntimeVersion {
     [CmdletBinding()]
     param(
@@ -8075,6 +8492,7 @@ Export-ModuleMember -Function @(
     'Set-CodexLocalRemoteManagedConfiguration',
     'Get-CodexLocalRemoteRuntimeVersionPlan',
     'Test-CodexLocalRemoteRuntimeVersion',
+    'Test-CodexLocalRemoteBrokerPayloadCompatibility',
     'Install-CodexLocalRemoteRuntimeVersion',
     'Get-CodexLocalRemoteCurrentRuntime',
     'Get-CodexLocalRemoteRuntimeTaskPreImage',
