@@ -238,6 +238,11 @@ function Invoke-RemoteStateCase {
         Invoke-RemoteStateCase -Scenario 'PreviousDegraded'
     PreviousDesktopConnected =
         Invoke-RemoteStateCase -Scenario 'PreviousDesktopConnected'
+    PreviousDesktopConnectedAuthorized =
+        Invoke-RemoteStateCase `
+            -Scenario 'PreviousDesktopConnected' `
+            -AllowActiveTurns `
+            -AllowNativePreviousDesktop
     PreviousUnsafeDesktopConnected =
         Invoke-RemoteStateCase -Scenario 'PreviousUnsafeDesktopConnected'
     PreviousUnsafeDesktopConnectedAuthorized =

@@ -806,6 +806,9 @@ function Get-OnDemandRemoteState {
                 [bool]$readiness.desktopConnected -and
                 -not [bool]$readiness.sidecarConnected -and
                 -not [bool]$readiness.degraded) {
+                if ([int]$readiness.unsafeThreadCount -gt 0) {
+                    return 'runtime-transition-busy'
+                }
                 return 'background-repairable'
             }
             if ([string]$readiness.status -ceq 'ready' -and
@@ -3051,10 +3054,10 @@ try {
         $null = Set-OnDemandOpenDesiredRemote -Runtime $runtime
         Write-OnDemandHandoffStatus `
             -Status 'restart-required' `
-            -Stage 'waiting-for-idle' `
+            -Stage 'restart-authorization' `
             -Message (
                 'The previous runtime is serving active turns. Explicit ' +
-                'restart authority is required to queue one idle handoff.'
+                'restart authority is required for one detached handoff.'
             )
         [pscustomobject]@{
             Status = 'restart-required'
@@ -3076,10 +3079,11 @@ try {
             -DesiredModeIntentId ([string]$desiredMode.IntentId)
         Write-OnDemandHandoffStatus `
             -Status 'restart-deferred' `
-            -Stage 'waiting-for-idle' `
+            -Stage 'restart-handoff' `
             -Message (
-                'One authorized runtime handoff is queued. The current ' +
-                'product remains online until every observed turn is idle.'
+                'One authorized runtime handoff was delegated to a detached ' +
+                'worker. It immediately re-enters installed control and may ' +
+                'restart Desktop while observed turns are active.'
             )
         [pscustomobject]@{
             Status = 'restart-deferred'

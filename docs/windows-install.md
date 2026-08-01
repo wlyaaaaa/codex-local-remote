@@ -204,10 +204,11 @@ $control = Join-Path $env:LOCALAPPDATA `
 优先只滚动公网层，Broker、app-server 与 Desktop 保持不动。只有它明确返回
 `restart-required`，并且本次另有 Desktop 重开授权时，才可再次调用
 `Open -AllowDesktopRestart`。若上一已验证运行代正在服务活动 turn，该调用返回
-`restart-deferred` 并只登记一个隐藏 worker；产品继续在线，待所有 Broker 观测
-任务空闲后，worker 经固定 dispatcher 重验 selected runtime 与原始 intent，再
-完成至多一次受控交接。只有 intent、运行代、路径和存活进程声明全部一致时才复用
-现有 worker；`Close` 或更新 intent 会让旧 worker 主动取消并释放单例，下一次
+`restart-deferred` 并只登记一个隐藏 worker；这里的 deferred 表示把控制移出即将
+关闭的 Desktop 宿主，不表示等待任务结束。worker 会立即经固定 dispatcher 重验
+selected runtime 与原始 intent，并在同一控制锁内完成至多一次受控交接。只有
+intent、运行代、路径和存活进程声明全部一致时才复用现有 worker；`Close` 或更新
+intent 会让旧 worker 主动取消并释放单例，下一次
 `Open` 不会被旧等待任务吞掉。V1 单 owner
 的历史迁移器只用于明确的旧安装迁移，不是日常打开或更新入口。
 

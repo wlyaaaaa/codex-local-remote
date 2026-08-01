@@ -61,8 +61,9 @@ Broker 启动时已经完成完整 hash 校验的运行时回执，并批量读�
   `Open -AllowDesktopRestart` 才能关闭精确根并启动任务一次。
 - 若已验证的上一运行代仍在线服务活动 turn，未授权的 Open 返回
   `restart-required`；授权后的 Open 只登记一个隐藏 worker 并返回
-  `restart-deferred`。当前产品保持在线，直到 Broker 明确变为空闲，worker 才经
-  稳定 dispatcher 重新校验 selected runtime 与原始 intent，并完成至多一次交接；
+  `restart-deferred`。这里的 deferred 只表示把控制移出即将关闭的 Desktop 宿主；
+  worker 会立即经稳定 dispatcher 重新校验 selected runtime 与原始 intent，并在
+  活动 turn 尚未结束时完成至多一次已授权交接；
   只复用 intent、运行代、路径和存活进程声明完全一致的 worker；`Close` 或更新的
   intent 会让旧 worker 主动取消并释放单例，后续 Open 不会复用已撤销的等待任务。
 - Open 失败只执行一次有界补偿：未产生安全任务时停止本次启动的任务并恢复

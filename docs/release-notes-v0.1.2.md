@@ -40,7 +40,7 @@ remain unchanged.
 - When one verified previous generation is still serving active turns, an
   authorized `Open` queues exactly one hidden worker and returns
   `restart-deferred` so the controller survives Desktop exit. The worker only
-  re-enters the stable dispatcher with the exact selected pointer, manifest and
+  immediately re-enters the stable dispatcher with the exact selected pointer, manifest and
   desired-mode intent. Inside one DataDir control-mutex critical section, that
   dispatcher rechecks the intent, closes only one exact package Desktop root
   through its PID plus creation identity, waits for the exact startup task to

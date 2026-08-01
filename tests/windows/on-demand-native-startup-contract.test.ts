@@ -149,8 +149,9 @@ describe("Windows native-default on-demand Remote contract", () => {
         PreviousIdleActive: "runtime-transition",
         PreviousDegraded: "unverified",
         PreviousDesktopConnected: "unverified",
+        PreviousDesktopConnectedAuthorized: "background-repairable",
         PreviousUnsafeDesktopConnected: "unverified",
-        PreviousUnsafeDesktopConnectedAuthorized: "background-repairable",
+        PreviousUnsafeDesktopConnectedAuthorized: "runtime-transition-busy",
         PreviousUnknown: "unverified",
         PreviousUnsafe: "runtime-transition-busy",
         PreviousManifestMismatch: "unverified",
@@ -161,7 +162,7 @@ describe("Windows native-default on-demand Remote contract", () => {
     }
   });
 
-  it("defers an authorized busy-generation handoff to one hidden idle worker", () => {
+  it("detaches an authorized busy-generation handoff to one hidden immediate worker", () => {
     const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
 
     expect(handoff).toContain("function Start-OnDemandDeferredRuntimeHandoff");
@@ -177,6 +178,7 @@ describe("Windows native-default on-demand Remote contract", () => {
 
     const deferredWorker = windowsScript("Complete-CodexLocalRemoteDeferredHandoff.ps1");
     expect(deferredWorker).toContain("Invoke-DeferredHandoffBrokerLifecycleReconciliation");
+    expect(handoff).toContain("restart Desktop while observed turns are active");
     expect(deferredWorker).toContain("'reconcile'");
     expect(deferredWorker).toContain("$reconciliationAttempts -lt 3");
 
