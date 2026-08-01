@@ -867,9 +867,9 @@ function Get-ManagedLauncherShortcutDefinition {
             [System.IO.Path]::GetFullPath([string]$expected.DataDir)
         }
         Description = if ($isLegacyRuntimeLauncher) {
-            "$safeLaunchName - Uses Remote when ready and otherwise starts Codex Desktop natively."
+            'Codex Remote - Uses Remote when ready and otherwise starts Codex Desktop natively.'
         } else {
-            "$safeLaunchName - Explicitly opens Remote through the stable control dispatcher."
+            'Codex Remote - Explicitly opens Remote through the stable control dispatcher.'
         }
         IconLocation = "$iconPath,0"
         WindowStyle = 1

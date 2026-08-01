@@ -314,7 +314,7 @@ function Get-StatusLauncherShortcutDefinition {
                 }
         ) -join ' '
         WorkingDirectory = $resolvedDataDir
-        Description = "$safeLaunchName - Explicitly opens Remote through the stable control dispatcher."
+        Description = 'Codex Remote - Explicitly opens Remote through the stable control dispatcher.'
         IconLocation = "$iconPath,0"
         WindowStyle = 1
         RunAsUser = $true

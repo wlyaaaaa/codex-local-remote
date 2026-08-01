@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -95,7 +96,9 @@ windowsOnly("Windows DataDir ownership gate", () => {
     const result = runDriver("protect", documents, environment);
 
     expect(result.status).not.toBe(0);
-    expect(`${result.stdout}${result.stderr}`.replace(/\s+/g, " ")).toContain("known folder");
+    expect(
+      stripVTControlCharacters(`${result.stdout}${result.stderr}`).replace(/\s+/g, " "),
+    ).toContain("known folder");
     expect(existsSync(markerPath(documents))).toBe(false);
     expect(inspectAcl(documents, environment)).toEqual(before);
   });
