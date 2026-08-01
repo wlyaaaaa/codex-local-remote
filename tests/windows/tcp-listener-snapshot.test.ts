@@ -49,6 +49,32 @@ windowsOnly("Windows TCP listener snapshot", () => {
     });
   });
 
+  it("treats an offline registration listener snapshot as an empty collection", () => {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        join(import.meta.dirname, "fixtures", "registration-offline-listener-driver.ps1"),
+        "-RegistrationPath",
+        join(scripts, "Register-CodexLocalRemoteStartup.ps1"),
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        timeout: 15_000,
+      },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      ResultIsNull: true,
+      ObservedListenerCount: 0,
+    });
+  });
+
   it("routes every supported control path through the bounded native snapshot", () => {
     for (const name of [
       "Get-CodexLocalRemoteStatus.ps1",
