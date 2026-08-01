@@ -151,7 +151,7 @@ describe("Windows native-default on-demand Remote contract", () => {
         PreviousDesktopConnected: "unverified",
         PreviousDesktopConnectedAuthorized: "background-repairable",
         PreviousUnsafeDesktopConnected: "unverified",
-        PreviousUnsafeDesktopConnectedAuthorized: "runtime-transition-busy",
+        PreviousUnsafeDesktopConnectedAuthorized: "background-repairable",
         PreviousUnknown: "unverified",
         PreviousUnsafe: "runtime-transition-busy",
         PreviousManifestMismatch: "unverified",

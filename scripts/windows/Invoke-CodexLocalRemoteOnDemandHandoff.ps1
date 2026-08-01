@@ -798,6 +798,12 @@ function Get-OnDemandRemoteState {
         }
         $script:onDemandLastReadiness = $readiness
         if ($previousGeneration) {
+            # Native mode intentionally has no Sidecar. With exact explicit
+            # restart authority, keep this on the infrastructure-first prepared
+            # attach path even when the old Broker still reports active turns.
+            # Sending it through the busy-Remote worker would close Desktop
+            # before publishing a preparation, allowing the old coordinator to
+            # revoke the desired-mode intent during shutdown.
             if ($AllowNativePreviousDesktop -and
                 [string]$receipt.Status -ceq 'broker-ready' -and
                 $null -eq $receipt.Sidecar -and
@@ -806,9 +812,6 @@ function Get-OnDemandRemoteState {
                 [bool]$readiness.desktopConnected -and
                 -not [bool]$readiness.sidecarConnected -and
                 -not [bool]$readiness.degraded) {
-                if ([int]$readiness.unsafeThreadCount -gt 0) {
-                    return 'runtime-transition-busy'
-                }
                 return 'background-repairable'
             }
             if ([string]$readiness.status -ceq 'ready' -and
