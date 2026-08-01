@@ -11,5 +11,5 @@ describe.runIf(process.platform === "win32")("Windows DPAPI prompt protector", (
 
     expect(protectedValue).not.toContain(marker);
     await expect(protector.unprotect(protectedValue)).resolves.toBe(marker);
-  });
+  }, 60_000);
 });

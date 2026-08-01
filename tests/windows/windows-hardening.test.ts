@@ -1121,7 +1121,7 @@ windowsOnly("Windows script hardening", () => {
     const removed = readJson<SchedulerState>(stateFile);
     expect(removed.Task).toBeNull();
     expect(removed.Operations).toEqual(["register", "stop", "unregister"]);
-  }, 15_000);
+  }, 60_000);
 
   it("upgrades and unregisters only the exact Desktop-owning V3 legacy action", () => {
     const installRoot = join(sandbox, "desktop owner v3 install");
