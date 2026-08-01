@@ -2600,7 +2600,8 @@ try {
     $remoteState = if ([string]$startupTask.State -ceq 'Running') {
         Get-OnDemandRemoteState `
             -Runtime $runtime `
-            -BrokerPort ([int]$configuration.BrokerPort)
+            -BrokerPort ([int]$configuration.BrokerPort) `
+            -AllowActiveTurns:($Operation -ceq 'Open' -and $AllowDesktopRestart)
     } elseif ([string]$startupTask.State -ceq 'Ready') {
         'inactive'
     } else {

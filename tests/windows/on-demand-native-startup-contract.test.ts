@@ -141,6 +141,8 @@ describe("Windows native-default on-demand Remote contract", () => {
         CurrentUnsafeDetached: "unverified",
         CurrentUnsafeDetachedAuthorized: "desktop-detached",
         CurrentBackground: "background-repairable",
+        CurrentUnsafeBackground: "unverified",
+        CurrentUnsafeBackgroundAuthorized: "background-repairable",
         PreviousSilent: "runtime-transition",
         PreviousWithSidecar: "runtime-transition",
         PreviousActive: "runtime-transition-busy",
@@ -334,6 +336,19 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(prepareBody).toContain("[switch]$AllowActiveTurns");
     expect(prepareBody).toContain("-AllowActiveTurns:$AllowActiveTurns");
     expect(nativePrepareCall).toContain("-AllowActiveTurns:$AllowDesktopRestart");
+  });
+
+  it("uses explicit restart authority when classifying the initial live generation", () => {
+    const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+    const initialStateStart = handoff.indexOf(
+      "$remoteState = if ([string]$startupTask.State -ceq 'Running')",
+    );
+    const initialStateEnd = handoff.indexOf("$allowActiveRuntimeRestart", initialStateStart);
+    const initialState = handoff.slice(initialStateStart, initialStateEnd);
+
+    expect(initialState).toContain(
+      "-AllowActiveTurns:($Operation -ceq 'Open' -and $AllowDesktopRestart)",
+    );
   });
 
   it("restores native Desktop when an authorized Open fails after closing it", () => {

@@ -155,6 +155,7 @@ function Invoke-RemoteStateCase {
         unsafeThreadCount = if ($Scenario -cin @(
             'CurrentActive',
             'CurrentUnsafeDetached',
+            'CurrentUnsafeBackground',
             'PreviousUnsafe',
             'PreviousActive'
         )) {
@@ -216,6 +217,12 @@ function Invoke-RemoteStateCase {
             -Scenario 'CurrentUnsafeDetached' `
             -AllowActiveTurns
     CurrentBackground = Invoke-RemoteStateCase -Scenario 'CurrentBackground'
+    CurrentUnsafeBackground =
+        Invoke-RemoteStateCase -Scenario 'CurrentUnsafeBackground'
+    CurrentUnsafeBackgroundAuthorized =
+        Invoke-RemoteStateCase `
+            -Scenario 'CurrentUnsafeBackground' `
+            -AllowActiveTurns
     PreviousSilent = Invoke-RemoteStateCase -Scenario 'PreviousSilent'
     PreviousWithSidecar =
         Invoke-RemoteStateCase -Scenario 'PreviousWithSidecar'
