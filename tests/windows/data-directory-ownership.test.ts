@@ -372,6 +372,13 @@ windowsOnly("Windows DataDir ownership gate", () => {
     expect(inspectAcl(dataDir, environment)).toEqual(before);
   });
 
+  it("checks marker hard-link count in-process without launching fsutil", () => {
+    const source = readFileSync(modulePath, "utf8");
+
+    expect(source).toContain("GetFileInformationByHandle");
+    expect(source).not.toContain("System32\\fsutil.exe");
+  });
+
   it("rejects a marker that is itself a junction", () => {
     const dataDir = join(sandbox, "junction marker");
     const target = join(sandbox, "foreign marker directory");

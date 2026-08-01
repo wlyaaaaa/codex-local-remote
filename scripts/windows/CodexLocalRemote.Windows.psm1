@@ -1137,6 +1137,76 @@ function Test-CodexLocalRemotePathInsideGitRepository {
     return $false
 }
 
+function Get-CodexLocalRemoteFileHardLinkCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not ('CodexLocalRemote.FileIdentityNativeMethods' -as [type])) {
+        $typeDefinition = @'
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace CodexLocalRemote
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    public static class FileIdentityNativeMethods
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetFileInformationByHandle(
+            SafeFileHandle fileHandle,
+            out ByHandleFileInformation fileInformation
+        );
+    }
+}
+'@
+        $null = Add-Type -TypeDefinition $typeDefinition -Language CSharp -ErrorAction Stop
+    }
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $resolvedPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        $information = [CodexLocalRemote.ByHandleFileInformation]::new()
+        if (-not [CodexLocalRemote.FileIdentityNativeMethods]::GetFileInformationByHandle(
+                $stream.SafeFileHandle,
+                [ref]$information
+            )) {
+            $win32Error = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "Windows rejected the file identity query (Win32 error $win32Error)."
+        }
+        return [uint32]$information.NumberOfLinks
+    } catch {
+        throw "Unable to verify the data directory owner marker file identity: $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
 function Assert-CodexLocalRemoteDataDirectoryOwnerMarker {
     [CmdletBinding()]
     param(
@@ -1163,18 +1233,8 @@ function Assert-CodexLocalRemoteDataDirectoryOwnerMarker {
         [string]$linkTypeProperty.Value -ceq 'HardLink') {
         throw "Data directory owner marker '$markerPath' is a hard link."
     }
-    $fsutilPath = Join-Path $env:SystemRoot 'System32\fsutil.exe'
-    if (-not (Test-Path -LiteralPath $fsutilPath -PathType Leaf)) {
-        throw "Data directory owner marker '$markerPath' hard-link count cannot be verified."
-    }
-    $hardLinks = @(
-        & $fsutilPath hardlink list $markerPath 2>$null |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
-    )
-    if ($LASTEXITCODE -ne 0) {
-        throw "Data directory owner marker '$markerPath' hard-link count cannot be verified."
-    }
-    if ($hardLinks.Count -ne 1) {
+    $hardLinkCount = Get-CodexLocalRemoteFileHardLinkCount -Path $markerPath
+    if ($hardLinkCount -ne 1) {
         throw "Data directory owner marker '$markerPath' is a hard link with multiple names."
     }
 
