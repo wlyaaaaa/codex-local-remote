@@ -82,6 +82,27 @@ export function composerDeliveryDecision(
   return thread.availableActions.reply ? "start" : "synchronize";
 }
 
+export function composerCanSubmit(
+  eventStreamConnected: boolean,
+  runtimeControlAvailable: boolean,
+  queueSupported: boolean,
+): boolean {
+  return queueSupported || (eventStreamConnected && runtimeControlAvailable);
+}
+
+export function composerDeliveryDecisionForRuntime(
+  thread: Pick<ThreadDetail, "activeTurnId" | "availableActions" | "state">,
+  mode: "queue" | "steer",
+  queueSupported: boolean,
+  runtimeControlAvailable: boolean,
+  eventStreamConnected = true,
+): ComposerDeliveryDecision {
+  if (!eventStreamConnected || !runtimeControlAvailable) {
+    return queueSupported ? "queue" : "synchronize";
+  }
+  return composerDeliveryDecision(thread, mode, queueSupported);
+}
+
 export function serviceTierSetting(
   capabilities: ComposerCapabilities | undefined,
   value: string | undefined,
@@ -273,7 +294,7 @@ export function composerToolActions(input: {
     result.push({
       id: "plan",
       label: "计划模式",
-      description: "选择下一轮的协作方式",
+      description: "选择后续工作的协作方式",
     });
   }
   if (composerFeatureSupported(input.capabilities, "compact")) {

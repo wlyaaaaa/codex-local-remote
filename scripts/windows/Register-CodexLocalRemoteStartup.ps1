@@ -1017,6 +1017,30 @@ function Test-ManagedLauncherShortcut {
     }
 }
 
+function Get-LegacyLocalizedManagedLauncherShortcutDefinition {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $canonicalPrefix = 'Codex Remote'
+    $description = [string]$Definition.Description
+    if (-not $description.StartsWith(
+            "$canonicalPrefix - ",
+            [System.StringComparison]::Ordinal
+        )) {
+        return $null
+    }
+
+    $historicalPrefix = 'Codex Remote (' +
+        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
+        ')'
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = $historicalPrefix +
+        $description.Substring($canonicalPrefix.Length)
+    return [pscustomobject]$properties
+}
+
 function Test-LegacyNonElevatedManagedLauncherShortcut {
     param(
         [Parameter(Mandatory)][object]$Definition,
@@ -1253,7 +1277,18 @@ function Assert-ManagedLauncherShortcutOwnership {
             $PreviousDefinition
         }
     )
+    $recognizedDefinitions =
+        [System.Collections.Generic.List[object]]::new()
     foreach ($candidate in $definitions) {
+        $recognizedDefinitions.Add($candidate)
+        $historicalLocalized =
+            Get-LegacyLocalizedManagedLauncherShortcutDefinition `
+                -Definition $candidate
+        if ($null -ne $historicalLocalized) {
+            $recognizedDefinitions.Add($historicalLocalized)
+        }
+    }
+    foreach ($candidate in $recognizedDefinitions) {
         if ((Test-ManagedLauncherShortcut `
                 -Definition $candidate `
                 -Path $shortcutPath) -or

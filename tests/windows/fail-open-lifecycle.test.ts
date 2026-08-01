@@ -115,6 +115,25 @@ windowsOnly("Windows fail-open lifecycle", () => {
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
   }
 
+  function writeHistoricalLocalizedShortcutDescription(path: string) {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SHORTCUT_PATH); $p='Codex Remote ('+(([char[]]@(0x5B89,0x5168,0x542F,0x52A8))-join '')+')'; $s.Description=$p+$s.Description.Substring('Codex Remote'.Length); $s.Save()",
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        env: { ...process.env, SHORTCUT_PATH: path },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  }
+
   function writeLegacyRuntimeShortcut(path: string) {
     const legacyLauncher = join(installRoot, "scripts", "windows", "Launch-CodexWithRemote.ps1");
     const legacyArguments =
@@ -406,6 +425,19 @@ windowsOnly("Windows fail-open lifecycle", () => {
     expect(removal).toContain("Test-VisibleManagedLauncherShortcut");
     expect(removal).toContain("Test-VisiblePreTakeoverManagedLauncherShortcut");
     expect(removal).toContain("Test-RecognizedManagedLauncherShortcut");
+  });
+
+  it("unregisters the historical localized launcher description", () => {
+    register();
+    const shortcutPath = join(dataDir, "Codex Remote safe launch.lnk");
+    writeHistoricalLocalizedShortcutDescription(shortcutPath);
+
+    const removal = runLifecycle("unregister");
+    expect(removal).toMatchObject({
+      Status: "removed",
+      LauncherShortcut: "removed",
+    });
+    expect(existsSync(shortcutPath)).toBe(false);
   });
 
   it("contains no normal registration path that writes the user override", () => {

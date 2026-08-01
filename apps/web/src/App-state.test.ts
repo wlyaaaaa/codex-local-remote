@@ -1521,7 +1521,7 @@ describe("Desktop 运行时健康门禁", () => {
       tone: "success",
     });
     expect(helpers.hostStatus(false, { appServer: "available" })).toEqual({
-      label: "连接中断",
+      label: "实时更新中断",
       ready: false,
       tone: "danger",
     });
@@ -1534,7 +1534,7 @@ describe("Desktop 运行时健康门禁", () => {
     });
     expect(helpers.conversationControlState(false, { appServer: "available" }, false)).toEqual({
       available: false,
-      reason: "与电脑的实时连接已中断",
+      reason: "与电脑的实时更新已中断",
     });
     expect(helpers.conversationControlState(true, { appServer: "degraded" }, false)).toEqual({
       available: false,
@@ -1829,6 +1829,11 @@ describe("运行中控制动作", () => {
 });
 
 describe("对话附件草稿恢复", () => {
+  it("浏览器拒绝提供 localStorage 时不会让对话崩溃", () => {
+    expect(helpers.readConversationAttachments(undefined, "thread-1")).toEqual([]);
+    expect(() => helpers.writeConversationAttachments(undefined, "thread-1", [])).not.toThrow();
+  });
+
   it("刷新后保留浏览器上传与电脑文件引用，但不保存文件正文", () => {
     const values = new Map<string, string>();
     const storage = {

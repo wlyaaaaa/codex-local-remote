@@ -84,8 +84,9 @@ Funnel approval or a real Desktop restart:
 - Start project or no-project tasks with the models your current Desktop actually exposes.
 - Steer, queue or stop a running turn; answer approvals and structured questions remotely.
 - Follow tool calls, file diffs, subagents, context usage and account limits in real time.
-- Keep the latest reasoning and active Work Log expanded while a turn is running, then expand the
-  reversible completed log for the full progress, tool, file and child-agent timeline.
+- Keep the active public Work Log expanded while a turn is running, then expand the reversible
+  completed log for the public progress, tool, file and child-agent timeline. Internal reasoning is
+  not rendered.
 - Browse, upload, create, edit, rename, copy, move, download and delete files
   across every detected drive available to the Sidecar's Windows identity.
 - Use any modern Android or desktop browser through your HTTPS reverse proxy or Tailscale Funnel.
@@ -123,14 +124,15 @@ JSON-RPC 日志原样铺进网页。
 - 从顶层对话的行操作菜单重命名、复制对话 ID、归档或恢复；归档前必须先
   停止仍在运行或等待审批的任务；提交后权威回读当前与归档列表，回读失败
   只重试读取并明确提示，不重复已提交的操作；
-- 在共享对话中实时查看当前回复、最新思考摘要、工具活动、文件变更、审批请求
-  和结构化提问；只有运行时为本次请求明确提供的审批选项才会显示并可提交；
-- 进行中的最新 WorkLog 默认展开且只显示最新官方思考摘要；任务完成后，长工作段
-  默认显示紧凑摘要，展开可按原顺序恢复完整进度、命令与有界输出、文件 diff、
-  图片和子智能体状态，最终回答仍独立显示；
-- 在运行中追加引导、停止任务，或把消息加入可编辑、排序和恢复的下一轮
+- 在共享对话中实时查看当前回复、助手公开的中文进展、工具活动、文件变更、
+  审批请求和结构化提问；内部 reasoning 不进入产品界面，只有运行时为本次
+  请求明确提供的审批选项才会显示并可提交；
+- 进行中的最新 WorkLog 默认展开；任务完成后，长工作段默认显示紧凑摘要，
+  展开可按原顺序恢复公开进展、命令与有界输出、文件 diff、图片和子智能体
+  状态，最终回答仍独立显示；
+- 在运行中追加引导、停止任务，或把消息加入可编辑、排序和恢复的稍后发送
   队列；
-- 从运行时目录选择下一轮模型、思考等级、速度、权限、审批路由和计划模式，
+- 从运行时目录选择模型、思考等级、速度、权限、审批路由和计划模式，
   并可设置任务目标；
 - 查看运行中或已完成的子智能体，进入详情后返回父对话；
 - 查看 ChatGPT/Codex 额度窗口、重置时间、使用统计和线程上下文；
@@ -147,7 +149,8 @@ JSON-RPC 日志原样铺进网页。
 - 使用一个本地设置的密码登录，手机无需安装应用、扩展或 Tailscale；
 - 在断线或页面重载后恢复事件流、新建任务提示词、项目/非项目选择、现有
   对话草稿、滚动位置和子智能体导航状态；短暂 SSE 抖动有 3 秒恢复宽限，真实
-  断线时草稿仍可继续编辑，只暂停发送、停止和审批等远程动作；
+  断线时草稿仍可继续编辑；若 HTTP 排队能力可用，仍可尝试安全排队，实际请求
+  失败时保留草稿并明确提示；停止、审批等实时动作继续失败关闭；
 - 长对话按最近内容渐进渲染，可逐段展开全部历史；输入框更新不会重新解析
   已经显示过的整段 Markdown；完整历史快照只作低频兜底，正在输入时会
   延后。
@@ -164,6 +167,8 @@ JSON-RPC 日志原样铺进网页。
   出现在 Desktop，不伪装成已同步的 Desktop 草稿；
 - app-server 若没有为某条审批请求提供可提交选项，Web 只能显示阻塞原因，
   不能猜造“允许一次 / 拒绝”等按钮；
+- Codex 临时目录中的图片只有在源文件仍存在时才能通过已登录的文件解析器打开；
+  若 Codex 或系统已先删除临时文件，手机端不能从历史消息中恢复其字节内容；
 - 不提供任意命令或 app-server 原始接口的公网代理；“电脑文件”是经过登录、
   同源、CSRF 和操作确认保护的所有者文件管理器，不是匿名裸文件代理。
 

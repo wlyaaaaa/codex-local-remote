@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { login } from "./helpers.js";
+import { openSharedThread, SharedRuntime } from "./shared-runtime.js";
 
 test.describe("单密码登录与完整远程旅程", () => {
   test("Desktop 置顶顺序在手机端独立于最近对话显示", async ({ page }) => {
@@ -38,7 +39,7 @@ test.describe("单密码登录与完整远程旅程", () => {
     await page.getByTestId("turn-composer").fill("补充一条不会立即提交的验收要求");
     await expect(page.getByTestId("turn-steer-submit")).toBeVisible();
     await expect(page.getByTestId("composer-settings-open")).toBeVisible();
-    await expect(page.getByTestId("next-turn-model-notice")).toContainText("下一轮");
+    await expect(page.getByTestId("next-turn-model-notice")).toHaveCount(0);
   });
 
   test("Desktop 创建的运行任务在手机端保持实时可控", async ({ page }) => {
@@ -52,6 +53,99 @@ test.describe("单密码登录与完整远程旅程", () => {
     await page.getByTestId("turn-composer").click();
     await page.getByTestId("turn-composer").fill("验证 Desktop 创建任务仍可从手机引导");
     await expect(page.getByTestId("turn-steer-submit")).toBeVisible();
+  });
+
+  test("浏览器草稿存储不可用时输入器仍可编辑并诚实提示", async ({ page }) => {
+    await page.addInitScript(() => {
+      const getItem = Object.getOwnPropertyDescriptor(Storage.prototype, "getItem")
+        ?.value as Storage["getItem"];
+      const setItem = Object.getOwnPropertyDescriptor(Storage.prototype, "setItem")
+        ?.value as Storage["setItem"];
+      const removeItem = Object.getOwnPropertyDescriptor(Storage.prototype, "removeItem")
+        ?.value as Storage["removeItem"];
+      Storage.prototype.getItem = function getItemWithDraftFailure(key) {
+        if (key.startsWith("draft:")) throw new DOMException("quota", "QuotaExceededError");
+        return Reflect.apply(getItem, this, [key]);
+      };
+      Storage.prototype.setItem = function setItemWithDraftFailure(key, value) {
+        if (key.startsWith("draft:")) throw new DOMException("quota", "QuotaExceededError");
+        return Reflect.apply(setItem, this, [key, value]);
+      };
+      Storage.prototype.removeItem = function removeItemWithDraftFailure(key) {
+        if (key.startsWith("draft:")) throw new DOMException("quota", "QuotaExceededError");
+        return Reflect.apply(removeItem, this, [key]);
+      };
+    });
+
+    await login(page);
+    await page.goto("./?demo=1#/threads/thread-active");
+    const composer = page.getByTestId("turn-composer");
+    await composer.focus();
+    await composer.fill("这段文字仍留在当前页面");
+    await expect(composer).toHaveValue("这段文字仍留在当前页面");
+    await expect(page.getByTestId("conversation-draft-persistence")).toHaveText(
+      "仅保存在当前页面，刷新会丢失",
+    );
+  });
+
+  test("事件流断开但 HTTP 可用时仍可安全排队", async ({ page }) => {
+    const runtime = new SharedRuntime();
+    await runtime.attach(page.context());
+    try {
+      await openSharedThread(page);
+      await expect(page.getByTestId("thread-view")).toBeVisible();
+      await runtime.setOnline(false);
+      await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible();
+
+      const composer = page.getByTestId("turn-composer");
+      await composer.focus();
+      await composer.fill("事件流断开后仍要安全排队");
+      const submit = page.getByTestId("turn-steer-submit");
+      await expect(submit).toBeEnabled();
+      await expect(submit).toHaveAttribute("aria-label", "尝试安全排队");
+      await submit.click();
+
+      await expect(page.getByTestId("turn-queued")).toBeVisible();
+      await expect(page.getByTestId("queue-shelf")).toContainText("事件流断开后仍要安全排队");
+      await expect(composer).toHaveValue("");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test("事件流断开且 HTTP 排队失败时保留草稿并明确报错", async ({ page }) => {
+    const runtime = new SharedRuntime();
+    await runtime.attach(page.context());
+    await page.route("**/api/v1/threads/shared-running-thread/queue", async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.fallback();
+        return;
+      }
+      await route.fulfill({
+        body: JSON.stringify({
+          error: { code: "E2E_QUEUE_UNAVAILABLE", message: "排队服务暂时不可用" },
+        }),
+        contentType: "application/json",
+        status: 503,
+      });
+    });
+    try {
+      await openSharedThread(page);
+      await expect(page.getByTestId("thread-view")).toBeVisible();
+      await runtime.setOnline(false);
+      await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible();
+
+      const composer = page.getByTestId("turn-composer");
+      await composer.focus();
+      await composer.fill("排队失败也不能丢失的草稿");
+      await page.getByTestId("turn-steer-submit").click();
+
+      await expect(page.getByText("排队服务暂时不可用", { exact: true })).toBeVisible();
+      await expect(page.getByTestId("turn-queued")).toHaveCount(0);
+      await expect(composer).toHaveValue("排队失败也不能丢失的草稿");
+    } finally {
+      await runtime.close();
+    }
   });
 
   test("切换任务时草稿和附件始终留在各自任务", async ({ page }) => {
@@ -140,14 +234,14 @@ test.describe("单密码登录与完整远程旅程", () => {
       await expect(page.getByTestId("turn-reply-submit")).toBeVisible();
     });
 
-    await test.step("模型选择明确标为下一轮", async () => {
+    await test.step("模型选择在专用面板说明生效范围，不占用输入区提示行", async () => {
       await page.getByTestId("turn-composer").click();
       await page.getByTestId("composer-settings-open").click();
       const settings = page.getByRole("dialog");
-      await expect(settings.getByRole("heading", { name: "下一轮设置" })).toBeVisible();
+      await expect(settings.getByRole("heading", { name: "模型与运行设置" })).toBeVisible();
       await settings.getByRole("button", { name: "高", exact: true }).click();
-      await settings.getByRole("button", { name: "应用于下一轮" }).click();
-      await expect(page.getByTestId("next-turn-model-notice")).toContainText("下一轮");
+      await settings.getByRole("button", { name: "保存设置" }).click();
+      await expect(page.getByTestId("next-turn-model-notice")).toHaveCount(0);
     });
 
     await test.step("额度缺失时也不伪造为零", async () => {
@@ -197,7 +291,7 @@ test.describe("单密码登录与完整远程旅程", () => {
       ).toBeVisible();
       await expect(
         page.getByText("相关文件和边界已经核对完成，正在整理可以回读的验证结果。"),
-      ).toHaveCount(0);
+      ).toBeVisible();
       await expect(
         page.getByText("子任务已完成：检查记录、工具活动和最终结论都保留在这个子智能体对话中。"),
       ).toBeVisible();

@@ -13,14 +13,11 @@ remain unchanged.
 > 置顶限制：当前 app-server 没有受支持的 pin/unpin 方法。Web 只读镜像
 > Desktop 的置顶顺序，不写 Desktop 私有状态，也不伪装置顶操作已同步。
 
-> Publication integrity: this source is eligible for `v0.1.2` only after it is
-> sealed as an immutable runtime and that exact runtime passes live adoption.
-> The sealed `fa50e18` base passed formatting, lint, type checking, all 1565
-> tests across 106 files, the production build and a public-safety scan of 351
-> files. The bounded presentation delta after that seal is verified separately
-> by its focused suites, affected-package type checks/builds and public scan; it
-> does not claim a second full-suite run. Source evidence alone is not
-> live-adoption evidence.
+> Publication integrity: this source is eligible for `v0.1.2` only after one
+> frozen-tree `pnpm check`, immutable installation and live adoption of that
+> exact runtime. The frozen browser fixture also has to pass its complete
+> six-viewport product matrix without hiding failures behind retries. Source or
+> fixture evidence alone is not live-adoption evidence.
 
 ## Highlights
 
@@ -235,11 +232,11 @@ and Broker/app-server loss fails closed.
   extended-length local paths, and separates recent root-task reads from full
   child-task reads and lightweight runtime-setting recovery.
 - Projects the public conversation timeline rather than commentary alone:
-  reasoning summaries, commentary and final answers, bounded command details
-  and output, file diffs and change counts, trusted local image activity, plan
+  public commentary and final answers, bounded command details and output,
+  file diffs and change counts, trusted local image activity, plan
   questions and child-agent lifecycle records remain in their original order.
-  Encrypted reasoning, secret answers, collaboration polling and unknown tool
-  parameters remain suppressed.
+  Internal reasoning summaries, encrypted reasoning, secret answers,
+  collaboration polling and unknown tool parameters remain suppressed.
 - Suppresses a standalone `<codex_internal_context>...</codex_internal_context>`
   host envelope in both app-server projections and persisted Desktop history,
   while preserving ordinary user text that quotes or discusses that reserved
@@ -266,20 +263,23 @@ and Broker/app-server loss fails closed.
 
 - Stabilizes ordering across live events, persisted history, context compaction
   and upward pagination.
-- Groups reasoning, progress, tools, file changes and child-agent activity into
-  a reversible Work Log. Only the newest real public reasoning summary from the
-  active turn is shown; historical reasoning and commentary output stay hidden.
-  Tool, file and child-agent records remain reversible, while final answers,
-  user messages and image activity remain first-class conversation content.
+- Groups public assistant progress, tools, file changes and child-agent activity
+  into a reversible Work Log. Internal reasoning summaries are never rendered;
+  public assistant commentary remains visible as progress. Tool, file and
+  child-agent records remain reversible, while final answers, user messages and
+  image activity remain first-class conversation content.
 - Makes the composer a deterministic collapsed/expanded state machine, keeps
-  send and Stop visible with many attachments, keeps offline drafts editable
-  while remote mutations remain disabled, and restores the caret and bottom
-  anchor. An active goal occupies its own full-width row above delivery mode and
-  plan progress. The conversation composer no longer carries a persistent
-  permission/approval settings button; real approval requests remain actionable.
+  send and Stop visible with many attachments, keeps offline drafts editable,
+  and restores the caret and bottom anchor. When SSE is disconnected but the
+  durable HTTP queue is available, sending performs one authoritative queue
+  request; failure retains the draft and is never shown as queued. An active
+  goal occupies its own full-width row above delivery mode and plan progress.
+  The conversation composer no longer carries a persistent permission/approval
+  settings button; real approval requests remain actionable.
 - Adds a three-second SSE offline grace so a short native or fetch-stream
   reconnect does not flash an offline banner or gray the composer. A sustained
-  disconnect still fails closed for every remote mutation.
+  disconnect keeps safe queue submission available only when the HTTP endpoint
+  accepts it; all live-only mutations remain fail closed.
 - Keeps the last verified app-server capability for at most 30 seconds when one
   optional diagnostics refresh fails, so a healthy SSE connection does not
   gray the composer because of a single polling error. Expired or malformed
@@ -304,7 +304,9 @@ and Broker/app-server loss fails closed.
   references, images, command output, prompts, final answers, drafts and task
   identifiers. Absolute attachment paths from persisted history use the
   authenticated host-file resolver, so existing Codex temporary images are not
-  misclassified as files outside the thread project.
+  misclassified as files outside the thread project. A temporary image that
+  Codex or Windows already deleted cannot be reconstructed from path-only
+  history and remains an explicit product limitation.
 - Removes standalone Codex UI directives such as `::git-stage{...}` and
   `::git-commit{...}` from projected assistant answers while preserving literal
   examples inside fenced code blocks.
@@ -463,13 +465,17 @@ covers the one-time snapshot-cursor subscription handoff, overlap de-duplication
 and the stale-route callback race, so a late detail response from task A cannot
 replace task B's already-bound cursor.
 
-The 2026-08-01 current-tree `pnpm check` passed formatting, lint, type checking,
-106/106 test files with 1565/1565 tests, the production build and the embedded
-public-safety scan of 351 files. Earlier closure attempts stopped before product
-tests on two formatting findings and one over-narrow TypeScript test-fixture
-inference; after those test-only corrections, one complete closure run passed.
-A standalone public-safety scan remains a release-commit gate after document
-closeout.
+The 2026-08-01 frozen-tree `pnpm check` passed formatting, lint, type checking,
+107/107 test files with 1591/1591 tests, all production builds and the embedded
+public-safety scan of 354 files. The complete six-viewport browser matrix also
+passed all 133 applicable scenarios with zero retries; 35 cases were skipped
+only where their fixture explicitly targets another viewport. Earlier closure
+attempts exposed one missing cross-package test-fixture field and two false
+Windows timeouts caused by excessive PowerShell process concurrency. The
+fixture was corrected, Windows Vitest workers were bounded to four, the two
+affected files passed 70/70 in parallel, and the final complete closure run
+passed. A standalone public-safety scan remains a release-commit gate after
+document closeout.
 
 The final delta review also closed release-blocking edge cases. Failed
 `Open` compensation can stop a just-started task only when exact-generation

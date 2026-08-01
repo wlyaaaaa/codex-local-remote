@@ -65,6 +65,8 @@ describe("composer 组件结构", () => {
     expect(html).toContain("Fast");
     expect(html).not.toContain("GPT-5.3-C…");
     expect(html).toContain('data-testid="composer-settings-open"');
+    expect(html).not.toContain('class="next-turn-badge"');
+    expect(html).toContain("模型与运行设置：5.3 Spark");
   });
 
   it("速度能力未确认时不在现有对话设置中展示运行时档位", () => {
@@ -111,6 +113,10 @@ describe("composer 组件结构", () => {
     expect(html).toContain(">标准<");
     expect(html).toContain("不启用额外加速");
     expect(html).toContain("Fast");
+    expect(html).toContain("模型与运行设置");
+    expect(html).toContain("保存设置");
+    expect(html).toContain("运行中的回复不会变更");
+    expect(html).not.toContain("只影响下一轮");
   });
 
   it("演示目录明确标注样例，且 Spark 不会继承别的模型的 Fast", () => {
@@ -175,16 +181,17 @@ describe("composer 组件结构", () => {
     expect(html).toContain("provider/custom-model");
     expect(html).toContain("ultra-future");
     expect(html).toContain('data-testid="runtime-model-outside-catalog"');
-    expect(html).not.toContain("下一轮设置：5.3 Spark");
+    expect(html).not.toContain("下一轮设置");
   });
 
-  it("运行中明确提供当前回复与下一轮两个发送目的地", () => {
+  it("运行中明确提供当前回复与排队两个发送目的地", () => {
     const html = renderToStaticMarkup(
       <DeliveryModeSwitch mode="steer" onChange={() => undefined} queueSupported />,
     );
     expect(html).toContain("发送到");
     expect(html).toContain("当前回复");
-    expect(html).toContain("下一轮");
+    expect(html).toContain("排队");
+    expect(html).not.toContain("下一轮");
     expect(html).toContain('aria-pressed="true"');
   });
 
@@ -346,7 +353,7 @@ describe("composer 组件结构", () => {
         running={false}
       />,
     );
-    expect(html).toContain("下一轮队列");
+    expect(html).toContain("消息队列");
     expect(html).toContain("完成真实三端同步验收，并保留全部证据。");
     expect(html).toContain('aria-label="编辑排队消息"');
     expect(html).toContain('aria-label="立即发送这条消息"');

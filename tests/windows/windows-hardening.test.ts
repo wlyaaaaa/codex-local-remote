@@ -430,12 +430,14 @@ windowsOnly("Windows script hardening", () => {
     ["candidate", "visible"],
     ["candidate", "pre-takeover"],
     ["candidate", "visible-pre-takeover"],
+    ["candidate", "localized-description"],
     ["previous", "exact"],
     ["previous", "minimized"],
     ["previous", "non-elevated"],
     ["previous", "visible"],
     ["previous", "pre-takeover"],
     ["previous", "visible-pre-takeover"],
+    ["previous", "localized-description"],
   ] as const)("accepts a read-only %s-root %s launcher preflight", (rootKind, shape) => {
     expect(shortcutOwnership(rootKind, shape)).toMatchObject({
       RootKind: rootKind,
@@ -502,6 +504,26 @@ windowsOnly("Windows script hardening", () => {
     expect(install).toContain("Move-ManagedLauncherShortcutNoOverwrite");
     expect(install).not.toContain("Move-Item");
     expect(registration).toContain("[System.IO.File]::Move($sourcePath, $destinationPath, $false)");
+  });
+
+  it("transactionally upgrades the historical localized launcher description", () => {
+    const result = shortcutOwnership(
+      "previous",
+      "localized-description",
+      false,
+      "file",
+      "install",
+      "none",
+    );
+    expect(result).toMatchObject({
+      Accepted: true,
+      Failure: null,
+      InstallStatus: "upgraded",
+      TargetForeign: false,
+      PreImageCount: 0,
+      TemporaryCount: 0,
+      MoveCalls: 3,
+    });
   });
 
   it("transactionally upgrades an exact style-7 launcher to normal style", () => {

@@ -9,7 +9,7 @@ describe("浏览器后台注意状态", () => {
         online: false,
         runningCount: 8,
       }),
-    ).toBe("连接中断 · Codex Local Remote");
+    ).toBe("实时更新中断 · Codex Local Remote");
     expect(
       browserAttentionTitle({
         approvalCount: 3,

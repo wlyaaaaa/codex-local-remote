@@ -213,7 +213,8 @@ import {
   collaborationModeSetting,
   CODEX_DEFAULT_SERVICE_TIER,
   composerCapabilityState,
-  composerDeliveryDecision,
+  composerCanSubmit,
+  composerDeliveryDecisionForRuntime,
   composerFeatureSupported,
   filterThreadApprovals,
   moveQueueItem,
@@ -363,6 +364,14 @@ function waitForThreadListRefresh(delayMs: number): Promise<void> {
 function browserSessionStorage(): Storage | undefined {
   try {
     return typeof sessionStorage === "undefined" ? undefined : sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+function browserLocalStorage(): Storage | undefined {
+  try {
+    return typeof localStorage === "undefined" ? undefined : localStorage;
   } catch {
     return undefined;
   }
@@ -917,9 +926,9 @@ function capabilityLabel(value: keyof ProductCapabilities) {
     inlineApprovals: "线程内审批",
     liveEvents: "共享任务实时事件",
     permissionProfiles: "动态权限",
-    queue: "下一轮队列",
+    queue: "消息队列",
     serviceTiers: "速度档位",
-    settingsUpdate: "下一轮设置同步",
+    settingsUpdate: "运行设置同步",
     subagents: "子智能体",
     usage: "额度信息",
   };
@@ -950,7 +959,7 @@ export function hostStatus(
 ): { label: string; ready: boolean; tone: StatusTone } {
   const ready = online && appServerReady(capabilities);
   return {
-    label: ready ? "电脑在线" : online ? "兼容性待确认" : "连接中断",
+    label: ready ? "电脑在线" : online ? "兼容性待确认" : "实时更新中断",
     ready,
     tone: ready ? "success" : online ? "warning" : "danger",
   };
@@ -962,7 +971,7 @@ export function conversationControlState(
   snapshot: boolean,
 ): { available: boolean; reason: string } {
   if (!online) {
-    return { available: false, reason: "与电脑的实时连接已中断" };
+    return { available: false, reason: "与电脑的实时更新已中断" };
   }
   if (!appServerReady(capabilities)) {
     return { available: false, reason: "Codex 运行时兼容性待确认" };
@@ -1253,10 +1262,49 @@ export function composerActionVisibility(
   };
 }
 
+type ConversationDraftPersistence = "saved" | "unavailable";
+
+function readConversationDraft(
+  threadId: string,
+  storage = browserLocalStorage(),
+): { persistence: ConversationDraftPersistence; value: string } {
+  if (!storage) return { persistence: "unavailable", value: "" };
+  try {
+    return { persistence: "saved", value: storage.getItem(`draft:${threadId}`) ?? "" };
+  } catch {
+    return { persistence: "unavailable", value: "" };
+  }
+}
+
+function writeConversationDraft(
+  threadId: string,
+  value: string,
+  storage = browserLocalStorage(),
+): boolean {
+  if (!storage) return false;
+  try {
+    storage.setItem(`draft:${threadId}`, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearConversationDraft(threadId: string, storage = browserLocalStorage()): boolean {
+  if (!storage) return false;
+  try {
+    storage.removeItem(`draft:${threadId}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function readConversationAttachments(
-  storage: Pick<Storage, "getItem">,
+  storage: Pick<Storage, "getItem"> | undefined,
   threadId: string,
 ): LocalInputReference[] {
+  if (!storage) return [];
   try {
     const raw = storage.getItem(`conversation-attachments:${encodeURIComponent(threadId)}`);
     if (raw === null) return [];
@@ -1299,10 +1347,11 @@ export function readConversationAttachments(
 }
 
 export function writeConversationAttachments(
-  storage: Pick<Storage, "removeItem" | "setItem">,
+  storage: Pick<Storage, "removeItem" | "setItem"> | undefined,
   threadId: string,
   attachments: readonly LocalInputReference[],
 ): void {
+  if (!storage) return;
   const key = `conversation-attachments:${encodeURIComponent(threadId)}`;
   try {
     if (attachments.length === 0) {
@@ -1393,7 +1442,7 @@ function MarkdownLocalImage({
     setEntry(undefined);
     setUrl("");
     void apiClient
-      .resolveFile(projectId, source)
+      .resolveFile(historyReferenceProjectId(projectId, source), source)
       .then(async (resolved) => {
         const result = await apiClient.preview(resolved.projectId, resolved.relativePath);
         if (!result.contentType.startsWith("image/")) {
@@ -1510,7 +1559,10 @@ function Markdown({
                     }
                     setLinkedFileLoading(true);
                     void apiClient
-                      .resolveFile(projectId, localReference.path)
+                      .resolveFile(
+                        historyReferenceProjectId(projectId, localReference.path),
+                        localReference.path,
+                      )
                       .then((entry) => {
                         if (!linkedFileRequests.isCurrent(request)) return;
                         setLinkedFile(entry);
@@ -2004,7 +2056,7 @@ function ConnectionBanner({ online, demo }: { online: boolean; demo: boolean }) 
   return (
     <div aria-live="polite" className="offline-banner">
       <Icon name="wifi-off" size={16} />
-      连接已中断，正在自动重连。实时操作暂不可用。
+      实时更新已中断，正在自动重连。仍可编辑，支持时可尝试安全排队。
     </div>
   );
 }
@@ -3431,7 +3483,7 @@ const MessageItem = memo(function MessageItem({
           data-testid={item.id === "unsafe-content-message" ? "unsafe-content-message" : undefined}
         >
           <div className="message__stage">
-            <span>{phase === "commentary" ? "思考" : "回答"}</span>
+            <span>{phase === "commentary" ? "进展" : "回答"}</span>
             {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
             {phase === "final_answer" ? (
               <CopyMessageButton label="复制最终回答" text={item.text} />
@@ -3449,23 +3501,7 @@ const MessageItem = memo(function MessageItem({
     );
   }
   if (item.kind === "reasoning-summary") {
-    return (
-      <article className="message message--assistant message--reasoning">
-        <div className="message__content">
-          <div className="message__stage">
-            <span>思考</span>
-            {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
-          </div>
-          <Markdown
-            apiClient={apiClient}
-            online={online}
-            {...(projectId === undefined ? {} : { projectId })}
-          >
-            {item.text}
-          </Markdown>
-        </div>
-      </article>
-    );
+    return null;
   }
   if (item.kind === "formal-plan") {
     return (
@@ -4392,10 +4428,10 @@ function AccessAndReviewerSheet({
 }) {
   return (
     <Sheet
-      description="这里只显示当前 Codex 运行时声明的选项，并在下一轮生效。"
+      description="这里只显示当前 Codex 提供的选项；运行中的回复不会变更。"
       footer={
         <Button disabled={busy} onClick={onApply} variant="primary">
-          {busy ? "正在应用…" : "应用到下一轮"}
+          {busy ? "正在保存…" : "保存设置"}
         </Button>
       }
       onClose={onClose}
@@ -4758,9 +4794,14 @@ function ConversationPageInstance({
   const [state, setState] = useState<LoadState>(summary ? "ready" : "loading");
   const [detailProjectionReady, setDetailProjectionReady] = useState(Boolean(routeSeed));
   const [error, setError] = useState("");
-  const [draft, setDraft] = useState(() => window.localStorage.getItem(`draft:${id}`) ?? "");
+  const [{ persistence: initialDraftPersistence, value: initialDraft }] = useState(() =>
+    readConversationDraft(id),
+  );
+  const [draft, setDraft] = useState(initialDraft);
+  const [draftPersistence, setDraftPersistence] =
+    useState<ConversationDraftPersistence>(initialDraftPersistence);
   const [attachments, setAttachments] = useState<LocalInputReference[]>(() =>
-    readConversationAttachments(window.localStorage, id),
+    readConversationAttachments(browserLocalStorage(), id),
   );
   const [nextTurnSettings, setNextTurnSettings] = useState(() =>
     nextTurnSettingsDraft(models, initialThread),
@@ -5666,7 +5707,7 @@ function ConversationPageInstance({
   }, [compactionRequestState, interruptRequestedTurnId, load, thread?.state]);
 
   useEffect(() => {
-    window.localStorage.setItem(`draft:${id}`, draft);
+    setDraftPersistence(writeConversationDraft(id, draft) ? "saved" : "unavailable");
   }, [draft, id]);
 
   useEffect(() => {
@@ -5676,14 +5717,14 @@ function ConversationPageInstance({
   }, [actionStatus]);
 
   useEffect(() => {
-    writeConversationAttachments(window.localStorage, id, attachments);
+    writeConversationAttachments(browserLocalStorage(), id, attachments);
   }, [attachments, id]);
 
   useEffect(() => {
     initialScrollThreadRef.current = "";
     setDraftCopyState("idle");
     setComposerExpansion(composerExpandedAfterIntent("thread-change"));
-    setAttachments(readConversationAttachments(window.localStorage, id));
+    setAttachments(readConversationAttachments(browserLocalStorage(), id));
   }, [id]);
 
   useEffect(() => {
@@ -5951,7 +5992,7 @@ function ConversationPageInstance({
       !thread ||
       thread.mode === "desktop-snapshot" ||
       !draft.trim() ||
-      !runtimeControlAvailable
+      !composerCanSubmit(online, runtimeControlAvailable, queueSupported)
     ) {
       return;
     }
@@ -5960,7 +6001,13 @@ function ConversationPageInstance({
     try {
       const prompt = draft.trim();
       let currentThread = threadRef.current ?? thread;
-      let decision = composerDeliveryDecision(currentThread, deliveryMode, queueSupported);
+      let decision = composerDeliveryDecisionForRuntime(
+        currentThread,
+        deliveryMode,
+        queueSupported,
+        runtimeControlAvailable,
+        online,
+      );
       const decisionBeforeRefresh = decision;
       if (decision === "start" || decision === "synchronize") {
         const authoritative = await readThreadControlBeforeSubmit(apiClient, currentThread.id);
@@ -5985,7 +6032,13 @@ function ConversationPageInstance({
         setThread(synchronized);
         onThreadLoaded(synchronized);
         currentThread = authoritative;
-        decision = composerDeliveryDecision(authoritative, deliveryMode, queueSupported);
+        decision = composerDeliveryDecisionForRuntime(
+          authoritative,
+          deliveryMode,
+          queueSupported,
+          runtimeControlAvailable,
+          online,
+        );
         if (decisionBeforeRefresh === "start" && decision !== "start") {
           setActionError(
             "电脑端刚开始或仍在执行回复，状态已同步；请选择“引导”或“排队”后再次发送，文字已保留。",
@@ -5993,7 +6046,7 @@ function ConversationPageInstance({
           return;
         }
         if (decisionBeforeRefresh === "synchronize" && decision === "start") {
-          setActionError("刚才的回复已经结束，状态已同步；再次发送会开始下一轮，文字已保留。");
+          setActionError("刚才的回复已经结束，状态已同步；再次发送会开始新的回复，文字已保留。");
           return;
         }
       }
@@ -6092,8 +6145,8 @@ function ConversationPageInstance({
       setDraft("");
       setAttachments([]);
       setComposerExpansion(composerExpandedAfterIntent("submit"));
-      window.localStorage.removeItem(`draft:${id}`);
-      window.localStorage.removeItem(`conversation-attachments:${encodeURIComponent(id)}`);
+      clearConversationDraft(id);
+      writeConversationAttachments(browserLocalStorage(), id, []);
       window.setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 20);
     } catch (submitError) {
       if (submitError instanceof ApiRequestError && submitError.code === "TURN_MISMATCH") {
@@ -6157,7 +6210,7 @@ function ConversationPageInstance({
         if (mismatches.length > 0) {
           setComposerSheet("");
           setActionError(
-            `Codex 没有接受这些下一轮设置：${mismatches.join("、")}。已恢复为电脑端实际值。`,
+            `Codex 没有接受这些运行设置：${mismatches.join("、")}。已恢复为电脑端实际值。`,
           );
           return;
         }
@@ -6571,11 +6624,11 @@ function ConversationPageInstance({
   const actionStatusCopy = {
     "steer-accepted": "引导已发送到当前回复",
     "turn-interrupted": "停止请求已发送",
-    "turn-queued": "已加入下一轮队列",
+    "turn-queued": "已加入消息队列",
     "settings-applied":
       settingsUpdateSupported && thread.availableActions.updateSettings !== false
-        ? "下一轮设置已同步"
-        : "下一轮设置已保存，将在发送时应用",
+        ? "设置已同步"
+        : "设置已保存",
     "goal-saved": goalDraft.trim() ? "任务目标已保存" : "任务目标已清除",
     "goal-paused": "任务目标已暂停",
     "goal-resumed": "任务目标已继续",
@@ -6911,8 +6964,8 @@ function ConversationPageInstance({
         </button>
       ) : null}
       {!online ? (
-        <Notice icon="wifi-off" title="连接已中断" tone="danger">
-          你仍可查看已加载内容；恢复连接前不能发送、停止或审批。
+        <Notice icon="wifi-off" title="实时更新已中断" tone="danger">
+          已加载内容仍可查看，草稿可继续编辑；停止、审批和直接引导暂不可用，排队会通过独立请求确认。
         </Notice>
       ) : null}
       {runtimeNotice ? (
@@ -7110,7 +7163,7 @@ function ConversationPageInstance({
             />
             <textarea
               aria-label={
-                running && deliveryMode === "queue" ? "排队到下一轮" : running ? "追加要求" : "回复"
+                running && deliveryMode === "queue" ? "排队消息" : running ? "追加要求" : "回复"
               }
               data-testid="turn-composer"
               onFocus={() => {
@@ -7153,6 +7206,16 @@ function ConversationPageInstance({
                 )
               }
             />
+            {draft && draftPersistence === "unavailable" ? (
+              <div
+                className="composer-draft-persistence"
+                data-testid="conversation-draft-persistence"
+                role="status"
+              >
+                <Icon name="alert" size={14} />
+                仅保存在当前页面，刷新会丢失
+              </div>
+            ) : null}
             <div className="composer__footer">
               {hasComposerTools ? (
                 <Button
@@ -7218,17 +7281,24 @@ function ConversationPageInstance({
                 {composerActions.showSubmit ? (
                   <Button
                     aria-label={
-                      running && deliveryMode === "queue"
-                        ? "加入下一轮队列"
-                        : running
-                          ? thread.activeTurnId
-                            ? "发送补充要求"
-                            : "同步状态并发送"
-                          : "发送"
+                      !online && queueSupported
+                        ? "尝试安全排队"
+                        : !runtimeControlAvailable && queueSupported
+                          ? "安全排队，电脑恢复后发送"
+                          : running && deliveryMode === "queue"
+                            ? "加入队列"
+                            : running
+                              ? thread.activeTurnId
+                                ? "发送补充要求"
+                                : "同步状态并发送"
+                              : "发送"
                     }
                     data-testid={running ? "turn-steer-submit" : "turn-reply-submit"}
                     disabled={
-                      !draft.trim() || !online || !control.available || sending || interrupting
+                      !draft.trim() ||
+                      !composerCanSubmit(online, runtimeControlAvailable, queueSupported) ||
+                      sending ||
+                      interrupting
                     }
                     icon="send"
                     onClick={() => void submit()}
@@ -7239,15 +7309,6 @@ function ConversationPageInstance({
               </div>
             </div>
           </div>
-          {running && deliveryMode !== "queue" && !thread.activeTurnId ? null : (
-            <small className="next-turn-hint" data-testid="next-turn-model-notice">
-              {running
-                ? deliveryMode === "queue"
-                  ? "这条消息会进入网页下一轮队列；Desktop 会在真正发送后显示，模型、思考、速度与权限随消息保存"
-                  : "正在引导当前回复；设置按钮中的选择只会在下一轮生效"
-                : "模型、思考、速度与权限只应用于下一轮 · Ctrl + Enter 发送"}
-            </small>
-          )}
         </div>
       ) : !isSnapshot && !thread.parentThreadId && !control.available ? (
         <div className="read-only-handoff" data-testid="runtime-control-unavailable">
@@ -7758,7 +7819,7 @@ function NewThreadPage({
               <span>3</span>
               <div>
                 <h2>工作方式</h2>
-                <p>开始后可为下一轮调整模型与思考等级</p>
+                <p>开始后仍可调整模型与思考等级</p>
               </div>
             </div>
             <ModelControls

@@ -79,7 +79,7 @@ export function workLogSummary(items: readonly ConversationItem[]): string {
     }
   }
   const parts: string[] = [];
-  if (thoughts) parts.push(`${thoughts} 条思考`);
+  if (thoughts) parts.push(`${thoughts} 条进展`);
   if (operations) parts.push(`${operations} 项操作`);
   if (agentIds.size) parts.push(`${agentIds.size} 个子智能体`);
   return parts.length ? parts.join(" · ") : "工作记录";
@@ -163,27 +163,17 @@ export function assistantPhaseForDisplay(
 
 export function conversationContentItems(
   items: readonly ConversationItem[],
-  activeTurnId?: string,
+  _activeTurnId?: string,
 ): ConversationItem[] {
-  const latestUserIndex = latestUserMessageIndex(items);
-  const activeReasoningId = latestActiveReasoning(items, activeTurnId)?.id;
-  return items.filter((item, index) => {
+  return items.filter((item) => {
     if (item.kind === "plan-progress") {
       return false;
     }
     if (item.kind === "reasoning-summary") {
-      return (
-        item.id === activeReasoningId &&
-        activeTurnId !== undefined &&
-        (item.turnId === activeTurnId ||
-          (item.turnId === undefined && latestUserIndex >= 0 && index > latestUserIndex))
-      );
+      return false;
     }
     if (item.kind !== "assistant-message") {
       return true;
-    }
-    if (item.phase === "commentary") {
-      return false;
     }
     const formalPlan = items.find(
       (candidate): candidate is Extract<ConversationItem, { kind: "formal-plan" }> =>

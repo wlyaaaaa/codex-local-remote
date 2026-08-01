@@ -12,7 +12,7 @@ export interface BrowserAttentionInput {
 }
 
 export function browserAttentionTitle(input: BrowserAttentionInput): string {
-  if (!input.online) return `连接中断 · ${PRODUCT_TITLE}`;
+  if (!input.online) return `实时更新中断 · ${PRODUCT_TITLE}`;
 
   const approvalCount = boundedCount(input.approvalCount);
   if (approvalCount > 0) {

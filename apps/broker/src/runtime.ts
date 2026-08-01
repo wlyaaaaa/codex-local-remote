@@ -8,6 +8,7 @@ import { createServer } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { createServer as createTcpServer, isIP } from "node:net";
 import type { Server as NetServer } from "node:net";
+import { performance } from "node:perf_hooks";
 import { isAbsolute, join, resolve, win32 } from "node:path";
 import type { Duplex } from "node:stream";
 
@@ -34,7 +35,18 @@ export interface LaunchOwnedAppServerOptions {
   upstreamCapabilityToken: string;
 }
 
+export interface ProbeAppServerOptions {
+  endpoint: string;
+  timeoutMs: number;
+  upstreamCapabilityToken: string;
+}
+
+export type ProbeAppServer = (options: ProbeAppServerOptions) => Promise<void>;
+
 export interface BrokerRuntimeOptions {
+  appServerProbeFailureThreshold?: number;
+  appServerProbeIntervalMs?: number;
+  appServerProbeTimeoutMs?: number;
   capabilityToken?: string;
   codexPath: string;
   dataDir: string;
@@ -45,6 +57,7 @@ export interface BrokerRuntimeOptions {
   launchOwnedAppServer?: (options: LaunchOwnedAppServerOptions) => Promise<OwnedAppServer>;
   maxFrameBytes?: number;
   port?: number;
+  probeAppServer?: ProbeAppServer;
   upstreamHost?: string;
   upstreamPort?: number;
 }
@@ -78,7 +91,11 @@ export const DEFAULT_BROKER_HEARTBEAT_INTERVAL_MS = 30_000;
 export const DEFAULT_BROKER_HEARTBEAT_DEADLINE_MS = 30_000;
 export const DEFAULT_BROKER_HEARTBEAT_RESUME_TOLERANCE_MS = 5_000;
 export const DEFAULT_BROKER_APP_SERVER_STARTUP_TIMEOUT_MS = 60_000;
+export const DEFAULT_BROKER_APP_SERVER_PROBE_INTERVAL_MS = 30_000;
+export const DEFAULT_BROKER_APP_SERVER_PROBE_TIMEOUT_MS = 5_000;
+export const DEFAULT_BROKER_APP_SERVER_PROBE_FAILURE_THRESHOLD = 2;
 const STARTUP_PROBE_TIMEOUT_MS = 500;
+const APP_SERVER_PROBE_MAX_FRAME_BYTES = 1024 * 1024;
 const MIN_CAPABILITY_TOKEN_LENGTH = 43;
 const MIN_CAPABILITY_TOKEN_UNIQUE_CHARACTERS = 12;
 const MAX_CAPABILITY_TOKEN_LENGTH = 256;
@@ -92,6 +109,12 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
   const port = options.port ?? DEFAULT_PORT;
   const upstreamHost = options.upstreamHost ?? DEFAULT_HOST;
   const upstreamPort = options.upstreamPort ?? DEFAULT_UPSTREAM_PORT;
+  const appServerProbeFailureThreshold =
+    options.appServerProbeFailureThreshold ?? DEFAULT_BROKER_APP_SERVER_PROBE_FAILURE_THRESHOLD;
+  const appServerProbeIntervalMs =
+    options.appServerProbeIntervalMs ?? DEFAULT_BROKER_APP_SERVER_PROBE_INTERVAL_MS;
+  const appServerProbeTimeoutMs =
+    options.appServerProbeTimeoutMs ?? DEFAULT_BROKER_APP_SERVER_PROBE_TIMEOUT_MS;
   const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_BROKER_MAX_FRAME_BYTES;
   const heartbeatDeadlineMs = options.heartbeatDeadlineMs ?? DEFAULT_BROKER_HEARTBEAT_DEADLINE_MS;
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_BROKER_HEARTBEAT_INTERVAL_MS;
@@ -107,6 +130,9 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
   assertLoopbackHost(upstreamHost, "upstream host");
   assertPort(port, "port", true);
   assertPort(upstreamPort, "upstreamPort", true);
+  assertPositiveInteger(appServerProbeFailureThreshold, "appServerProbeFailureThreshold");
+  assertNonNegativeInteger(appServerProbeIntervalMs, "appServerProbeIntervalMs");
+  assertPositiveInteger(appServerProbeTimeoutMs, "appServerProbeTimeoutMs");
   assertPositiveInteger(maxFrameBytes, "maxFrameBytes");
   assertPositiveInteger(heartbeatDeadlineMs, "heartbeatDeadlineMs");
   assertPositiveInteger(heartbeatIntervalMs, "heartbeatIntervalMs");
@@ -134,19 +160,79 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
     throw error;
   }
   const coordinator = new BrokerCoordinator({ maxFrameBytes });
-  let ready = true;
+  const probeAppServer = options.probeAppServer ?? probeCodexAppServerResponsiveness;
+  let ready = false;
   let stopped = false;
+  let consecutiveProbeFailures = 0;
+  let lastProbeCompletedAt = Number.NEGATIVE_INFINITY;
+  let probePromise: Promise<boolean> | undefined;
+  const refreshAppServerReadiness = async (force = false): Promise<boolean> => {
+    if (stopped) {
+      return false;
+    }
+    if (probePromise) {
+      return await probePromise;
+    }
+    if (
+      !force &&
+      consecutiveProbeFailures === 0 &&
+      performance.now() - lastProbeCompletedAt < appServerProbeIntervalMs
+    ) {
+      return ready;
+    }
+    const currentProbe = (async () => {
+      let responsive = false;
+      try {
+        await probeAppServer({
+          endpoint: upstreamEndpoint,
+          timeoutMs: appServerProbeTimeoutMs,
+          upstreamCapabilityToken,
+        });
+        responsive = true;
+      } catch {
+        // Readiness tracks only the bounded outcome. Probe failures and response
+        // bodies are intentionally not logged or reflected in the public state.
+      }
+      lastProbeCompletedAt = performance.now();
+      if (stopped) {
+        return false;
+      }
+      if (responsive) {
+        consecutiveProbeFailures = 0;
+        ready = true;
+      } else {
+        consecutiveProbeFailures += 1;
+        if (consecutiveProbeFailures >= appServerProbeFailureThreshold) {
+          ready = false;
+        }
+      }
+      return responsive;
+    })();
+    probePromise = currentProbe;
+    try {
+      return await currentProbe;
+    } finally {
+      if (probePromise === currentProbe) {
+        probePromise = undefined;
+      }
+    }
+  };
   const activePairs = new Set<BrokerPair>();
-  const server = createHealthServer(() => {
+  const readiness = (): BrokerReadiness => {
     void coordinator.revalidateUnsafeThreads();
+    const coordinatorState = coordinator.snapshot();
     return {
       appServerReady: ready && !stopped,
       brokerProcessId: process.pid,
-      ...coordinator.snapshot(),
+      ...coordinatorState,
+      degraded: coordinatorState.degraded || consecutiveProbeFailures > 0,
       runtimeInvocationId,
       unsafeThreadCount: coordinator.unsafeThreadCount(),
       upstreamProcessId: owned.processId,
     };
+  };
+  const server = createHealthServer(readiness, async () => {
+    await refreshAppServerReadiness();
   });
   const webSocketServer = new WebSocketServer({
     maxPayload: maxFrameBytes,
@@ -205,35 +291,59 @@ export async function startBroker(options: BrokerRuntimeOptions): Promise<Runnin
     );
   });
 
+  const startupResponsive = await refreshAppServerReadiness(true);
+  if (stopped) {
+    await shutdownPromise;
+    throw new Error("Codex app-server exited before the Broker became ready");
+  }
+  if (!startupResponsive) {
+    await shutdown("stopped");
+    throw new Error("Codex app-server did not pass the startup responsiveness probe");
+  }
+
   server.on("upgrade", (request, socket, head) => {
-    if (!ready || stopped) {
-      rejectUpgrade(socket, 503, "Service Unavailable");
-      return;
-    }
-    if (!isLoopbackAddress(remoteAddress(socket))) {
-      rejectUpgrade(socket, 403, "Forbidden");
-      return;
-    }
-    if (request.headers.origin !== undefined) {
-      rejectUpgrade(socket, 403, "Forbidden");
-      return;
-    }
-    const launchIdentity = parseDownstreamLaunchIdentity(request.url, capabilityPath);
-    if (!launchIdentity) {
-      rejectUpgrade(socket, 404, "Not Found");
-      return;
-    }
-    webSocketServer.handleUpgrade(request, socket, head, (downstream) => {
-      connectDownstream(
-        coordinator,
-        activePairs,
-        downstream,
-        upstreamEndpoint,
-        upstreamCapabilityToken,
-        maxFrameBytes,
-        liveness,
-        launchIdentity.desktopLaunchNonceDigest,
-      );
+    void (async () => {
+      if (stopped) {
+        rejectUpgrade(socket, 503, "Service Unavailable");
+        return;
+      }
+      if (!isLoopbackAddress(remoteAddress(socket))) {
+        rejectUpgrade(socket, 403, "Forbidden");
+        return;
+      }
+      if (request.headers.origin !== undefined) {
+        rejectUpgrade(socket, 403, "Forbidden");
+        return;
+      }
+      const launchIdentity = parseDownstreamLaunchIdentity(request.url, capabilityPath);
+      if (!launchIdentity) {
+        rejectUpgrade(socket, 404, "Not Found");
+        return;
+      }
+      await refreshAppServerReadiness();
+      if (socket.destroyed) {
+        return;
+      }
+      if (!ready || stopped) {
+        rejectUpgrade(socket, 503, "Service Unavailable");
+        return;
+      }
+      webSocketServer.handleUpgrade(request, socket, head, (downstream) => {
+        connectDownstream(
+          coordinator,
+          activePairs,
+          downstream,
+          upstreamEndpoint,
+          upstreamCapabilityToken,
+          maxFrameBytes,
+          liveness,
+          launchIdentity.desktopLaunchNonceDigest,
+        );
+      });
+    })().catch(() => {
+      if (!socket.destroyed) {
+        rejectUpgrade(socket, 503, "Service Unavailable");
+      }
     });
   });
 
@@ -641,7 +751,10 @@ interface BrokerReadiness {
   upstreamProcessId: number;
 }
 
-function createHealthServer(readiness: () => BrokerReadiness): HttpServer {
+function createHealthServer(
+  readiness: () => BrokerReadiness,
+  refreshReadiness: () => Promise<void>,
+): HttpServer {
   return createServer((request, response) => {
     const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
     response.setHeader("Cache-Control", "no-store");
@@ -652,15 +765,28 @@ function createHealthServer(readiness: () => BrokerReadiness): HttpServer {
       return;
     }
     if (request.method === "GET" && pathname === "/ready") {
-      const state = readiness();
-      const ready = state.appServerReady;
-      response.statusCode = ready ? 200 : 503;
-      response.end(
-        JSON.stringify({
-          status: ready ? (state.degraded ? "degraded" : "ready") : "not-ready",
-          ...state,
-        }),
-      );
+      void refreshReadiness()
+        .then(() => {
+          if (response.writableEnded) {
+            return;
+          }
+          const state = readiness();
+          const ready = state.appServerReady;
+          response.statusCode = ready ? 200 : 503;
+          response.end(
+            JSON.stringify({
+              status: ready ? (state.degraded ? "degraded" : "ready") : "not-ready",
+              ...state,
+            }),
+          );
+        })
+        .catch(() => {
+          if (response.writableEnded) {
+            return;
+          }
+          response.statusCode = 503;
+          response.end(JSON.stringify({ appServerReady: false, status: "not-ready" }));
+        });
       return;
     }
     response.statusCode = 404;
@@ -777,6 +903,110 @@ async function waitForChildSpawn(child: ChildProcess): Promise<void> {
     };
     child.once("spawn", onSpawn);
     child.once("error", onError);
+  });
+}
+
+export async function probeCodexAppServerResponsiveness(
+  options: ProbeAppServerOptions,
+): Promise<void> {
+  const endpoint = normalizeLoopbackWebSocketUrl(options.endpoint);
+  const upstreamCapabilityToken = assertHighEntropyCapabilityToken(options.upstreamCapabilityToken);
+  assertPositiveInteger(options.timeoutMs, "appServerProbeTimeoutMs");
+  const requestId = `broker-readiness-${randomUUID()}`;
+
+  await new Promise<void>((resolve, reject) => {
+    const socket = new WebSocket(endpoint, {
+      handshakeTimeout: options.timeoutMs,
+      headers: {
+        Authorization: `Bearer ${upstreamCapabilityToken}`,
+      },
+      maxPayload: APP_SERVER_PROBE_MAX_FRAME_BYTES,
+    });
+    let settled = false;
+    const finish = (responsive: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      if (responsive) {
+        closeSocket(socket, 1000, "responsiveness probe complete");
+        resolve();
+      } else {
+        terminateSocket(socket);
+        reject(new Error("Codex app-server responsiveness probe failed"));
+      }
+    };
+    const timeout = setTimeout(() => {
+      finish(false);
+    }, options.timeoutMs);
+    timeout.unref();
+
+    socket.once("open", () => {
+      socket.send(
+        JSON.stringify({
+          id: requestId,
+          method: "initialize",
+          params: {
+            capabilities: {
+              experimentalApi: true,
+              mcpServerOpenaiFormElicitation: false,
+              requestAttestation: false,
+            },
+            clientInfo: {
+              name: "codex-local-remote-readiness-probe",
+              version: "1",
+            },
+          },
+        }),
+        (error) => {
+          if (error) {
+            finish(false);
+          }
+        },
+      );
+    });
+    socket.on("message", (data, isBinary) => {
+      const frame = decodeTextFrame(data, isBinary, APP_SERVER_PROBE_MAX_FRAME_BYTES);
+      if (frame === undefined) {
+        finish(false);
+        return;
+      }
+      let message: unknown;
+      try {
+        message = JSON.parse(frame);
+      } catch {
+        finish(false);
+        return;
+      }
+      if (typeof message !== "object" || message === null) {
+        finish(false);
+        return;
+      }
+      const response = message as Record<string, unknown>;
+      if (response.id !== requestId) {
+        return;
+      }
+      if (!Object.hasOwn(response, "result") || Object.hasOwn(response, "error")) {
+        finish(false);
+        return;
+      }
+      socket.send(JSON.stringify({ method: "initialized" }), (error) => {
+        finish(!error);
+      });
+    });
+    socket.once("unexpected-response", (_request, response) => {
+      response.on("error", () => undefined);
+      response.socket.on("error", () => undefined);
+      response.destroy();
+      finish(false);
+    });
+    socket.once("error", () => {
+      finish(false);
+    });
+    socket.once("close", () => {
+      finish(false);
+    });
   });
 }
 

@@ -365,9 +365,9 @@ test.describe("412×915 动态复杂态 UI", () => {
       await expectNoHorizontalOverflow(page);
 
       await expect(page.getByText("先确认真实历史基线", { exact: true })).toHaveCount(0);
-      await expect(page.getByText("正在核对长对话顺序", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("正在核对长对话顺序", { exact: true })).toBeVisible();
       await expect(page.getByText("已完成合并并验证无重复", { exact: true })).toHaveCount(0);
-      await expect(page.getByText("准备给出最终结果", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("准备给出最终结果", { exact: true })).toBeVisible();
       await expect(page.getByText("历史完整性检查", { exact: true })).toBeVisible();
 
       const expandedTextOrder = await workLog.locator(".work-log__items").evaluate((element) => {
@@ -569,7 +569,7 @@ test.describe("412×915 动态复杂态 UI", () => {
         const settingsSheet = page.getByRole("dialog");
         await expect(settingsSheet).toBeVisible();
         await expect(
-          settingsSheet.getByRole("heading", { name: "下一轮设置", exact: true }),
+          settingsSheet.getByRole("heading", { name: "模型与运行设置", exact: true }),
         ).toBeVisible();
         for (const model of runtimeModels) {
           await expect(settingsSheet.getByText(model.displayName, { exact: true })).toBeVisible();
@@ -578,7 +578,7 @@ test.describe("412×915 动态复杂态 UI", () => {
         await expect(settingsSheet.getByRole("button", { name: dynamicEffort })).toBeVisible();
         await settingsSheet.getByRole("button", { name: dynamicEffort }).click();
         await expectNoHorizontalOverflow(page);
-        await settingsSheet.getByRole("button", { name: "应用于下一轮" }).click();
+        await settingsSheet.getByRole("button", { name: "保存设置" }).click();
         await expect
           .poll(() => runtime.settingsUpdates.at(-1)?.["reasoningEffort"])
           .toBe(dynamicEffort);
@@ -762,17 +762,21 @@ test.describe("412×915 动态复杂态 UI", () => {
 
       await test.step("连接中断保留草稿与复制入口，并移除不可执行的停止入口", async () => {
         await runtime.setOnline(false);
-        await expect(page.getByText("连接已中断", { exact: true }).first()).toBeVisible();
+        await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible();
         const composer = page.getByTestId("turn-composer");
         await expect(composer).toBeVisible();
         await expect(composer).toHaveValue("离线也要能够复制的草稿");
         await expect(
           page.getByRole("button", { name: /输入框内容已复制|复制输入框内容/u }),
         ).toBeVisible();
-        await expect(page.getByTestId("turn-steer-submit")).toBeDisabled();
+        await expect(page.getByTestId("turn-steer-submit")).toBeEnabled();
+        await expect(page.getByTestId("turn-steer-submit")).toHaveAttribute(
+          "aria-label",
+          "尝试安全排队",
+        );
         await expect(page.getByTestId("turn-interrupt")).toHaveCount(0);
         await runtime.setOnline(true);
-        await expect(page.getByText("连接已中断", { exact: true })).toHaveCount(0);
+        await expect(page.getByText("实时更新已中断", { exact: true })).toHaveCount(0);
         await expect(page.getByTestId("turn-interrupt")).toBeVisible();
       });
 

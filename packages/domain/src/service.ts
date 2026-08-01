@@ -594,13 +594,17 @@ export class CodexDomainService {
         if (this.#managedThreads.has(options.threadId)) {
           await this.#ensureSharedThread(options.threadId);
         }
-        const response = asRecord(
-          await this.#gateway.request("thread/read", {
-            includeTurns: false,
-            threadId: options.threadId,
-          }),
-        );
-        cwd = asString(asRecord(response.thread).cwd);
+        if (this.#sharedAppServer) {
+          cwd = asString(this.#requireSharedThreadMetadata(options.threadId).cwd);
+        } else {
+          const response = asRecord(
+            await this.#gateway.request("thread/read", {
+              includeTurns: false,
+              threadId: options.threadId,
+            }),
+          );
+          cwd = asString(asRecord(response.thread).cwd);
+        }
       } else if (options.projectId !== undefined) {
         cwd = await this.#requireAuthorizedProjectRoot(options.projectId);
       } else {
@@ -1038,7 +1042,16 @@ export class CodexDomainService {
       this.#readPersistedThreadHead !== undefined &&
       options.historyCursor === undefined
     ) {
-      const shellResponse = await this.#readThreadForDisplay(threadId, false);
+      const cachedThread = this.#sharedThreadSnapshots.get(threadId);
+      const cachedSessionPath = asString(cachedThread?.path);
+      const cachedShell =
+        asString(cachedThread?.id) === threadId
+          ? {
+              thread: cachedThread,
+              ...(cachedSessionPath === undefined ? {} : { path: cachedSessionPath }),
+            }
+          : undefined;
+      const shellResponse = cachedShell ?? (await this.#readThreadForDisplay(threadId, false));
       const shellThread = asRecord(shellResponse.thread);
       const shellSessionPath = asString(shellThread.path) ?? asString(shellResponse.path);
       persistedThreadHead = await this.#readPersistedThreadHeadSafely(threadId, shellSessionPath);
@@ -1636,14 +1649,6 @@ export class CodexDomainService {
       ["thread/archive", "thread/unarchive"],
       "当前 Codex 版本不支持归档与恢复，请更新 Desktop 后重试。",
     );
-    const thread = await this.#readAuthorizedThread(normalizedThreadId);
-    if (asString(thread.parentThreadId) !== undefined) {
-      throw new DomainError(
-        "THREAD_READ_ONLY",
-        "子任务由所属主任务统一管理，不能单独归档或恢复。",
-        409,
-      );
-    }
     if (archived && this.#sharedAppServer) {
       await this.resubscribeSharedThreads();
       if (!this.#sharedInventoryComplete) {
@@ -1653,6 +1658,14 @@ export class CodexDomainService {
           409,
         );
       }
+    }
+    const thread = await this.#readAuthorizedThread(normalizedThreadId);
+    if (asString(thread.parentThreadId) !== undefined) {
+      throw new DomainError(
+        "THREAD_READ_ONLY",
+        "子任务由所属主任务统一管理，不能单独归档或恢复。",
+        409,
+      );
     }
     if (
       archived &&
@@ -2097,10 +2110,12 @@ export class CodexDomainService {
   }
 
   async #readAuthorizedThread(threadId: string): Promise<Record<string, unknown>> {
-    const response = asRecord(
-      await this.#gateway.request("thread/read", { includeTurns: false, threadId }),
-    );
-    const thread = asRecord(response.thread);
+    const thread = this.#sharedAppServer
+      ? this.#requireSharedThreadMetadata(threadId)
+      : asRecord(
+          asRecord(await this.#gateway.request("thread/read", { includeTurns: false, threadId }))
+            .thread,
+        );
     if (asString(thread.id) !== threadId) {
       throw new DomainError("THREAD_NOT_FOUND", "找不到这个对话", 404);
     }
@@ -3115,7 +3130,12 @@ export class CodexDomainService {
     if (!this.#restoredThreadsNeedingRefresh.has(threadId)) {
       return undefined;
     }
-    const response = asRecord(await this.#gateway.request("thread/resume", { threadId }));
+    const response = asRecord(
+      await this.#gateway.request("thread/resume", {
+        ...(this.#sharedAppServer ? { excludeTurns: true } : {}),
+        threadId,
+      }),
+    );
     const thread = asRecord(response.thread);
     if (!asString(thread.id)) {
       throw new DomainError("THREAD_NOT_FOUND", "找不到这个对话", 404);
@@ -3564,18 +3584,26 @@ export class CodexDomainService {
 
   async #hydrateUsageContext(threadId: string): Promise<void> {
     let sessionPath: string | undefined;
-    try {
-      const response = asRecord(
-        await this.#gateway.request("thread/read", {
-          includeTurns: false,
-          threadId,
-        }),
-      );
-      this.#rememberUsageFromSource(threadId, response);
-      sessionPath = asString(asRecord(response.thread).path) ?? asString(response.path);
-    } catch {
-      // Current app-server schemas do not guarantee persisted token usage on
-      // thread/read. Absence stays unavailable rather than becoming a fake 0.
+    if (this.#sharedAppServer) {
+      const thread = this.#sharedThreadSnapshots.get(threadId);
+      if (thread !== undefined && asString(thread.id) === threadId) {
+        this.#rememberUsageFromSource(threadId, thread);
+        sessionPath = asString(thread.path);
+      }
+    } else {
+      try {
+        const response = asRecord(
+          await this.#gateway.request("thread/read", {
+            includeTurns: false,
+            threadId,
+          }),
+        );
+        this.#rememberUsageFromSource(threadId, response);
+        sessionPath = asString(asRecord(response.thread).path) ?? asString(response.path);
+      } catch {
+        // Current app-server schemas do not guarantee persisted token usage on
+        // thread/read. Absence stays unavailable rather than becoming a fake 0.
+      }
     }
     await this.#hydratePersistedUsageContext(threadId, sessionPath);
   }
@@ -3754,6 +3782,18 @@ export class CodexDomainService {
     } else {
       this.#activeThreadIds.delete(threadId);
     }
+  }
+
+  #requireSharedThreadMetadata(threadId: string): Record<string, unknown> {
+    const thread = this.#sharedThreadSnapshots.get(threadId);
+    if (thread === undefined || asString(thread.id) !== threadId) {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "暂时无法安全确认这个对话的项目；未读取完整历史，请刷新后重试。",
+        409,
+      );
+    }
+    return thread;
   }
 
   #activeTopLevelThreadIds(): Set<string> {
@@ -4117,25 +4157,14 @@ export class CodexDomainService {
         if (asString(resumedThread.id) !== threadId) {
           throw new DomainError("THREAD_NOT_FOUND", "找不到这个对话", 404);
         }
-        const readResponse = asRecord(
-          await this.#gateway.request("thread/read", {
-            includeTurns: false,
-            threadId,
-          }),
-        );
-        const thread = asRecord(readResponse.thread);
-        if (asString(thread.id) !== threadId) {
-          throw new DomainError("THREAD_NOT_FOUND", "找不到这个对话", 404);
-        }
+        const thread = resumedThread;
         if (this.#archivedThreadIds.has(threadId)) {
           return;
         }
         this.#sharedSubscribedThreads.add(threadId);
         this.#rememberDirectInput(threadId, thread);
         this.#rememberRuntimeSettings(threadId, response);
-        this.#rememberRuntimeSettings(threadId, readResponse);
         this.#rememberUsageFromSource(threadId, response);
-        this.#rememberUsageFromSource(threadId, readResponse);
         this.#rememberSharedThreadSnapshot(thread);
         const projectId = this.#projectIdForCwd(thread.cwd);
         const detail = projectThreadDetail(thread, {

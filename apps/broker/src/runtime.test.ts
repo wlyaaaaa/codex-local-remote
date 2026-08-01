@@ -22,6 +22,7 @@ const cleanup: Array<() => Promise<void>> = [];
 const DOWNSTREAM_CAPABILITY_TOKEN =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
 const DESKTOP_LAUNCH_NONCE = "0123456789_abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const successfulAppServerProbe = (): Promise<void> => Promise.resolve();
 
 afterEach(async () => {
   for (const dispose of cleanup.splice(0).reverse()) {
@@ -32,6 +33,216 @@ afterEach(async () => {
 describe("startBroker", () => {
   it("allows a bounded slow Codex app-server cold start", () => {
     expect(DEFAULT_BROKER_APP_SERVER_STARTUP_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it("fails startup when an authenticated upstream opens but never answers initialize", async () => {
+    const upstreamServer = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(upstreamServer, "listening");
+    const upstreamAddress = upstreamServer.address();
+    if (typeof upstreamAddress === "string" || upstreamAddress === null) {
+      throw new Error("missing upstream address");
+    }
+    const upstreamConnections: WebSocket[] = [];
+    const upstreamAuthorizations: Array<string | undefined> = [];
+    const upstreamMethods: unknown[] = [];
+    upstreamServer.on("connection", (socket, request) => {
+      upstreamConnections.push(socket);
+      upstreamAuthorizations.push(request.headers.authorization);
+      socket.on("message", (data) => {
+        const message = JSON.parse(textFrame(data)) as Record<string, unknown>;
+        upstreamMethods.push(message.method);
+      });
+    });
+    cleanup.push(
+      async () =>
+        await new Promise<void>((resolve) => {
+          for (const socket of upstreamConnections) {
+            socket.terminate();
+          }
+          upstreamServer.close(() => {
+            resolve();
+          });
+        }),
+    );
+
+    const stopOwned = vi.fn(async () => undefined);
+    let upstreamCapabilityToken: string | undefined;
+    const attempt = await startBroker({
+      capabilityToken: DOWNSTREAM_CAPABILITY_TOKEN,
+      codexPath: "C:\\fixture\\codex.exe",
+      dataDir: "C:\\fixture",
+      host: "127.0.0.1",
+      launchOwnedAppServer: async (options) => {
+        upstreamCapabilityToken = options.upstreamCapabilityToken;
+        return {
+          endpoint: `ws://127.0.0.1:${upstreamAddress.port}/`,
+          onExit() {
+            return () => undefined;
+          },
+          processId: 41_007,
+          stop: stopOwned,
+        };
+      },
+      port: 0,
+      upstreamHost: "127.0.0.1",
+      upstreamPort: upstreamAddress.port,
+      appServerProbeTimeoutMs: 200,
+    }).then(
+      (broker) => ({ broker, kind: "started" as const }),
+      (error: unknown) => ({ error, kind: "failed" as const }),
+    );
+    if (attempt.kind === "started") {
+      await attempt.broker.stop();
+    }
+
+    expect(attempt.kind).toBe("failed");
+    expect(upstreamMethods).toContain("initialize");
+    expect(upstreamCapabilityToken).toBeDefined();
+    expect(upstreamAuthorizations).toEqual([`Bearer ${upstreamCapabilityToken}`]);
+    expect(stopOwned).toHaveBeenCalledTimes(1);
+  });
+
+  it("becomes ready only after a fresh authenticated initialize handshake completes", async () => {
+    const upstreamServer = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await once(upstreamServer, "listening");
+    const upstreamAddress = upstreamServer.address();
+    if (typeof upstreamAddress === "string" || upstreamAddress === null) {
+      throw new Error("missing upstream address");
+    }
+    const upstreamConnections: WebSocket[] = [];
+    const upstreamAuthorizations: Array<string | undefined> = [];
+    const upstreamMethods: unknown[] = [];
+    const probeClosed = Promise.withResolvers<void>();
+    upstreamServer.on("connection", (socket, request) => {
+      upstreamConnections.push(socket);
+      upstreamAuthorizations.push(request.headers.authorization);
+      socket.once("close", () => {
+        probeClosed.resolve();
+      });
+      socket.on("message", (data) => {
+        const message = JSON.parse(textFrame(data)) as Record<string, unknown>;
+        upstreamMethods.push(message.method);
+        if (message.method === "initialize") {
+          socket.send(JSON.stringify({ id: message.id, result: {} }));
+        }
+      });
+    });
+    cleanup.push(
+      async () =>
+        await new Promise<void>((resolve) => {
+          for (const socket of upstreamConnections) {
+            socket.terminate();
+          }
+          upstreamServer.close(() => {
+            resolve();
+          });
+        }),
+    );
+
+    const stopOwned = vi.fn(async () => undefined);
+    let upstreamCapabilityToken: string | undefined;
+    const broker = await startBroker({
+      capabilityToken: DOWNSTREAM_CAPABILITY_TOKEN,
+      codexPath: "C:\\fixture\\codex.exe",
+      dataDir: "C:\\fixture",
+      host: "127.0.0.1",
+      launchOwnedAppServer: async (options) => {
+        upstreamCapabilityToken = options.upstreamCapabilityToken;
+        return {
+          endpoint: `ws://127.0.0.1:${upstreamAddress.port}/`,
+          onExit() {
+            return () => undefined;
+          },
+          processId: 41_009,
+          stop: stopOwned,
+        };
+      },
+      port: 0,
+      upstreamHost: "127.0.0.1",
+      upstreamPort: upstreamAddress.port,
+      appServerProbeTimeoutMs: 1_000,
+    });
+    cleanup.push(async () => {
+      await broker.stop();
+    });
+
+    await probeClosed.promise;
+    expect(upstreamMethods).toEqual(["initialize", "initialized"]);
+    expect(upstreamCapabilityToken).toBeDefined();
+    expect(upstreamAuthorizations).toEqual([`Bearer ${upstreamCapabilityToken}`]);
+    const ready = await fetch(`${broker.httpEndpoint}ready`);
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toMatchObject({ appServerReady: true, status: "ready" });
+    expect(stopOwned).not.toHaveBeenCalled();
+  });
+
+  it("fails closed after consecutive steady probes and recovers without stopping the owner", async () => {
+    const outcomes = [
+      undefined,
+      new Error("first steady failure"),
+      new Error("second steady failure"),
+      new Error("upgrade recheck failure"),
+      undefined,
+    ];
+    const probeAppServer = vi.fn(async () => {
+      const outcome = outcomes.shift();
+      if (outcome) {
+        throw outcome;
+      }
+    });
+    const stopOwned = vi.fn(async () => undefined);
+    const broker = await startBroker({
+      capabilityToken: DOWNSTREAM_CAPABILITY_TOKEN,
+      codexPath: "C:\\fixture\\codex.exe",
+      dataDir: "C:\\fixture",
+      host: "127.0.0.1",
+      launchOwnedAppServer: async () => ({
+        endpoint: "ws://127.0.0.1:18792/",
+        onExit() {
+          return () => undefined;
+        },
+        processId: 41_008,
+        stop: stopOwned,
+      }),
+      port: 0,
+      upstreamHost: "127.0.0.1",
+      upstreamPort: 18_792,
+      appServerProbeFailureThreshold: 2,
+      // A successful readiness result may be cached, but the first failure
+      // must force the very next readiness or upgrade check to probe again.
+      appServerProbeIntervalMs: 100,
+      probeAppServer,
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 110));
+      const suspect = await fetch(`${broker.httpEndpoint}ready`);
+      expect(suspect.status).toBe(200);
+      expect(await suspect.json()).toMatchObject({
+        appServerReady: true,
+        status: "degraded",
+      });
+
+      const unavailable = await fetch(`${broker.httpEndpoint}ready`);
+      expect(unavailable.status).toBe(503);
+      expect(await unavailable.json()).toMatchObject({
+        appServerReady: false,
+        status: "not-ready",
+      });
+      await expect(rejectedUpgradeStatus(broker.webSocketEndpoint)).resolves.toBe(503);
+      expect(stopOwned).not.toHaveBeenCalled();
+
+      const recovered = await fetch(`${broker.httpEndpoint}ready`);
+      expect(recovered.status).toBe(200);
+      expect(await recovered.json()).toMatchObject({
+        appServerReady: true,
+        status: "ready",
+      });
+      expect(stopOwned).not.toHaveBeenCalled();
+      expect(probeAppServer).toHaveBeenCalledTimes(5);
+    } finally {
+      await broker.stop();
+    }
+    expect(stopOwned).toHaveBeenCalledTimes(1);
   });
 
   it("uses the strict ws://IP:PORT syntax accepted by codex app-server", () => {
@@ -107,6 +318,7 @@ describe("startBroker", () => {
         stop: stopOwned,
       }),
       port: 0,
+      probeAppServer: successfulAppServerProbe,
       upstreamHost: "127.0.0.1",
       upstreamPort: 18_792,
     });
@@ -176,6 +388,7 @@ describe("startBroker", () => {
         stop: async () => undefined,
       }),
       port: 0,
+      probeAppServer: successfulAppServerProbe,
       upstreamHost: "127.0.0.1",
       upstreamPort: upstreamAddress.port,
     });
@@ -258,6 +471,7 @@ describe("startBroker", () => {
         return owned;
       },
       port: 0,
+      probeAppServer: successfulAppServerProbe,
       upstreamHost: "127.0.0.1",
       upstreamPort: upstreamAddress.port,
     });
@@ -382,6 +596,7 @@ describe("startBroker", () => {
         stop: async () => undefined,
       }),
       port: 0,
+      probeAppServer: successfulAppServerProbe,
       upstreamHost: "127.0.0.1",
       upstreamPort: upstreamAddress.port,
     });
@@ -545,6 +760,7 @@ describe("startBroker", () => {
         stop: async () => undefined,
       }),
       port: 0,
+      probeAppServer: successfulAppServerProbe,
       upstreamHost: "127.0.0.1",
       upstreamPort: upstreamAddress.port,
     });
@@ -629,6 +845,7 @@ describe("startBroker", () => {
         stop: stopOwned,
       }),
       port: 0,
+      probeAppServer: successfulAppServerProbe,
       upstreamHost: "127.0.0.1",
       upstreamPort: upstreamAddress.port,
     });

@@ -1282,7 +1282,8 @@ class DemoApiClient implements ApiClient {
           },
           {
             id: `${id}-verification`,
-            kind: "reasoning-summary",
+            kind: "assistant-message",
+            phase: "commentary",
             text: "相关文件和边界已经核对完成，正在整理可以回读的验证结果。",
           },
           {

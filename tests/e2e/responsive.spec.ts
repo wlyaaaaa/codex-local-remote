@@ -15,6 +15,10 @@ test.describe("六视口布局契约", () => {
 
       await expect(toggle).toHaveAttribute("aria-expanded", "true");
       await expect(page.getByText("先确认真实历史基线", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("正在核对长对话顺序", { exact: true })).toBeVisible();
+      await expect(page.getByText("准备给出最终结果", { exact: true })).toBeVisible();
+      await expect(workLog.getByText("进展", { exact: true }).first()).toBeVisible();
+      await expect(workLog.getByText("思考", { exact: true })).toHaveCount(0);
       await expect(page.getByText("完整工作记录之后的最终回答。", { exact: true })).toBeVisible();
       await expectNoHorizontalOverflow(page);
       expect((await toggle.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
@@ -64,20 +68,109 @@ test.describe("六视口布局契约", () => {
     await expect(page.getByTestId("new-thread-prompt")).toHaveValue(draft);
   });
 
-  test("运行中模型选择始终明确标注为下一轮", async ({ page }) => {
+  test("运行中设置按钮保持简洁、完整且没有重复提示行", async ({ page }) => {
     await login(page);
     await page.goto("./?demo=1#/threads/thread-active");
 
-    const badge = page.locator(".next-turn-badge");
-    const hint = page.getByTestId("next-turn-model-notice");
-    await expect(badge).toBeVisible();
-    await expect(hint).toBeVisible();
-    await expect(hint).toContainText("下一轮");
-    const hintFontSize = await hint.evaluate((element) =>
-      Number.parseFloat(window.getComputedStyle(element).fontSize),
-    );
-    expect(hintFontSize).toBeGreaterThanOrEqual(12);
+    const settings = page.getByTestId("composer-settings-open");
+    const modelLabel = settings.locator(".composer-settings-button__model");
+    await expect(page.locator(".next-turn-badge")).toHaveCount(0);
+    await expect(page.getByTestId("next-turn-model-notice")).toHaveCount(0);
+    await expect(modelLabel).toHaveText("GPT-5.4");
+    expect(
+      await modelLabel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+    ).toBe(true);
+    await expect(settings).toHaveAttribute("aria-label", /模型与运行设置/u);
+    await settings.click();
+    const sheet = page.getByRole("dialog");
+    await expect(sheet.getByRole("heading", { name: "模型与运行设置" })).toBeVisible();
+    await expect(sheet.getByTestId("runtime-model-outside-catalog")).toContainText("GPT-5.4");
+    await sheet.getByRole("button", { name: /^GPT-5\.3-Codex-Spark/u }).click();
+    await expect(sheet.getByRole("button", { name: "高", exact: true })).toBeVisible();
+    await expect(sheet.getByRole("button", { name: /^标准/u })).toBeVisible();
+    await sheet.getByRole("button", { name: "保存设置" }).click();
+    await expect(modelLabel).toHaveText("5.3 Spark");
+    expect(
+      await modelLabel.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+    ).toBe(true);
+    if ((page.viewportSize()?.width ?? 0) <= 412) {
+      const composer = page.getByTestId("turn-composer");
+      await composer.focus();
+      await expect(composer).not.toHaveAttribute("readonly");
+      const mobileControls = [
+        settings,
+        page.getByTestId("composer-mode-open"),
+        page.getByTestId("composer-plan-progress").locator("summary"),
+      ];
+      for (const control of mobileControls) {
+        const box = await control.boundingBox();
+        expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+        expect(box?.width ?? 0).toBeGreaterThanOrEqual(44);
+      }
+      await page.getByTestId("composer-plan-progress").evaluate((details) => {
+        if (details instanceof HTMLDetailsElement) {
+          details.open = true;
+          details.dispatchEvent(new Event("toggle"));
+        }
+      });
+      const close = page.getByTestId("composer-plan-progress-close");
+      await expect(close).toBeVisible();
+      const closeBox = await close.boundingBox();
+      expect(closeBox?.height ?? 0).toBeGreaterThanOrEqual(44);
+      expect(closeBox?.width ?? 0).toBeGreaterThanOrEqual(44);
+    }
     await expectNoHorizontalOverflow(page);
+  });
+
+  test("手机端目标与运行控制均保持至少 44px 触控高度", async ({ page }) => {
+    const runtime = new SharedRuntime({ complexState: true });
+    await runtime.attach(page.context());
+
+    try {
+      await openSharedThread(page);
+      if ((page.viewportSize()?.width ?? 0) > 412) return;
+      const composer = page.getByTestId("turn-composer");
+      await composer.focus();
+      await expect(composer).not.toHaveAttribute("readonly");
+
+      const targets = [
+        page.getByTestId("composer-settings-open"),
+        page.getByTestId("composer-goal-open"),
+        page.getByTestId("composer-mode-open"),
+      ];
+      for (const target of targets) {
+        await expect(target).toBeVisible();
+        const box = await target.boundingBox();
+        expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+        expect(box?.width ?? 0).toBeGreaterThanOrEqual(44);
+      }
+
+      const goalText = page.locator(".composer-goal-button > span");
+      await expect(goalText).toContainText("完成移动端复杂状态验收");
+      const goalPresentation = await goalText.evaluate((element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        const buttonRect = element.parentElement?.getBoundingClientRect();
+        return {
+          overflow: style.overflow,
+          textOverflow: style.textOverflow,
+          whiteSpace: style.whiteSpace,
+          oneLine: rect.height <= Number.parseFloat(style.lineHeight) + 1,
+          insideButton: buttonRect ? rect.right <= buttonRect.right + 1 : false,
+        };
+      });
+      expect(goalPresentation).toEqual({
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        oneLine: true,
+        insideButton: true,
+      });
+
+      await expectNoHorizontalOverflow(page);
+    } finally {
+      await runtime.close();
+    }
   });
 
   test("运行中只显示真实最新动作，不显示计时、历史思考框或边框", async ({ page }) => {

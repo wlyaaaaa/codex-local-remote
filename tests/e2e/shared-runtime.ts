@@ -208,7 +208,8 @@ export class SharedRuntime {
       const goalTimestamp = now();
       this.goal = {
         threadId: this.thread.id,
-        objective: "完成移动端复杂状态验收并交付",
+        objective:
+          "完成移动端复杂状态验收、真实任务闭环、断线安全排队与发布前最终复核，确保所有关键操作在手机上清晰可用",
         status: "active",
         tokensUsed: 3,
         timeUsedSeconds: 90,

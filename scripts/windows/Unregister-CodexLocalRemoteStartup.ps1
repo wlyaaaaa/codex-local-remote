@@ -551,6 +551,30 @@ function Test-ManagedLauncherShortcut {
     }
 }
 
+function Get-LegacyLocalizedManagedLauncherShortcutDefinition {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $canonicalPrefix = 'Codex Remote'
+    $description = [string]$Definition.Description
+    if (-not $description.StartsWith(
+            "$canonicalPrefix - ",
+            [System.StringComparison]::Ordinal
+        )) {
+        return $null
+    }
+
+    $historicalPrefix = 'Codex Remote (' +
+        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
+        ')'
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = $historicalPrefix +
+        $description.Substring($canonicalPrefix.Length)
+    return [pscustomobject]$properties
+}
+
 function Test-NonElevatedManagedLauncherShortcut {
     param([Parameter(Mandatory)][object]$Definition)
 
@@ -691,18 +715,28 @@ function Test-RecognizedManagedLauncherShortcut {
     )
 
     foreach ($definition in $Definitions) {
-        if ((Test-ManagedLauncherShortcut -Definition $definition) -or
+        $recognizedDefinitions = @($definition)
+        $historicalLocalized =
+            Get-LegacyLocalizedManagedLauncherShortcutDefinition `
+                -Definition $definition
+        if ($null -ne $historicalLocalized) {
+            $recognizedDefinitions += $historicalLocalized
+        }
+        foreach ($recognizedDefinition in $recognizedDefinitions) {
+            if ((Test-ManagedLauncherShortcut `
+                    -Definition $recognizedDefinition) -or
             (Test-NonElevatedManagedLauncherShortcut `
-                -Definition $definition) -or
+                -Definition $recognizedDefinition) -or
             (Test-MinimizedManagedLauncherShortcut `
-                -Definition $definition) -or
+                -Definition $recognizedDefinition) -or
             (Test-VisibleManagedLauncherShortcut `
-                -Definition $definition) -or
+                -Definition $recognizedDefinition) -or
             (Test-PreTakeoverManagedLauncherShortcut `
-                -Definition $definition) -or
+                -Definition $recognizedDefinition) -or
             (Test-VisiblePreTakeoverManagedLauncherShortcut `
-                -Definition $definition)) {
-            return $true
+                -Definition $recognizedDefinition)) {
+                return $true
+            }
         }
     }
     return $false

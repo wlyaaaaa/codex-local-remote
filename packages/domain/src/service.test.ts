@@ -2206,8 +2206,6 @@ describe("CodexDomainService", () => {
       "thread/loaded/list",
       "thread/resume",
       "thread/read",
-      "thread/read",
-      "thread/read",
       "turn/steer",
     ]);
   });
@@ -3186,6 +3184,7 @@ describe("CodexDomainService", () => {
         if (method === "thread/resume" || method === "thread/read") {
           return { thread: desktopThread };
         }
+        if (method === "thread/goal/set") return {};
         if (method === "turn/steer") return { turnId: "tail-active-turn" };
         if (method === "turn/interrupt") return {};
         if (method === "thread/items/list" || method === "thread/turns/list") {
@@ -3219,9 +3218,171 @@ describe("CodexDomainService", () => {
     await expect(
       service.steerTurn(desktopThread.id, "tail-active-turn", "继续当前目标"),
     ).resolves.toMatchObject({ state: "running", turnId: "tail-active-turn" });
+    await expect(
+      service.setThreadGoal(desktopThread.id, { status: "paused" }),
+    ).resolves.toBeUndefined();
+    await expect(
+      service.interruptTurn(desktopThread.id, "tail-active-turn"),
+    ).resolves.toMatchObject({ state: "running", turnId: "tail-active-turn" });
+    expect(calls).toContainEqual({
+      method: "thread/goal/set",
+      params: { status: "paused", threadId: desktopThread.id },
+    });
+    expect(calls).toContainEqual({
+      method: "turn/interrupt",
+      params: { threadId: desktopThread.id, turnId: "tail-active-turn" },
+    });
     expect(calls.some((call) => call.method === "thread/items/list")).toBe(false);
     expect(calls.some((call) => call.method === "thread/turns/list")).toBe(false);
-    expect(readPersistedThreadHead).toHaveBeenCalled();
+    expect(calls.filter((call) => call.method === "thread/read")).toHaveLength(0);
+    expect(calls.filter((call) => call.method === "thread/resume")).toEqual([
+      {
+        method: "thread/resume",
+        params: { excludeTurns: true, threadId: desktopThread.id },
+      },
+    ]);
+    expect(readPersistedThreadHead).toHaveBeenCalledWith(desktopThread.id, desktopThread.path);
+  });
+
+  it("keeps cold shared pause, steer, and interrupt paths off thread/read when the persisted head fails", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const desktopThread = {
+      ...threadFixture,
+      id: "desktop-cold-control",
+      path: "C:\\sessions\\rollout-desktop-cold-control.jsonl",
+      status: { activeFlags: [], type: "active" },
+      turns: [
+        {
+          id: "desktop-cold-turn",
+          items: [],
+          startedAt: 1_721_000_001,
+          status: "inProgress",
+        },
+      ],
+    };
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/resume" || method === "thread/read") {
+          return { thread: desktopThread };
+        }
+        if (method === "thread/goal/set" || method === "turn/interrupt") return {};
+        if (method === "turn/steer") return { turnId: "desktop-cold-turn" };
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: [desktopThread.id],
+        readPersistedThreadHead: async () => {
+          throw new Error("persisted head temporarily unavailable");
+        },
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await expect(
+      service.getThread(desktopThread.id, { includeTurns: false }),
+    ).resolves.toMatchObject({
+      activeTurnId: "desktop-cold-turn",
+      id: desktopThread.id,
+      mode: "managed",
+    });
+    await expect(
+      service.setThreadGoal(desktopThread.id, { status: "paused" }),
+    ).resolves.toBeUndefined();
+    await expect(
+      service.steerTurn(desktopThread.id, "desktop-cold-turn", "继续执行"),
+    ).resolves.toMatchObject({ state: "running", turnId: "desktop-cold-turn" });
+    await expect(
+      service.interruptTurn(desktopThread.id, "desktop-cold-turn"),
+    ).resolves.toMatchObject({ state: "running", turnId: "desktop-cold-turn" });
+
+    expect(calls.filter((call) => call.method === "thread/read")).toHaveLength(0);
+    expect(calls.filter((call) => call.method === "thread/resume")).toEqual([
+      {
+        method: "thread/resume",
+        params: { excludeTurns: true, threadId: desktopThread.id },
+      },
+    ]);
+  });
+
+  it("fails shared control authorization closed without reading thread history", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const desktopThread = {
+      ...threadFixture,
+      cwd: "D:\\unregistered",
+      id: "desktop-unauthorized-control",
+    };
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/resume" || method === "thread/read") {
+          return { thread: desktopThread };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: [desktopThread.id],
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await expect(
+      service.setThreadGoal(desktopThread.id, { status: "paused" }),
+    ).rejects.toMatchObject({
+      code: "PROJECT_NOT_AUTHORIZED",
+    });
+    expect(calls.filter((call) => call.method === "thread/read")).toHaveLength(0);
+  });
+
+  it("uses bounded shared metadata for usage and permission-profile lookups", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const desktopThread = {
+      ...threadFixture,
+      id: "desktop-bounded-metadata",
+      path: "C:\\sessions\\rollout-desktop-bounded-metadata.jsonl",
+    };
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/resume" || method === "thread/read") {
+          return { thread: desktopThread };
+        }
+        if (method === "thread/goal/get") return { goal: null };
+        if (method === "permissionProfile/list") return { data: [] };
+        if (method === "account/read") return { account: {} };
+        if (method === "account/rateLimits/read" || method === "account/usage/read") return {};
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: [desktopThread.id],
+        readPersistedUsageContext: async () => ({
+          limitTokens: 100,
+          usedPercent: 25,
+          usedTokens: 25,
+        }),
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    await expect(service.getThreadGoal(desktopThread.id)).resolves.toBeUndefined();
+    await expect(
+      service.listPermissionProfiles({ threadId: desktopThread.id }),
+    ).resolves.toMatchObject({
+      data: [],
+    });
+    await expect(service.getUsage(desktopThread.id)).resolves.toMatchObject({
+      data: { context: { limitTokens: 100, usedTokens: 25 } },
+    });
+    expect(calls.filter((call) => call.method === "thread/read")).toHaveLength(0);
   });
 
   it.each([undefined, false] as const)(
@@ -3412,10 +3573,6 @@ describe("CodexDomainService", () => {
       {
         method: "thread/resume",
         params: { excludeTurns: true, threadId: "desktop-hydrated" },
-      },
-      {
-        method: "thread/read",
-        params: { includeTurns: false, threadId: "desktop-hydrated" },
       },
     ]);
     const [snapshotEvent] = events.replayAfter(0).events;

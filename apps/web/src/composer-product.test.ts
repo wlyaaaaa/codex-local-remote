@@ -8,7 +8,9 @@ import type {
 import {
   collaborationModeSetting,
   composerCapabilityState,
+  composerCanSubmit,
   composerDeliveryDecision,
+  composerDeliveryDecisionForRuntime,
   composerFeatureSupported,
   composerToolActions,
   filterThreadApprovals,
@@ -164,6 +166,27 @@ describe("移动端 composer 产品契约", () => {
     } satisfies Pick<ThreadDetail, "activeTurnId" | "availableActions" | "state">;
 
     expect(composerDeliveryDecision(idle, "steer", true)).toBe("start");
+  });
+
+  it("运行时恢复期间仍允许把消息安全写入持久队列", () => {
+    const running = {
+      activeTurnId: "turn-1",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+      state: "running",
+    } satisfies Pick<ThreadDetail, "activeTurnId" | "availableActions" | "state">;
+
+    expect(composerCanSubmit(true, false, true)).toBe(true);
+    expect(composerCanSubmit(true, false, false)).toBe(false);
+    expect(composerCanSubmit(false, true, true)).toBe(true);
+    expect(composerCanSubmit(false, true, false)).toBe(false);
+    expect(composerDeliveryDecisionForRuntime(running, "steer", true, false)).toBe("queue");
+    expect(composerDeliveryDecisionForRuntime(running, "steer", true, true)).toBe("steer");
+    expect(composerDeliveryDecisionForRuntime(running, "steer", true, true, false)).toBe("queue");
   });
 
   it("只在服务器支持时显示目标、计划模式与压缩入口", () => {

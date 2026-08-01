@@ -80,7 +80,7 @@ export function DeliveryModeSwitch({
           onClick={() => onChange("queue")}
           type="button"
         >
-          下一轮
+          排队
         </button>
       ) : null}
     </div>
@@ -207,8 +207,8 @@ export function ComposerSettingsButton({
   ]
     .filter(Boolean)
     .join(" · ");
-  const compactLabel = [
-    selected ? modelComposerLabel(selected.displayName) : model,
+  const primaryLabel = selected ? modelComposerLabel(selected.displayName) : model;
+  const secondaryLabel = [
     reasoningEffortLabel(displayedEffort),
     tier ? (tier.id === null ? "标准" : tier.label) : undefined,
   ]
@@ -217,21 +217,25 @@ export function ComposerSettingsButton({
   return (
     <div className="composer-settings-control">
       <button
-        aria-label={`下一轮设置：${detailedLabel}`}
+        aria-label={`模型与运行设置：${detailedLabel}`}
         className="composer-settings-button"
         data-testid="composer-settings-open"
         disabled={disabled}
         onClick={onOpen}
         type="button"
       >
-        <span className="next-turn-badge">下一轮</span>
         {fastTier ? (
           <span aria-label="Fast 加速已开启" className="composer-fast-indicator" title="Fast">
             ⚡
           </span>
         ) : null}
         <span className="composer-settings-button__label">
-          {compactLabel || "选择模型与思考等级"}
+          <span className="composer-settings-button__model">
+            {primaryLabel || "选择模型与思考等级"}
+          </span>
+          {secondaryLabel ? (
+            <span className="composer-settings-button__secondary"> · {secondaryLabel}</span>
+          ) : null}
         </span>
         <Icon name="chevron-down" size={14} />
       </button>
@@ -335,15 +339,15 @@ export function ComposerSettingsSheet({
   const currentTier = selectedTier(selected, serviceTier);
   return (
     <Sheet
-      description="这些设置只影响下一轮，不会热切换正在运行的回复。"
+      description="运行中的回复不会变更。"
       footer={
         <Button disabled={busy} onClick={onApply} variant="primary">
-          {busy ? "正在应用…" : "应用于下一轮"}
+          {busy ? "正在保存…" : "保存设置"}
         </Button>
       }
       onClose={onClose}
       open={open}
-      title="下一轮设置"
+      title="模型与运行设置"
     >
       <div className="composer-sheet-section">
         <h3>模型</h3>
@@ -358,8 +362,7 @@ export function ComposerSettingsSheet({
         ) : null}
         {!selected && model ? (
           <p className="composer-sheet-note" data-testid="runtime-model-outside-catalog">
-            当前实际模型：{model}。它不在 Codex
-            当前可选目录中；只有主动选择下方模型后才会切换下一轮。
+            当前实际模型：{model}。它不在 Codex 当前可选目录中；选择下方模型并保存后生效。
           </p>
         ) : null}
         <div className="composer-option-list">
@@ -573,7 +576,7 @@ export function PlanModeSheet({
 }) {
   return (
     <Sheet
-      description="计划模式只影响下一轮；当前回复可通过“发送到当前回复”继续引导。"
+      description="为后续工作选择协作方式；当前回复仍可直接引导。"
       onClose={onClose}
       open={open}
       title="计划模式"
@@ -660,7 +663,7 @@ export function QueueShelf({
       <header>
         <span>
           <Icon name="clock" size={15} />
-          下一轮队列
+          消息队列
         </span>
         <b>{items.length} 条</b>
       </header>

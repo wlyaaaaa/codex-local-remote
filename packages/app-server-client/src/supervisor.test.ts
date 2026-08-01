@@ -9,6 +9,7 @@ import {
   JsonlRpcConnection,
   RpcConnectionClosedError,
   RpcRequestError,
+  RpcTimeoutError,
   type RpcNotification,
 } from "./jsonl-connection.js";
 import {
@@ -70,6 +71,7 @@ function createChildSession(
 
 function createSession(
   request = vi.fn(async (_method: string, _params?: unknown) => ({ ok: true })),
+  stop = vi.fn(async () => undefined),
 ): AppServerSession & { exit(): void; notification(notification: RpcNotification): void } {
   const exitListeners = new Set<(error?: Error) => void>();
   const notificationListeners = new Set<(notification: RpcNotification) => void>();
@@ -117,7 +119,7 @@ function createSession(
     },
     request: async <T = unknown>(method: string, params?: unknown): Promise<T> =>
       (await request(method, params)) as T,
-    stop: vi.fn(async () => undefined),
+    stop,
   };
 }
 
@@ -346,6 +348,188 @@ describe("AppServerSupervisor", () => {
       await vi.advanceTimersByTimeAsync(100);
       expect(launchCandidate).toHaveBeenCalledTimes(2);
       expect(supervisor.snapshot().state).toBe("stopped");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recycles a shared session after an RPC timeout instead of staying falsely running", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstStop = vi.fn(async () => undefined);
+      const firstSession = createSession(
+        vi.fn(async () => {
+          throw new RpcTimeoutError("thread/read", 30_000);
+        }),
+        firstStop,
+      );
+      const secondSession = createSession();
+      const sessions = [firstSession, secondSession];
+      const connectSharedSession = vi.fn(async () => sessions.shift() ?? createSession());
+      const supervisor = new AppServerSupervisor({
+        connectSharedSession,
+        endpoint: "ws://127.0.0.1:4747",
+        mode: "shared-websocket",
+        restartDelaysMs: [10],
+      });
+
+      await supervisor.start();
+      await expect(
+        supervisor.request("thread/read", { threadId: "thread-1" }),
+      ).rejects.toBeInstanceOf(RpcTimeoutError);
+
+      expect(firstStop).toHaveBeenCalledTimes(1);
+      expect(supervisor.snapshot()).toMatchObject({
+        restartAttempt: 1,
+        state: "degraded",
+      });
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(connectSharedSession).toHaveBeenCalledTimes(2);
+      expect(supervisor.snapshot()).toMatchObject({
+        restartAttempt: 0,
+        state: "running",
+      });
+      await expect(supervisor.request("thread/read", { threadId: "thread-1" })).resolves.toEqual({
+        ok: true,
+      });
+      await supervisor.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds repeated business-RPC recovery attempts inside a sliding time window", async () => {
+    vi.useFakeTimers();
+    try {
+      const timedOutSession = () =>
+        createSession(
+          vi.fn(async () => {
+            throw new RpcTimeoutError("thread/read", 30_000);
+          }),
+        );
+      const recoveredSession = createSession();
+      const sessions = [timedOutSession(), timedOutSession(), recoveredSession, timedOutSession()];
+      const connectSharedSession = vi.fn(async () => sessions.shift() ?? createSession());
+      const supervisor = new AppServerSupervisor({
+        connectSharedSession,
+        endpoint: "ws://127.0.0.1:4747",
+        mode: "shared-websocket",
+        restartDelaysMs: [10],
+        runtimeFailureLimit: 2,
+        runtimeFailureWindowMs: 1_000,
+      });
+
+      await supervisor.start();
+      await expect(
+        supervisor.request("thread/read", { threadId: "thread-1" }),
+      ).rejects.toBeInstanceOf(RpcTimeoutError);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(connectSharedSession).toHaveBeenCalledTimes(2);
+
+      await expect(
+        supervisor.request("thread/read", { threadId: "thread-1" }),
+      ).rejects.toBeInstanceOf(RpcTimeoutError);
+      expect(supervisor.snapshot()).toMatchObject({
+        runtimeFailureCount: 2,
+        state: "degraded",
+      });
+
+      await vi.advanceTimersByTimeAsync(989);
+      expect(connectSharedSession).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(connectSharedSession).toHaveBeenCalledTimes(3);
+
+      await expect(supervisor.request("thread/read", { threadId: "thread-1" })).resolves.toEqual({
+        ok: true,
+      });
+      expect(supervisor.snapshot().runtimeFailureCount).toBe(1);
+
+      recoveredSession.exit();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(connectSharedSession).toHaveBeenCalledTimes(4);
+      await supervisor.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let request or notify bypass a scheduled runtime-failure restart", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstSession = createSession(
+        vi.fn(async () => {
+          throw new RpcTimeoutError("thread/read", 30_000);
+        }),
+      );
+      const secondSession = createSession();
+      const sessions = [firstSession, secondSession];
+      const connectSharedSession = vi.fn(async () => sessions.shift() ?? createSession());
+      const supervisor = new AppServerSupervisor({
+        connectSharedSession,
+        endpoint: "ws://127.0.0.1:4747",
+        mode: "shared-websocket",
+        restartDelaysMs: [10],
+        runtimeFailureLimit: 1,
+        runtimeFailureWindowMs: 1_000,
+      });
+
+      await supervisor.start();
+      await expect(
+        supervisor.request("thread/read", { threadId: "thread-1" }),
+      ).rejects.toBeInstanceOf(RpcTimeoutError);
+
+      await expect(supervisor.request("model/list", {})).rejects.toBeInstanceOf(
+        RpcConnectionClosedError,
+      );
+      await expect(supervisor.notify("initialized")).rejects.toBeInstanceOf(
+        RpcConnectionClosedError,
+      );
+      expect(connectSharedSession).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(connectSharedSession).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(connectSharedSession).toHaveBeenCalledTimes(2);
+      await supervisor.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts concurrent failures from one stale session only once", async () => {
+    vi.useFakeTimers();
+    try {
+      const failure = Promise.withResolvers<never>();
+      const firstStop = vi.fn(async () => undefined);
+      const firstSession = createSession(
+        vi.fn(async () => await failure.promise),
+        firstStop,
+      );
+      const connectSharedSession = vi.fn(async () => firstSession);
+      const supervisor = new AppServerSupervisor({
+        connectSharedSession,
+        endpoint: "ws://127.0.0.1:4747",
+        mode: "shared-websocket",
+        restartDelaysMs: [10],
+        runtimeFailureLimit: 2,
+        runtimeFailureWindowMs: 1_000,
+      });
+
+      await supervisor.start();
+      const first = supervisor.request("thread/read", { threadId: "thread-1" });
+      const second = supervisor.request("thread/read", { threadId: "thread-2" });
+      failure.reject(new RpcTimeoutError("thread/read", 30_000));
+
+      await expect(first).rejects.toBeInstanceOf(RpcTimeoutError);
+      await expect(second).rejects.toBeInstanceOf(RpcTimeoutError);
+      expect(firstStop).toHaveBeenCalledTimes(1);
+      expect(supervisor.snapshot()).toMatchObject({
+        restartAttempt: 1,
+        runtimeFailureCount: 1,
+        state: "degraded",
+      });
+      await supervisor.stop();
     } finally {
       vi.useRealTimers();
     }

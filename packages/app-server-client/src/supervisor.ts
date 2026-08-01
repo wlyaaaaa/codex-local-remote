@@ -16,6 +16,7 @@ import {
   JsonlRpcConnection,
   RpcConnectionClosedError,
   RpcRequestError,
+  RpcTimeoutError,
 } from "./jsonl-connection.js";
 import type { WebSocketFactory } from "./websocket-connection.js";
 import {
@@ -69,6 +70,7 @@ export interface AppServerSupervisorSnapshot {
   capabilities?: AppServerCapabilities;
   diagnostics: CodexDiscoveryDiagnostic[];
   restartAttempt: number;
+  runtimeFailureCount: number;
 }
 
 interface SupervisorEvents {
@@ -90,6 +92,8 @@ export interface AppServerSupervisorOptions {
   probeTimeoutMs?: number;
   requestTimeoutMs?: number;
   restartDelaysMs?: number[];
+  runtimeFailureLimit?: number;
+  runtimeFailureWindowMs?: number;
   webSocketFactory?: WebSocketFactory;
 }
 
@@ -442,12 +446,15 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
   readonly #launchCandidate: (candidate: CodexExecutable) => Promise<AppServerSession>;
   readonly #mode: AppServerTransportMode;
   readonly #restartDelaysMs: number[];
+  readonly #runtimeFailureLimit: number;
+  readonly #runtimeFailureWindowMs: number;
   #diagnostics: CodexDiscoveryDiagnostic[] = [];
   #detachSessionListeners: Array<() => void> = [];
   #intendedRunning = false;
   #lifecycleChain: Promise<void> = Promise.resolve();
   #restartAttempt = 0;
   #restartTimer: NodeJS.Timeout | undefined;
+  #runtimeFailures: number[] = [];
   #session: AppServerSession | undefined;
   #state: AppServerSupervisorSnapshot["state"] = "stopped";
 
@@ -466,6 +473,11 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
         : undefined;
     this.#candidateProvider = options.candidateProvider ?? (() => discoverCodexExecutables());
     this.#restartDelaysMs = options.restartDelaysMs ?? [500, 1_000, 2_500, 5_000, 10_000];
+    this.#runtimeFailureLimit = Math.max(1, Math.trunc(options.runtimeFailureLimit ?? 3));
+    this.#runtimeFailureWindowMs = Math.max(
+      1,
+      Math.trunc(options.runtimeFailureWindowMs ?? 60_000),
+    );
     this.#launchCandidate =
       options.launchCandidate ??
       (async (candidate) =>
@@ -508,7 +520,7 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
   async start(): Promise<void> {
     this.#intendedRunning = true;
     await this.#enqueueLifecycle(async () => {
-      if (!this.#intendedRunning || this.#session) {
+      if (!this.#intendedRunning || this.#session || this.#restartTimer) {
         return;
       }
       await this.#startNow();
@@ -529,6 +541,7 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
         await session.stop();
       }
       this.#restartAttempt = 0;
+      this.#runtimeFailures = [];
       this.#setState("stopped");
     });
   }
@@ -545,7 +558,21 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
     if (!session) {
       throw new RpcConnectionClosedError("Codex 后台尚未就绪");
     }
-    return await session.request<T>(method, params, options);
+    try {
+      const result = await session.request<T>(method, params, options);
+      if (this.#session === session) {
+        this.#pruneRuntimeFailures(Date.now());
+      }
+      return result;
+    } catch (error) {
+      if (error instanceof RpcTimeoutError || error instanceof RpcConnectionClosedError) {
+        await this.#recycleFailedSession(session);
+      } else if (this.#session === session) {
+        // A structured RPC error still proves that the active runtime answered.
+        this.#pruneRuntimeFailures(Date.now());
+      }
+      throw error;
+    }
   }
 
   async notify(method: string, params?: unknown): Promise<void> {
@@ -556,7 +583,14 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
     if (!session) {
       throw new RpcConnectionClosedError("Codex 后台尚未就绪");
     }
-    await session.notify(method, params);
+    try {
+      await session.notify(method, params);
+    } catch (error) {
+      if (error instanceof RpcTimeoutError || error instanceof RpcConnectionClosedError) {
+        await this.#recycleFailedSession(session);
+      }
+      throw error;
+    }
   }
 
   snapshot(): AppServerSupervisorSnapshot {
@@ -566,6 +600,7 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
       mode: this.#mode,
       diagnostics: [...this.#diagnostics],
       restartAttempt: this.#restartAttempt,
+      runtimeFailureCount: this.#runtimeFailureCount(),
       ...(this.#endpoint === undefined ? {} : { endpoint: this.#endpoint }),
       ...(session
         ? {
@@ -669,12 +704,29 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
         }
         this.#detachActiveSession();
         this.#session = undefined;
+        this.#recordRuntimeFailure();
         this.#setState("degraded");
         if (this.#intendedRunning) {
           this.#scheduleRestart();
         }
       }),
     ];
+  }
+
+  async #recycleFailedSession(session: AppServerSession): Promise<void> {
+    await this.#enqueueLifecycle(async () => {
+      if (this.#session !== session) {
+        return;
+      }
+      this.#detachActiveSession();
+      this.#session = undefined;
+      this.#recordRuntimeFailure();
+      await session.stop().catch(() => undefined);
+      this.#setState("degraded");
+      if (this.#intendedRunning) {
+        this.#scheduleRestart();
+      }
+    });
   }
 
   #detachActiveSession(): void {
@@ -688,7 +740,15 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
       return;
     }
     const index = Math.min(this.#restartAttempt, this.#restartDelaysMs.length - 1);
-    const delay = this.#restartDelaysMs[index] ?? 5_000;
+    const retryDelay = this.#restartDelaysMs[index] ?? 5_000;
+    const now = Date.now();
+    this.#pruneRuntimeFailures(now);
+    const oldestFailure = this.#runtimeFailures[0];
+    const circuitDelay =
+      this.#runtimeFailures.length >= this.#runtimeFailureLimit && oldestFailure !== undefined
+        ? Math.max(0, oldestFailure + this.#runtimeFailureWindowMs - now)
+        : 0;
+    const delay = Math.max(retryDelay, circuitDelay);
     this.#restartAttempt += 1;
     this.#restartTimer = setTimeout(() => {
       this.#restartTimer = undefined;
@@ -701,6 +761,24 @@ export class AppServerSupervisor extends EventEmitter<SupervisorEvents> {
     }, delay);
     this.#restartTimer.unref();
     this.emit("state", this.snapshot());
+  }
+
+  #recordRuntimeFailure(): void {
+    const now = Date.now();
+    this.#pruneRuntimeFailures(now);
+    this.#runtimeFailures.push(now);
+  }
+
+  #runtimeFailureCount(): number {
+    this.#pruneRuntimeFailures(Date.now());
+    return this.#runtimeFailures.length;
+  }
+
+  #pruneRuntimeFailures(now: number): void {
+    const cutoff = now - this.#runtimeFailureWindowMs;
+    while (this.#runtimeFailures[0] !== undefined && this.#runtimeFailures[0] <= cutoff) {
+      this.#runtimeFailures.shift();
+    }
   }
 
   #setState(state: AppServerSupervisorSnapshot["state"]): void {

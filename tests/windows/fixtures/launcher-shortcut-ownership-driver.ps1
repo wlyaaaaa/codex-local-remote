@@ -18,6 +18,7 @@ param(
         'visible',
         'pre-takeover',
         'visible-pre-takeover',
+        'localized-description',
         'foreign-drift'
     )]
     [string]$Shape,
@@ -69,8 +70,7 @@ function New-TestDefinition {
             '-RequestDesktopLaunch'
         )
         WorkingDirectory = $RuntimeRoot
-        Description =
-            'Codex Remote safe launch - exact managed fixture'
+        Description = 'Codex Remote - exact managed fixture'
         IconLocation = "$(Join-Path $dataDir 'managed.ico'),0"
         WindowStyle = 1
         RunAsUser = $true
@@ -91,6 +91,8 @@ function Set-TestShortcut {
         [Parameter(Mandatory)]
         [string]$IconLocation,
 
+        [string]$Description = ([string]$Definition.Description),
+
         [int]$WindowStyle = ([int]$Definition.WindowStyle),
 
         [bool]$RunAsUser = ([bool]$Definition.RunAsUser)
@@ -105,7 +107,7 @@ function Set-TestShortcut {
         $shortcut.Arguments = $Arguments
         $shortcut.WorkingDirectory =
             [string]$Definition.WorkingDirectory
-        $shortcut.Description = [string]$Definition.Description
+        $shortcut.Description = $Description
         $shortcut.IconLocation = $IconLocation
         $shortcut.WindowStyle = $WindowStyle
         $shortcut.Save()
@@ -147,6 +149,17 @@ $actualWindowStyle = if ($Shape -ceq 'minimized') {
     [int]$sourceDefinition.WindowStyle
 }
 $actualRunAsUser = $Shape -cne 'non-elevated'
+$actualDescription = if ($Shape -ceq 'localized-description') {
+    $historicalPrefix = 'Codex Remote (' +
+        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
+        ')'
+    $historicalPrefix +
+        ([string]$sourceDefinition.Description).Substring(
+            'Codex Remote'.Length
+        )
+} else {
+    [string]$sourceDefinition.Description
+}
 if ($Shape -cin @('visible', 'visible-pre-takeover')) {
     $actualArguments = $actualArguments.Replace(
         ' -WindowStyle Hidden ',
@@ -188,6 +201,7 @@ if ($PathKind -ceq 'directory') {
         -Definition $sourceDefinition `
         -Arguments $actualArguments `
         -IconLocation $actualIcon `
+        -Description $actualDescription `
         -WindowStyle $actualWindowStyle `
         -RunAsUser $actualRunAsUser
 }
@@ -196,6 +210,7 @@ $functionNames = @(
     'Get-ManagedLauncherShortcutLinkFlags',
     'Set-ManagedLauncherShortcutRunAsUser',
     'Test-ManagedLauncherShortcut',
+    'Get-LegacyLocalizedManagedLauncherShortcutDefinition',
     'Test-LegacyNonElevatedManagedLauncherShortcut',
     'Test-LegacyMinimizedManagedLauncherShortcut',
     'Test-LegacyVisibleManagedLauncherShortcut',
