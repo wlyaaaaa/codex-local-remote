@@ -23,6 +23,9 @@ param(
     [ValidateRange(15, 180)]
     [int]$ReadyWaitSeconds = 120,
 
+    [ValidateRange(15, 300)]
+    [int]$InfrastructureReadyWaitSeconds = 240,
+
     [ValidatePattern('^[a-f0-9]{64}$')]
     [string]$ExpectedSelectedVersionId,
 
@@ -1563,7 +1566,9 @@ function Prepare-OnDemandSelectedRemoteRuntime {
             -ExpectedState 'Running' `
             -TimeoutSeconds 20
         $readyDeadline =
-            [DateTime]::UtcNow.AddSeconds($ReadyWaitSeconds)
+            [DateTime]::UtcNow.AddSeconds(
+                $InfrastructureReadyWaitSeconds
+            )
         do {
             Start-Sleep -Milliseconds 250
             $remoteState = Get-OnDemandRemoteState `

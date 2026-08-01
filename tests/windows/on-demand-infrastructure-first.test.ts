@@ -78,6 +78,21 @@ describe("Windows infrastructure-first on-demand handoff", () => {
     expect(earlyExit).toBeGreaterThan(taskRefresh);
   });
 
+  it("gives cold infrastructure preparation its own complete startup budget", () => {
+    const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+    const prepare = functionBlock(
+      handoff,
+      "Prepare-OnDemandSelectedRemoteRuntime",
+      "Stop-OnDemandDesktopProcessGroup",
+    );
+
+    expect(handoff).toMatch(
+      /\[ValidateRange\(15, 300\)\]\s+\[int\]\$InfrastructureReadyWaitSeconds = 240/u,
+    );
+    expect(prepare).toMatch(/AddSeconds\(\s+\$InfrastructureReadyWaitSeconds\s+\)/u);
+    expect(prepare).not.toMatch(/AddSeconds\(\s*\$ReadyWaitSeconds\s*\)/u);
+  });
+
   it("keeps the post-close path attach-only", () => {
     const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
     const attachOnly = functionBlock(
