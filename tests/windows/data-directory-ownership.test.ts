@@ -95,7 +95,7 @@ windowsOnly("Windows DataDir ownership gate", () => {
     const result = runDriver("protect", documents, environment);
 
     expect(result.status).not.toBe(0);
-    expect(`${result.stdout}${result.stderr}`).toContain("known folder");
+    expect(`${result.stdout}${result.stderr}`.replace(/\s+/g, " ")).toContain("known folder");
     expect(existsSync(markerPath(documents))).toBe(false);
     expect(inspectAcl(documents, environment)).toEqual(before);
   });

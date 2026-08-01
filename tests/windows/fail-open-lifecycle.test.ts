@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -23,6 +23,7 @@ interface ShortcutDefinition {
   Arguments: string;
   Description: string;
   IconLocation: string;
+  TargetPath: string;
   WorkingDirectory: string;
   WindowStyle: number;
   LinkFlags: number;
@@ -79,7 +80,7 @@ windowsOnly("Windows fail-open lifecycle", () => {
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SHORTCUT_PATH); $b=[IO.File]::ReadAllBytes($env:SHORTCUT_PATH); $f=[BitConverter]::ToUInt32($b,20); [pscustomobject]@{Arguments=$s.Arguments;Description=$s.Description;IconLocation=$s.IconLocation;WorkingDirectory=$s.WorkingDirectory;WindowStyle=$s.WindowStyle;LinkFlags=$f;RunAsUser=(($f -band 0x2000)-ne 0)}|ConvertTo-Json -Compress",
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SHORTCUT_PATH); $b=[IO.File]::ReadAllBytes($env:SHORTCUT_PATH); $f=[BitConverter]::ToUInt32($b,20); [pscustomobject]@{Arguments=$s.Arguments;Description=$s.Description;IconLocation=$s.IconLocation;TargetPath=$s.TargetPath;WorkingDirectory=$s.WorkingDirectory;WindowStyle=$s.WindowStyle;LinkFlags=$f;RunAsUser=(($f -band 0x2000)-ne 0)}|ConvertTo-Json -Compress",
       ],
       {
         cwd: repositoryRoot,
@@ -221,7 +222,16 @@ windowsOnly("Windows fail-open lifecycle", () => {
         env: { ...process.env, LOCALAPPDATA: sandbox },
       },
     );
-    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    let shortcutDiagnostics = "";
+    if (result.status !== 0 && existsSync(dataDir)) {
+      const candidates = readdirSync(dataDir)
+        .filter((name) => name.endsWith(".lnk"))
+        .map((name) => join(dataDir, name));
+      shortcutDiagnostics = candidates
+        .map((path) => `${path}: ${JSON.stringify(readShortcut(path))}`)
+        .join("\n");
+    }
+    expect(result.status, `${result.stdout}\n${result.stderr}\n${shortcutDiagnostics}`).toBe(0);
     return JSON.parse(result.stdout.trim()) as RegistrationResult;
   }
 
