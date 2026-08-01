@@ -163,6 +163,10 @@ and Broker/app-server loss fails closed.
   takeover request. Package and active-runtime identity are revalidated only
   when an explicit `Open` needs a handoff; otherwise the native root is
   preserved and Remote remains closed or update-pending.
+- Treats a transient empty Broker readiness response or temporarily unavailable
+  upstream listener snapshot as `Wait` during steady supervision. The verified
+  Sidecar is preserved for the next observation, while a concrete runtime
+  identity mismatch remains a fail-closed `Reject`.
 - Revalidates a package refresh at three destructive-safety observations,
   including one immediately before stopping the exact Desktop root. Every
   observation requires `unsafeThreadCount=0`, the same Broker/runtime

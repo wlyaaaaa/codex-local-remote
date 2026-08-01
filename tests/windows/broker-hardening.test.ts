@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 const windowsOnly = process.platform === "win32" ? describe : describe.skip;
 const repositoryRoot = resolve(import.meta.dirname, "..", "..");
 const modulePath = join(repositoryRoot, "scripts", "windows", "CodexLocalRemote.Windows.psm1");
+const startScriptPath = join(repositoryRoot, "scripts", "windows", "Start-CodexLocalRemote.ps1");
 const driver = join(import.meta.dirname, "fixtures", "broker-module-driver.ps1");
 
 function runDriver(arguments_: string[], environment: NodeJS.ProcessEnv = {}) {
@@ -872,6 +873,28 @@ windowsOnly("Windows shared app-server broker hardening", () => {
     expect(strict.status).toBe(0);
     expect(JSON.parse(strict.stdout)).toBe("Reject");
   });
+
+  it.each([
+    ["missing-readiness", "Wait"],
+    ["missing-upstream", "Wait"],
+    ["identity-mismatch", "Reject"],
+    ["ready", "Ready"],
+  ] as const)(
+    "keeps runtime supervision non-destructive for a transient %s observation",
+    (scenario, expected) => {
+      const result = runDriver([
+        "-Operation",
+        "runtime-supervision-decision",
+        "-StartScriptPath",
+        startScriptPath,
+        "-Scenario",
+        scenario,
+      ]);
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toBe(expected);
+    },
+  );
 
   it("keeps degraded application state alive while strict readiness stays fail closed", () => {
     const degraded = {

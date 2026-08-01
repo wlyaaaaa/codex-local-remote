@@ -1120,12 +1120,17 @@ function Get-SharedRuntimeDecision {
     $decision = Get-BrokerReadinessDecision `
         -Readiness $readiness `
         -Phase RuntimeTransition
+    if ($decision -ceq 'Reject' -or $null -eq $readiness) {
+        return $decision
+    }
     if ($decision -ceq 'Ready' -or
         $decision -ceq 'Degraded' -or
         $decision -ceq 'Wait') {
         $upstream = Get-VerifiedManagedUpstream
-        if ($null -eq $upstream -or
-            -not (Test-BrokerReadinessRuntimeIdentity `
+        if ($null -eq $upstream) {
+            return 'Wait'
+        }
+        if (-not (Test-BrokerReadinessRuntimeIdentity `
                 -Readiness $readiness `
                 -ExpectedBrokerProcessId $brokerPid `
                 -ExpectedUpstreamProcessId ([int]$upstream.ProcessId) `

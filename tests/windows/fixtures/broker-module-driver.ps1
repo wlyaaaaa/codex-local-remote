@@ -23,7 +23,8 @@ param(
         'write-state',
         'classify-app-server',
         'validate-unknown-count',
-        'sidecar-readiness-decision'
+        'sidecar-readiness-decision',
+        'runtime-supervision-decision'
     )]
     [string]$Operation,
 
@@ -50,6 +51,16 @@ param(
     [string]$PreviousValue,
 
     [string]$ParentProcessName,
+
+    [string]$StartScriptPath,
+
+    [ValidateSet(
+        'missing-readiness',
+        'missing-upstream',
+        'identity-mismatch',
+        'ready'
+    )]
+    [string]$Scenario = 'ready',
 
     [ValidateSet('Infrastructure', 'SidecarHandshake', 'RuntimeTransition', 'StrictRuntime')]
     [string]$Phase = 'Infrastructure'
@@ -222,5 +233,62 @@ switch ($Operation) {
             -Readiness $readiness `
             -Phase $Phase |
             ConvertTo-Json -Compress -Depth 20
+    }
+    'runtime-supervision-decision' {
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $StartScriptPath,
+            [ref]$tokens,
+            [ref]$errors
+        )
+        if ($errors.Count -gt 0) {
+            throw 'The startup script could not be parsed.'
+        }
+        $functionAst = @(
+            $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -ceq 'Get-SharedRuntimeDecision'
+            }, $true)
+        )
+        if ($functionAst.Count -ne 1) {
+            throw 'Expected exactly one Get-SharedRuntimeDecision function.'
+        }
+        Invoke-Expression ([string]$functionAst[0].Extent.Text)
+
+        $script:testReadiness = if ($Scenario -ceq 'missing-readiness') {
+            $null
+        } else {
+            [pscustomobject]@{
+                runtimeInvocationId = '0123456789abcdef0123456789abcdef'
+                brokerProcessId = 17
+                upstreamProcessId = 19
+                appServerReady = $true
+                desktopConnected = $true
+                sidecarConnected = $true
+                degraded = $false
+                unknownCount = 0
+            }
+        }
+        function Get-BrokerReadinessSnapshot {
+            return $script:testReadiness
+        }
+        function Get-VerifiedManagedUpstream {
+            if ($Scenario -ceq 'missing-readiness') {
+                throw 'Upstream verification must not run without readiness.'
+            }
+            if ($Scenario -ceq 'missing-upstream') {
+                return $null
+            }
+            return [pscustomobject]@{ ProcessId = 19 }
+        }
+        function Test-BrokerReadinessRuntimeIdentity {
+            return $Scenario -cne 'identity-mismatch'
+        }
+        $brokerPid = 17
+        $runtimeInvocationId = '0123456789abcdef0123456789abcdef'
+
+        Get-SharedRuntimeDecision | ConvertTo-Json -Compress
     }
 }
