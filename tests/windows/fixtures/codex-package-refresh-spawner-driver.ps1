@@ -12,9 +12,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$dataDir = Join-Path $SandboxRoot 'Data'
-$null = New-Item -ItemType Directory -Path $dataDir -Force
 . $LauncherPath -DefinitionOnly
+$sandboxDataDir = Join-Path $SandboxRoot 'Data'
+$null = New-Item -ItemType Directory -Path $sandboxDataDir -Force
 
 $rootKey = '42001|638899999999999999|' + ('a' * 64)
 $runtimeInvocationId = 'fedcba9876543210fedcba9876543210'
@@ -35,7 +35,7 @@ function Start-Process {
 }
 
 Write-AtomicJsonFile `
-    -Path (Join-Path $dataDir 'desktop-package-refresh-intent.json') `
+    -Path (Join-Path $sandboxDataDir 'desktop-package-refresh-intent.json') `
     -Value ([ordered]@{
         Signature =
             'codex-local-remote/desktop-package-refresh-intent/v1'
@@ -59,7 +59,7 @@ Write-AtomicJsonFile `
 
 $started = Start-CodexLocalRemotePackageRefreshWorker `
     -Name 'Codex Local Remote' `
-    -ManagedDataDir $dataDir `
+    -ManagedDataDir $sandboxDataDir `
     -ManagedSidecarPort 18790 `
     -ManagedBrokerPort 18791 `
     -ManagedBrokerUpstreamPort 18792 `
@@ -67,7 +67,7 @@ $started = Start-CodexLocalRemotePackageRefreshWorker `
     -ExpectedRootIdentityKey $rootKey `
     -ExpectedRuntimeInvocationId $runtimeInvocationId
 $intent = Get-Content `
-    -LiteralPath (Join-Path $dataDir 'desktop-package-refresh-intent.json') `
+    -LiteralPath (Join-Path $sandboxDataDir 'desktop-package-refresh-intent.json') `
     -Raw `
     -Encoding utf8 |
     ConvertFrom-Json -Depth 8
