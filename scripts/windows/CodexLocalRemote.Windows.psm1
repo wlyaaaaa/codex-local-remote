@@ -3741,7 +3741,8 @@ function New-CodexLocalRemoteDesktopHandoffPreparation {
                 -DataDir $DataDir `
                 -ExpectedRuntimeVersionId $RuntimeVersionId `
                 -ExpectedRuntimeRoot $resolvedRuntimeRoot `
-                -ExpectedManifestSha256 $ManifestSha256
+                -ExpectedManifestSha256 $ManifestSha256 `
+                -RequireLiveOwnership
         if ($null -eq $existing) {
             try {
                 $existingItem =
@@ -3796,7 +3797,8 @@ function New-CodexLocalRemoteDesktopHandoffPreparation {
                                 [string](
                                     $existingUnverified.ManifestSha256
                                 )
-                            )
+                            ) `
+                            -RequireLiveOwnership
                 }
             } catch {
                 $existingSelf = $null

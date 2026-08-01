@@ -46,6 +46,8 @@ windowsOnly("Desktop handoff preparation receipt", () => {
         TamperedRejected: true,
         TamperedReplaced: true,
         DifferentFreshPreparationBlocked: true,
+        DifferentRuntimeOrphanReplaced: true,
+        SameRuntimeOrphanReplaced: true,
         AmbiguousDesktopRootsBlocked: true,
       });
     } finally {

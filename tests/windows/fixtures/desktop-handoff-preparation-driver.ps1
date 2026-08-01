@@ -281,7 +281,7 @@ $differentRuntimeVersionId = 'd' * 64
 $differentManifestSha256 = 'e' * 64
 $differentRuntimeRoot =
     Join-Path $resolvedSandbox $differentRuntimeVersionId
-$null =
+$differentPreparation =
     New-CodexLocalRemoteDesktopHandoffPreparation `
         -DataDir $resolvedSandbox `
         -RuntimeVersionId $differentRuntimeVersionId `
@@ -300,6 +300,56 @@ try {
 } catch {
     $differentFreshPreparationBlocked = $true
 }
+$script:fixtureOwnership = [pscustomobject]@{
+    DesktopRootProcessId = 43001
+    DesktopRootStartTimeUtcTicks = 638894448000000010
+    DesktopExecutablePath = $desktopPath
+    DesktopRootIdentityKey =
+        Get-CodexDesktopOwnerRootIdentityKey `
+            -ProcessId 43001 `
+            -StartTimeUtcTicks 638894448000000010 `
+            -ExecutablePath $desktopPath
+    DesktopAppServerProcessId = 43002
+    DesktopAppServerStartTimeUtcTicks = 638894448000000011
+    DesktopAppServerExecutablePath = $appServerPath
+    DesktopAppServerIdentityKey =
+        Get-CodexDesktopOwnerRootIdentityKey `
+            -ProcessId 43002 `
+            -StartTimeUtcTicks 638894448000000011 `
+            -ExecutablePath $appServerPath
+}
+$differentRuntimeOrphanReplacement =
+    New-CodexLocalRemoteDesktopHandoffPreparation `
+        -DataDir $resolvedSandbox `
+        -RuntimeVersionId $runtimeVersionId `
+        -RuntimeRoot $runtimeRoot `
+        -ManifestSha256 $manifestSha256 `
+        -Ownership $script:fixtureOwnership
+$script:fixtureOwnership = [pscustomobject]@{
+    DesktopRootProcessId = 44001
+    DesktopRootStartTimeUtcTicks = 638894448000000020
+    DesktopExecutablePath = $desktopPath
+    DesktopRootIdentityKey =
+        Get-CodexDesktopOwnerRootIdentityKey `
+            -ProcessId 44001 `
+            -StartTimeUtcTicks 638894448000000020 `
+            -ExecutablePath $desktopPath
+    DesktopAppServerProcessId = 44002
+    DesktopAppServerStartTimeUtcTicks = 638894448000000021
+    DesktopAppServerExecutablePath = $appServerPath
+    DesktopAppServerIdentityKey =
+        Get-CodexDesktopOwnerRootIdentityKey `
+            -ProcessId 44002 `
+            -StartTimeUtcTicks 638894448000000021 `
+            -ExecutablePath $appServerPath
+}
+$sameRuntimeOrphanReplacement =
+    New-CodexLocalRemoteDesktopHandoffPreparation `
+        -DataDir $resolvedSandbox `
+        -RuntimeVersionId $runtimeVersionId `
+        -RuntimeRoot $runtimeRoot `
+        -ManifestSha256 $manifestSha256 `
+        -Ownership $script:fixtureOwnership
 
 [pscustomobject]@{
     RequestedPhase = [string]$requested.Phase
@@ -316,5 +366,11 @@ try {
     TamperedReplaced = $tamperedReplaced
     DifferentFreshPreparationBlocked =
         $differentFreshPreparationBlocked
+    DifferentRuntimeOrphanReplaced =
+        [string]$differentRuntimeOrphanReplacement.PreparationId -cne
+            [string]$differentPreparation.PreparationId
+    SameRuntimeOrphanReplaced =
+        [string]$sameRuntimeOrphanReplacement.PreparationId -cne
+            [string]$differentRuntimeOrphanReplacement.PreparationId
     AmbiguousDesktopRootsBlocked = $ambiguousDesktopRootsBlocked
 } | ConvertTo-Json -Depth 8 -Compress
