@@ -23,11 +23,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Scan repository for public-safety violations
         run: pnpm check:public
-      - name: Run checks with a canonical Windows temp path
+      - name: Run checks outside the Windows short-path user temp
         run: |
-          $canonicalTemp = (Get-Item -LiteralPath $env:TEMP -Force).FullName
-          $env:TEMP = $canonicalTemp
-          $env:TMP = $canonicalTemp
+          $testTemp = (Get-Item -LiteralPath $env:RUNNER_TEMP -Force).FullName
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
           pnpm check
       - name: Install Chromium for browser acceptance
         run: pnpm exec playwright install chromium
