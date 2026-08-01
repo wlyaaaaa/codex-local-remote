@@ -19,6 +19,7 @@ const viewports = [
 export default defineConfig({
   testDir: "./tests/e2e",
   outputDir: "./test-results",
+  retries: process.env["CI"] === "true" ? 1 : 0,
   reporter: [["list"], ["html", { open: "never" }]],
   webServer: externalBaseUrl
     ? undefined
