@@ -149,6 +149,8 @@ describe("Windows native-default on-demand Remote contract", () => {
         PreviousIdleActive: "runtime-transition",
         PreviousDegraded: "unverified",
         PreviousDesktopConnected: "unverified",
+        PreviousUnsafeDesktopConnected: "unverified",
+        PreviousUnsafeDesktopConnectedAuthorized: "background-repairable",
         PreviousUnknown: "unverified",
         PreviousUnsafe: "runtime-transition-busy",
         PreviousManifestMismatch: "unverified",
@@ -349,6 +351,9 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(initialState).toContain(
       "-AllowActiveTurns:($Operation -ceq 'Open' -and $AllowDesktopRestart)",
     );
+    expect(handoff).toContain("$allowNativePreviousDesktop = (");
+    expect(handoff).toContain("[string]$currentDesiredMode.Mode -ceq 'Native'");
+    expect(initialState).toContain("-AllowNativePreviousDesktop:$allowNativePreviousDesktop");
   });
 
   it("restores native Desktop when an authorized Open fails after closing it", () => {

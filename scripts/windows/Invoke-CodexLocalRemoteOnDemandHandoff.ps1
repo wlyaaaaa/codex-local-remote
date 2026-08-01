@@ -623,7 +623,9 @@ function Get-OnDemandRemoteState {
         [ValidateRange(1, 65535)]
         [int]$BrokerPort,
 
-        [switch]$AllowActiveTurns
+        [switch]$AllowActiveTurns,
+
+        [switch]$AllowNativePreviousDesktop
     )
 
     $script:onDemandLastReadiness = $null
@@ -796,6 +798,16 @@ function Get-OnDemandRemoteState {
         }
         $script:onDemandLastReadiness = $readiness
         if ($previousGeneration) {
+            if ($AllowNativePreviousDesktop -and
+                [string]$receipt.Status -ceq 'broker-ready' -and
+                $null -eq $receipt.Sidecar -and
+                [string]$readiness.status -ceq 'ready' -and
+                [bool]$readiness.appServerReady -and
+                [bool]$readiness.desktopConnected -and
+                -not [bool]$readiness.sidecarConnected -and
+                -not [bool]$readiness.degraded) {
+                return 'background-repairable'
+            }
             if ([string]$readiness.status -ceq 'ready' -and
                 [bool]$readiness.appServerReady -and
                 [bool]$readiness.desktopConnected -and
@@ -2597,11 +2609,17 @@ try {
             )
         }
     }
+    $allowNativePreviousDesktop = (
+        $Operation -ceq 'Open' -and
+        $AllowDesktopRestart -and
+        [string]$currentDesiredMode.Mode -ceq 'Native'
+    )
     $remoteState = if ([string]$startupTask.State -ceq 'Running') {
         Get-OnDemandRemoteState `
             -Runtime $runtime `
             -BrokerPort ([int]$configuration.BrokerPort) `
-            -AllowActiveTurns:($Operation -ceq 'Open' -and $AllowDesktopRestart)
+            -AllowActiveTurns:($Operation -ceq 'Open' -and $AllowDesktopRestart) `
+            -AllowNativePreviousDesktop:$allowNativePreviousDesktop
     } elseif ([string]$startupTask.State -ceq 'Ready') {
         'inactive'
     } else {

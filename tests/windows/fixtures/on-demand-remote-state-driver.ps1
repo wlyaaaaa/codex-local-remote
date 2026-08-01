@@ -115,7 +115,9 @@ function Invoke-RemoteStateCase {
         [Parameter(Mandatory)]
         [string]$Scenario,
 
-        [switch]$AllowActiveTurns
+        [switch]$AllowActiveTurns,
+
+        [switch]$AllowNativePreviousDesktop
     )
 
     $global:OnDemandRemoteStateScenario = $Scenario
@@ -143,6 +145,7 @@ function Invoke-RemoteStateCase {
         desktopConnected = $Scenario -cin @(
             'CurrentActive',
             'PreviousDesktopConnected',
+            'PreviousUnsafeDesktopConnected',
             'PreviousActive',
             'PreviousIdleActive'
         )
@@ -157,6 +160,7 @@ function Invoke-RemoteStateCase {
             'CurrentUnsafeDetached',
             'CurrentUnsafeBackground',
             'PreviousUnsafe',
+            'PreviousUnsafeDesktopConnected',
             'PreviousActive'
         )) {
             4
@@ -202,7 +206,8 @@ function Invoke-RemoteStateCase {
     return Get-OnDemandRemoteState `
         -Runtime $runtime `
         -BrokerPort 18791 `
-        -AllowActiveTurns:$AllowActiveTurns
+        -AllowActiveTurns:$AllowActiveTurns `
+        -AllowNativePreviousDesktop:$AllowNativePreviousDesktop
 }
 
 [pscustomobject][ordered]@{
@@ -233,6 +238,13 @@ function Invoke-RemoteStateCase {
         Invoke-RemoteStateCase -Scenario 'PreviousDegraded'
     PreviousDesktopConnected =
         Invoke-RemoteStateCase -Scenario 'PreviousDesktopConnected'
+    PreviousUnsafeDesktopConnected =
+        Invoke-RemoteStateCase -Scenario 'PreviousUnsafeDesktopConnected'
+    PreviousUnsafeDesktopConnectedAuthorized =
+        Invoke-RemoteStateCase `
+            -Scenario 'PreviousUnsafeDesktopConnected' `
+            -AllowActiveTurns `
+            -AllowNativePreviousDesktop
     PreviousUnknown =
         Invoke-RemoteStateCase -Scenario 'PreviousUnknown'
     PreviousUnsafe =
