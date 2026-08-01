@@ -197,7 +197,7 @@ test.describe("单密码登录与完整远程旅程", () => {
       ).toBeVisible();
       await expect(
         page.getByText("相关文件和边界已经核对完成，正在整理可以回读的验证结果。"),
-      ).toBeVisible();
+      ).toHaveCount(0);
       await expect(
         page.getByText("子任务已完成：检查记录、工具活动和最终结论都保留在这个子智能体对话中。"),
       ).toBeVisible();

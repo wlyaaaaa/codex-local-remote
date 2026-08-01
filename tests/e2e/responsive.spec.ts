@@ -13,14 +13,20 @@ test.describe("六视口布局契约", () => {
       const workLog = page.locator("section.work-log");
       const toggle = workLog.getByRole("button", { name: /工作记录/u }).first();
 
-      await expect(toggle).toHaveAttribute("aria-expanded", "false");
+      await expect(toggle).toHaveAttribute("aria-expanded", "true");
+      await expect(page.getByText("先确认真实历史基线", { exact: true })).toHaveCount(0);
       await expect(page.getByText("完整工作记录之后的最终回答。", { exact: true })).toBeVisible();
       await expectNoHorizontalOverflow(page);
       expect((await toggle.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
 
       await toggle.click();
+      await expect(toggle).toHaveAttribute("aria-expanded", "false");
+      await expect(page.getByText("完整工作记录之后的最终回答。", { exact: true })).toBeVisible();
+      await expectNoHorizontalOverflow(page);
+
+      await toggle.click();
       await expect(toggle).toHaveAttribute("aria-expanded", "true");
-      await expect(page.getByText("先确认真实历史基线", { exact: true })).toBeVisible();
+      await expect(page.getByText("先确认真实历史基线", { exact: true })).toHaveCount(0);
       await expectNoHorizontalOverflow(page);
 
       if ((page.viewportSize()?.width ?? 0) <= 700) {
