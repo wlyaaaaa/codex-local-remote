@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$env:CODEX_REMOTE_TEST_FIXTURE = '1'
 $resolvedScriptPath = (Resolve-Path -LiteralPath $ScriptPath).Path
 $resolvedSandboxRoot = [System.IO.Path]::GetFullPath($SandboxRoot)
 $runtimeRoot = Join-Path $resolvedSandboxRoot 'runtime'

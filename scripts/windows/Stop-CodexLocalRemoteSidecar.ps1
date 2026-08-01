@@ -36,12 +36,19 @@ $resolvedCli = [System.IO.Path]::GetFullPath($ExpectedSidecarCliPath)
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
 
 function Get-SidecarListeners {
-    return @(
-        Get-NetTCPConnection `
-            -State Listen `
-            -LocalPort $Port `
-            -ErrorAction SilentlyContinue
-    )
+    return $(if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        @(
+            Get-NetTCPConnection `
+                -State Listen `
+                -LocalPort $Port `
+                -ErrorAction SilentlyContinue
+        )
+    } else {
+        @(
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts @($Port)
+        )
+    })
 }
 
 function Get-ManagedSidecarOwnerSnapshot {

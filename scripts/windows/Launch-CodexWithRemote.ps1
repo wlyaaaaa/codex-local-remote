@@ -677,25 +677,26 @@ function Get-CodexLocalRemoteReceiptProcessLiveness {
             {
                 param([Parameter(Mandatory)][int]$Port)
 
-                return @(
-                    Get-NetTCPConnection `
-                        -State Listen `
-                        -LocalPort $Port `
-                        -ErrorAction Stop
-                ).Count
+                return $(if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+                    @(
+                        Get-NetTCPConnection `
+                            -State Listen `
+                            -LocalPort $Port `
+                            -ErrorAction SilentlyContinue
+                    ).Count
+                } else {
+                    @(
+                        Get-CodexLocalRemoteTcpListenerSnapshot `
+                            -LocalPorts @($Port)
+                    ).Count
+                })
             }
         }
         foreach ($port in $ports) {
             $listenerCount = try {
                 & $listenerCountAction ([int]$port)
             } catch {
-                if ($_.FullyQualifiedErrorId -ceq
-                        'CmdletizationQuery_NotFound,Get-NetTCPConnection' -and
-                    [string]$_.CategoryInfo.Category -ceq 'ObjectNotFound') {
-                    0
-                } else {
-                    -1
-                }
+                -1
             }
             if (-not (Test-NonNegativeInteger -Value $listenerCount) -or
                 [decimal]$listenerCount -ne 0) {

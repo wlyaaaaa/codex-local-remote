@@ -1343,6 +1343,13 @@ blocked`，再继续后台工作。
   请求同代 Desktop 恢复，不再拿旧 selected 对象产生二次补偿失败。真实现场
   只读预检返回 `transition-required / switch`，相关 Windows 定向回归
   166/166 通过；尚未安装和采用本源码，因此本项仍保持 `[~]`。
+- [x] Codex 包更新后的首次显式启动在关闭 Desktop 前停在 `preflight`；现场反例
+      证明 `Get-NetTCPConnection` 超过 5 秒仍不返回，而原生 `netstat.exe` 可及时
+      给出监听 owner。当前源码已让启动、状态、交接、登记和精确停止路径统一使用
+      严格解析且 5 秒硬超时的原生监听快照，查询失败保持 unknown，不伪装为端口
+      空闲。Windows 定向回归 11 个文件、212/212 项通过，源码状态探针也在不停止、
+      不重启 Desktop 的情况下返回；该证据只关闭阻塞机制，真实采用与公网 ready
+      仍等待单独授权的最终重启。
 - [ ] **界面验收必须由主任务亲自操作**：候选采用后，主任务必须实际打开并点击
       Desktop、本机 Web、公网桌面视口和 412×915 手机视口，观察真实状态变化并
       核对同一 thread/turn。单元测试、Playwright demo、HTTP 200、截图审计或

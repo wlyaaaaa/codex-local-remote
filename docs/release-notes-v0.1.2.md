@@ -494,6 +494,17 @@ restart the running Desktop. The existing live public lease supplied functional
 Web evidence, but it must not be cited as live proof of the new locked restart
 barrier or its timing.
 
+A subsequent Codex package update exposed a host-specific control-plane stall:
+`Get-NetTCPConnection` did not return while native `netstat.exe` remained
+responsive, leaving startup at `preflight` before Desktop was closed. Every
+supported startup, status, handoff, registration and exact-stop path now uses a
+strictly parsed native listener snapshot with a five-second hard timeout;
+fixture-only provider shims remain isolated behind the test gate. The focused
+Windows regression run passed 11 files and 212/212 tests, and a source-tree
+status probe returned without stopping or restarting Desktop. This is
+no-restart source evidence only; adoption and real remote readiness still wait
+for the separately authorized final restart.
+
 Two real `-NoStart` attempts against the pre-fix candidate were rejected by
 Windows Task Scheduler without adopting a partial generation. Both attempts
 restored the exact prior task/runtime-pointer pair; Desktop/Codex process

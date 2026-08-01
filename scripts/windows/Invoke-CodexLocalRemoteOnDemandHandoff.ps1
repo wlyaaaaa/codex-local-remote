@@ -1253,16 +1253,35 @@ function Assert-OnDemandSelectedRemoteRuntimeActivationPreflight {
                 "'$($generation.Status)'."
             )
         }
-        foreach ($port in @(
+        $managedPorts = @(
             [int]$Configuration.SidecarPort,
             [int]$Configuration.BrokerPort,
             [int]$Configuration.BrokerUpstreamPort
-        )) {
+        )
+        $managedListeners = if (
+            $env:CODEX_REMOTE_TEST_FIXTURE -ceq '1'
+        ) {
+            @(
+                foreach ($port in $managedPorts) {
+                    Get-NetTCPConnection `
+                        -State Listen `
+                        -LocalPort $port `
+                        -ErrorAction SilentlyContinue |
+                        ForEach-Object {
+                            [pscustomobject]@{ LocalPort = $port }
+                        }
+                }
+            )
+        } else {
+            @(
+                Get-CodexLocalRemoteTcpListenerSnapshot `
+                    -LocalPorts $managedPorts
+            )
+        }
+        foreach ($port in $managedPorts) {
             if (@(
-                Get-NetTCPConnection `
-                    -State Listen `
-                    -LocalPort $port `
-                    -ErrorAction SilentlyContinue
+                $managedListeners |
+                    Where-Object { [int]$_.LocalPort -eq $port }
             ).Count -gt 0) {
                 throw (
                     "Remote activation preflight found an unowned listener " +

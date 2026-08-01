@@ -717,12 +717,19 @@ function Get-UninstallRuntimePreflight {
         }
     }
 
-    $listeners = @(
-        Get-NetTCPConnection `
-            -State Listen `
-            -LocalPort $BrokerPort `
-            -ErrorAction SilentlyContinue
-    )
+    $listeners = if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        @(
+            Get-NetTCPConnection `
+                -State Listen `
+                -LocalPort $BrokerPort `
+                -ErrorAction SilentlyContinue
+        )
+    } else {
+        @(
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts @($BrokerPort)
+        )
+    }
     if ($listeners.Count -eq 0) {
         return [pscustomobject]@{
             Status = 'not-running'

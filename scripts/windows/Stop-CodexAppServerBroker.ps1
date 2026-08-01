@@ -53,12 +53,19 @@ function Get-ExactListenerOwner {
         [int]$Port
     )
 
-    $listeners = @(
-        Get-NetTCPConnection `
-            -State Listen `
-            -LocalPort $Port `
-            -ErrorAction SilentlyContinue
-    )
+    $listeners = if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        @(
+            Get-NetTCPConnection `
+                -State Listen `
+                -LocalPort $Port `
+                -ErrorAction SilentlyContinue
+        )
+    } else {
+        @(
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts @($Port)
+        )
+    }
     if ($listeners.Count -eq 0) {
         return $null
     }

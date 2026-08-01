@@ -24,6 +24,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$env:CODEX_REMOTE_TEST_FIXTURE = '1'
 $global:CodexRemoteBrokerStopScenario = Get-Content -LiteralPath $ScenarioFile -Raw |
     ConvertFrom-Json -Depth 20
 $global:CodexRemoteBrokerListenerRead = 0

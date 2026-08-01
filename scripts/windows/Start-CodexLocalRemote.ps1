@@ -525,21 +525,35 @@ if ($desktopStdioPids.Count -gt 0) {
 }
 
 function Get-BrokerListeners {
-    return @(
-        Get-NetTCPConnection `
-            -State Listen `
-            -LocalPort $BrokerPort `
-            -ErrorAction SilentlyContinue
-    )
+    return $(if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        @(
+            Get-NetTCPConnection `
+                -State Listen `
+                -LocalPort $BrokerPort `
+                -ErrorAction SilentlyContinue
+        )
+    } else {
+        @(
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts @($BrokerPort)
+        )
+    })
 }
 
 function Get-UpstreamListeners {
-    return @(
-        Get-NetTCPConnection `
-            -State Listen `
-            -LocalPort $BrokerUpstreamPort `
-            -ErrorAction SilentlyContinue
-    )
+    return $(if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        @(
+            Get-NetTCPConnection `
+                -State Listen `
+                -LocalPort $BrokerUpstreamPort `
+                -ErrorAction SilentlyContinue
+        )
+    } else {
+        @(
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts @($BrokerUpstreamPort)
+        )
+    })
 }
 
 function Get-VerifiedManagedBroker {

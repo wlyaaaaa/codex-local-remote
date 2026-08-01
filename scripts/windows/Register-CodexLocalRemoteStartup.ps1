@@ -2711,12 +2711,19 @@ function Resolve-RegistrationPendingRuntimeAction {
 }
 
 function Get-RegistrationActiveRuntimeEvidence {
-    $listeners = @(
-        Get-NetTCPConnection `
-            -State Listen `
-            -LocalPort $BrokerPort `
-            -ErrorAction SilentlyContinue
-    )
+    $listeners = if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        @(
+            Get-NetTCPConnection `
+                -State Listen `
+                -LocalPort $BrokerPort `
+                -ErrorAction SilentlyContinue
+        )
+    } else {
+        @(
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts @($BrokerPort)
+        )
+    }
     $nonLoopback = @(
         $listeners |
             Where-Object {

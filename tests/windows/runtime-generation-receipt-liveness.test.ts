@@ -29,7 +29,7 @@ windowsOnly("Windows stale transition receipt classification", () => {
       MissingMandatory: "unknown",
       IncompleteBrokerReadyAbsent: "absent",
       IncompleteBrokerReadyListener: "unknown",
-      IncompleteBrokerReadyNotFound: "absent",
+      IncompleteBrokerReadyNotFound: "unknown",
       IncompleteBrokerReadyLive: "live",
     });
   });
@@ -45,7 +45,8 @@ windowsOnly("Windows stale transition receipt classification", () => {
     expect(generation).toContain("Get-CodexLocalRemoteReceiptProcessLiveness");
     expect(generation).toContain("-AllowIncompleteBrokerReadyReceipt");
     expect(generation).toContain("-ManagedPorts @(");
-    expect(source).toContain("CmdletizationQuery_NotFound,Get-NetTCPConnection");
+    expect(source).toContain("Get-CodexLocalRemoteTcpListenerSnapshot");
+    expect(source).toContain("CODEX_REMOTE_TEST_FIXTURE");
     expect(generation).toContain("stale-transition-receipt");
     expect(generation).toContain("transition-process-unverified");
   });

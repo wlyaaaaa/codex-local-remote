@@ -2264,6 +2264,155 @@ function Test-IsLoopbackListenerAddress {
     return $text -ceq '127.0.0.1' -or $text -ceq '::1'
 }
 
+function Get-CodexLocalRemoteTcpListenerSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [int[]]$LocalPorts,
+
+        [ValidateRange(1, 30)]
+        [int]$TimeoutSeconds = 5
+    )
+
+    $ports = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($localPort in $LocalPorts) {
+        if ($localPort -lt 1 -or $localPort -gt 65535) {
+            throw "TCP listener snapshot port '$localPort' is outside 1-65535."
+        }
+        $null = $ports.Add([int]$localPort)
+    }
+    if ($ports.Count -eq 0) {
+        throw 'TCP listener snapshot requires at least one local port.'
+    }
+
+    $netstatPath = Join-Path $env:SystemRoot 'System32\netstat.exe'
+    if (-not (Test-Path -LiteralPath $netstatPath -PathType Leaf)) {
+        throw 'The Windows TCP listener snapshot executable is unavailable.'
+    }
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $netstatPath
+    foreach ($argument in @('-a', '-n', '-o', '-p', 'tcp')) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'The Windows TCP listener snapshot process did not start.'
+        }
+        $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
+        $standardErrorTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                $process.Kill($true)
+                $process.WaitForExit()
+            } catch {
+                # Preserve the bounded snapshot timeout as the owning failure.
+            }
+            throw (
+                'The Windows TCP listener snapshot exceeded ' +
+                "$TimeoutSeconds seconds."
+            )
+        }
+        $standardOutput = $standardOutputTask.GetAwaiter().GetResult()
+        $null = $standardErrorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw (
+                'The Windows TCP listener snapshot exited with code ' +
+                "$($process.ExitCode)."
+            )
+        }
+    } finally {
+        $process.Dispose()
+    }
+
+    function ConvertFrom-CodexLocalRemoteNetstatEndpoint {
+        param([Parameter(Mandatory)][string]$Endpoint)
+
+        $match = if ($Endpoint.StartsWith('[')) {
+            [regex]::Match(
+                $Endpoint,
+                '^\[(?<address>[^\]]+)\]:(?<port>[0-9]+)$',
+                [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+            )
+        } else {
+            [regex]::Match(
+                $Endpoint,
+                '^(?<address>[^:]+):(?<port>[0-9]+)$',
+                [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+            )
+        }
+        if (-not $match.Success) {
+            return $null
+        }
+        $port = 0
+        if (-not [int]::TryParse(
+            $match.Groups['port'].Value,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$port
+        ) -or $port -lt 0 -or $port -gt 65535) {
+            return $null
+        }
+        $address = $null
+        if (-not [System.Net.IPAddress]::TryParse(
+            $match.Groups['address'].Value,
+            [ref]$address
+        )) {
+            return $null
+        }
+        return [pscustomobject]@{
+            Address = $address.ToString()
+            Port = $port
+        }
+    }
+
+    $listeners = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in @($standardOutput -split "`r?`n")) {
+        $match = [regex]::Match(
+            $line,
+            '^\s*TCP\s+(?<local>\S+)\s+(?<remote>\S+)\s+\S+\s+(?<pid>[0-9]+)\s*$',
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+        if (-not $match.Success) {
+            continue
+        }
+        $local = ConvertFrom-CodexLocalRemoteNetstatEndpoint `
+            -Endpoint $match.Groups['local'].Value
+        $remote = ConvertFrom-CodexLocalRemoteNetstatEndpoint `
+            -Endpoint $match.Groups['remote'].Value
+        $owningProcess = 0
+        if ($null -eq $local -or
+            $null -eq $remote -or
+            [int]$remote.Port -ne 0 -or
+            -not $ports.Contains([int]$local.Port) -or
+            -not [int]::TryParse(
+                $match.Groups['pid'].Value,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$owningProcess
+            ) -or
+            $owningProcess -lt 1) {
+            continue
+        }
+        $listeners.Add([pscustomobject]@{
+            LocalAddress = [string]$local.Address
+            LocalPort = [int]$local.Port
+            OwningProcess = $owningProcess
+        })
+    }
+    return @(
+        $listeners |
+            Sort-Object LocalPort, LocalAddress, OwningProcess -Unique
+    )
+}
+
 function Get-ManagedIpv4Listeners {
     [CmdletBinding()]
     param(
@@ -7821,6 +7970,7 @@ Export-ModuleMember -Function @(
     'Get-BrokerReadinessDecision',
     'Assert-LoopbackWebSocketUrl',
     'Test-IsLoopbackListenerAddress',
+    'Get-CodexLocalRemoteTcpListenerSnapshot',
     'Get-ManagedIpv4Listeners',
     'Get-ProcessCreationIdentity',
     'Open-ProcessIdentityHandle',

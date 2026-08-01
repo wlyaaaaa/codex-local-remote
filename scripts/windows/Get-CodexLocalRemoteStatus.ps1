@@ -552,10 +552,8 @@ function Get-StatusListenerSnapshot {
         )
     } else {
         @(
-            Get-NetTCPConnection `
-                -State Listen `
-                -LocalPort $LocalPorts `
-                -ErrorAction SilentlyContinue |
+            Get-CodexLocalRemoteTcpListenerSnapshot `
+                -LocalPorts $LocalPorts |
                 ForEach-Object {
                     [pscustomobject]@{
                         LocalAddress = [string]$_.LocalAddress
