@@ -66,6 +66,15 @@ import {
   resolveProjectFileReference,
 } from "./files.js";
 import { HostFileStore } from "./host-files.js";
+import {
+  isCanonicalMaintenanceUpdateId,
+  isHighEntropyMaintenanceToken,
+  MaintenanceDrainTimeoutError,
+  type MaintenanceMutationLease,
+  MaintenanceUpdateConflictError,
+  matchesMaintenanceBearer,
+  SidecarMaintenanceController,
+} from "./maintenance.js";
 import type { SessionLookup, SidecarStateStore } from "./state-store.js";
 import type { SidecarTurnQueueApi } from "./turn-queue.js";
 import { OutboxConflictError } from "./turn-outbox.js";
@@ -125,6 +134,9 @@ export interface CreateSidecarServerOptions {
   domain: SidecarDomainApi;
   events: RemoteEventBuffer;
   hostFiles?: HostFileStore;
+  maintenanceController?: SidecarMaintenanceController;
+  maintenanceDrainTimeoutMs?: number;
+  maintenanceToken?: string;
   queue?: SidecarTurnQueueApi;
   requestReady?: () => boolean;
   state: SidecarStateStore;
@@ -140,6 +152,11 @@ interface AuthenticatedRequest {
 interface CachedCommand {
   body?: unknown;
   status: number;
+}
+
+interface TrackedMutation {
+  handlerStarted: boolean;
+  lease: MaintenanceMutationLease;
 }
 
 interface EventStreamWriterOptions {
@@ -183,6 +200,21 @@ export async function createSidecarServer(
     },
   );
   const api = `${config.basePath}/api/v1`;
+  const maintenanceDrainPath = `${config.basePath}/_control/drain`;
+  if (
+    options.maintenanceToken !== undefined &&
+    !isHighEntropyMaintenanceToken(options.maintenanceToken)
+  ) {
+    throw new Error("Sidecar maintenance token is invalid");
+  }
+  const maintenance =
+    options.maintenanceController ??
+    new SidecarMaintenanceController(options.maintenanceDrainTimeoutMs);
+  const mutations = new WeakMap<FastifyRequest, TrackedMutation>();
+  const releaseMutation = (request: FastifyRequest) => {
+    mutations.get(request)?.lease.release();
+    mutations.delete(request);
+  };
   const uploads = await BrowserUploadStore.open(config.dataDir);
   const hostFiles = options.hostFiles ?? (await HostFileStore.open());
   const streamInstanceId = randomUUID();
@@ -212,6 +244,44 @@ export async function createSidecarServer(
     if (request.protocol === "https") {
       reply.header("Strict-Transport-Security", "max-age=31536000");
     }
+    if (isMutatingHttpMethod(request.method) && request.url !== maintenanceDrainPath) {
+      const lease = maintenance.tryAdmitActivity();
+      if (lease === undefined) {
+        reply.header("Retry-After", "1");
+        throw new ProductHttpError("SIDECAR_DRAINING", "服务正在安全更新，请稍后重试", 503);
+      }
+      mutations.set(request, { handlerStarted: false, lease });
+    }
+  });
+
+  app.addHook("preHandler", (request, _reply, done) => {
+    const mutation = mutations.get(request);
+    if (mutation !== undefined) {
+      mutation.handlerStarted = true;
+    }
+    done();
+  });
+
+  app.addHook("onRequestAbort", (request, done) => {
+    if (mutations.get(request)?.handlerStarted === false) {
+      releaseMutation(request);
+    }
+    done();
+  });
+
+  app.addHook("onSend", async (request, _reply, payload) => {
+    releaseMutation(request);
+    return payload;
+  });
+
+  app.addHook("onError", (request, _reply, _error, done) => {
+    releaseMutation(request);
+    done();
+  });
+
+  app.addHook("onResponse", (request, _reply, done) => {
+    releaseMutation(request);
+    done();
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -228,6 +298,47 @@ export async function createSidecarServer(
   app.get(config.basePath, async (_request, reply) => {
     return await reply.redirect(`${config.basePath}/`, 308);
   });
+
+  if (options.maintenanceToken !== undefined) {
+    const maintenanceToken = options.maintenanceToken;
+    app.post(maintenanceDrainPath, async (request, reply) => {
+      reply.header("Cache-Control", "no-store");
+      if (!isLoopbackAddress(request.raw.socket.remoteAddress) || !isLoopbackAddress(request.ip)) {
+        throw new ProductHttpError(
+          "MAINTENANCE_LOOPBACK_REQUIRED",
+          "维护控制入口仅供本机使用",
+          403,
+        );
+      }
+      if (!matchesMaintenanceBearer(maintenanceToken, headerValue(request.headers.authorization))) {
+        throw new ProductHttpError("MAINTENANCE_CAPABILITY_REQUIRED", "维护能力验证失败", 401);
+      }
+      const updateId = headerValue(request.headers["x-codex-update-id"]);
+      if (!isCanonicalMaintenanceUpdateId(updateId)) {
+        throw new ProductHttpError("INVALID_UPDATE_ID", "更新标识无效", 400);
+      }
+      try {
+        return await maintenance.drain(updateId);
+      } catch (error) {
+        if (error instanceof MaintenanceDrainTimeoutError) {
+          reply.header("Retry-After", "1");
+          throw new ProductHttpError(
+            "SIDECAR_DRAIN_TIMEOUT",
+            "仍有已接纳操作正在完成，请稍后重试",
+            503,
+          );
+        }
+        if (error instanceof MaintenanceUpdateConflictError) {
+          throw new ProductHttpError(
+            "SIDECAR_DRAIN_UPDATE_CONFLICT",
+            "Sidecar 正在为另一更新排空",
+            409,
+          );
+        }
+        throw error;
+      }
+    });
+  }
 
   app.get(`${api}/bootstrap`, async (request, reply) => {
     reply.header("Cache-Control", "no-store");
@@ -2054,6 +2165,10 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 function firstForwardedValue(value: string | string[] | undefined): string | undefined {
   const header = headerValue(value);
   return header?.split(",", 1)[0]?.trim();
+}
+
+function isMutatingHttpMethod(method: string): boolean {
+  return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
 function isLoopbackAddress(address: string | undefined): boolean {

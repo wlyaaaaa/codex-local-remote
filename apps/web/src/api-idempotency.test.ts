@@ -77,6 +77,74 @@ describe("HttpApiClient logical mutation idempotency", () => {
     expect(retryDelays).toEqual([300]);
   });
 
+  it("keeps one logical mutation alive through a bounded Sidecar restart", async () => {
+    const response = {
+      activeTurnId: "turn-after-restart",
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+      id: "thread-1",
+      items: [],
+      mode: "managed",
+      state: "running",
+      title: "热更新测试",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError("old Sidecar closed"))
+      .mockRejectedValueOnce(new TypeError("listener is restarting"))
+      .mockRejectedValueOnce(new TypeError("new Sidecar is handshaking"))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(response), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        }),
+      );
+    const retryDelays: number[] = [];
+    const client = new HttpApiClient(
+      "/codex-remote/api/v1",
+      fetcher,
+      async (delayMs) => void retryDelays.push(delayMs),
+    );
+
+    await expect(
+      client.sendTurn("thread-1", {
+        clientUserMessageId: "client-sidecar-restart",
+        prompt: "切换期间只发送一次",
+      }),
+    ).resolves.toMatchObject({ id: "thread-1", activeTurnId: "turn-after-restart" });
+
+    expect(retryDelays).toEqual([300, 700, 1_000]);
+    const keys = fetcher.mock.calls.map(([, init]) =>
+      new Headers(init?.headers).get("Idempotency-Key"),
+    );
+    expect(new Set(keys).size).toBe(1);
+  });
+
+  it("stops retrying after the bounded Sidecar recovery window", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockRejectedValue(new TypeError("listener remains unavailable"));
+    const retryDelays: number[] = [];
+    const client = new HttpApiClient(
+      "/codex-remote/api/v1",
+      fetcher,
+      async (delayMs) => void retryDelays.push(delayMs),
+    );
+
+    await expect(client.interrupt("thread-1", "turn-1")).rejects.toMatchObject({
+      code: "OFFLINE",
+      status: 0,
+    });
+
+    expect(fetcher).toHaveBeenCalledTimes(8);
+    expect(retryDelays).toEqual([300, 700, 1_000, 2_000, 3_000, 4_000, 5_000]);
+  });
+
   it("respects a bounded Retry-After while the Desktop runtime recovers", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

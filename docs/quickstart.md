@@ -101,8 +101,10 @@ Desktop 的路径。只有返回需要 Desktop 重开且当前已明确授权时
 `-AllowDesktopRestart`。状态未知、运行代不匹配、存在活动/未知任务或进程枚举
 失败时保持失败关闭。
 
-符合当前 Broker 兼容门的 Web/Sidecar 修复可以在现有显式租约内有界采用；
-普通 Sidecar crash recovery 也只恢复同一精确租约。Broker、app-server 和
+符合当前 Broker 兼容门的 Web/Sidecar 修复可以在现有显式租约内有界采用。旧
+Sidecar 会先拒绝新的写请求与后台下一轮派发，并排空已经接纳的写请求和派发，再进行
+同端口短切换；运行中的 Codex 任务继续由 Broker/app-server 持有，浏览器使用同一幂等键自动重试并
+重连。普通 Sidecar crash recovery 也只恢复同一精确租约。Broker、app-server 和
 Desktop 均保持不动。Broker/app-server 丢失则失败关闭，不能从“公网可更新”
 推导出 Broker 或 Desktop 重启授权。Codex 更新与 Windows 睡眠/唤醒只触发
 重新发现或连接探测，不自动接管原生 Desktop。

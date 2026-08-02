@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DomainError } from "@codex-local-remote/domain";
 
+import { SidecarMaintenanceController } from "./maintenance.js";
 import type { PromptProtector } from "./prompt-protector.js";
 import { DurableTurnOutbox } from "./turn-outbox.js";
 import { TurnQueueDispatcher, type TurnQueueGateway } from "./turn-queue-dispatcher.js";
@@ -22,7 +23,10 @@ const protector: PromptProtector = {
   unprotect: async (value) => Buffer.from(value, "base64").toString("utf8"),
 };
 
-async function fixture(initialState: "active" | "idle" | "unknown" = "idle") {
+async function fixture(
+  initialState: "active" | "idle" | "unknown" = "idle",
+  activityGate?: SidecarMaintenanceController,
+) {
   const directory = await DurableTurnOutbox.createTemporaryDirectoryForTests(
     path.join(os.tmpdir(), "codex-local-remote-dispatcher-"),
   );
@@ -50,7 +54,11 @@ async function fixture(initialState: "active" | "idle" | "unknown" = "idle") {
     startTurn,
     steerTurn,
   };
-  const dispatcher = new TurnQueueDispatcher({ gateway, outbox });
+  const dispatcher = new TurnQueueDispatcher({
+    ...(activityGate === undefined ? {} : { activityGate }),
+    gateway,
+    outbox,
+  });
   return {
     directory,
     dispatcher,
@@ -66,6 +74,80 @@ async function fixture(initialState: "active" | "idle" | "unknown" = "idle") {
 }
 
 describe("TurnQueueDispatcher", () => {
+  it("waits for an admitted background dispatch before issuing the drain receipt", async () => {
+    const maintenance = new SidecarMaintenanceController(1_000);
+    const { dispatcher, outbox, startTurn } = await fixture("idle", maintenance);
+    await outbox.enqueue({
+      idempotencyScope: "maintenance-inflight-dispatch",
+      input: { prompt: "排空前已经开始的后台派发" },
+      threadId: "thread-1",
+    });
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    startTurn.mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return { turnId: "turn-dispatched" };
+    });
+
+    const wake = dispatcher.wake("thread-1");
+    await entered.promise;
+    let receiptSettled = false;
+    const receipt = maintenance.drain("0123456789abcdef0123456789abcdef").then((value) => {
+      receiptSettled = true;
+      return value;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(receiptSettled).toBe(false);
+
+    release.resolve();
+    await wake;
+    await expect(receipt).resolves.toEqual({
+      activeMutations: 0,
+      status: "drained",
+      updateId: "0123456789abcdef0123456789abcdef",
+    });
+  });
+
+  it("does not dispatch a next turn when drain wins a turn/completed race", async () => {
+    const maintenance = new SidecarMaintenanceController(1_000);
+    const { dispatcher, outbox, startTurn } = await fixture("idle", maintenance);
+    await outbox.enqueue({
+      idempotencyScope: "maintenance-completion-race",
+      input: { prompt: "排空回执之后不能开始下一轮" },
+      threadId: "thread-1",
+    });
+    const terminalRecorded = deferred<void>();
+    const resumeNotification = deferred<void>();
+    const recordTerminal = outbox.recordTerminal.bind(outbox);
+    vi.spyOn(outbox, "recordTerminal").mockImplementation(async (...args) => {
+      await recordTerminal(...args);
+      terminalRecorded.resolve();
+      await resumeNotification.promise;
+    });
+
+    const notification = dispatcher.handleNotification({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "turn-current", status: "completed" },
+      },
+    });
+    await terminalRecorded.promise;
+    await expect(maintenance.drain("fedcba9876543210fedcba9876543210")).resolves.toMatchObject({
+      status: "drained",
+    });
+
+    resumeNotification.resolve();
+    await notification;
+    await dispatcher.handleNotification({
+      method: "thread/status/changed",
+      params: { status: { type: "idle" }, threadId: "thread-1" },
+    });
+    expect(startTurn).not.toHaveBeenCalled();
+    expect((await outbox.snapshot("thread-1")).items[0]).toMatchObject({ state: "queued" });
+  });
+
   it("does not call turn/start while the authoritative thread is active", async () => {
     const { dispatcher, outbox, startTurn } = await fixture("active");
     await outbox.enqueue({
@@ -500,3 +582,13 @@ describe("TurnQueueDispatcher", () => {
     expect((await current.outbox.snapshot("thread-1")).items).toHaveLength(0);
   });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, reject, resolve };
+}

@@ -36,6 +36,7 @@ import {
 } from "./desktop-session-conversation.js";
 import { DesktopSessionUsageReader } from "./desktop-session-usage.js";
 import { resolveProjectInputReference } from "./files.js";
+import { readMaintenanceToken, SidecarMaintenanceController } from "./maintenance.js";
 import { createWindowsDpapiPromptProtector } from "./prompt-protector.js";
 import { loadCodexProtocolCatalog, type CodexProtocolCatalog } from "./protocol-catalog.js";
 import { createSidecarServer } from "./server.js";
@@ -44,7 +45,7 @@ import { DurableTurnOutbox } from "./turn-outbox.js";
 import { TurnQueueService } from "./turn-queue.js";
 import { TurnQueueDispatcher } from "./turn-queue-dispatcher.js";
 
-const SIDECAR_VERSION = "0.1.4";
+const SIDECAR_VERSION = "0.1.5";
 const DESKTOP_RECONCILIATION_INTERVAL_MS = 5_000;
 const SHARED_CAPABILITY_PROBE_TIMEOUT_MS = 30_000;
 
@@ -186,6 +187,11 @@ export function createSharedThreadReconnectHandler(
 }
 
 export async function startSidecar(config: SidecarConfig): Promise<RunningSidecar> {
+  const maintenanceToken =
+    config.maintenanceTokenFile === undefined
+      ? undefined
+      : await readMaintenanceToken(config.maintenanceTokenFile);
+  const maintenanceController = new SidecarMaintenanceController();
   const state = await SidecarStateStore.open(config.dataDir);
   const browserUploads = await BrowserUploadStore.open(config.dataDir);
   const generalConversationRoot = path.join(config.dataDir, "RemoteConversations");
@@ -328,6 +334,7 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     protector: createWindowsDpapiPromptProtector(),
   });
   const queueDispatcher = new TurnQueueDispatcher({
+    activityGate: maintenanceController,
     gateway: {
       inspectThread: async (threadId) => {
         const thread = await domain.getThread(threadId);
@@ -441,6 +448,8 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     diagnostics,
     domain,
     events,
+    maintenanceController,
+    ...(maintenanceToken === undefined ? {} : { maintenanceToken }),
     queue,
     requestReady: () =>
       isSidecarRequestReady(supervisor.snapshot(), desktopRuntimeHealth, brokerDesktopHealth),

@@ -387,8 +387,9 @@ endpoint。每次显式 Open 动态发现当前 Desktop 包、随附 app-server 
 普通 Desktop 更新不要求用户重新配置，也不会自动打开 Remote。下一次显式
 Open 在启动 attached Desktop 前比较活动 Broker receipt 与当前包路径/hash/
 generation；只有 `Open -AllowDesktopRestart` 才能对精确 native root 执行一次
-交接。可兼容 Web/Sidecar 更新在 Broker/upstream/Desktop identity 全部稳定且
-无活动/未知任务时只滚动公网层，失败恢复旧 Sidecar。
+交接。可兼容 Web/Sidecar 更新在 Broker/upstream/Desktop identity 全部稳定时
+先排空 Sidecar 写请求，再只滚动公网层；运行中的任务继续由 Broker/app-server
+持有，失败恢复旧 Sidecar。
 兼容探测通过才继续，不兼容则原生 fail-open 并在 Web/启动通知中明确显示。
 只有出现兼容告警、运行代不匹配或协议行为变化时才触发真实 Windows 增量复验，
 不把频繁应用更新变成人工全量验收。发布冻结时至少覆盖：

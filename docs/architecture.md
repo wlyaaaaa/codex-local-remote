@@ -369,8 +369,12 @@ dispatcher、快捷方式、任务、pointer 与 desired mode 作为可补偿事
 但不启停 Desktop、Broker 或 Sidecar。模糊 task/pointer/receipt lineage
 失败关闭。
 
-显式租约内可在严格 compatibility id 相等时执行 Sidecar-only 更新。事务前后
-必须保持 selected root、Broker PID/start、invocation、upstream PID/start、
-Desktop root identity 和连接状态不变，且 `unsafeThreadCount=0`、
-`unknownCount=0`；失败时恢复旧 Sidecar 并复核同一不变量。Broker、app-server
-或不兼容运行代需要一次新的显式 Open 决策，不能伪装成公网层更新。
+显式租约内可在严格 compatibility id 相等时执行 Sidecar-only 更新。旧 Sidecar
+先通过受保护的 Supervisor 会话级 capability 控制入口进入排空状态：拒绝新的写请求和
+自动下一轮派发，并等待已经接纳的写请求或派发完成后返回绑定本次 update id 的回执；
+排空超时会恢复服务状态，不把手机永久留在只读状态。事务前后必须保持 selected root、
+Broker PID/start、invocation、upstream PID/start、Desktop root identity 和连接状态
+不变，且 `unknownCount=0`。`unsafeThreadCount` 只作为任务运行观测，不再要求为
+零；任务继续由 Broker/app-server 持有。失败时恢复旧 Sidecar 并复核同一不变量。
+Broker、app-server 或不兼容运行代需要一次新的显式 Open 决策，不能伪装成公网层
+更新。

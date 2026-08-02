@@ -2546,6 +2546,57 @@ function Get-VerifiedSidecarRuntimeBinding {
     }
 }
 
+function New-ManagedSidecarMaintenanceToken {
+    [CmdletBinding()]
+    param()
+
+    $path = Join-Path $resolvedDataDir 'sidecar-maintenance-token.txt'
+    if (Test-Path -LiteralPath $path) {
+        $existing = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($existing.PSIsContainer -or
+            ($existing.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Sidecar maintenance token path is not one ordinary file.'
+        }
+    }
+    $temporary = Join-Path `
+        $resolvedDataDir `
+        ".sidecar-maintenance-token.$([Guid]::NewGuid().ToString('N')).tmp"
+    [byte[]]$randomBytes = New-Object byte[] 32
+    try {
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill(
+            $randomBytes
+        )
+        $token = [Convert]::ToHexString($randomBytes).ToLowerInvariant()
+        [System.IO.File]::WriteAllText(
+            $temporary,
+            $token,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        [System.IO.File]::Move($temporary, $path, $true)
+        $readBack = [System.IO.File]::ReadAllText(
+            $path,
+            [System.Text.UTF8Encoding]::new($false, $true)
+        )
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -ne 64 -or
+            $readBack -cne $token -or
+            $readBack -cnotmatch '^[a-f0-9]{64}$') {
+            throw 'Sidecar maintenance token file did not verify.'
+        }
+        return [System.IO.Path]::GetFullPath($path)
+    } finally {
+        [Array]::Clear($randomBytes, 0, $randomBytes.Length)
+        Remove-Item `
+            -LiteralPath $temporary `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-ManagedSidecarArguments {
     param(
         [Parameter(Mandatory)]
@@ -2568,6 +2619,9 @@ function Get-ManagedSidecarArguments {
         (ConvertTo-WindowsCommandLineArgument -Value $resolvedCodex)
         '--data-dir'
         (ConvertTo-WindowsCommandLineArgument -Value $resolvedDataDir)
+        '--maintenance-token-file'
+        (ConvertTo-WindowsCommandLineArgument `
+            -Value $sidecarMaintenanceTokenPath)
     ) -join ' '
 }
 
@@ -2664,6 +2718,53 @@ function New-VerifiedUpstreamReceipt {
     }
 }
 
+function Get-SidecarOwnerLeaseInvariant {
+    [CmdletBinding()]
+    param()
+
+    $snapshot = Get-VerifiedBrokerRuntimeSnapshot `
+        -ExpectedBrokerProcessId $brokerPid
+    if ($null -eq $snapshot -or
+        $null -eq $snapshot.Upstream -or
+        [string]$snapshot.RuntimeInvocationId -cne
+            $runtimeInvocationId) {
+        throw 'Broker/upstream identity is not exact for a Sidecar-only update.'
+    }
+    $upstreamCreationIdentity = Get-ProcessCreationIdentity `
+        -CreationDate $snapshot.Upstream.CreationDate
+    $upstreamIdentityHandle = Open-ProcessIdentityHandle `
+        -ProcessId ([int]$snapshot.Upstream.ProcessId) `
+        -ExpectedCreationDateUtcTicks (
+            [long]$upstreamCreationIdentity.CreationDateUtcTicks
+        )
+    try {
+        $desktopRootIdentityKey =
+            Get-UniqueCodexDesktopRootIdentityKey `
+                -Processes @(Get-RunningCodexDesktopRootProcesses)
+        return [pscustomobject]@{
+            BrokerProcessId = [int]$brokerPid
+            BrokerStartTimeUtcTicks =
+                [long]$brokerIdentityHandle.StartTimeUtcTicks
+            RuntimeInvocationId = $runtimeInvocationId
+            UpstreamProcessId = [int]$snapshot.Upstream.ProcessId
+            UpstreamStartTimeUtcTicks =
+                [long]$upstreamIdentityHandle.StartTimeUtcTicks
+            DesktopRootIdentityKey =
+                [string]$desktopRootIdentityKey
+            BrokerSidecarCompatibilityId =
+                $brokerSidecarCompatibilityId
+            UnsafeThreadCount =
+                $snapshot.Readiness.unsafeThreadCount
+            UnknownCount =
+                $snapshot.Readiness.unknownCount
+            DesktopConnected =
+                $snapshot.Readiness.desktopConnected
+        }
+    } finally {
+        $upstreamIdentityHandle.Process.Dispose()
+    }
+}
+
 function Get-SidecarOnlyUpdateInvariant {
     param(
         [Parameter(Mandatory)]
@@ -2688,55 +2789,85 @@ function Get-SidecarOnlyUpdateInvariant {
     if (-not $runtimeCheck.IsValid) {
         throw "Selected Sidecar runtime changed: $($runtimeCheck.Reason)"
     }
-    $snapshot = Get-VerifiedBrokerRuntimeSnapshot `
-        -ExpectedBrokerProcessId $brokerPid
-    if ($null -eq $snapshot -or
-        $null -eq $snapshot.Upstream -or
-        [string]$snapshot.RuntimeInvocationId -cne
-            $runtimeInvocationId) {
-        throw 'Broker/upstream identity is not exact for a Sidecar-only update.'
+    $ownerInvariant = Get-SidecarOwnerLeaseInvariant
+    return [pscustomobject]@{
+        SelectedVersionId =
+            [string]$TargetRuntimeBinding.VersionId
+        SelectedRoot =
+            [string]$TargetRuntimeBinding.RuntimeRoot
+        BrokerProcessId = $ownerInvariant.BrokerProcessId
+        BrokerStartTimeUtcTicks =
+            $ownerInvariant.BrokerStartTimeUtcTicks
+        RuntimeInvocationId = $ownerInvariant.RuntimeInvocationId
+        UpstreamProcessId = $ownerInvariant.UpstreamProcessId
+        UpstreamStartTimeUtcTicks =
+            $ownerInvariant.UpstreamStartTimeUtcTicks
+        DesktopRootIdentityKey =
+            $ownerInvariant.DesktopRootIdentityKey
+        BrokerSidecarCompatibilityId =
+            $ownerInvariant.BrokerSidecarCompatibilityId
+        CandidateSidecarCompatibilityId =
+            [string](
+                $TargetRuntimeBinding.BrokerSidecarCompatibilityId
+            )
+        UnsafeThreadCount = $ownerInvariant.UnsafeThreadCount
+        UnknownCount = $ownerInvariant.UnknownCount
+        DesktopConnected = $ownerInvariant.DesktopConnected
     }
-    $upstreamCreationIdentity = Get-ProcessCreationIdentity `
-        -CreationDate $snapshot.Upstream.CreationDate
-    $upstreamIdentityHandle = Open-ProcessIdentityHandle `
-        -ProcessId ([int]$snapshot.Upstream.ProcessId) `
-        -ExpectedCreationDateUtcTicks (
-            [long]$upstreamCreationIdentity.CreationDateUtcTicks
-        )
-    try {
-        $desktopRootIdentityKey =
-            Get-UniqueCodexDesktopRootIdentityKey `
-                -Processes @(Get-RunningCodexDesktopRootProcesses)
-        return [pscustomobject]@{
-            SelectedVersionId =
-                [string]$TargetRuntimeBinding.VersionId
-            SelectedRoot =
-                [string]$TargetRuntimeBinding.RuntimeRoot
-            BrokerProcessId = [int]$brokerPid
-            BrokerStartTimeUtcTicks =
-                [long]$brokerIdentityHandle.StartTimeUtcTicks
-            RuntimeInvocationId = $runtimeInvocationId
-            UpstreamProcessId = [int]$snapshot.Upstream.ProcessId
-            UpstreamStartTimeUtcTicks =
-                [long]$upstreamIdentityHandle.StartTimeUtcTicks
-            DesktopRootIdentityKey =
-                [string]$desktopRootIdentityKey
-            BrokerSidecarCompatibilityId =
-                $brokerSidecarCompatibilityId
-            CandidateSidecarCompatibilityId =
-                [string](
-                    $TargetRuntimeBinding.BrokerSidecarCompatibilityId
-                )
-            UnsafeThreadCount =
-                [int]$snapshot.Readiness.unsafeThreadCount
-            UnknownCount =
-                [int]$snapshot.Readiness.unknownCount
-            DesktopConnected =
-                [bool]$snapshot.Readiness.desktopConnected
-        }
-    } finally {
-        $upstreamIdentityHandle.Process.Dispose()
+}
+
+function Get-SidecarOnlyRollbackInvariant {
+    param(
+        [Parameter(Mandatory)]
+        [object]$OldRuntimeBinding
+    )
+
+    $runtimeCheck = Test-CodexLocalRemoteRuntimeVersion `
+        -RuntimeRoot ([string]$OldRuntimeBinding.RuntimeRoot) `
+        -ExpectedVersionId ([string]$OldRuntimeBinding.VersionId)
+    if (-not $runtimeCheck.IsValid) {
+        throw "Prior Sidecar runtime changed: $($runtimeCheck.Reason)"
     }
+    return Get-SidecarOwnerLeaseInvariant
+}
+
+function Invoke-ManagedSidecarDrain {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{32}$')]
+        [string]$UpdateId
+    )
+
+    $maintenanceToken = [System.IO.File]::ReadAllText(
+        $sidecarMaintenanceTokenPath,
+        [System.Text.UTF8Encoding]::new($false, $true)
+    )
+    if ([string]$maintenanceToken -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'Sidecar maintenance token is unavailable.'
+    }
+    $controlPath = if ($BasePath -ceq '/') {
+        '/_control/drain'
+    } else {
+        "$($BasePath.TrimEnd('/'))/_control/drain"
+    }
+    $uri = [System.UriBuilder]::new(
+        'http',
+        '127.0.0.1',
+        $SidecarPort,
+        $controlPath
+    ).Uri.AbsoluteUri
+    return Invoke-RestMethod `
+        -Method Post `
+        -Uri $uri `
+        -Headers @{
+            Authorization = "Bearer $maintenanceToken"
+            'X-Codex-Update-Id' = $UpdateId
+        } `
+        -ContentType 'application/json' `
+        -Body '{}' `
+        -TimeoutSec 35 `
+        -ErrorAction Stop
 }
 
 function Stop-ManagedSidecarChildExact {
@@ -2763,8 +2894,17 @@ if ($null -eq $startupSidecarRuntime -or
 $activeSidecarRuntimeBinding =
     Get-VerifiedSidecarRuntimeBinding `
         -Runtime $startupSidecarRuntime
-$sidecarChild = Start-ManagedSidecarChild `
-    -RuntimeBinding $activeSidecarRuntimeBinding
+$sidecarMaintenanceTokenPath = New-ManagedSidecarMaintenanceToken
+try {
+    $sidecarChild = Start-ManagedSidecarChild `
+        -RuntimeBinding $activeSidecarRuntimeBinding
+} catch {
+    Remove-Item `
+        -LiteralPath $sidecarMaintenanceTokenPath `
+        -Force `
+        -ErrorAction SilentlyContinue
+    throw
+}
 $sidecarProcess = $sidecarChild.Process
 $sidecarIdentityHandle = $sidecarChild.IdentityHandle
 $sidecarReceipt = $sidecarChild.Receipt
@@ -3061,6 +3201,7 @@ try {
     $nextSidecarRuntimeUpdateCheckAt =
         [DateTime]::UtcNow.AddSeconds(2)
     $sidecarRuntimeUpdateAttempt = 0
+    $pendingSidecarUpdateId = $null
     $nativeModeStatusWritten = $false
     $lastDesktopOwnerSupervisorObservationUtc = [DateTimeOffset]::UtcNow
     $desktopOwnerResumeSuppressedAtUtc = $null
@@ -3352,6 +3493,11 @@ try {
                         Receipt = $sidecarReceipt
                         RuntimeBinding = $oldSidecarRuntimeBinding
                     }
+                    if ([string]$pendingSidecarUpdateId -cnotmatch
+                            '^[a-f0-9]{32}$') {
+                        $pendingSidecarUpdateId =
+                            [Guid]::NewGuid().ToString('N')
+                    }
                     $sidecarUpdate =
                         Invoke-CodexLocalRemoteSidecarUpdateTransaction `
                             -CaptureInvariant {
@@ -3359,6 +3505,19 @@ try {
                                     -TargetRuntimeBinding (
                                         $candidateSidecarRuntimeBinding
                                     )
+                            } `
+                            -CaptureRollbackInvariant {
+                                Get-SidecarOnlyRollbackInvariant `
+                                    -OldRuntimeBinding (
+                                        $oldSidecarRuntimeBinding
+                                    )
+                            } `
+                            -OldSidecarBinding $oldSidecarRuntimeBinding `
+                            -UpdateId $pendingSidecarUpdateId `
+                            -PrepareOldSidecar {
+                                param($updateId)
+                                Invoke-ManagedSidecarDrain `
+                                    -UpdateId $updateId
                             } `
                             -StopOldSidecar {
                                 Stop-ManagedSidecarChildExact `
@@ -3391,15 +3550,14 @@ try {
                             } `
                             -StartOldSidecar {
                                 $oldSidecarChild.Process.Refresh()
-                                if (-not
-                                    $oldSidecarChild.Process.HasExited) {
-                                    $oldSidecarChild
-                                } else {
-                                    Start-ManagedSidecarChild `
-                                        -RuntimeBinding (
-                                            $oldSidecarRuntimeBinding
-                                        )
+                                if (-not $oldSidecarChild.Process.HasExited) {
+                                    Stop-ManagedSidecarChildExact `
+                                        -SidecarChild $oldSidecarChild
                                 }
+                                Start-ManagedSidecarChild `
+                                    -RuntimeBinding (
+                                        $oldSidecarRuntimeBinding
+                                    )
                             } `
                             -VerifyOldSidecar {
                                 param($rollbackChild)
@@ -3414,6 +3572,7 @@ try {
                                         $SidecarHandshakeTimeoutSeconds
                                     )
                             }
+                    $pendingSidecarUpdateId = $null
                     if ([int]$sidecarUpdate.Sidecar.IdentityHandle.ProcessId -ne
                         [int]$oldSidecarChild.IdentityHandle.ProcessId) {
                         $oldSidecarChild.IdentityHandle.Process.Dispose()
@@ -4001,6 +4160,14 @@ try {
             -IdentityHandle $sidecarIdentityHandle `
             -ErrorAction SilentlyContinue
         $sidecarIdentityHandle.Process.Dispose()
+    }
+    if (-not [string]::IsNullOrWhiteSpace(
+        [string]$sidecarMaintenanceTokenPath
+    )) {
+        Remove-Item `
+            -LiteralPath $sidecarMaintenanceTokenPath `
+            -Force `
+            -ErrorAction SilentlyContinue
     }
     $brokerIdentityHandle.Process.Dispose()
     $bootstrapIdentityHandle.Process.Dispose()

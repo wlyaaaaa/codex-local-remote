@@ -11,7 +11,7 @@ import { SidecarStateStore } from "./state-store.js";
 const HELP = `Codex Local Remote
 
 用法:
-  codex-local-remote serve [--host 127.0.0.1] [--port 18790] [--app-server-url ws://127.0.0.1:18791] [--base-path /codex-remote] [--codex-path PATH] [--data-dir PATH] [--no-desktop-sync]
+  codex-local-remote serve [--host 127.0.0.1] [--port 18790] [--app-server-url ws://127.0.0.1:18791] [--base-path /codex-remote] [--codex-path PATH] [--data-dir PATH] [--maintenance-token-file PATH] [--no-desktop-sync]
   codex-local-remote setup-password [--data-dir PATH]
   codex-local-remote register-project --id ID --name NAME --root PATH [--data-dir PATH]
 

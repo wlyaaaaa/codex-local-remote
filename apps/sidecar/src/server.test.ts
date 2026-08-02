@@ -79,6 +79,7 @@ async function createFixture(
   queue?: SidecarTurnQueueApi,
   webFilesAtStartup?: Record<string, string>,
   requestReady?: () => boolean,
+  maintenance?: { drainTimeoutMs?: number; token: string },
 ) {
   const directory = await SidecarStateStore.createTemporaryDirectoryForTests(
     path.join(os.tmpdir(), "codex-local-remote-server-"),
@@ -240,6 +241,14 @@ async function createFixture(
       domain,
       events,
       hostFiles,
+      ...(maintenance === undefined
+        ? {}
+        : {
+            ...(maintenance.drainTimeoutMs === undefined
+              ? {}
+              : { maintenanceDrainTimeoutMs: maintenance.drainTimeoutMs }),
+            maintenanceToken: maintenance.token,
+          }),
       requestReady: requestReady ?? (() => diagnostics.capabilities.appServer === "available"),
       ...(queue === undefined ? {} : { queue }),
       state: stateOverride,
@@ -265,6 +274,250 @@ async function createFixture(
     webDir,
   };
 }
+
+describe("Sidecar maintenance drain", () => {
+  const maintenanceToken = "a".repeat(64);
+  const updateId = "0123456789abcdef0123456789abcdef";
+  const controlHeaders = (token = maintenanceToken, id = updateId) => ({
+    authorization: `Bearer ${token}`,
+    "x-codex-update-id": id,
+  });
+
+  it("requires only the loopback maintenance capability and a canonical update id", async () => {
+    const fixture = await createFixture(true, undefined, undefined, undefined, {
+      token: maintenanceToken,
+    });
+
+    const missingCapability = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: { "x-codex-update-id": updateId },
+    });
+    expect(missingCapability.statusCode).toBe(401);
+    expect(missingCapability.json()).toMatchObject({
+      error: { code: "MAINTENANCE_CAPABILITY_REQUIRED" },
+    });
+
+    const invalidCapability = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders("b".repeat(64)),
+    });
+    expect(invalidCapability.statusCode).toBe(401);
+
+    const invalidUpdate = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(maintenanceToken, updateId.toUpperCase()),
+    });
+    expect(invalidUpdate.statusCode).toBe(400);
+    expect(invalidUpdate.json()).toMatchObject({ error: { code: "INVALID_UPDATE_ID" } });
+
+    const drained = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(),
+    });
+    expect(drained.statusCode).toBe(200);
+    expect(drained.json()).toEqual({
+      activeMutations: 0,
+      status: "drained",
+      updateId,
+    });
+    await fixture.app.close();
+  });
+
+  it("waits for admitted mutations, rejects new mutations, and keeps reads available", async () => {
+    const fixture = await createFixture(true, undefined, undefined, undefined, {
+      drainTimeoutMs: 1_000,
+      token: maintenanceToken,
+    });
+    const session = await login(fixture);
+    let releaseMutation!: () => void;
+    const mutationPending = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+    fixture.domain.setThreadName.mockImplementationOnce(async () => {
+      await mutationPending;
+    });
+    const mutationHeaders = {
+      cookie: session.cookie,
+      host: "127.0.0.1:18790",
+      origin: "http://127.0.0.1:18790",
+      "sec-fetch-site": "same-origin",
+      "x-csrf-token": session.csrfToken,
+      "idempotency-key": "maintenance-admitted-mutation",
+    };
+    const admittedMutation = fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/name",
+      headers: mutationHeaders,
+      payload: { name: "排空前已接纳" },
+    });
+    await vi.waitFor(() => expect(fixture.domain.setThreadName).toHaveBeenCalledOnce());
+
+    const drain = fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const rejectedMutation = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/name",
+      headers: { ...mutationHeaders, "idempotency-key": "maintenance-rejected-mutation" },
+      payload: { name: "排空后不得接纳" },
+    });
+    expect(rejectedMutation.statusCode).toBe(503);
+    expect(rejectedMutation.headers["retry-after"]).toBe("1");
+    expect(rejectedMutation.json()).toMatchObject({ error: { code: "SIDECAR_DRAINING" } });
+
+    const read = await fixture.app.inject({
+      method: "GET",
+      url: "/codex-remote/api/v1/ready",
+    });
+    expect(read.statusCode).toBe(200);
+
+    releaseMutation();
+    expect((await admittedMutation).statusCode).toBe(204);
+    expect((await drain).json()).toEqual({ activeMutations: 0, status: "drained", updateId });
+    expect(fixture.domain.setThreadName).toHaveBeenCalledOnce();
+    await fixture.app.close();
+  });
+
+  it("returns to serving after the last drain waiter times out, then can drain again", async () => {
+    const fixture = await createFixture(true, undefined, undefined, undefined, {
+      drainTimeoutMs: 10,
+      token: maintenanceToken,
+    });
+    const session = await login(fixture);
+    let releaseMutation!: () => void;
+    const mutationPending = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+    fixture.domain.setThreadName.mockImplementationOnce(async () => {
+      await mutationPending;
+    });
+    const mutation = fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/name",
+      headers: {
+        cookie: session.cookie,
+        host: "127.0.0.1:18790",
+        origin: "http://127.0.0.1:18790",
+        "sec-fetch-site": "same-origin",
+        "x-csrf-token": session.csrfToken,
+        "idempotency-key": "maintenance-timeout-mutation",
+      },
+      payload: { name: "等待超时后完成" },
+    });
+    await vi.waitFor(() => expect(fixture.domain.setThreadName).toHaveBeenCalledOnce());
+
+    const timedOut = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(),
+    });
+    expect(timedOut.statusCode).toBe(503);
+    expect(timedOut.headers["retry-after"]).toBe("1");
+    expect(timedOut.json()).toMatchObject({ error: { code: "SIDECAR_DRAIN_TIMEOUT" } });
+
+    const admittedAfterTimeout = await fixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/name",
+      headers: {
+        cookie: session.cookie,
+        host: "127.0.0.1:18790",
+        origin: "http://127.0.0.1:18790",
+        "sec-fetch-site": "same-origin",
+        "x-csrf-token": session.csrfToken,
+        "idempotency-key": "maintenance-after-timeout",
+      },
+      payload: { name: "超时后恢复接纳" },
+    });
+    expect(admittedAfterTimeout.statusCode).toBe(204);
+    expect(fixture.domain.setThreadName).toHaveBeenCalledTimes(2);
+
+    releaseMutation();
+    expect((await mutation).statusCode).toBe(204);
+    const firstReceipt = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(),
+    });
+    const repeatedReceipt = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(),
+    });
+    expect(firstReceipt.json()).toEqual({ activeMutations: 0, status: "drained", updateId });
+    expect(repeatedReceipt.json()).toEqual(firstReceipt.json());
+
+    const mismatchedUpdate = await fixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(maintenanceToken, "fedcba9876543210fedcba9876543210"),
+    });
+    expect(mismatchedUpdate.statusCode).toBe(409);
+    expect(mismatchedUpdate.json()).toMatchObject({
+      error: { code: "SIDECAR_DRAIN_UPDATE_CONFLICT" },
+    });
+    await fixture.app.close();
+  });
+
+  it("releases admission leases after body parse failure or a client-aborted upload", async () => {
+    const parseFixture = await createFixture(true, undefined, undefined, undefined, {
+      token: maintenanceToken,
+    });
+    const malformed = await parseFixture.app.inject({
+      method: "PUT",
+      url: "/codex-remote/api/v1/threads/thread-new/name",
+      headers: { "content-type": "application/json" },
+      payload: '{"name":',
+    });
+    expect(malformed.statusCode).toBe(400);
+    const parseDrain = await parseFixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(),
+    });
+    expect(parseDrain.statusCode).toBe(200);
+    await parseFixture.app.close();
+
+    const abortFixture = await createFixture(true, undefined, undefined, undefined, {
+      token: maintenanceToken,
+    });
+    await abortFixture.app.listen({ host: "127.0.0.1", port: 0 });
+    const address = abortFixture.app.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Missing maintenance abort test listener");
+    }
+    await new Promise<void>((resolve) => {
+      const request = httpRequest({
+        headers: { "content-length": "128", "content-type": "application/json" },
+        host: "127.0.0.1",
+        method: "PUT",
+        path: "/codex-remote/api/v1/threads/thread-new/name",
+        port: address.port,
+      });
+      request.on("error", () => resolve());
+      request.write('{"name":');
+      setTimeout(() => {
+        request.destroy();
+        resolve();
+      }, 20);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const abortDrain = await abortFixture.app.inject({
+      method: "POST",
+      url: "/codex-remote/_control/drain",
+      headers: controlHeaders(),
+    });
+    expect(abortDrain.statusCode).toBe(200);
+    await abortFixture.app.close();
+  });
+});
 
 interface SseFrame {
   event: RemoteEvent;

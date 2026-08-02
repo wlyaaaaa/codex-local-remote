@@ -11,6 +11,7 @@ export interface SidecarConfig {
   codexPath?: string;
   dataDir: string;
   desktopSyncEnabled: boolean;
+  maintenanceTokenFile?: string;
   webDir: string;
 }
 
@@ -22,6 +23,7 @@ export interface SidecarConfigOverrides {
   codexPath?: string;
   dataDir?: string;
   desktopSyncEnabled?: boolean;
+  maintenanceTokenFile?: string;
   webDir?: string;
 }
 
@@ -74,6 +76,9 @@ export function resolveSidecarConfig(options: ResolveSidecarConfigOptions = {}):
     path.resolve(import.meta.dirname, "../../web/dist");
   const desktopSyncEnabled =
     cli.desktopSyncEnabled ?? parseBooleanSwitch(environment.CODEX_REMOTE_DESKTOP_SYNC) ?? true;
+  const maintenanceTokenFile = normalizeLocalMaintenanceTokenFile(
+    cli.maintenanceTokenFile ?? environment.CODEX_REMOTE_MAINTENANCE_TOKEN_FILE,
+  );
   const appServerUrl = normalizeLoopbackWebSocketEndpoint(
     cli.appServerUrl ??
       environment.CODEX_REMOTE_APP_SERVER_WS_URL ??
@@ -88,6 +93,7 @@ export function resolveSidecarConfig(options: ResolveSidecarConfigOptions = {}):
     dataDir,
     desktopSyncEnabled,
     host,
+    ...(maintenanceTokenFile === undefined ? {} : { maintenanceTokenFile }),
     port,
     webDir,
   };
@@ -113,6 +119,7 @@ export function parseCliInvocation(args: string[]): CliInvocation {
       "codex-path",
       "data-dir",
       "host",
+      "maintenance-token-file",
       "no-desktop-sync",
       "port",
       "web-dir",
@@ -126,6 +133,7 @@ export function parseCliInvocation(args: string[]): CliInvocation {
         dataDir: values.get("data-dir"),
         desktopSyncEnabled: values.has("no-desktop-sync") ? false : undefined,
         host: values.get("host"),
+        maintenanceTokenFile: values.get("maintenance-token-file"),
         port: parsePort(values.get("port")),
         webDir: values.get("web-dir"),
       }),
@@ -209,6 +217,20 @@ function parseBooleanSwitch(value: string | undefined): boolean | undefined {
   }
 }
 
+function normalizeLocalMaintenanceTokenFile(value: string | undefined): string | undefined {
+  if (value === undefined || value.length === 0) {
+    return undefined;
+  }
+  if (!path.win32.isAbsolute(value)) {
+    throw new Error("Sidecar maintenance token 必须使用绝对路径");
+  }
+  const resolved = path.win32.normalize(value);
+  if (resolved.startsWith("\\\\")) {
+    throw new Error("Sidecar maintenance token 必须使用本机文件路径");
+  }
+  return resolved;
+}
+
 function parseFlags(args: string[]): Map<string, string> {
   const result = new Map<string, string>();
   for (let index = 0; index < args.length; ) {
@@ -250,6 +272,7 @@ function compactConfig(input: {
   codexPath?: string | undefined;
   dataDir?: string | undefined;
   desktopSyncEnabled?: boolean | undefined;
+  maintenanceTokenFile?: string | undefined;
   webDir?: string | undefined;
 }): SidecarConfigOverrides {
   return {
@@ -262,6 +285,9 @@ function compactConfig(input: {
     ...(input.desktopSyncEnabled === undefined
       ? {}
       : { desktopSyncEnabled: input.desktopSyncEnabled }),
+    ...(input.maintenanceTokenFile === undefined
+      ? {}
+      : { maintenanceTokenFile: input.maintenanceTokenFile }),
     ...(input.webDir === undefined ? {} : { webDir: input.webDir }),
   };
 }

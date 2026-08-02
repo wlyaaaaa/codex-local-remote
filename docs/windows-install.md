@@ -462,7 +462,8 @@ PowerShell 的格式化文本误当成对象：
 到 PATH 或 Codex CLI。
 
 更新发生在共享任务运行期间时不会热替换 app-server，也不会强杀或重启
-Desktop、Broker 或 Sidecar。bootstrap 每 30 秒重新发现当前 Desktop package
+Desktop、Broker。兼容的 Web/Sidecar 候选可以先排空已接纳的写请求，再短暂
+切换公网层；共享任务继续由原 Broker/app-server 持有。bootstrap 每 30 秒重新发现当前 Desktop package
 generation 和二进制 hash；发现漂移后把 `startup-last.json` 写为
 `degraded`/`update-pending`，但保留全部活跃进程。状态命令也会独立重新发现
 并报告 `DesktopRuntimeStatus=update-pending`、`Degraded=true`、
@@ -507,8 +508,9 @@ Windows 睡眠会造成 Node timer 长间隔。heartbeat sweep 发现超出容�
 时不会沿用睡眠前 miss，也不会在唤醒瞬间立即关闭连接；它会清零两腿状态并马上
 发起 fresh probe。唤醒本身不创建 Remote intent，也不授权停止或重开 Desktop、
 Broker 或 app-server。只有既有显式租约中的 Web/Sidecar 满足约 3 秒连续兼容门，
-才可滚动公网层；任何 reconnect、unsafe、Broker/app-server 丢失或运行代漂移
-都失败关闭，并等待新的显式 `Open`。
+旧 Sidecar 成功排空写请求且 Broker 未知连接数为零，才可滚动公网层；active task
+不再阻塞。排空失败、未知连接、Broker/app-server 丢失或运行代漂移都失败关闭，
+并等待新的显式 `Open`。
 
 上述行为已有定向自动化；发布证明仍必须绑定同一不可变候选，不能以源码测试替代
 真实冷启动、公网、Desktop 同步或真实 Windows 睡眠/唤醒门。

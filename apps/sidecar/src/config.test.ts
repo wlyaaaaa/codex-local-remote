@@ -116,6 +116,8 @@ describe("parseCliInvocation", () => {
         "C:\\Codex\\codex.exe",
         "--data-dir",
         "D:\\Remote State",
+        "--maintenance-token-file",
+        "D:\\Remote State\\maintenance.token",
       ]),
     ).toEqual({
       command: "serve",
@@ -125,6 +127,7 @@ describe("parseCliInvocation", () => {
         codexPath: "C:\\Codex\\codex.exe",
         dataDir: "D:\\Remote State",
         host: "127.0.0.1",
+        maintenanceTokenFile: "D:\\Remote State\\maintenance.token",
         port: 18_790,
       },
     });
@@ -132,6 +135,29 @@ describe("parseCliInvocation", () => {
     expect(() => parseCliInvocation(["setup-password", "--password", "secret"])).toThrow(
       "不支持的参数",
     );
+  });
+
+  it("accepts only a local maintenance capability file path", () => {
+    expect(
+      resolveSidecarConfig({
+        cli: { maintenanceTokenFile: "D:\\Remote State\\maintenance.token" },
+        environment: { LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local" },
+      }),
+    ).toMatchObject({ maintenanceTokenFile: "D:\\Remote State\\maintenance.token" });
+
+    expect(() =>
+      resolveSidecarConfig({
+        cli: { maintenanceTokenFile: "\\\\server\\share\\maintenance.token" },
+        environment: { LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local" },
+      }),
+    ).toThrow("本机文件");
+
+    expect(() =>
+      resolveSidecarConfig({
+        cli: { maintenanceTokenFile: "maintenance.token" },
+        environment: { LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local" },
+      }),
+    ).toThrow("绝对路径");
   });
 
   it("supports an explicit serve-only Desktop synchronization opt-out", () => {

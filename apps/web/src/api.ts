@@ -218,6 +218,7 @@ export const EVENT_STREAM_ONLINE_STABILITY_MS = 750;
 export const EVENT_STREAM_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000] as const;
 const TRANSIENT_MUTATION_RETRY_DELAY_MS = 300;
 const TRANSIENT_MUTATION_RETRY_MAX_MS = 5_000;
+const TRANSIENT_MUTATION_RETRY_DELAYS_MS = [300, 700, 1_000, 2_000, 3_000, 4_000, 5_000] as const;
 
 type RetryWait = (delayMs: number) => Promise<void>;
 
@@ -225,7 +226,10 @@ function defaultRetryWait(delayMs: number): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, delayMs));
 }
 
-function transientMutationRetryDelay(response: Response): number | undefined {
+function transientMutationRetryDelay(
+  response: Response,
+  fallbackDelayMs = TRANSIENT_MUTATION_RETRY_DELAY_MS,
+): number | undefined {
   const retryAfter = response.headers.get("retry-after")?.trim();
   const isUnqualifiedGatewayFailure = response.status === 502 || response.status === 504;
   const isQualifiedServiceRecovery =
@@ -234,14 +238,14 @@ function transientMutationRetryDelay(response: Response): number | undefined {
     return undefined;
   }
   if (retryAfter === undefined || retryAfter.length === 0) {
-    return TRANSIENT_MUTATION_RETRY_DELAY_MS;
+    return fallbackDelayMs;
   }
   const seconds = Number(retryAfter);
   const requestedMs = Number.isFinite(seconds)
     ? seconds * 1_000
     : Date.parse(retryAfter) - Date.now();
   if (!Number.isFinite(requestedMs)) {
-    return TRANSIENT_MUTATION_RETRY_DELAY_MS;
+    return fallbackDelayMs;
   }
   return Math.min(TRANSIENT_MUTATION_RETRY_MAX_MS, Math.max(0, requestedMs));
 }
@@ -637,32 +641,40 @@ export class HttpApiClient implements ApiClient {
       idempotencyKey !== undefined &&
       options.signal?.aborted !== true;
     let response: Response;
-    let transientRetryUsed = false;
-    try {
-      response = await execute();
-    } catch {
-      if (!canRetryTransiently) {
-        throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
-      }
-      transientRetryUsed = true;
-      await this.waitForRetry(TRANSIENT_MUTATION_RETRY_DELAY_MS);
+    let retryAttempt = 0;
+    for (;;) {
       try {
         response = await execute();
       } catch {
-        throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
-      }
-    }
-    if (!transientRetryUsed && canRetryTransiently) {
-      const retryDelay = transientMutationRetryDelay(response);
-      if (retryDelay !== undefined) {
-        transientRetryUsed = true;
-        await this.waitForRetry(retryDelay);
-        try {
-          response = await execute();
-        } catch {
+        if (
+          !canRetryTransiently ||
+          options.signal?.aborted === true ||
+          retryAttempt >= TRANSIENT_MUTATION_RETRY_DELAYS_MS.length
+        ) {
           throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
         }
+        const retryDelay = TRANSIENT_MUTATION_RETRY_DELAYS_MS[retryAttempt++]!;
+        await this.waitForRetry(retryDelay);
+        continue;
       }
+
+      if (
+        !canRetryTransiently ||
+        options.signal?.aborted === true ||
+        retryAttempt >= TRANSIENT_MUTATION_RETRY_DELAYS_MS.length
+      ) {
+        break;
+      }
+      const retryDelay = transientMutationRetryDelay(
+        response,
+        TRANSIENT_MUTATION_RETRY_DELAYS_MS[retryAttempt],
+      );
+      if (retryDelay === undefined) {
+        break;
+      }
+      retryAttempt += 1;
+      await response.body?.cancel().catch(() => undefined);
+      await this.waitForRetry(retryDelay);
     }
 
     if (!response.ok) {

@@ -6,6 +6,7 @@ import type {
 import { RpcRequestError } from "@codex-local-remote/app-server-client";
 import { DomainError } from "@codex-local-remote/domain";
 
+import type { MaintenanceActivityGate } from "./maintenance.js";
 import type { DurableTurnOutbox } from "./turn-outbox.js";
 
 export interface TurnQueueGateway {
@@ -38,12 +39,18 @@ export interface AppServerNotificationLike {
 type WakeResult = "ambiguous" | "dispatched" | "empty" | "not-idle";
 
 export class TurnQueueDispatcher {
+  readonly #activityGate: MaintenanceActivityGate | undefined;
   readonly #completedThreads = new Set<string>();
   readonly #gateway: TurnQueueGateway;
   readonly #outbox: DurableTurnOutbox;
   readonly #threadOperations = new Map<string, Promise<void>>();
 
-  constructor(options: { gateway: TurnQueueGateway; outbox: DurableTurnOutbox }) {
+  constructor(options: {
+    activityGate?: MaintenanceActivityGate;
+    gateway: TurnQueueGateway;
+    outbox: DurableTurnOutbox;
+  }) {
+    this.#activityGate = options.activityGate;
     this.#gateway = options.gateway;
     this.#outbox = options.outbox;
   }
@@ -103,61 +110,69 @@ export class TurnQueueDispatcher {
   #wakeWithResult(threadId: string): Promise<WakeResult> {
     const current = this.#threadOperations.get(threadId) ?? Promise.resolve();
     const result = current.then(async (): Promise<WakeResult> => {
-      const inspection = await this.#gateway.inspectThread(threadId);
-      if (inspection.state === "active") {
-        await this.#outbox.observeThreadActive(threadId);
+      const activityLease = this.#activityGate?.tryAdmitActivity();
+      if (this.#activityGate !== undefined && activityLease === undefined) {
         return "not-idle";
-      }
-      if (inspection.state !== "idle") {
-        return "not-idle";
-      }
-      const authorization = await this.#outbox.authorizeIdleDispatch(threadId);
-      if (authorization === "empty") {
-        return "empty";
-      }
-      if (authorization !== "authorized") {
-        return "not-idle";
-      }
-      const claim = await this.#outbox.claimNext(threadId);
-      if (!claim) {
-        return "empty";
       }
       try {
-        const result = await this.#gateway.startTurn(threadId, {
-          clientUserMessageId: claim.clientUserMessageId,
-          prompt: claim.prompt,
-          ...(claim.attachments === undefined ? {} : { attachments: claim.attachments }),
-          ...(claim.approvalPolicy === undefined ? {} : { approvalPolicy: claim.approvalPolicy }),
-          ...(claim.approvalsReviewer === undefined
-            ? {}
-            : { approvalsReviewer: claim.approvalsReviewer }),
-          ...(claim.collaborationMode === undefined
-            ? {}
-            : { collaborationMode: claim.collaborationMode }),
-          ...(claim.model === undefined ? {} : { model: claim.model }),
-          ...(claim.permissionProfileId === undefined
-            ? {}
-            : { permissionProfileId: claim.permissionProfileId }),
-          ...(claim.reasoningEffort === undefined
-            ? {}
-            : { reasoningEffort: claim.reasoningEffort }),
-          ...(claim.serviceTier === undefined ? {} : { serviceTier: claim.serviceTier }),
-        });
-        await this.#outbox.markStarted(claim.id, result.turnId);
-        return "dispatched";
-      } catch (error) {
-        if (isDeterministicBusy(error)) {
-          await this.#outbox.returnClaimToQueue(claim.id);
+        const inspection = await this.#gateway.inspectThread(threadId);
+        if (inspection.state === "active") {
+          await this.#outbox.observeThreadActive(threadId);
           return "not-idle";
         }
-        if (isDeterministicRejection(error)) {
-          await this.#outbox.pauseClaim(claim.id, `TURN_START_REJECTED:${errorCode(error)}`);
+        if (inspection.state !== "idle") {
+          return "not-idle";
+        }
+        const authorization = await this.#outbox.authorizeIdleDispatch(threadId);
+        if (authorization === "empty") {
           return "empty";
         }
-        // A transport error may occur after turn/start was accepted. Preserve
-        // the encrypted prompt, fail closed, and require an explicit retry.
-        await this.#outbox.markAmbiguous(claim.id);
-        return "ambiguous";
+        if (authorization !== "authorized") {
+          return "not-idle";
+        }
+        const claim = await this.#outbox.claimNext(threadId);
+        if (!claim) {
+          return "empty";
+        }
+        try {
+          const result = await this.#gateway.startTurn(threadId, {
+            clientUserMessageId: claim.clientUserMessageId,
+            prompt: claim.prompt,
+            ...(claim.attachments === undefined ? {} : { attachments: claim.attachments }),
+            ...(claim.approvalPolicy === undefined ? {} : { approvalPolicy: claim.approvalPolicy }),
+            ...(claim.approvalsReviewer === undefined
+              ? {}
+              : { approvalsReviewer: claim.approvalsReviewer }),
+            ...(claim.collaborationMode === undefined
+              ? {}
+              : { collaborationMode: claim.collaborationMode }),
+            ...(claim.model === undefined ? {} : { model: claim.model }),
+            ...(claim.permissionProfileId === undefined
+              ? {}
+              : { permissionProfileId: claim.permissionProfileId }),
+            ...(claim.reasoningEffort === undefined
+              ? {}
+              : { reasoningEffort: claim.reasoningEffort }),
+            ...(claim.serviceTier === undefined ? {} : { serviceTier: claim.serviceTier }),
+          });
+          await this.#outbox.markStarted(claim.id, result.turnId);
+          return "dispatched";
+        } catch (error) {
+          if (isDeterministicBusy(error)) {
+            await this.#outbox.returnClaimToQueue(claim.id);
+            return "not-idle";
+          }
+          if (isDeterministicRejection(error)) {
+            await this.#outbox.pauseClaim(claim.id, `TURN_START_REJECTED:${errorCode(error)}`);
+            return "empty";
+          }
+          // A transport error may occur after turn/start was accepted. Preserve
+          // the encrypted prompt, fail closed, and require an explicit retry.
+          await this.#outbox.markAmbiguous(claim.id);
+          return "ambiguous";
+        }
+      } finally {
+        activityLease?.release();
       }
     });
     const operation = result

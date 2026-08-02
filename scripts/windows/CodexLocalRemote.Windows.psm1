@@ -7515,6 +7515,41 @@ function Remove-CodexLocalRemoteControlDispatcher {
         }
 }
 
+function Test-CodexLocalRemoteSidecarUpdateRuntimeBinding {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Binding
+    )
+
+    if ($null -eq $Binding) {
+        return $false
+    }
+    foreach ($required in @(
+        'VersionId',
+        'RuntimeRoot',
+        'BrokerSidecarCompatibilityId'
+    )) {
+        if ($null -eq $Binding.PSObject.Properties[$required]) {
+            return $false
+        }
+    }
+    if ([string]$Binding.VersionId -cnotmatch '^[a-f0-9]{64}$' -or
+        [string]::IsNullOrWhiteSpace([string]$Binding.RuntimeRoot) -or
+        [string]$Binding.BrokerSidecarCompatibilityId -cnotmatch
+            '^codex-local-remote/broker-sidecar/v[1-9][0-9]*$') {
+        return $false
+    }
+    try {
+        $null = [System.IO.Path]::GetFullPath(
+            [string]$Binding.RuntimeRoot
+        )
+    } catch {
+        return $false
+    }
+    return $true
+}
+
 function Assert-CodexLocalRemoteSidecarUpdateInvariant {
     [CmdletBinding()]
     param(
@@ -7548,11 +7583,17 @@ function Assert-CodexLocalRemoteSidecarUpdateInvariant {
     if ([string]$Current.SelectedVersionId -cnotmatch
             '^[a-f0-9]{64}$' -or
         [string]::IsNullOrWhiteSpace([string]$Current.SelectedRoot) -or
+        -not (Test-NonNegativeInteger -Value $Current.BrokerProcessId) -or
         [int]$Current.BrokerProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Current.BrokerStartTimeUtcTicks) -or
         [long]$Current.BrokerStartTimeUtcTicks -le 0 -or
         [string]$Current.RuntimeInvocationId -cnotmatch
             '^[a-f0-9]{32}$' -or
+        -not (Test-NonNegativeInteger -Value $Current.UpstreamProcessId) -or
         [int]$Current.UpstreamProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Current.UpstreamStartTimeUtcTicks) -or
         [long]$Current.UpstreamStartTimeUtcTicks -le 0 -or
         [string]::IsNullOrWhiteSpace(
             [string]$Current.DesktopRootIdentityKey
@@ -7561,8 +7602,11 @@ function Assert-CodexLocalRemoteSidecarUpdateInvariant {
             '^codex-local-remote/broker-sidecar/v[1-9][0-9]*$' -or
         [string]$Current.CandidateSidecarCompatibilityId -cne
             [string]$Current.BrokerSidecarCompatibilityId -or
-        [int]$Current.UnsafeThreadCount -ne 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Current.UnsafeThreadCount) -or
+        -not (Test-NonNegativeInteger -Value $Current.UnknownCount) -or
         [int]$Current.UnknownCount -ne 0 -or
+        $Current.DesktopConnected -isnot [bool] -or
         -not [bool]$Current.DesktopConnected) {
         throw 'Sidecar update invariant is not one safe connected lease.'
     }
@@ -7592,11 +7636,97 @@ function Assert-CodexLocalRemoteSidecarUpdateInvariant {
     return $true
 }
 
+function Assert-CodexLocalRemoteSidecarRollbackInvariant {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Baseline,
+
+        [Parameter(Mandatory)]
+        [object]$Current,
+
+        [Parameter(Mandatory)]
+        [object]$OldSidecarBinding
+    )
+
+    foreach ($required in @(
+        'BrokerProcessId',
+        'BrokerStartTimeUtcTicks',
+        'RuntimeInvocationId',
+        'UpstreamProcessId',
+        'UpstreamStartTimeUtcTicks',
+        'DesktopRootIdentityKey',
+        'BrokerSidecarCompatibilityId',
+        'UnknownCount',
+        'DesktopConnected'
+    )) {
+        if ($null -eq $Baseline.PSObject.Properties[$required] -or
+            $null -eq $Current.PSObject.Properties[$required]) {
+            throw "Sidecar rollback invariant is missing '$required'."
+        }
+    }
+    if (-not (Test-CodexLocalRemoteSidecarUpdateRuntimeBinding `
+            -Binding $OldSidecarBinding) -or
+        -not (Test-NonNegativeInteger -Value $Current.BrokerProcessId) -or
+        [int]$Current.BrokerProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Current.BrokerStartTimeUtcTicks) -or
+        [long]$Current.BrokerStartTimeUtcTicks -le 0 -or
+        [string]$Current.RuntimeInvocationId -cnotmatch
+            '^[a-f0-9]{32}$' -or
+        -not (Test-NonNegativeInteger -Value $Current.UpstreamProcessId) -or
+        [int]$Current.UpstreamProcessId -le 0 -or
+        -not (Test-NonNegativeInteger `
+            -Value $Current.UpstreamStartTimeUtcTicks) -or
+        [long]$Current.UpstreamStartTimeUtcTicks -le 0 -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$Current.DesktopRootIdentityKey
+        ) -or
+        [string]$Current.BrokerSidecarCompatibilityId -cnotmatch
+            '^codex-local-remote/broker-sidecar/v[1-9][0-9]*$' -or
+        [string]$OldSidecarBinding.BrokerSidecarCompatibilityId -cne
+            [string]$Current.BrokerSidecarCompatibilityId -or
+        -not (Test-NonNegativeInteger -Value $Current.UnknownCount) -or
+        [int]$Current.UnknownCount -ne 0 -or
+        $Current.DesktopConnected -isnot [bool] -or
+        -not [bool]$Current.DesktopConnected) {
+        throw 'Sidecar rollback invariant is not one safe owner lease.'
+    }
+    foreach ($property in @(
+        'BrokerProcessId',
+        'BrokerStartTimeUtcTicks',
+        'RuntimeInvocationId',
+        'UpstreamProcessId',
+        'UpstreamStartTimeUtcTicks',
+        'DesktopRootIdentityKey',
+        'BrokerSidecarCompatibilityId'
+    )) {
+        if ([string]$Baseline.$property -cne
+            [string]$Current.$property) {
+            throw "Sidecar rollback invariant drifted at '$property'."
+        }
+    }
+    return $true
+}
+
 function Invoke-CodexLocalRemoteSidecarUpdateTransaction {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [scriptblock]$CaptureInvariant,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$CaptureRollbackInvariant,
+
+        [Parameter(Mandatory)]
+        [object]$OldSidecarBinding,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{32}$')]
+        [string]$UpdateId,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$PrepareOldSidecar,
 
         [Parameter(Mandatory)]
         [scriptblock]$StopOldSidecar,
@@ -7621,8 +7751,50 @@ function Invoke-CodexLocalRemoteSidecarUpdateTransaction {
     $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
         -Baseline $baseline `
         -Current $baseline
+    if (-not (Test-CodexLocalRemoteSidecarUpdateRuntimeBinding `
+            -Binding $OldSidecarBinding) -or
+        [string]$OldSidecarBinding.BrokerSidecarCompatibilityId -cne
+            [string]$baseline.BrokerSidecarCompatibilityId) {
+        throw 'Old Sidecar runtime binding is invalid or incompatible.'
+    }
+    $oldRoot = [System.IO.Path]::GetFullPath(
+        [string]$OldSidecarBinding.RuntimeRoot
+    )
+    $targetRoot = [System.IO.Path]::GetFullPath(
+        [string]$baseline.SelectedRoot
+    )
+    if ([string]$OldSidecarBinding.VersionId -ceq
+            [string]$baseline.SelectedVersionId -and
+        [string]::Equals(
+            $oldRoot,
+            $targetRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw 'Sidecar update target is already the active runtime.'
+    }
     $newSidecar = $null
+    $drainCompleted = $false
     try {
+        $candidateDrainReceipt =
+            & $PrepareOldSidecar $UpdateId
+        if ($null -eq $candidateDrainReceipt -or
+            $null -eq $candidateDrainReceipt.PSObject.Properties['status'] -or
+            $null -eq $candidateDrainReceipt.PSObject.Properties['updateId'] -or
+            $null -eq $candidateDrainReceipt.PSObject.Properties[
+                'activeMutations'
+            ] -or
+            [string]$candidateDrainReceipt.status -cne 'drained' -or
+            [string]$candidateDrainReceipt.updateId -cne $UpdateId -or
+            -not (Test-NonNegativeInteger `
+                -Value $candidateDrainReceipt.activeMutations) -or
+            [int]$candidateDrainReceipt.activeMutations -ne 0) {
+            throw 'Old Sidecar drain receipt is invalid or unbound.'
+        }
+        $drainCompleted = $true
+        $afterDrain = & $CaptureInvariant
+        $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+            -Baseline $baseline `
+            -Current $afterDrain
         $null = & $StopOldSidecar
         $afterStop = & $CaptureInvariant
         $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
@@ -7639,30 +7811,37 @@ function Invoke-CodexLocalRemoteSidecarUpdateTransaction {
             Sidecar = $newSidecar
             Verification = $verification
             Failure = $null
+            UpdateId = $UpdateId
         }
     } catch {
         $primaryFailure = $_
+        if (-not $drainCompleted) {
+            throw $primaryFailure
+        }
         $rollbackSidecar = $null
         try {
             if ($null -ne $newSidecar) {
                 $null = & $StopNewSidecar $newSidecar
             }
-            $rollbackInvariant = & $CaptureInvariant
-            $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+            $rollbackInvariant = & $CaptureRollbackInvariant
+            $null = Assert-CodexLocalRemoteSidecarRollbackInvariant `
                 -Baseline $baseline `
-                -Current $rollbackInvariant
+                -Current $rollbackInvariant `
+                -OldSidecarBinding $OldSidecarBinding
             $rollbackSidecar = & $StartOldSidecar
             $rollbackVerification =
                 & $VerifyOldSidecar $rollbackSidecar
-            $finalInvariant = & $CaptureInvariant
-            $null = Assert-CodexLocalRemoteSidecarUpdateInvariant `
+            $finalInvariant = & $CaptureRollbackInvariant
+            $null = Assert-CodexLocalRemoteSidecarRollbackInvariant `
                 -Baseline $baseline `
-                -Current $finalInvariant
+                -Current $finalInvariant `
+                -OldSidecarBinding $OldSidecarBinding
             return [pscustomobject]@{
                 Status = 'rolled-back'
                 Sidecar = $rollbackSidecar
                 Verification = $rollbackVerification
                 Failure = $primaryFailure.Exception.Message
+                UpdateId = $UpdateId
             }
         } catch {
             throw (

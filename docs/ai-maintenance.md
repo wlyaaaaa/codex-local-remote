@@ -78,8 +78,9 @@ Broker 启动时已经完成完整 hash 校验的运行时回执，并批量读�
   任务时，不得停止 Broker。
 - `-NoStart` 只登记不可变候选，不能启停现有 Desktop/Broker/Sidecar。
 - Web/Sidecar 更新在 compatibility id 与 selected/Broker/upstream/Desktop
-  不变量全部通过且无 active/unknown task 时热切换并可回滚；Broker、app-server
-  或不兼容代必须等待新的显式 Open 决策。
+  不变量全部通过、未知连接为零且旧 Sidecar 已完成写请求排空时热切换并可回滚；
+  active task 继续由 Broker/app-server 持有，不再阻塞公网层更新。Broker、
+  app-server 或不兼容代必须等待新的显式 Open 决策。
 - “打开远程”本身只授权必要时至多一次 Desktop 受控交接；普通管理员授权、
   安装、更新、重启或后台维护都不构成这项授权。
 
