@@ -407,6 +407,51 @@ function Get-OnDemandExactProcessInspection {
     }
 }
 
+function Test-OnDemandManagedSidecarProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandLine,
+
+        [Parameter(Mandatory)]
+        [string]$ExecutablePath,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedNodePath,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedSidecarCliPath,
+
+        [Parameter(Mandatory)]
+        [int]$Port,
+
+        [Parameter(Mandatory)]
+        [string]$BasePath,
+
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [string]$MaintenanceTokenFilePath
+    )
+
+    $modulePath = [System.IO.Path]::GetFullPath(
+        (Join-Path $PSScriptRoot 'CodexLocalRemote.Windows.psm1')
+    )
+    $module = Import-Module `
+        $modulePath `
+        -Force `
+        -Global `
+        -PassThru `
+        -ErrorAction Stop
+    $command = $module.ExportedCommands['Test-ManagedSidecarProcess']
+    if ($null -eq $command -or
+        -not $command.Parameters.ContainsKey('MaintenanceTokenFilePath')) {
+        throw 'The selected immutable runtime has no token-bound Sidecar ownership contract.'
+    }
+    return & $command @PSBoundParameters
+}
+
 function Test-OnDemandReceiptProcessIdentity {
     param(
         [Parameter(Mandatory)]
@@ -1530,7 +1575,7 @@ function Get-OnDemandRemoteState {
                                         ) `
                                         -TestOwnership {
                                             param($process)
-                                            Test-ManagedSidecarProcess `
+                                            Test-OnDemandManagedSidecarProcess `
                                                 -CommandLine (
                                                     [string]$process.CommandLine
                                                 ) `
@@ -2321,7 +2366,7 @@ function Get-OnDemandPreparedTransportSnapshot {
             [int]$receipt.Sidecar.ProcessId) {
         throw 'Prepared transport Sidecar does not own one exact loopback listener.'
     }
-    $sidecarOwnership = Test-ManagedSidecarProcess `
+    $sidecarOwnership = Test-OnDemandManagedSidecarProcess `
         -CommandLine ([string]$sidecarProcess.CommandLine) `
         -ExecutablePath ([string]$sidecarProcess.ExecutablePath) `
         -ExpectedNodePath ([string]$receipt.NodePath) `

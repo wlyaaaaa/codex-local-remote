@@ -341,6 +341,29 @@ function Test-ManagedSidecarProcess {
     }
 }
 
+function Test-OnDemandManagedSidecarProcess {
+    param(
+        [string]$CommandLine,
+        [string]$ExecutablePath,
+        [string]$ExpectedNodePath,
+        [string]$ExpectedSidecarCliPath,
+        [int]$Port,
+        [string]$BasePath,
+        [string]$DataDir,
+        [string]$MaintenanceTokenFilePath
+    )
+
+    Test-ManagedSidecarProcess `
+        -CommandLine $CommandLine `
+        -ExecutablePath $ExecutablePath `
+        -ExpectedNodePath $ExpectedNodePath `
+        -ExpectedSidecarCliPath $ExpectedSidecarCliPath `
+        -Port $Port `
+        -BasePath $BasePath `
+        -DataDir $DataDir `
+        -MaintenanceTokenFilePath $MaintenanceTokenFilePath
+}
+
 function Invoke-RestMethod {
     param(
         [string]$Method,

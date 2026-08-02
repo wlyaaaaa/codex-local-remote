@@ -28,6 +28,9 @@ upstream listener handle.
 - Includes the v0.1.5 Sidecar maintenance-token argument in the exact ownership
   contract. The legacy no-token contract remains distinct and cannot accept an
   unexpected token path.
+- Resolves the Sidecar ownership matcher from the selected immutable runtime's
+  exact module export, so a stale same-named PowerShell module cannot shadow the
+  token-bound contract during a runtime handoff.
 
 ## Compatibility recovery
 

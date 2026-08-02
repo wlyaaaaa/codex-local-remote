@@ -123,6 +123,11 @@ describe("Windows infrastructure-first on-demand handoff", () => {
       "Get-OnDemandExactProcessInspection",
       "Test-OnDemandReceiptProcessIdentity",
     );
+    const sidecarOwnership = functionBlock(
+      handoff,
+      "Test-OnDemandManagedSidecarProcess",
+      "Test-OnDemandReceiptProcessIdentity",
+    );
     const readyGate = functionBlock(
       handoff,
       "Assert-OnDemandPreparedInfrastructureReadyForAttach",
@@ -143,6 +148,12 @@ describe("Windows infrastructure-first on-demand handoff", () => {
     expect(transportSnapshot).toContain("OwningProcess");
     expect(transportSnapshot).toContain("$rawFinal -cne $rawBefore");
     expect(processInspection).toContain("Get-CodexLocalRemoteProcessCommandLine");
+    expect(sidecarOwnership).toContain("Import-Module");
+    expect(sidecarOwnership).toContain("-Global");
+    expect(sidecarOwnership).toContain("-PassThru");
+    expect(sidecarOwnership).toContain("ExportedCommands['Test-ManagedSidecarProcess']");
+    expect(sidecarOwnership).toContain("MaintenanceTokenFilePath");
+    expect(transportSnapshot).toContain("Test-OnDemandManagedSidecarProcess");
     expect(calls?.length ?? 0).toBeGreaterThanOrEqual(3);
     expect(handoff).toContain("-Outcome 'preclose-drift'");
   });
