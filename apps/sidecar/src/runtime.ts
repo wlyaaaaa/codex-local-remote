@@ -44,7 +44,7 @@ import { DurableTurnOutbox } from "./turn-outbox.js";
 import { TurnQueueService } from "./turn-queue.js";
 import { TurnQueueDispatcher } from "./turn-queue-dispatcher.js";
 
-const SIDECAR_VERSION = "0.1.2";
+const SIDECAR_VERSION = "0.1.3";
 const DESKTOP_RECONCILIATION_INTERVAL_MS = 5_000;
 const SHARED_CAPABILITY_PROBE_TIMEOUT_MS = 30_000;
 
@@ -221,7 +221,12 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
     ...(notifyManagedThreadCreated === undefined ? {} : { notifyManagedThreadCreated }),
     pendingDesktopNotificationThreadIds: state.listPendingDesktopNotificationThreadIds(),
     protocolCatalog,
-    readPersistedConversationItems: async (threadId, sessionPath, scope = "recent") => {
+    readPersistedConversationItems: async (
+      threadId,
+      sessionPath,
+      scope = "recent",
+      historyCursor,
+    ) => {
       const codexHome = supervisor.snapshot().codexHome;
       if (codexHome === undefined) {
         return {
@@ -239,8 +244,15 @@ export async function startSidecar(config: SidecarConfig): Promise<RunningSideca
         ...(sessionPath === undefined ? {} : { sessionPath }),
         threadId,
       };
-      const result = await desktopSessionConversation.readWithDiagnostic(input, scope);
+      const result = await desktopSessionConversation.readWithDiagnostic(
+        input,
+        scope,
+        historyCursor,
+      );
       return {
+        ...(result?.historyNextCursor === undefined
+          ? {}
+          : { historyNextCursor: result.historyNextCursor }),
         integrity: persistedConversationHistoryIntegrity(
           scope,
           result?.items.length ?? 0,

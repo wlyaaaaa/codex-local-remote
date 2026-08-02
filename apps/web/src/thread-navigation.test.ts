@@ -1053,6 +1053,62 @@ describe("新任务详情首屏", () => {
     ]);
   });
 
+  it("活动刷新只收敛同一 turn 的 Desktop 实时别名并保留上一轮同文发送", () => {
+    const prompt = "继续检查";
+    const current = threadDetail({
+      id: "thread-desktop-alias",
+      state: "running",
+      activeTurnId: "turn-current",
+      updatedAt: "2026-07-25T12:00:03.000Z",
+      items: [
+        {
+          id: "previous-user",
+          kind: "user-message",
+          text: prompt,
+          turnId: "turn-previous",
+        },
+        {
+          id: "desktop-live-alias",
+          kind: "user-message",
+          text: prompt,
+          turnId: "turn-current",
+        },
+        {
+          id: "desktop-real-repeat",
+          kind: "user-message",
+          text: prompt,
+          turnId: "turn-current",
+        },
+      ],
+    });
+    const incoming = threadDetail({
+      id: current.id,
+      state: "running",
+      activeTurnId: "turn-current",
+      updatedAt: "2026-07-25T12:00:04.000Z",
+      items: [
+        {
+          id: "previous-user",
+          kind: "user-message",
+          text: prompt,
+          turnId: "turn-previous",
+        },
+        {
+          id: "persisted-current-user",
+          kind: "user-message",
+          text: prompt,
+          turnId: "turn-current",
+        },
+      ],
+    });
+
+    expect(mergeThreadRefresh(current, incoming).items.map((item) => item.id)).toEqual([
+      "previous-user",
+      "persisted-current-user",
+      "desktop-real-repeat",
+    ]);
+  });
+
   it("未覆盖当前最新用户消息的终态刷新不会清除活跃控制状态", () => {
     const current = threadDetail({
       id: "thread-stale-terminal-control",

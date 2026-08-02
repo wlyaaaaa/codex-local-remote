@@ -46,6 +46,29 @@ test.describe("六视口布局契约", () => {
     }
   });
 
+  test("超大运行中对话只在用户要求时向前加载一页本地历史", async ({ page }) => {
+    const runtime = new SharedRuntime({ deferredHistory: true });
+    await runtime.attach(page.context());
+
+    try {
+      await openSharedThread(page);
+      const history = page.getByTestId("conversation-history-more");
+      await expect(history).toBeVisible();
+      await page.waitForTimeout(250);
+      expect(runtime.historyRequests).toEqual([]);
+
+      await history.click();
+      await expect.poll(() => runtime.historyRequests).toEqual(["persisted-page-2"]);
+      await expect(
+        page.getByText("这是从本地固定窗口安全加载的更早记录。", { exact: true }),
+      ).toBeVisible();
+      await expect(history).toHaveCount(0);
+      await expectNoHorizontalOverflow(page);
+    } finally {
+      await runtime.close();
+    }
+  });
+
   test("首页没有横向溢出且主要触控目标至少 44px", async ({ page }) => {
     await login(page);
     await expectNoHorizontalOverflow(page);
@@ -102,6 +125,7 @@ test.describe("六视口布局契约", () => {
         page.getByTestId("composer-mode-open"),
         page.getByTestId("composer-plan-progress").locator("summary"),
       ];
+      await expect(page.getByTestId("composer-plan-progress")).toContainText(/第 \d+\/\d+ 步/u);
       for (const control of mobileControls) {
         const box = await control.boundingBox();
         expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
@@ -120,6 +144,18 @@ test.describe("六视口布局契约", () => {
       expect(closeBox?.width ?? 0).toBeGreaterThanOrEqual(44);
     }
     await expectNoHorizontalOverflow(page);
+  });
+
+  test("设置页显示 Codex 登录账号且额度卡片不重复报错", async ({ page }) => {
+    await login(page);
+    await page.goto("./?demo=1#/settings");
+
+    const account = page.getByTestId("codex-account-identity");
+    await expect(account).toContainText("Codex 登录账号");
+    await expect(account).toContainText("demo@example.invalid");
+    await expect(page.getByTestId("usage-panel")).not.toContainText("暂时无法读取");
+    await expectNoHorizontalOverflow(page);
+    await expectPrimaryTouchTargets(page);
   });
 
   test("手机端目标与运行控制均保持至少 44px 触控高度", async ({ page }) => {
@@ -145,32 +181,97 @@ test.describe("六视口布局契约", () => {
         expect(box?.width ?? 0).toBeGreaterThanOrEqual(44);
       }
 
-      const goalText = page.locator(".composer-goal-button > span");
+      const goalRow = page.locator(".composer__goal-row");
+      const contextRow = page.locator(".composer__context-bar");
+      const [goalBox, contextBox] = await Promise.all([
+        goalRow.boundingBox(),
+        contextRow.boundingBox(),
+      ]);
+      expect(
+        goalBox === null ? Number.POSITIVE_INFINITY : goalBox.y + goalBox.height,
+      ).toBeLessThanOrEqual((contextBox?.y ?? 0) + 1);
+
+      const goalText = page.locator(".composer-goal__summary strong");
       await expect(goalText).toContainText("完成移动端复杂状态验收");
       const goalPresentation = await goalText.evaluate((element) => {
         const style = window.getComputedStyle(element);
         const rect = element.getBoundingClientRect();
-        const buttonRect = element.parentElement?.getBoundingClientRect();
+        const buttonRect = element.closest("button")?.getBoundingClientRect();
         return {
-          overflow: style.overflow,
-          textOverflow: style.textOverflow,
           whiteSpace: style.whiteSpace,
-          oneLine: rect.height <= Number.parseFloat(style.lineHeight) + 1,
           insideButton: buttonRect ? rect.right <= buttonRect.right + 1 : false,
+          visibleHeight: rect.height,
         };
       });
-      expect(goalPresentation).toEqual({
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-        oneLine: true,
-        insideButton: true,
-      });
+      expect(goalPresentation.whiteSpace).toBe("normal");
+      expect(goalPresentation.insideButton).toBe(true);
+      expect(goalPresentation.visibleHeight).toBeGreaterThan(0);
 
       await expectNoHorizontalOverflow(page);
     } finally {
       await runtime.close();
     }
+  });
+
+  test("手机端折叠输入框与发送控件互不覆盖", async ({ page }) => {
+    if ((page.viewportSize()?.width ?? 0) > 412) return;
+    await login(page);
+    await page.goto("./?demo=1#/threads/thread-active");
+
+    await expect(page.getByTestId("conversation-loading")).toHaveCount(0);
+    const shell = page.locator(".composer-shell--collapsed");
+    await expect(shell).toBeVisible();
+    const textarea = page.getByTestId("turn-composer");
+    const footer = shell.locator(".composer__footer");
+    await expect(textarea).toBeVisible();
+    await expect(footer).toBeVisible();
+    const [textareaBox, footerBox] = await Promise.all([
+      textarea.boundingBox(),
+      footer.boundingBox(),
+    ]);
+    expect(
+      textareaBox === null ? Number.POSITIVE_INFINITY : textareaBox.x + textareaBox.width,
+    ).toBeLessThanOrEqual((footerBox?.x ?? 0) + 1);
+    await expectNoHorizontalOverflow(page);
+  });
+
+  test("手机端逐个移除附件不会关闭选择器或误收起输入框", async ({ page }) => {
+    if ((page.viewportSize()?.width ?? 0) > 412) return;
+    await login(page);
+    await page.evaluate(() => {
+      const attachments = Array.from({ length: 13 }, (_, index) => ({
+        kind: "file",
+        relativePath: `file-${String(index + 1).padStart(2, "0")}.txt`,
+        uploadId: `upload-${String(index + 1).padStart(2, "0")}`,
+      }));
+      window.localStorage.setItem(
+        "conversation-attachments:thread-active",
+        JSON.stringify(attachments),
+      );
+    });
+    await page.goto("./?demo=1#/threads/thread-active");
+    await expect(page.getByTestId("conversation-loading")).toHaveCount(0);
+
+    const composer = page.getByTestId("turn-composer");
+    await composer.focus();
+    await page.getByTestId("composer-tools-open").click();
+    const tools = page.getByRole("dialog").filter({ hasText: "对话工具" });
+    await tools.getByRole("button", { name: /^添加文件/u }).click();
+
+    const picker = page.getByRole("dialog").filter({ hasText: "从此设备上传" });
+    await expect(picker).toBeVisible();
+    const removeButtons = picker.getByRole("button", { name: /^移除 /u });
+    await expect(removeButtons).toHaveCount(13);
+    await removeButtons.first().click();
+    await expect(picker).toBeVisible();
+    await expect(removeButtons).toHaveCount(12);
+
+    await picker.getByRole("button", { name: "取消", exact: true }).click();
+    await expect(picker).toHaveCount(0);
+    const composerShell = page.locator(".composer-shell");
+    await expect(composerShell).not.toHaveClass(/composer-shell--collapsed/u);
+    await expect(composerShell.locator(".attachment-chip")).toHaveCount(13);
+    await expectNoHorizontalOverflow(page);
   });
 
   test("运行中只显示真实最新动作，不显示计时、历史思考框或边框", async ({ page }) => {

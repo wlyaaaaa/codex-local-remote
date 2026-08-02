@@ -124,6 +124,26 @@ function createSession(
 }
 
 describe("probeAppServerCapabilities", () => {
+  it("probes account identity without refreshing credentials and isolates its failure", async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === "account/read") {
+        throw new RpcRequestError(method, -32_000, "Temporarily unavailable");
+      }
+      return {};
+    });
+
+    const capabilities = await probeAppServerCapabilities(request, 50);
+
+    expect(request).toHaveBeenCalledWith(
+      "account/read",
+      { refreshToken: false },
+      { timeoutMs: 50 },
+    );
+    expect(capabilities.account).toEqual({ reason: "probe-failed", state: "degraded" });
+    expect(capabilities.rateLimits).toEqual({ state: "available" });
+    expect(capabilities.usage).toEqual({ state: "available" });
+  });
+
   it("keeps startup usable when optional methods are missing or temporarily fail", async () => {
     const request = vi.fn(async (method: string) => {
       if (method === "collaborationMode/list") {

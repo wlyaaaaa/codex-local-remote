@@ -276,27 +276,14 @@ function Get-DeferredHandoffLaunchReceiptObservation {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$Path
+        [string]$DataDir
     )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return [pscustomobject]@{
-            IsValid = $false
-            CorrelationId = $null
-            RecordedAtUtc = $null
-        }
-    }
     try {
-        $receipt = Get-Content `
-            -LiteralPath $Path `
-            -Raw `
-            -Encoding utf8 |
-            ConvertFrom-Json -Depth 10 -DateKind String
-        if ([string]$receipt.Signature -cne
-                'codex-local-remote/desktop-launch/v2' -or
-            [int]$receipt.Version -ne 2 -or
+        $receipt = Read-CodexDesktopLaunchReceipt -DataDir $DataDir
+        if ($null -eq $receipt -or
             [string]$receipt.CorrelationId -cnotmatch '^[0-9a-f]{32}$') {
-            throw 'The launch receipt identity is invalid.'
+            throw 'The launch receipt is unavailable or invalid.'
         }
         $recordedAtUtc = [DateTimeOffset]::Parse(
             [string]$receipt.RecordedAtUtc,
@@ -1242,12 +1229,9 @@ if (-not $DefinitionOnly) {
                 'waiting; this worker is stale and will not launch.'
             )
         }
-        $launchReceiptPath = Join-Path `
-            $resolvedDataDir `
-            'desktop-launch-last.json'
         $launchReceiptBaseline = (
             Get-DeferredHandoffLaunchReceiptObservation `
-                -Path $launchReceiptPath
+                -DataDir $resolvedDataDir
         )
         $launchStartedAt = [DateTimeOffset]::UtcNow
         $launchRequest = & $launcherPath `
@@ -1292,11 +1276,8 @@ if (-not $DefinitionOnly) {
                     -Raw `
                     -Encoding utf8 |
                     ConvertFrom-Json -Depth 20 -DateKind String
-                $launchReceipt = Get-Content `
-                    -LiteralPath $launchReceiptPath `
-                    -Raw `
-                    -Encoding utf8 |
-                    ConvertFrom-Json -Depth 10 -DateKind String
+                $launchReceipt =
+                    Read-CodexDesktopLaunchReceipt -DataDir $resolvedDataDir
                 $verificationCandidate = (
                     Test-DeferredHandoffVerificationCandidate `
                         -CurrentRuntime $current `

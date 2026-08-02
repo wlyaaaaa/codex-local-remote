@@ -1,11 +1,13 @@
 import type { UsageSnapshot } from "@codex-local-remote/contracts";
 import { describe, expect, it } from "vitest";
 import {
+  codexAccountPresentation,
   contextPresentation,
   contextUsageOrbLabel,
   formatUtc8Time,
   quotaPresentation,
   remainingContextPercentLabel,
+  usageAvailabilityMessage,
 } from "./usage-display";
 
 function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
@@ -25,6 +27,57 @@ function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
 }
 
 describe("额度圆环与 UTC+8 展示", () => {
+  it("显示 Codex 账号安全投影，并为旧快照保留诚实降级", () => {
+    expect(
+      codexAccountPresentation(
+        snapshot({
+          codexAccount: { email: "user@example.com", type: "chatgpt" },
+          plan: "Plus",
+        }),
+      ),
+    ).toEqual({ detail: "user@example.com", status: "Plus", tone: "success" });
+    expect(codexAccountPresentation(snapshot({ codexAccount: { type: "apiKey" } }))).toEqual({
+      detail: "OpenAI API Key",
+      status: "已配置",
+      tone: "success",
+    });
+    expect(codexAccountPresentation(undefined)).toEqual({
+      detail: "账号信息暂时无法读取",
+      status: "暂时不可用",
+      tone: "warning",
+    });
+  });
+
+  it("把同一根因的额度错误合并成一条可行动提示", () => {
+    expect(
+      usageAvailabilityMessage(
+        snapshot({
+          availability: {
+            account: "available",
+            rateLimits: "temporarily-unavailable",
+            tokenUsage: "temporarily-unavailable",
+          },
+          codexAccount: { email: "user@example.com", type: "chatgpt" },
+          windows: [],
+        }),
+      ),
+    ).toBe(
+      "Codex 已登录，但额度、Credits 与 Token 用量暂时无法读取。请检查电脑的系统网络或代理后重试。",
+    );
+    expect(
+      usageAvailabilityMessage(
+        snapshot({
+          availability: {
+            account: "available",
+            rateLimits: "available",
+            tokenUsage: "available",
+          },
+        }),
+      ),
+    ).toBeUndefined();
+    expect(usageAvailabilityMessage(snapshot())).toBeUndefined();
+  });
+
   it("所有重置时间都明确转换为 UTC+8，而不是浏览器本地时区", () => {
     expect(formatUtc8Time("2026-07-26T10:05:00.000Z")).toBe("2026年7月26日 18:05（UTC+8）");
     expect(formatUtc8Time("not-a-date")).toBe("暂时无法读取");

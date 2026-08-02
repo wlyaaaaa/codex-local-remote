@@ -134,6 +134,11 @@ function Test-OnDemandRuntimePathEqual {
     )
 }
 
+function Assert-OnDemandRuntimeFreshForDesktopSwitch {
+    param([object]$ExpectedRuntime)
+    return $ExpectedRuntime
+}
+
 function Get-CodexLocalRemoteDesiredMode {
     param([string]$DataDir)
     $null = $DataDir

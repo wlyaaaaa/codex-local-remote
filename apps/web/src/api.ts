@@ -209,7 +209,42 @@ export const EVENT_SOURCE_CLOSED = 2;
 export const EVENT_SOURCE_CONNECTING = 0;
 export const EVENT_SOURCE_OPEN = 1;
 export const EVENT_STREAM_OFFLINE_GRACE_MS = 3_000;
+// A reconnect already in flight gets one bounded confirmation window before
+// the UI disables mutations; repeated retries cannot extend this deadline.
+export const EVENT_STREAM_OFFLINE_CONFIRM_MS = 2_000;
+// Once offline is visible, require a newly opened stream to stay quiet long
+// enough that a half-second reconnect flap cannot hide the real outage.
+export const EVENT_STREAM_ONLINE_STABILITY_MS = 750;
 export const EVENT_STREAM_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000] as const;
+const TRANSIENT_MUTATION_RETRY_DELAY_MS = 300;
+const TRANSIENT_MUTATION_RETRY_MAX_MS = 5_000;
+
+type RetryWait = (delayMs: number) => Promise<void>;
+
+function defaultRetryWait(delayMs: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, delayMs));
+}
+
+function transientMutationRetryDelay(response: Response): number | undefined {
+  const retryAfter = response.headers.get("retry-after")?.trim();
+  const isUnqualifiedGatewayFailure = response.status === 502 || response.status === 504;
+  const isQualifiedServiceRecovery =
+    response.status === 503 && retryAfter !== undefined && retryAfter.length > 0;
+  if (!isUnqualifiedGatewayFailure && !isQualifiedServiceRecovery) {
+    return undefined;
+  }
+  if (retryAfter === undefined || retryAfter.length === 0) {
+    return TRANSIENT_MUTATION_RETRY_DELAY_MS;
+  }
+  const seconds = Number(retryAfter);
+  const requestedMs = Number.isFinite(seconds)
+    ? seconds * 1_000
+    : Date.parse(retryAfter) - Date.now();
+  if (!Number.isFinite(requestedMs)) {
+    return TRANSIENT_MUTATION_RETRY_DELAY_MS;
+  }
+  return Math.min(TRANSIENT_MUTATION_RETRY_MAX_MS, Math.max(0, requestedMs));
+}
 
 export interface EventStreamSource {
   readonly readyState: number;
@@ -366,7 +401,9 @@ export function subscribeRemoteEvents(
   },
 ): () => void {
   let currentSource: EventStreamSource | undefined;
-  let offlineTimer: number | undefined;
+  let offlineConfirmationTimer: number | undefined;
+  let offlineGraceTimer: number | undefined;
+  let onlineStabilityTimer: number | undefined;
   let retryTimer: number | undefined;
   let retryAttempt = 0;
   let disposed = false;
@@ -386,16 +423,39 @@ export function subscribeRemoteEvents(
   };
 
   const clearOffline = () => {
-    if (offlineTimer === undefined) return;
-    dependencies.cancel(offlineTimer);
-    offlineTimer = undefined;
+    if (offlineGraceTimer !== undefined) {
+      dependencies.cancel(offlineGraceTimer);
+      offlineGraceTimer = undefined;
+    }
+    if (offlineConfirmationTimer !== undefined) {
+      dependencies.cancel(offlineConfirmationTimer);
+      offlineConfirmationTimer = undefined;
+    }
+  };
+
+  const clearOnlineStability = () => {
+    if (onlineStabilityTimer === undefined) return;
+    dependencies.cancel(onlineStabilityTimer);
+    onlineStabilityTimer = undefined;
   };
 
   const scheduleOffline = () => {
-    if (disposed || offlineTimer !== undefined || lastConnectionState === false) return;
-    offlineTimer = dependencies.schedule(() => {
-      offlineTimer = undefined;
-      if (!disposed) reportConnection(false);
+    clearOnlineStability();
+    if (
+      disposed ||
+      offlineGraceTimer !== undefined ||
+      offlineConfirmationTimer !== undefined ||
+      lastConnectionState === false
+    ) {
+      return;
+    }
+    offlineGraceTimer = dependencies.schedule(() => {
+      offlineGraceTimer = undefined;
+      if (disposed || lastConnectionState === false) return;
+      offlineConfirmationTimer = dependencies.schedule(() => {
+        offlineConfirmationTimer = undefined;
+        if (!disposed) reportConnection(false);
+      }, EVENT_STREAM_OFFLINE_CONFIRM_MS);
     }, EVENT_STREAM_OFFLINE_GRACE_MS);
   };
 
@@ -428,10 +488,19 @@ export function subscribeRemoteEvents(
       retryAttempt = 0;
       clearRetry();
       clearOffline();
-      reportConnection(true);
+      if (lastConnectionState !== false) {
+        reportConnection(true);
+        return;
+      }
+      clearOnlineStability();
+      onlineStabilityTimer = dependencies.schedule(() => {
+        onlineStabilityTimer = undefined;
+        if (!disposed && currentSource === source) reportConnection(true);
+      }, EVENT_STREAM_ONLINE_STABILITY_MS);
     };
     source.onerror = () => {
       if (disposed || currentSource !== source) return;
+      clearOnlineStability();
       scheduleOffline();
       if (source.readyState !== EVENT_SOURCE_CLOSED) return;
       source.close();
@@ -453,6 +522,7 @@ export function subscribeRemoteEvents(
   return () => {
     disposed = true;
     clearOffline();
+    clearOnlineStability();
     clearRetry();
     const source = currentSource;
     currentSource = undefined;
@@ -514,10 +584,16 @@ export class HttpApiClient implements ApiClient {
   private csrfToken: string | undefined;
   private readonly fetcher: typeof fetch;
   private readonly pendingIdempotencyKeys = new Map<string, string>();
+  private readonly waitForRetry: RetryWait;
 
-  constructor(apiRoot = initialApiRoot(), fetcher: typeof fetch = fetch) {
+  constructor(
+    apiRoot = initialApiRoot(),
+    fetcher: typeof fetch = fetch,
+    waitForRetry: RetryWait = defaultRetryWait,
+  ) {
     this.apiRoot = apiRoot;
     this.fetcher = (input, init) => fetcher(input, init);
+    this.waitForRetry = waitForRetry;
   }
 
   private updateBasePath(basePath: string) {
@@ -555,11 +631,38 @@ export class HttpApiClient implements ApiClient {
       });
     };
 
+    const canRetryTransiently =
+      options.idempotent === true &&
+      options.mutation === true &&
+      idempotencyKey !== undefined &&
+      options.signal?.aborted !== true;
     let response: Response;
+    let transientRetryUsed = false;
     try {
       response = await execute();
     } catch {
-      throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
+      if (!canRetryTransiently) {
+        throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
+      }
+      transientRetryUsed = true;
+      await this.waitForRetry(TRANSIENT_MUTATION_RETRY_DELAY_MS);
+      try {
+        response = await execute();
+      } catch {
+        throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
+      }
+    }
+    if (!transientRetryUsed && canRetryTransiently) {
+      const retryDelay = transientMutationRetryDelay(response);
+      if (retryDelay !== undefined) {
+        transientRetryUsed = true;
+        await this.waitForRetry(retryDelay);
+        try {
+          response = await execute();
+        } catch {
+          throw new ApiRequestError("无法连接到电脑，请检查网络后重试。", 0, "OFFLINE");
+        }
+      }
     }
 
     if (!response.ok) {
@@ -991,40 +1094,21 @@ export class HttpApiClient implements ApiClient {
       name: file.name,
       relativePath,
     });
-    const headers = new Headers({
-      Accept: "application/json",
-      "Content-Type": "application/octet-stream",
-      "Idempotency-Key": crypto.randomUUID(),
-    });
-    if (this.csrfToken) headers.set("X-CSRF-Token", this.csrfToken);
-
-    let response: Response;
     try {
-      response = await fetch(`${this.apiRoot}/uploads?${query.toString()}`, {
+      return await this.request<LocalInputReference>(`/uploads?${query.toString()}`, {
         body: file,
-        credentials: "same-origin",
-        headers,
+        headers: { "Content-Type": "application/octet-stream" },
+        idempotencyKey: crypto.randomUUID(),
+        idempotent: true,
         method: "POST",
+        mutation: true,
       });
-    } catch {
-      throw new ApiRequestError("上传中断，请检查网络后重新选择。", 0, "OFFLINE");
-    }
-    if (!response.ok) {
-      const fallback = `上传失败（${response.status}）`;
-      let message = fallback;
-      let code = "UPLOAD_FAILED";
-      try {
-        const payload = (await response.json()) as {
-          error?: { code?: string; message?: string };
-        };
-        message = payload.error?.message ?? fallback;
-        code = payload.error?.code ?? code;
-      } catch {
-        // Non-JSON errors are intentionally collapsed into a product-safe message.
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.code === "OFFLINE") {
+        throw new ApiRequestError("上传中断，请检查网络后重新选择。", 0, "OFFLINE");
       }
-      throw new ApiRequestError(message, response.status, code);
+      throw error;
     }
-    return (await response.json()) as LocalInputReference;
   }
 
   files(projectId: string, path: string) {

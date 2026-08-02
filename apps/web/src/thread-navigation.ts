@@ -353,6 +353,8 @@ function mergeConversationItems(
   const currentById = new Map(currentItems.map((item) => [item.id, item]));
   const contextCompactionAliasIds = findContextCompactionAliasIds(persistedOrder, currentItems);
   const optimisticSteerAliases = findOptimisticSteerAliases(persistedOrder, currentItems);
+  const liveUserRefreshAliases = findLiveUserRefreshAliases(persistedOrder, currentItems);
+  const userAliases = new Map([...optimisticSteerAliases, ...liveUserRefreshAliases]);
   const terminalTextAliasIds = reconcileTerminalTextAliases
     ? findTerminalTextAliasIds(persistedOrder, currentItems)
     : new Set<string>();
@@ -370,7 +372,7 @@ function mergeConversationItems(
       if (
         (dropUnpersistedRunningTools && item.kind === "tool" && item.status === "running") ||
         contextCompactionAliasIds.has(item.id) ||
-        optimisticSteerAliases.has(item.id) ||
+        userAliases.has(item.id) ||
         terminalTextAliasIds.has(item.id) ||
         isCurrentTurnAssistantAlias(item, persistedOrder, currentItems)
       ) {
@@ -379,12 +381,7 @@ function mergeConversationItems(
       retainedCurrentOnly.add(item.id);
     }
   }
-  return mergeCurrentOnlyItemsInStableOrder(
-    merged,
-    currentItems,
-    retainedCurrentOnly,
-    optimisticSteerAliases,
-  );
+  return mergeCurrentOnlyItemsInStableOrder(merged, currentItems, retainedCurrentOnly, userAliases);
 }
 
 function mergeCurrentOnlyItemsInStableOrder(
@@ -532,6 +529,42 @@ function findOptimisticSteerAliases(
     aliases.set(item.id, match.id);
     consumedPersistedIds.add(match.id);
   }
+  return aliases;
+}
+
+function findLiveUserRefreshAliases(
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const currentIds = new Set(currentItems.map((item) => item.id));
+  const persistedIds = new Set(persistedOrder.map((item) => item.id));
+  const consumedPersistedIds = new Set<string>();
+  const candidates = persistedOrder.filter(
+    (item): item is Extract<ConversationItem, { kind: "user-message" }> =>
+      item.kind === "user-message" && item.turnId !== undefined && !currentIds.has(item.id),
+  );
+
+  for (const item of currentItems) {
+    if (
+      item.kind !== "user-message" ||
+      item.turnId === undefined ||
+      persistedIds.has(item.id) ||
+      item.id.startsWith("pending-steer-")
+    ) {
+      continue;
+    }
+    const match = candidates.find(
+      (persisted) =>
+        !consumedPersistedIds.has(persisted.id) &&
+        persisted.turnId === item.turnId &&
+        persisted.text === item.text,
+    );
+    if (!match) continue;
+    aliases.set(item.id, match.id);
+    consumedPersistedIds.add(match.id);
+  }
+
   return aliases;
 }
 

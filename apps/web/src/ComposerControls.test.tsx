@@ -1,4 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type {
   ApprovalRequest,
@@ -13,9 +14,11 @@ import {
   ComposerContextRows,
   DeliveryModeSwitch,
   GoalSheet,
+  GoalInlineControl,
   InlineDecisionStack,
   PlanProgressControl,
   QueueShelf,
+  reasoningEffortLabel,
 } from "./ComposerControls";
 
 const model: ModelOption = {
@@ -193,6 +196,22 @@ describe("composer 组件结构", () => {
     expect(html).toContain("排队");
     expect(html).not.toContain("下一轮");
     expect(html).toContain('aria-pressed="true"');
+    expect(html).toContain('class="delivery-switch__compact-label">当前</span>');
+  });
+
+  it("移动端工具栏保留短标签并禁止计划步数折断", () => {
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+
+    expect(css).toMatch(
+      /\.composer-plan-progress\s*>\s*summary\s+strong\s*\{[^}]*white-space:\s*nowrap;/su,
+    );
+    expect(css).toMatch(
+      /@media \(max-width: 700px\)[\s\S]*?\.delivery-switch__label[^}]*\{[^}]*display:\s*none;/u,
+    );
+    expect(css).toMatch(
+      /@media \(max-width: 700px\)[\s\S]*?\.delivery-switch__compact-label\s*\{[^}]*display:\s*inline;/u,
+    );
+    expect(css).not.toMatch(/\.composer__context-bar[^}]*word-break:\s*(?:break-all|break-word)/u);
   });
 
   it("计划进度以输入区右侧胶囊展示并可展开全部步骤", () => {
@@ -288,6 +307,88 @@ describe("composer 组件结构", () => {
       />,
     );
     expect(pausedHtml).toContain("继续目标");
+  });
+
+  it("目标独占一行完整展示并直接提供暂停继续开始和删除", () => {
+    const goal = {
+      threadId: "thread-goal",
+      objective: "完成完整目标文本，不截断任何验收条件，并保持移动端可连续操作。",
+      status: "active" as const,
+      tokensUsed: 10,
+      timeUsedSeconds: 20,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:01:00.000Z",
+    };
+    const activeHtml = renderToStaticMarkup(
+      <GoalInlineControl
+        busy={false}
+        goal={goal}
+        onClear={() => undefined}
+        onOpen={() => undefined}
+        onStatusChange={() => undefined}
+      />,
+    );
+    expect(activeHtml).toContain(goal.objective);
+    expect(activeHtml).toContain("暂停");
+    expect(activeHtml).toContain("删除");
+    expect(activeHtml).not.toContain("text-overflow");
+
+    const pausedHtml = renderToStaticMarkup(
+      <GoalInlineControl
+        busy={false}
+        goal={{ ...goal, status: "paused" }}
+        onClear={() => undefined}
+        onOpen={() => undefined}
+        onStatusChange={() => undefined}
+      />,
+    );
+    expect(pausedHtml).toContain("继续");
+
+    const completedHtml = renderToStaticMarkup(
+      <GoalInlineControl
+        busy={false}
+        goal={{ ...goal, status: "complete" }}
+        onClear={() => undefined}
+        onOpen={() => undefined}
+        onStatusChange={() => undefined}
+      />,
+    );
+    expect(completedHtml).toContain("开始");
+  });
+
+  it("Ultra 在默认和已选位置统一只显示 Ultra", () => {
+    expect(reasoningEffortLabel("ultra")).toBe("Ultra");
+    expect(reasoningEffortLabel("max")).toBe("最高");
+    expect(
+      renderToStaticMarkup(
+        <ComposerSettingsButton
+          effort="ultra"
+          model={model.id}
+          models={[
+            { ...model, supportedReasoningEfforts: ["ultra"], defaultReasoningEffort: "ultra" },
+          ]}
+          onEffort={() => undefined}
+          onModel={() => undefined}
+          onOpen={() => undefined}
+          serviceTiersSupported={false}
+        />,
+      ),
+    ).toContain("Ultra");
+    expect(
+      renderToStaticMarkup(
+        <ComposerSettingsButton
+          effort="ultra"
+          model={model.id}
+          models={[
+            { ...model, supportedReasoningEfforts: ["ultra"], defaultReasoningEffort: "ultra" },
+          ]}
+          onEffort={() => undefined}
+          onModel={() => undefined}
+          onOpen={() => undefined}
+          serviceTiersSupported={false}
+        />,
+      ),
+    ).not.toContain("最高");
   });
 
   it("当前线程的结构化问题固定显示在对话内", () => {

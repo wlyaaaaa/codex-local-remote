@@ -132,6 +132,7 @@ function approval(id: string, title: string, choiceSuffix: string): ApprovalRequ
 
 export class SharedRuntime {
   readonly goalUpdates: Array<SetThreadGoalInput | null> = [];
+  readonly historyRequests: string[] = [];
   readonly settingsUpdates: Array<Record<string, string | null | undefined>> = [];
   private readonly contexts = new Set<BrowserContext>();
   private sequence = 0;
@@ -142,8 +143,9 @@ export class SharedRuntime {
 
   constructor({
     complexState = false,
+    deferredHistory = false,
     longWorkLog = false,
-  }: { complexState?: boolean; longWorkLog?: boolean } = {}) {
+  }: { complexState?: boolean; deferredHistory?: boolean; longWorkLog?: boolean } = {}) {
     this.thread = {
       id: "shared-running-thread",
       title: "双客户端实时同步自动验收",
@@ -204,6 +206,10 @@ export class SharedRuntime {
         updateSettings: true,
       },
     };
+    if (deferredHistory) {
+      this.thread.historyLoadPolicy = "explicit";
+      this.thread.historyNextCursor = "persisted-page-2";
+    }
     if (complexState) {
       const goalTimestamp = now();
       this.goal = {
@@ -673,7 +679,26 @@ export class SharedRuntime {
     }
 
     if (segments[0] === "threads" && segments[1] === this.thread.id) {
-      if (segments.length === 2 && method === "GET") return this.json(route, this.thread);
+      if (segments.length === 2 && method === "GET") {
+        const historyCursor = url.searchParams.get("historyCursor");
+        if (historyCursor !== null) {
+          this.historyRequests.push(historyCursor);
+          return this.json(route, {
+            ...this.thread,
+            historyLoadPolicy: "explicit",
+            historyNextCursor: undefined,
+            items: [
+              {
+                id: "shared-older-message",
+                kind: "user-message",
+                text: "这是从本地固定窗口安全加载的更早记录。",
+                createdAt: now(),
+              },
+            ],
+          });
+        }
+        return this.json(route, this.thread);
+      }
       if (segments[2] === "subagents" && method === "GET") return this.json(route, []);
       if (segments[2] === "goal" && method === "GET") {
         return this.json(route, { goal: this.goal });

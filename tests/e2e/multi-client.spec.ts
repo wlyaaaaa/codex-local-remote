@@ -1,7 +1,14 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  EVENT_STREAM_OFFLINE_CONFIRM_MS,
+  EVENT_STREAM_OFFLINE_GRACE_MS,
+} from "../../apps/web/src/api.js";
 import { expectNoHorizontalOverflow } from "./helpers.js";
 import { openSharedThread, runtimeModels, SharedRuntime } from "./shared-runtime.js";
+
+const confirmedDisconnectTimeoutMs =
+  EVENT_STREAM_OFFLINE_GRACE_MS + EVENT_STREAM_OFFLINE_CONFIRM_MS + 5_000;
 
 test.beforeEach(({ browser: _browser }, testInfo) => {
   test.skip(
@@ -443,7 +450,7 @@ test.describe("412×915 动态复杂态 UI", () => {
     }
   });
 
-  test("输入框可反复展开，二十个附件不遮挡发送和停止操作", async ({ browser }) => {
+  test("草稿和二十个附件阻止输入框误收起，发送和停止操作不被遮挡", async ({ browser }) => {
     const runtime = new SharedRuntime();
     const mobile = await browser.newContext({
       colorScheme: "light",
@@ -475,18 +482,12 @@ test.describe("412×915 动态复杂态 UI", () => {
       await composer.fill(draft);
       for (let attempt = 0; attempt < 4; attempt += 1) {
         await page.locator(".conversation-header").click();
-        await expect(composer).toHaveValue(/…$/u);
+        await expect(page.locator(".composer-shell")).not.toHaveClass(/composer-shell--collapsed/u);
+        await expect(composer).toHaveValue(draft);
         await composer.click();
         await expect(page.getByRole("dialog")).toHaveCount(0);
         await expect(composer).toHaveValue(draft);
-        await expect
-          .poll(() =>
-            composer.evaluate((element) => ({
-              end: (element as HTMLTextAreaElement).selectionEnd,
-              length: (element as HTMLTextAreaElement).value.length,
-            })),
-          )
-          .toEqual({ end: draft.length, length: draft.length });
+        await expect(composer).toBeFocused();
       }
 
       const chips = page.locator(".attachment-chips");
@@ -762,7 +763,10 @@ test.describe("412×915 动态复杂态 UI", () => {
 
       await test.step("连接中断保留草稿与复制入口，并移除不可执行的停止入口", async () => {
         await runtime.setOnline(false);
-        await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible();
+        await expect(page.getByText("实时更新已中断", { exact: true })).toHaveCount(0);
+        await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible({
+          timeout: confirmedDisconnectTimeoutMs,
+        });
         const composer = page.getByTestId("turn-composer");
         await expect(composer).toBeVisible();
         await expect(composer).toHaveValue("离线也要能够复制的草稿");

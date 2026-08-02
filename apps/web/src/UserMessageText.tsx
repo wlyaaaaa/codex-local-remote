@@ -7,8 +7,8 @@ const HOST_FILE_MANIFEST =
   /^[ \t]*#{1,6}[ \t]+Files mentioned by the user:[ \t]*(?:\r\n|\n|\r)(?:(?!^[ \t]*#{1,6}[ \t]+My request for Codex:)[\s\S])*?(?=^[ \t]*#{1,6}[ \t]+My request for Codex:)/gmu;
 const HOST_REQUEST_HEADING =
   /^[ \t]*#{1,6}[ \t]+My request for Codex(?::[ \t]*)?(.*?)(\r\n|\n|\r|$)/gmu;
-const HOST_IMAGE_MARKER =
-  /^[ \t]*<image[ \t]+name=\[Image #[0-9]+\][ \t]+path="[^"\r\n]*">[ \t]*(?:\r\n|\n|\r|$)/gmu;
+const HOST_IMAGE_SCAFFOLDING_LINE =
+  /^[ \t]*(<image[ \t]+name=\[Image #[0-9]+\][ \t]+path="[^"\r\n]*">|<\/image>)[ \t]*(?:\r\n|\n|\r|$)/gmu;
 
 export function UserMessageText({ children }: { children: string }) {
   return <div className="user-message-text">{stripInjectedMessageScaffolding(children)}</div>;
@@ -27,13 +27,28 @@ export function stripInjectedMessageScaffolding(message: string): string {
     (_match, inlineContent: string, lineEnding: string) =>
       inlineContent.length > 0 ? `${inlineContent}${lineEnding}` : "",
   );
-  visible = visible.replace(HOST_IMAGE_MARKER, "");
+  visible = stripHostImageScaffolding(visible);
   return trimBlankSeparatorLines(visible);
 }
 
 // Kept as a compatibility export for callers and older tests that used the
 // narrower name before all host scaffolding was removed in one place.
 export const stripInjectedBrowserContext = stripInjectedMessageScaffolding;
+
+function stripHostImageScaffolding(message: string): string {
+  let pendingHostImageClosings = 0;
+  return message.replace(HOST_IMAGE_SCAFFOLDING_LINE, (line, marker: string) => {
+    if (marker.startsWith("<image")) {
+      pendingHostImageClosings += 1;
+      return "";
+    }
+    if (pendingHostImageClosings > 0) {
+      pendingHostImageClosings -= 1;
+      return "";
+    }
+    return line;
+  });
+}
 
 function stripCompleteTaggedBlocks(message: string, open: string, close: string): string {
   let cursor = 0;

@@ -118,6 +118,7 @@ function createService(
       threadId: string,
       sessionPath?: string,
       scope?: PersistedConversationHistoryScope,
+      historyCursor?: string,
     ) => Promise<ConversationItem[] | PersistedConversationReadResult>;
     readPersistedRuntimeSettings?: (
       threadId: string,
@@ -126,7 +127,14 @@ function createService(
     readPersistedThreadHead?: (
       threadId: string,
       sessionPath?: string,
-    ) => Promise<{ activeTurnId?: string; sourceBytes: number } | undefined>;
+    ) => Promise<
+      | {
+          activeTurnId?: string;
+          controlState?: "active" | "idle" | "unknown";
+          sourceBytes: number;
+        }
+      | undefined
+    >;
     persistManagedThread?: (
       threadId: string,
       options: { desktopNotificationPending: boolean },
@@ -2343,6 +2351,7 @@ describe("CodexDomainService", () => {
     );
 
     await expect(service.getThread(threadFixture.id)).resolves.toMatchObject({
+      historyNextCursor: "older",
       items: [{ id: "message-recent", kind: "user-message", text: "最近消息" }],
     });
     expect(calls).toEqual([
@@ -2353,6 +2362,123 @@ describe("CodexDomainService", () => {
       {
         method: "thread/turns/list",
         params: {
+          itemsView: "full",
+          limit: 12,
+          sortDirection: "desc",
+          threadId: threadFixture.id,
+        },
+      },
+    ]);
+  });
+
+  it("continues and exhausts turns-only history with the returned cursor", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const turnPage = (id: string, text: string) => ({
+      id,
+      items: [
+        {
+          content: [{ text, type: "text" }],
+          id: `message-${id}`,
+          type: "userMessage",
+        },
+      ],
+      status: "completed",
+    });
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, turns: [] } };
+        }
+        if (method === "thread/turns/list") {
+          const cursor = (params as { cursor?: string }).cursor;
+          if (cursor === "older") {
+            return { data: [turnPage("older", "更早消息")], nextCursor: "oldest" };
+          }
+          if (cursor === "oldest") {
+            return { data: [turnPage("oldest", "最早消息")] };
+          }
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { protocolCatalog: { clientMethods: ["thread/turns/list"] } },
+    );
+
+    await expect(
+      service.getThread(threadFixture.id, { historyCursor: "older" }),
+    ).resolves.toMatchObject({
+      historyNextCursor: "oldest",
+      items: [{ id: "message-older", kind: "user-message", text: "更早消息" }],
+    });
+    const oldest = await service.getThread(threadFixture.id, { historyCursor: "oldest" });
+    expect(oldest).toMatchObject({
+      items: [{ id: "message-oldest", kind: "user-message", text: "最早消息" }],
+    });
+    expect(oldest).not.toHaveProperty("historyNextCursor");
+    expect(calls).toEqual([
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: threadFixture.id },
+      },
+      {
+        method: "thread/turns/list",
+        params: {
+          cursor: "older",
+          itemsView: "full",
+          limit: 12,
+          sortDirection: "desc",
+          threadId: threadFixture.id,
+        },
+      },
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: threadFixture.id },
+      },
+      {
+        method: "thread/turns/list",
+        params: {
+          cursor: "oldest",
+          itemsView: "full",
+          limit: 12,
+          sortDirection: "desc",
+          threadId: threadFixture.id,
+        },
+      },
+    ]);
+  });
+
+  it("fails a turns-only cursor closed without falling back to unbounded history", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") {
+          return { thread: { ...threadFixture, turns: [] } };
+        }
+        if (method === "thread/turns/list") {
+          throw new Error("turn page unavailable");
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      { protocolCatalog: { clientMethods: ["thread/turns/list"] } },
+    );
+
+    await expect(
+      service.getThread(threadFixture.id, { historyCursor: "older" }),
+    ).rejects.toMatchObject({ code: "FEATURE_UNAVAILABLE", httpStatus: 409 });
+    expect(calls).toEqual([
+      {
+        method: "thread/read",
+        params: { includeTurns: false, threadId: threadFixture.id },
+      },
+      {
+        method: "thread/turns/list",
+        params: {
+          cursor: "older",
           itemsView: "full",
           limit: 12,
           sortDirection: "desc",
@@ -3166,14 +3292,38 @@ describe("CodexDomainService", () => {
       status: { activeFlags: [], type: "active" },
       turns: [],
     };
-    const readPersistedConversationItems = vi.fn(async () => [
-      {
-        id: "persisted-recent",
-        kind: "assistant-message" as const,
-        text: "最近的有界历史",
-        turnId: "tail-active-turn",
-      },
-    ]);
+    const localHistoryCursor = "persisted-jsonl-v1.eyJ2ZXJzaW9uIjoxfQ";
+    const readPersistedConversationItems = vi.fn(
+      async (
+        _threadId: string,
+        _sessionPath?: string,
+        _scope?: PersistedConversationHistoryScope,
+        historyCursor?: string,
+      ): Promise<PersistedConversationReadResult> => ({
+        ...(historyCursor === undefined ? { historyNextCursor: localHistoryCursor } : {}),
+        integrity: {
+          observedCount: 1,
+          reason: "recent-window",
+          scope: "recent",
+          status: "partial",
+        },
+        items: [
+          historyCursor === undefined
+            ? {
+                id: "persisted-recent",
+                kind: "assistant-message" as const,
+                text: "最近的有界历史",
+                turnId: "tail-active-turn",
+              }
+            : {
+                id: "persisted-older",
+                kind: "user-message" as const,
+                text: "更早的有界历史",
+                turnId: "tail-older-turn",
+              },
+        ],
+      }),
+    );
     const readPersistedThreadHead = vi.fn(async () => ({
       activeTurnId: "tail-active-turn",
       sourceBytes: 1_985_428_985,
@@ -3215,6 +3365,17 @@ describe("CodexDomainService", () => {
     expect(detail.items).toContainEqual(
       expect.objectContaining({ id: "persisted-recent", turnId: "tail-active-turn" }),
     );
+    expect(detail).toMatchObject({
+      historyLoadPolicy: "explicit",
+      historyNextCursor: localHistoryCursor,
+    });
+    const older = await service.getThread(desktopThread.id, {
+      historyCursor: localHistoryCursor,
+    });
+    expect(older).toMatchObject({
+      historyLoadPolicy: "explicit",
+      items: [{ id: "persisted-older", kind: "user-message" }],
+    });
     await expect(
       service.steerTurn(desktopThread.id, "tail-active-turn", "继续当前目标"),
     ).resolves.toMatchObject({ state: "running", turnId: "tail-active-turn" });
@@ -3242,6 +3403,133 @@ describe("CodexDomainService", () => {
       },
     ]);
     expect(readPersistedThreadHead).toHaveBeenCalledWith(desktopThread.id, desktopThread.path);
+    expect(readPersistedConversationItems).toHaveBeenNthCalledWith(
+      2,
+      desktopThread.id,
+      desktopThread.path,
+      "recent",
+      localHistoryCursor,
+    );
+  });
+
+  it("fails closed when bounded lifecycle recovery cannot prove the active turn", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const desktopThread = {
+      ...threadFixture,
+      id: "desktop-huge-unknown-control",
+      path: "C:\\sessions\\rollout-desktop-huge-unknown-control.jsonl",
+      status: { activeFlags: [], type: "active" },
+      turns: [],
+    };
+    let controlState: "idle" | "unknown" = "unknown";
+    const readPersistedThreadHead = vi.fn(async () => ({
+      controlState,
+      sourceBytes: 1_985_428_985,
+    }));
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/resume" || method === "thread/read") {
+          return { thread: desktopThread };
+        }
+        if (method === "thread/turns/list") {
+          throw new Error("huge rollout history must stay off the control path");
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        managedThreadIds: [desktopThread.id],
+        protocolCatalog: { clientMethods: ["thread/turns/list"] },
+        readPersistedThreadHead,
+        sharedAppServer: true,
+        sharedResumeDelaysMs: [0],
+      },
+    );
+
+    const unknown = await service.getThread(desktopThread.id, { includeTurns: false });
+    expect(unknown).toMatchObject({
+      availableActions: {
+        changeModelNextTurn: false,
+        interrupt: false,
+        reply: false,
+        steer: false,
+      },
+      state: "running",
+    });
+    expect(unknown.activeTurnId).toBeUndefined();
+    await expect(
+      service.startTurn(desktopThread.id, { prompt: "不要并发启动另一个回复" }),
+    ).rejects.toMatchObject({ code: "TURN_CONTROL_LOST" } satisfies Partial<DomainError>);
+    expect(calls.some((call) => call.method === "thread/turns/list")).toBe(false);
+    expect(calls.some((call) => call.method === "turn/start")).toBe(false);
+
+    controlState = "idle";
+    await expect(
+      service.getThread(desktopThread.id, { includeTurns: false }),
+    ).resolves.toMatchObject({
+      availableActions: {
+        changeModelNextTurn: true,
+        interrupt: false,
+        reply: true,
+        steer: false,
+      },
+      state: "running",
+    });
+  });
+
+  it("uses the bounded persisted page for a huge child instead of scanning complete history", async () => {
+    const calls: Array<{ method: string; params?: unknown }> = [];
+    const childThread = {
+      ...threadFixture,
+      id: "desktop-huge-child",
+      parentThreadId: "desktop-parent",
+      path: "C:\\sessions\\rollout-desktop-huge-child.jsonl",
+      turns: [],
+    };
+    const readPersistedConversationItems = vi.fn(
+      async (): Promise<PersistedConversationReadResult> => ({
+        historyNextCursor: "persisted-jsonl-v1.eyJ2ZXJzaW9uIjoxfQ",
+        integrity: {
+          observedCount: 1,
+          reason: "recent-window",
+          scope: "recent",
+          status: "partial",
+        },
+        items: [{ id: "huge-child-tail", kind: "assistant-message", text: "有界尾页" }],
+      }),
+    );
+    const service = createService(
+      async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/read") return { thread: childThread };
+        if (method === "thread/items/list" || method === "thread/turns/list") {
+          throw new Error("huge child must stay off app-server history");
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      undefined,
+      undefined,
+      {
+        protocolCatalog: { clientMethods: ["thread/items/list", "thread/turns/list"] },
+        readPersistedConversationItems,
+        readPersistedThreadHead: async () => ({ sourceBytes: 65 * 1024 * 1024 }),
+        sharedAppServer: true,
+      },
+    );
+
+    await expect(service.getThread(childThread.id)).resolves.toMatchObject({
+      historyLoadPolicy: "explicit",
+      items: [{ id: "huge-child-tail" }],
+    });
+    expect(readPersistedConversationItems).toHaveBeenCalledWith(
+      childThread.id,
+      childThread.path,
+      "recent",
+    );
+    expect(calls.some((call) => call.method === "thread/items/list")).toBe(false);
+    expect(calls.some((call) => call.method === "thread/turns/list")).toBe(false);
   });
 
   it("keeps cold shared pause, steer, and interrupt paths off thread/read when the persisted head fails", async () => {
@@ -6514,7 +6802,17 @@ describe("CodexDomainService", () => {
   it("projects account token history and credits from schema-native usage responses", async () => {
     const service = createService(async (method) => {
       if (method === "account/read") {
-        return { account: { planType: "plus" } };
+        return {
+          account: {
+            apiKey: "must-not-leak-api-key",
+            authSession: { csrfToken: "must-not-leak-csrf" },
+            email: "owner@example.com",
+            name: "must-not-leak-name",
+            planType: "plus",
+            type: "chatgpt",
+          },
+          authSession: { accessToken: "must-not-leak-access-token" },
+        };
       }
       if (method === "account/rateLimits/read") {
         return {
@@ -6555,6 +6853,15 @@ describe("CodexDomainService", () => {
 
     expect(result.degradations).toEqual([]);
     expect(result.data).toMatchObject({
+      availability: {
+        account: "available",
+        rateLimits: "available",
+        tokenUsage: "available",
+      },
+      codexAccount: {
+        email: "owner@example.com",
+        type: "chatgpt",
+      },
       credits: [
         {
           balance: "12.50",
@@ -6587,6 +6894,9 @@ describe("CodexDomainService", () => {
       ],
     });
     expect(typeof result.data.updatedAt).toBe("string");
+    const publicSnapshot = JSON.stringify(result.data);
+    expect(publicSnapshot).not.toContain("must-not-leak");
+    expect(publicSnapshot).not.toContain("authSession");
   });
 
   it("keeps quota and credits available when account usage history independently fails", async () => {
@@ -6615,6 +6925,11 @@ describe("CodexDomainService", () => {
     const result = await service.getUsage();
 
     expect(result.data).toMatchObject({
+      availability: {
+        account: "available",
+        rateLimits: "available",
+        tokenUsage: "temporarily-unavailable",
+      },
       credits: [{ hasCredits: true, id: "codex", unlimited: true }],
       plan: "plus",
       windows: [{ id: "codex-primary", usedPercent: 10 }],
@@ -6628,6 +6943,130 @@ describe("CodexDomainService", () => {
         message: "累计与每日用量暂时不可用。",
       },
     ]);
+  });
+
+  it("keeps quota and token history available when account identity independently fails", async () => {
+    const service = createService(async (method) => {
+      if (method === "account/read") {
+        throw new Error("account identity temporarily unavailable");
+      }
+      if (method === "account/rateLimits/read") {
+        return {
+          rateLimits: {
+            limitId: "codex",
+            limitName: "Codex",
+            primary: { resetsAt: null, usedPercent: 20 },
+          },
+        };
+      }
+      if (method === "account/usage/read") {
+        return { summary: { lifetimeTokens: "9000" } };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    const result = await service.getUsage();
+
+    expect(result.data).toMatchObject({
+      availability: {
+        account: "temporarily-unavailable",
+        rateLimits: "available",
+        tokenUsage: "available",
+      },
+      tokenUsageSummary: { lifetimeTokens: "9000" },
+      windows: [{ id: "codex-primary", usedPercent: 20 }],
+    });
+    expect(result.data.codexAccount).toBeUndefined();
+    expect(result.data.plan).toBeUndefined();
+    expect(result.degradations).toEqual([
+      {
+        code: "temporarily-unavailable",
+        feature: "usage",
+        message: "暂时无法读取账户套餐信息。",
+      },
+    ]);
+  });
+
+  it("marks rate limits unavailable without hiding account or token history", async () => {
+    const service = createService(async (method) => {
+      if (method === "account/read") {
+        return {
+          account: {
+            apiKey: "must-not-leak-api-key",
+            email: "must-not-project@example.com",
+            type: "apiKey",
+          },
+        };
+      }
+      if (method === "account/rateLimits/read") {
+        throw new Error("quota temporarily unavailable");
+      }
+      if (method === "account/usage/read") {
+        return { summary: { lifetimeTokens: "12000" } };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    const result = await service.getUsage();
+
+    expect(result.data).toMatchObject({
+      availability: {
+        account: "available",
+        rateLimits: "temporarily-unavailable",
+        tokenUsage: "available",
+      },
+      codexAccount: { type: "apiKey" },
+      tokenUsageSummary: { lifetimeTokens: "12000" },
+      windows: [],
+    });
+    expect(result.data.codexAccount).not.toHaveProperty("email");
+    expect(JSON.stringify(result.data)).not.toContain("must-not-leak-api-key");
+    expect(result.degradations).toEqual([
+      {
+        code: "temporarily-unavailable",
+        feature: "usage",
+        message: "暂时无法读取使用额度，请稍后刷新。",
+      },
+    ]);
+  });
+
+  it("projects the non-secret amazon Bedrock account discriminator only", async () => {
+    const service = createService(async (method) => {
+      if (method === "account/read") {
+        return {
+          account: {
+            accessKeyId: "must-not-leak-access-key",
+            email: "must-not-project@example.com",
+            secretAccessKey: "must-not-leak-secret-key",
+            type: "amazonBedrock",
+          },
+        };
+      }
+      if (method === "account/rateLimits/read") return {};
+      if (method === "account/usage/read") return {};
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    const result = await service.getUsage();
+
+    expect(result.data.codexAccount).toEqual({ type: "amazonBedrock" });
+    expect(JSON.stringify(result.data)).not.toContain("must-not-leak");
+  });
+
+  it("keeps a ChatGPT account identity when its schema-native email is null", async () => {
+    const service = createService(async (method) => {
+      if (method === "account/read") {
+        return { account: { email: null, planType: "team", type: "chatgpt" } };
+      }
+      if (method === "account/rateLimits/read") return {};
+      if (method === "account/usage/read") return {};
+      throw new Error(`unexpected method ${method}`);
+    });
+
+    const result = await service.getUsage();
+
+    expect(result.data.codexAccount).toEqual({ type: "chatgpt" });
+    expect(result.data.plan).toBe("team");
   });
 
   it("keeps token context scoped to its thread and never guesses without a thread id", async () => {

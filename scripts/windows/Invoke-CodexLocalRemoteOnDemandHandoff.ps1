@@ -71,6 +71,9 @@ if (@($expectedSelectionArguments | Where-Object { $_ }).Count -notin @(0, 3)) {
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
 $statusPath = Join-Path $resolvedDataDir 'on-demand-handoff-last.json'
 $script:onDemandLastReadiness = $null
+$script:onDemandOperationStartedAtUtc = [DateTimeOffset]::UtcNow
+$script:onDemandRuntimeValidationCache = @{}
+$script:onDemandBrokerPayloadCompatibilityCache = @{}
 $runtime = $null
 $expectedDesktopPath = $null
 $nativeDesktopWasClosedForOpen = $false
@@ -816,6 +819,148 @@ function Get-OnDemandIndependentStdioProcesses {
     return @($independent)
 }
 
+function Get-OnDemandCachedRuntimeValidation {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedVersionId,
+
+        [switch]$Refresh
+    )
+
+    if ($null -eq $script:onDemandRuntimeValidationCache) {
+        $script:onDemandRuntimeValidationCache = @{}
+    }
+    $resolvedRuntimeRoot = [System.IO.Path]::GetFullPath($RuntimeRoot)
+    $cacheKey = (
+        $ExpectedVersionId + '|' + $resolvedRuntimeRoot.ToUpperInvariant()
+    )
+    if (-not $Refresh -and
+        $script:onDemandRuntimeValidationCache.ContainsKey($cacheKey)) {
+        return $script:onDemandRuntimeValidationCache[$cacheKey]
+    }
+    $validation = Test-CodexLocalRemoteRuntimeVersion `
+        -RuntimeRoot $resolvedRuntimeRoot `
+        -ExpectedVersionId $ExpectedVersionId
+    $script:onDemandRuntimeValidationCache[$cacheKey] = $validation
+    return $validation
+}
+
+function Get-OnDemandCachedBrokerPayloadCompatibility {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CurrentRuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$CurrentVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$CurrentManifestSha256,
+
+        [Parameter(Mandatory)]
+        [string]$ActiveRuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ActiveVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$ActiveManifestSha256
+    )
+
+    if ($null -eq $script:onDemandBrokerPayloadCompatibilityCache) {
+        $script:onDemandBrokerPayloadCompatibilityCache = @{}
+    }
+    $resolvedCurrentRoot =
+        [System.IO.Path]::GetFullPath($CurrentRuntimeRoot)
+    $resolvedActiveRoot =
+        [System.IO.Path]::GetFullPath($ActiveRuntimeRoot)
+    $cacheKey = @(
+        $CurrentVersionId,
+        $resolvedCurrentRoot.ToUpperInvariant(),
+        $CurrentManifestSha256,
+        $ActiveVersionId,
+        $resolvedActiveRoot.ToUpperInvariant(),
+        $ActiveManifestSha256
+    ) -join '|'
+    if ($script:onDemandBrokerPayloadCompatibilityCache.ContainsKey(
+        $cacheKey
+    )) {
+        return $script:onDemandBrokerPayloadCompatibilityCache[$cacheKey]
+    }
+    $compatibility =
+        Test-CodexLocalRemoteBrokerPayloadCompatibility `
+            -CurrentRuntimeRoot $resolvedCurrentRoot `
+            -CurrentVersionId $CurrentVersionId `
+            -CurrentManifestSha256 $CurrentManifestSha256 `
+            -ActiveRuntimeRoot $resolvedActiveRoot `
+            -ActiveVersionId $ActiveVersionId `
+            -ActiveManifestSha256 $ActiveManifestSha256
+    $script:onDemandBrokerPayloadCompatibilityCache[$cacheKey] =
+        $compatibility
+    return $compatibility
+}
+
+function Assert-OnDemandDesktopLaunchNotTerminal {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{32}$')]
+        [string]$ExpectedCorrelationId,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset]$NotBeforeUtc
+    )
+
+    $receipt = Read-CodexDesktopLaunchReceipt -DataDir $DataDir
+    if ($null -eq $receipt) {
+        return
+    }
+    try {
+        $recordedAt = [DateTimeOffset]::Parse(
+            [string]$receipt.RecordedAtUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+    } catch {
+        return
+    }
+    if ([string]$receipt.Status -cnotin @(
+            'launched-native',
+            'remote-launch-unverified'
+        ) -or
+        $receipt.RemoteEnabled -ne $false -or
+        [string]$receipt.CorrelationId -cne $ExpectedCorrelationId -or
+        $recordedAt -lt $NotBeforeUtc.ToUniversalTime() -or
+        $recordedAt -gt [DateTimeOffset]::UtcNow.AddSeconds(5)) {
+        return
+    }
+    $failureCode = if ([string]$receipt.Status -ceq 'launched-native') {
+        'native-fallback'
+    } elseif (-not [string]::IsNullOrWhiteSpace(
+        [string]$receipt.RemoteFailureCode
+    )) {
+        [string]$receipt.RemoteFailureCode
+    } else {
+        'remote-launch-unverified'
+    }
+    $error = [InvalidOperationException]::new(
+        'The correlated Desktop launch reached a terminal non-Remote state.'
+    )
+    $error.Data['CodexLocalRemote.DesktopLaunchStatus'] =
+        [string]$receipt.Status
+    $error.Data['CodexLocalRemote.FailureStage'] = 'desktop-launch'
+    $error.Data['CodexLocalRemote.FailureCode'] = $failureCode
+    $error.Data['CodexLocalRemote.RemoteFailureStage'] =
+        [string]$receipt.RemoteFailureStage
+    $error.Data['CodexLocalRemote.RemoteFailureCode'] =
+        [string]$receipt.RemoteFailureCode
+    throw $error
+}
+
 function Get-OnDemandRemoteState {
     param(
         [Parameter(Mandatory)]
@@ -884,7 +1029,7 @@ function Get-OnDemandRemoteState {
                 $activeBrokerVersionId)
         )
         $activeBrokerRuntimeCheck =
-            Test-CodexLocalRemoteRuntimeVersion `
+            Get-OnDemandCachedRuntimeValidation `
                 -RuntimeRoot $activeBrokerRuntimeRoot `
                 -ExpectedVersionId $activeBrokerVersionId
         $activeBrokerCompatibilityId =
@@ -1099,7 +1244,7 @@ function Get-OnDemandRemoteState {
                 ($supervisorResumeTransport -or
                     $hasSupervisorAdoptionClaim)) {
                 $payloadCompatibility =
-                    Test-CodexLocalRemoteBrokerPayloadCompatibility `
+                    Get-OnDemandCachedBrokerPayloadCompatibility `
                         -CurrentRuntimeRoot ([string]$Runtime.CurrentRoot) `
                         -CurrentVersionId (
                             [string]$Runtime.CurrentVersionId
@@ -1208,13 +1353,13 @@ function Get-OnDemandRemoteState {
                             [System.StringComparison]::OrdinalIgnoreCase
                         )) {
                             $supersededSupervisorRuntimeCheck =
-                                Test-CodexLocalRemoteRuntimeVersion `
+                                Get-OnDemandCachedRuntimeValidation `
                                     -RuntimeRoot $supersededSupervisorRoot `
                                     -ExpectedVersionId (
                                         $supersededSupervisorVersionId
                                     )
                             $supersededSupervisorPayloadCompatibility =
-                                Test-CodexLocalRemoteBrokerPayloadCompatibility `
+                                Get-OnDemandCachedBrokerPayloadCompatibility `
                                     -CurrentRuntimeRoot (
                                         $supersededSupervisorRoot
                                     ) `
@@ -1766,6 +1911,30 @@ function Assert-OnDemandSelectedRuntimeUnchanged {
         throw (
             'The selected runtime changed after activation preflight; ' +
             'Desktop was preserved.'
+        )
+    }
+    return $current
+}
+
+function Assert-OnDemandRuntimeFreshForDesktopSwitch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$ExpectedRuntime
+    )
+
+    $current = Assert-OnDemandSelectedRuntimeUnchanged `
+        -ExpectedRuntime $ExpectedRuntime
+    $validation = Get-OnDemandCachedRuntimeValidation `
+        -RuntimeRoot ([string]$current.CurrentRoot) `
+        -ExpectedVersionId ([string]$current.CurrentVersionId) `
+        -Refresh
+    if (-not [bool]$validation.IsValid -or
+        [string]$validation.ManifestSha256 -cne
+            [string]$current.CurrentManifestSha256) {
+        throw (
+            'The selected immutable runtime failed the final Desktop ' +
+            'switch validation; Desktop was preserved.'
         )
     }
     return $current
@@ -2557,6 +2726,9 @@ function Invoke-OnDemandPreparedAttach {
         Set-CodexLocalRemoteDesktopHandoffPreparationAttaching `
             -DataDir $resolvedDataDir `
             -Preparation $preClose.Preparation
+    $preClose.Runtime =
+        Assert-OnDemandRuntimeFreshForDesktopSwitch `
+            -ExpectedRuntime $preClose.Runtime
     Stop-OnDemandDesktopProcessGroup `
         -Preparation $attaching `
         -ExpectedDesktopPath $DesktopExecutablePath
@@ -2581,6 +2753,12 @@ function Invoke-OnDemandPreparedAttach {
         [DateTime]::UtcNow.AddSeconds($ReadyWaitSeconds)
     do {
         Start-Sleep -Milliseconds 250
+        Assert-OnDemandDesktopLaunchNotTerminal `
+            -DataDir $resolvedDataDir `
+            -ExpectedCorrelationId (
+                [string]$script:preparedAttachIntent.IntentId
+            ) `
+            -NotBeforeUtc $script:onDemandOperationStartedAtUtc
         $remoteState = Get-OnDemandRemoteState `
             -Runtime $verified.Runtime `
             -BrokerPort ([int]$Configuration.BrokerPort)
@@ -3009,7 +3187,6 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
         -ExpectedIntentId $ExpectedIntentId)) {
         throw 'The deferred Open authorization was cancelled before Desktop shutdown.'
     }
-
     # A superseded supervisor can only drain through its existing Native-mode
     # contract. Own that temporary transition under the same control mutex,
     # then re-arm Remote only after the old task has exited. This keeps the
@@ -3026,6 +3203,8 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
         -ExpectedMode Native)) {
         throw 'The authorized Desktop shutdown intent failed exact read-back.'
     }
+    $Runtime = Assert-OnDemandRuntimeFreshForDesktopSwitch `
+        -ExpectedRuntime $Runtime
 
     # The caller already owns the per-DataDir OnDemandControl mutex. Keep the
     # two exact intent checks, package-identity stop, task drain, Remote
@@ -3189,7 +3368,7 @@ try {
             throw 'The selected runtime changed after dispatcher verification.'
         }
     }
-    $runtimeCheck = Test-CodexLocalRemoteRuntimeVersion `
+    $runtimeCheck = Get-OnDemandCachedRuntimeValidation `
         -RuntimeRoot $runtime.CurrentRoot `
         -ExpectedVersionId $runtime.CurrentVersionId
     if (-not $runtimeCheck.IsValid) {
@@ -3633,11 +3812,18 @@ try {
         return
     }
     if ($decision -ceq 'wait-background-recovery') {
-        $null = Set-OnDemandOpenDesiredRemote -Runtime $runtime
+        $backgroundRecoveryDesiredMode =
+            Set-OnDemandOpenDesiredRemote -Runtime $runtime
         $recoveryDeadline =
             [DateTime]::UtcNow.AddSeconds($RecoveryWaitSeconds)
         do {
             Start-Sleep -Milliseconds 250
+            Assert-OnDemandDesktopLaunchNotTerminal `
+                -DataDir $resolvedDataDir `
+                -ExpectedCorrelationId (
+                    [string]$backgroundRecoveryDesiredMode.IntentId
+                ) `
+                -NotBeforeUtc $script:onDemandOperationStartedAtUtc
             $remoteState = Get-OnDemandRemoteState `
                 -Runtime $runtime `
                 -BrokerPort ([int]$configuration.BrokerPort) `
@@ -3701,6 +3887,10 @@ try {
             [DateTime]::UtcNow.AddSeconds($RecoveryWaitSeconds)
         do {
             Start-Sleep -Milliseconds 250
+            Assert-OnDemandDesktopLaunchNotTerminal `
+                -DataDir $resolvedDataDir `
+                -ExpectedCorrelationId ([string]$intent.IntentId) `
+                -NotBeforeUtc $script:onDemandOperationStartedAtUtc
             $remoteState = Get-OnDemandRemoteState `
                 -Runtime $runtime `
                 -BrokerPort ([int]$configuration.BrokerPort)
@@ -3972,7 +4162,7 @@ try {
                 -Name $TaskName `
                 -AllowActiveTurns:$allowActiveRuntimeRestart
     }
-    $null = Set-OnDemandOpenDesiredRemote -Runtime $runtime
+    $desiredMode = Set-OnDemandOpenDesiredRemote -Runtime $runtime
     Write-OnDemandHandoffStatus `
         -Status 'running' `
         -Stage 'remote-start' `
@@ -3995,6 +4185,10 @@ try {
         [DateTime]::UtcNow.AddSeconds($ReadyWaitSeconds)
     do {
         Start-Sleep -Milliseconds 250
+        Assert-OnDemandDesktopLaunchNotTerminal `
+            -DataDir $resolvedDataDir `
+            -ExpectedCorrelationId ([string]$desiredMode.IntentId) `
+            -NotBeforeUtc $script:onDemandOperationStartedAtUtc
         $remoteState = Get-OnDemandRemoteState `
             -Runtime $runtime `
             -BrokerPort ([int]$configuration.BrokerPort) `
@@ -4040,6 +4234,14 @@ try {
     }
 } catch {
     $failure = $_
+    $desktopLaunchTerminalStatus = [string]$failure.Exception.Data[
+        'CodexLocalRemote.DesktopLaunchStatus'
+    ]
+    $desktopLaunchTerminalFailure =
+        $desktopLaunchTerminalStatus -cin @(
+            'launched-native',
+            'remote-launch-unverified'
+        )
     $openFailureCompensation = $null
     $openFailureCompensationFailed = $false
     $nativeModeConfirmedAfterFailure = (
@@ -4114,11 +4316,17 @@ try {
             }
             $failureStage = if ($remoteGenerationPreserved) {
                 'open-compensation'
+            } elseif ($desktopLaunchTerminalFailure) {
+                'desktop-launch'
             } else {
                 'handoff'
             }
             $failureCode = if ($remoteGenerationPreserved) {
                 'running-generation-preserved'
+            } elseif ($desktopLaunchTerminalFailure) {
+                [string]$failure.Exception.Data[
+                    'CodexLocalRemote.FailureCode'
+                ]
             } elseif ($openFailureCompensationFailed) {
                 'open-compensation-failed'
             } else {
@@ -4126,6 +4334,8 @@ try {
             }
             $failureMessage = if ($remoteGenerationPreserved) {
                 'The started Remote generation and its recovery intent remain active because readiness was not verified idle.'
+            } elseif ($desktopLaunchTerminalFailure) {
+                'The correlated Desktop launch ended in a terminal non-Remote state; no second launch was attempted.'
             } else {
                 'The Remote control operation failed. ' +
                     'No exception text, path, endpoint, or token was persisted.'

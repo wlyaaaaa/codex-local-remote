@@ -415,6 +415,12 @@ export const demoSubagents: SubagentSummary[] = [
 
 export const demoUsage: UsageSnapshot = {
   updatedAt: isoAgo(2),
+  availability: {
+    account: "available",
+    rateLimits: "available",
+    tokenUsage: "available",
+  },
+  codexAccount: { email: "demo@example.invalid", type: "chatgpt" },
   plan: "个人计划",
   windows: [
     {
@@ -578,7 +584,7 @@ export const demoFiles: Record<string, FileListing> = {
 
 export const demoDiagnostics: DiagnosticSnapshot = {
   generatedAt: new Date(now).toISOString(),
-  version: "0.1.2",
+  version: "0.1.3",
   appServerVersion: "0.78.0",
   capabilities: demoCapabilities,
   listener: {

@@ -40,17 +40,21 @@ $functionAsts = @(
                 [System.Management.Automation.Language.FunctionDefinitionAst] -and
             $node.Name -cin @(
                 'Get-OnDemandRemoteState',
+                'Get-OnDemandCachedRuntimeValidation',
+                'Get-OnDemandCachedBrokerPayloadCompatibility',
                 'Test-OnDemandReceiptProcessIdentity'
             )
         },
         $true
     )
 )
-if ($functionAsts.Count -ne 2) {
+if ($functionAsts.Count -ne 4) {
     throw 'The on-demand remote-state helpers were not found exactly once.'
 }
 foreach ($functionName in @(
     'Test-OnDemandReceiptProcessIdentity',
+    'Get-OnDemandCachedRuntimeValidation',
+    'Get-OnDemandCachedBrokerPayloadCompatibility',
     'Get-OnDemandRemoteState'
 )) {
     $functionAst = @(
@@ -330,6 +334,8 @@ function Invoke-RemoteStateCase {
     )
 
     $global:OnDemandRemoteStateScenario = $Scenario
+    $script:onDemandRuntimeValidationCache = @{}
+    $script:onDemandBrokerPayloadCompatibilityCache = @{}
     $isSupersededScenario = $Scenario -clike 'PreviousSuperseded*'
     $activeRoot = switch ($Scenario) {
         { $_ -clike 'Current*' } { $currentRoot; break }

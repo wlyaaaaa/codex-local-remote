@@ -21,6 +21,7 @@ import {
   mergeRefreshedFirstPage,
   nextCursorAfterRefresh,
   nextCursorFrom,
+  shouldAutoLoadCurrentThreads,
 } from "./pagination";
 import { threadRuntimeSummary } from "./thread-runtime";
 import {
@@ -45,6 +46,17 @@ describe("界面基础渲染", () => {
     );
     expect(styles).toMatch(
       /@media \(max-width:\s*700px\)\s*\{[\s\S]*?\.thread-actions__menu\s*\{[^}]*max-width:\s*calc\(100vw - 24px\);/u,
+    );
+  });
+
+  it("仅当前思考标题使用无框扫光，并为减少动态效果保留静态文字", () => {
+    const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    expect(styles).toMatch(
+      /\.live-phase--reasoning\s*\{[^}]*animation:\s*live-reasoning-shimmer[^}]*background-clip:\s*text;/su,
+    );
+    expect(styles).toMatch(/@keyframes\s+live-reasoning-shimmer/u);
+    expect(styles).toMatch(
+      /@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.live-phase--reasoning\s*\{[^}]*animation:\s*none;[^}]*-webkit-text-fill-color:\s*currentColor;/u,
     );
   });
 
@@ -252,6 +264,13 @@ describe("界面基础渲染", () => {
       { id: "same", value: 1 },
       { id: "old", value: 1 },
     ]);
+  });
+
+  it("当前任务列表自动读完续页，加载中或失败时不自旋", () => {
+    expect(shouldAutoLoadCurrentThreads("ready", "page-2", "idle")).toBe(true);
+    expect(shouldAutoLoadCurrentThreads("ready", "page-2", "loading")).toBe(false);
+    expect(shouldAutoLoadCurrentThreads("ready", "page-2", "error")).toBe(false);
+    expect(shouldAutoLoadCurrentThreads("ready", undefined, "idle")).toBe(false);
   });
 
   it("首屏刷新权威移除已取消置顶或已归档的旧行，同时保留明确加载的尾页", () => {

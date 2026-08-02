@@ -286,9 +286,13 @@ export function currentLivePhase(
       return undefined;
     }
     if (item.kind === "reasoning-summary") {
+      const text = latestReasoningText(item.text);
+      if (text === undefined) {
+        return undefined;
+      }
       return {
         kind: "reasoning",
-        text: "正在思考",
+        text,
       };
     }
     if (item.kind === "assistant-message") {

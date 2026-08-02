@@ -1,12 +1,16 @@
-import { appendFile, mkdtemp, mkdir, open, rm, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, open, rename, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { PERSISTED_CONVERSATION_CURSOR_PREFIX } from "@codex-local-remote/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DesktopSessionConversationReader } from "./desktop-session-conversation.js";
 
 const THREAD_ID = "00000000-0000-0000-0000-000000000002";
+const OTHER_THREAD_ID = "00000000-0000-0000-0000-000000000003";
+const LARGE_SESSION_PREFIX_BYTES = 65 * 1024 * 1024;
+const DEEP_CONTROL_TAIL_BYTES = 8 * 1024 * 1024 + 256 * 1024;
 
 function persistedMessage(id: string, role: "user" | "assistant", text: string): string {
   return JSON.stringify({
@@ -44,6 +48,70 @@ describe("DesktopSessionConversationReader", () => {
     return { codexHome, sessionPath };
   }
 
+  async function writeLargeSessionTail(
+    sessionPath: string,
+    records: readonly Record<string, unknown>[],
+  ): Promise<void> {
+    const handle = await open(sessionPath, "w");
+    try {
+      await handle.truncate(LARGE_SESSION_PREFIX_BYTES);
+    } finally {
+      await handle.close();
+    }
+    await appendFile(
+      sessionPath,
+      `\n${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+      "utf8",
+    );
+  }
+
+  async function writeLargeSessionWithDeepControl(
+    sessionPath: string,
+    lifecycleStart: Record<string, unknown>,
+    tailRecords: readonly Record<string, unknown>[] = [],
+  ): Promise<void> {
+    const handle = await open(sessionPath, "w");
+    try {
+      await handle.truncate(LARGE_SESSION_PREFIX_BYTES);
+    } finally {
+      await handle.close();
+    }
+    const noiseLine = `${JSON.stringify({
+      timestamp: "2026-07-31T15:33:47.484Z",
+      type: "event_msg",
+      payload: { type: "token_count", input_tokens: 1, output_tokens: 1 },
+    })}\n`;
+    const noise = noiseLine.repeat(
+      Math.ceil(DEEP_CONTROL_TAIL_BYTES / Buffer.byteLength(noiseLine, "utf8")),
+    );
+    await appendFile(
+      sessionPath,
+      `\n${JSON.stringify(lifecycleStart)}\n${noise}${tailRecords
+        .map((record) => JSON.stringify(record))
+        .join("\n")}${tailRecords.length === 0 ? "" : "\n"}`,
+      "utf8",
+    );
+  }
+
+  async function writeTwoPageConversation(sessionPath: string, pageBytes: number): Promise<void> {
+    const older = persistedMessage("page-older", "user", "更早的完整消息");
+    const boundary = persistedMessage("page-boundary", "assistant", "b".repeat(240));
+    const newer = persistedMessage("page-newer", "assistant", "最新的完整消息");
+    const paddingEnvelope = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", padding: "" },
+    });
+    const targetAfterBoundaryBytes = pageBytes - Math.floor(Buffer.byteLength(boundary) / 2);
+    const fixedAfterBoundaryBytes =
+      Buffer.byteLength(paddingEnvelope) + 1 + Buffer.byteLength(newer) + 1;
+    const paddingBytes = Math.max(1, targetAfterBoundaryBytes - fixedAfterBoundaryBytes);
+    const padding = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", padding: "p".repeat(paddingBytes) },
+    });
+    await writeFile(sessionPath, `${older}\n${boundary}\n${padding}\n${newer}\n`, "utf8");
+  }
+
   it("recovers the latest active turn from a bounded tail after a multi-megabyte prefix", async () => {
     const { codexHome, sessionPath } = await fixture();
     const prefix = `${"x".repeat(9 * 1024 * 1024)}\n`;
@@ -59,8 +127,260 @@ describe("DesktopSessionConversationReader", () => {
 
     const reader = new DesktopSessionConversationReader();
     const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("active");
     expect(head?.activeTurnId).toBe("tail-active-turn");
     expect(head?.sourceBytes).toBeGreaterThan(8 * 1024 * 1024);
+  });
+
+  it("recovers a task_started lifecycle event from a session larger than 64 MiB", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionTail(sessionPath, [
+      {
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "tail-started-turn" },
+      },
+    ]);
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("active");
+    expect(head?.activeTurnId).toBe("tail-started-turn");
+    expect(head?.sourceBytes).toBeGreaterThan(64 * 1024 * 1024);
+  });
+
+  it("recovers an active turn whose start is outside the newest 8 MiB", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionWithDeepControl(sessionPath, {
+      timestamp: "2026-07-31T15:33:46.484Z",
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: "deep-active-turn" },
+    });
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("active");
+    expect(head?.activeTurnId).toBe("deep-active-turn");
+  });
+
+  it("proves idle when a same-turn terminal follows a start outside the newest 8 MiB", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionWithDeepControl(
+      sessionPath,
+      {
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "turn_context",
+        payload: { turn_id: "deep-completed-turn" },
+      },
+      [
+        {
+          timestamp: "2026-07-31T15:33:48.484Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "deep-completed-turn" },
+        },
+      ],
+    );
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("idle");
+    expect(head?.activeTurnId).toBeUndefined();
+  });
+
+  it("keeps the active turn when a terminal for another turn follows a deep start", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionWithDeepControl(
+      sessionPath,
+      {
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "deep-current-turn" },
+      },
+      [
+        {
+          timestamp: "2026-07-31T15:33:48.484Z",
+          type: "event_msg",
+          payload: { type: "turn_aborted", turn_id: "deep-other-turn" },
+        },
+      ],
+    );
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("active");
+    expect(head?.activeTurnId).toBe("deep-current-turn");
+  });
+
+  it("proves idle immediately when an unkeyed terminal follows a deep start", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionWithDeepControl(
+      sessionPath,
+      {
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "deep-uncertain-turn" },
+      },
+      [
+        {
+          timestamp: "2026-07-31T15:33:48.484Z",
+          type: "event_msg",
+          payload: { type: "task_complete" },
+        },
+      ],
+    );
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("idle");
+    expect(head?.activeTurnId).toBeUndefined();
+  });
+
+  it("reports unknown instead of idle when the bounded scan cannot reach an anchor", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const handle = await open(sessionPath, "w");
+    try {
+      await handle.truncate(65 * 1024 * 1024);
+    } finally {
+      await handle.close();
+    }
+    await appendFile(
+      sessionPath,
+      `\n${JSON.stringify({
+        timestamp: "2026-07-31T15:33:47.484Z",
+        type: "event_msg",
+        payload: { type: "token_count" },
+      })}\n`,
+      "utf8",
+    );
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("unknown");
+    expect(head?.activeTurnId).toBeUndefined();
+  });
+
+  it.each([
+    { startType: "turn_context", terminalType: "task_complete" },
+    { startType: "task_started", terminalType: "turn_aborted" },
+  ] as const)(
+    "clears a $startType active turn after $terminalType in a session larger than 64 MiB",
+    async ({ startType, terminalType }) => {
+      const { codexHome, sessionPath } = await fixture();
+      const turnId = `tail-${terminalType}-turn`;
+      await writeLargeSessionTail(sessionPath, [
+        startType === "turn_context"
+          ? {
+              timestamp: "2026-07-31T15:33:46.484Z",
+              type: "turn_context",
+              payload: { turn_id: turnId },
+            }
+          : {
+              timestamp: "2026-07-31T15:33:46.484Z",
+              type: "event_msg",
+              payload: { type: startType, turn_id: turnId },
+            },
+        {
+          timestamp: "2026-07-31T15:33:47.484Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            id: `message-${terminalType}`,
+            role: "assistant",
+            content: [{ type: "output_text", text: "done" }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-31T15:33:48.484Z",
+          type: "event_msg",
+          payload: { type: terminalType, turn_id: turnId },
+        },
+      ]);
+
+      const reader = new DesktopSessionConversationReader();
+      const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+      expect(head?.controlState).toBe("idle");
+      expect(head?.activeTurnId).toBeUndefined();
+      expect(head?.sourceBytes).toBeGreaterThan(64 * 1024 * 1024);
+    },
+  );
+
+  it("does not treat an arbitrary payload turn id as an active lifecycle", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeFile(sessionPath, `${persistedMessage("terminal", "assistant", "done")}\n`, "utf8");
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("idle");
+    expect(head?.activeTurnId).toBeUndefined();
+  });
+
+  it("does not let a terminal marker for another turn replace the active lifecycle", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionTail(sessionPath, [
+      {
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "turn_context",
+        payload: { turn_id: "tail-current-turn" },
+      },
+      {
+        timestamp: "2026-07-31T15:33:48.484Z",
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "tail-older-turn" },
+      },
+    ]);
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("active");
+    expect(head?.activeTurnId).toBe("tail-current-turn");
+  });
+
+  it("fails closed when a terminal lifecycle omits its turn id", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionTail(sessionPath, [
+      {
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "turn_context",
+        payload: { turn_id: "tail-uncertain-turn" },
+      },
+      {
+        timestamp: "2026-07-31T15:33:47.484Z",
+        type: "event_msg",
+        payload: { type: "task_complete" },
+      },
+    ]);
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("idle");
+    expect(head?.activeTurnId).toBeUndefined();
+  });
+
+  it("recovers a newer active lifecycle after the previous turn terminates", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    await writeLargeSessionTail(sessionPath, [
+      {
+        timestamp: "2026-07-31T15:33:46.484Z",
+        type: "turn_context",
+        payload: { turn_id: "tail-completed-turn" },
+      },
+      {
+        timestamp: "2026-07-31T15:33:47.484Z",
+        type: "event_msg",
+        payload: { type: "task_complete" },
+      },
+      {
+        timestamp: "2026-07-31T15:33:48.484Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "tail-new-turn" },
+      },
+    ]);
+
+    const reader = new DesktopSessionConversationReader();
+    const head = await reader.readControlHead({ codexHome, sessionPath, threadId: THREAD_ID });
+    expect(head?.controlState).toBe("active");
+    expect(head?.activeTurnId).toBe("tail-new-turn");
   });
 
   it("restores answered plan questions and the formal plan in event order", async () => {
@@ -1024,6 +1344,271 @@ describe("DesktopSessionConversationReader", () => {
       { id: "recent-user", kind: "user-message" },
       { id: "recent-assistant", kind: "assistant-message" },
     ]);
+  });
+
+  it("walks a session larger than 64 MiB backward across complete-line pages without loss or duplicates", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const pageBytes = 8 * 1024 * 1024;
+    const older = persistedMessage("large-page-older", "user", "超大历史中的较早消息");
+    const newer = persistedMessage("large-page-newer", "assistant", "超大历史中的最新消息");
+    const paddingEnvelope = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", padding: "" },
+    });
+    const targetAfterOlderBytes = pageBytes - Math.floor(Buffer.byteLength(older) / 2);
+    const paddingBytes =
+      targetAfterOlderBytes - Buffer.byteLength(paddingEnvelope) - 1 - Buffer.byteLength(newer) - 1;
+    const padding = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", padding: "p".repeat(paddingBytes) },
+    });
+    const handle = await open(sessionPath, "w");
+    try {
+      await handle.truncate(LARGE_SESSION_PREFIX_BYTES);
+    } finally {
+      await handle.close();
+    }
+    await appendFile(sessionPath, `\n${older}\n${padding}\n${newer}\n`, "utf8");
+
+    const reader = new DesktopSessionConversationReader();
+    const input = { codexHome, sessionPath, threadId: THREAD_ID };
+    const first = await reader.readWithDiagnostic(input, "recent");
+    expect(first?.historyNextCursor).toEqual(expect.stringMatching(/^persisted-jsonl-v1\./u));
+    const second = await reader.readWithDiagnostic(input, "recent", first?.historyNextCursor);
+
+    const ids = [...(second?.items ?? []), ...(first?.items ?? [])]
+      .filter((item) => item.kind === "user-message" || item.kind === "assistant-message")
+      .map((item) => item.id);
+    expect(ids).toEqual(["large-page-older", "large-page-newer"]);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(first?.diagnostic.processedBytes).toBe(pageBytes.toString());
+
+    const cursor = first?.historyNextCursor;
+    if (cursor === undefined) throw new Error("expected a persisted history cursor");
+    const payload = JSON.parse(
+      Buffer.from(cursor.slice(PERSISTED_CONVERSATION_CURSOR_PREFIX.length), "base64url").toString(
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    expect(JSON.stringify(payload)).not.toContain(codexHome);
+    expect(JSON.stringify(payload)).not.toContain(sessionPath);
+    expect(payload).toMatchObject({ threadId: THREAD_ID, version: 1 });
+  });
+
+  it("puts a JSONL record crossing the nominal byte boundary on exactly one page", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const pageBytes = 1_024;
+    await writeTwoPageConversation(sessionPath, pageBytes);
+    const reader = new DesktopSessionConversationReader({
+      historyPageBytes: pageBytes,
+      maxJsonLineBytes: 512,
+    });
+    const input = { codexHome, sessionPath, threadId: THREAD_ID };
+
+    const first = await reader.readWithDiagnostic(input, "recent");
+    const second = await reader.readWithDiagnostic(input, "recent", first?.historyNextCursor);
+    const firstIds = first?.items.map((item) => item.id) ?? [];
+    const secondIds = second?.items.map((item) => item.id) ?? [];
+
+    expect(firstIds).toContain("page-newer");
+    expect(firstIds).toContain("page-boundary");
+    expect(secondIds).toContain("page-older");
+    expect(secondIds).not.toContain("page-boundary");
+    expect([...firstIds, ...secondIds].filter((id) => id === "page-boundary")).toHaveLength(1);
+  });
+
+  it("aligns backward by at most maxJsonLineBytes so a legal line larger than one page appears once", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const pageBytes = 384;
+    const maxJsonLineBytes = 1_024;
+    const prefixLine = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", padding: "q".repeat(96) },
+    });
+    const older = persistedMessage("wide-line-older", "user", "更早消息");
+    const wide = persistedMessage("wide-line", "assistant", "w".repeat(600));
+    const newer = persistedMessage("wide-line-newer", "assistant", "最新消息");
+    expect(Buffer.byteLength(wide)).toBeGreaterThan(pageBytes);
+    expect(Buffer.byteLength(wide)).toBeLessThanOrEqual(maxJsonLineBytes);
+    await writeFile(
+      sessionPath,
+      `${Array.from({ length: 8 }, () => prefixLine).join("\n")}\n${older}\n${wide}\n${newer}\n`,
+      "utf8",
+    );
+    const reader = new DesktopSessionConversationReader({
+      historyPageBytes: pageBytes,
+      maxJsonLineBytes,
+    });
+    const input = { codexHome, sessionPath, threadId: THREAD_ID };
+
+    const first = await reader.readWithDiagnostic(input, "recent");
+    expect(first?.historyNextCursor).toBeDefined();
+    const second = await reader.readWithDiagnostic(input, "recent", first?.historyNextCursor);
+    const ids = [...(second?.items ?? []), ...(first?.items ?? [])]
+      .filter((item) => item.kind === "user-message" || item.kind === "assistant-message")
+      .map((item) => item.id);
+
+    expect(ids).toEqual(["wide-line-older", "wide-line", "wide-line-newer"]);
+    expect(ids.filter((id) => id === "wide-line")).toHaveLength(1);
+  });
+
+  it("includes a max-sized line when its trailing delimiter lands on the nominal boundary", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const pageBytes = 256;
+    const maxJsonLineBytes = 1_024;
+    const older = persistedMessage("exact-max-older", "user", "更早消息");
+    const exactMaxEnvelope = persistedMessage("exact-max-line", "assistant", "");
+    const exactMax = persistedMessage(
+      "exact-max-line",
+      "assistant",
+      "m".repeat(maxJsonLineBytes - Buffer.byteLength(exactMaxEnvelope)),
+    );
+    const tailEnvelope = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", padding: "" },
+    });
+    const tail = JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        padding: "t".repeat(pageBytes - 2 - Buffer.byteLength(tailEnvelope)),
+      },
+    });
+    expect(Buffer.byteLength(exactMax)).toBe(maxJsonLineBytes);
+    expect(Buffer.byteLength(`${tail}\n`)).toBe(pageBytes - 1);
+    await writeFile(sessionPath, `${older}\n${exactMax}\n${tail}\n`, "utf8");
+    const reader = new DesktopSessionConversationReader({
+      historyPageBytes: pageBytes,
+      maxJsonLineBytes,
+    });
+    const input = { codexHome, sessionPath, threadId: THREAD_ID };
+
+    const first = await reader.readWithDiagnostic(input, "recent");
+    expect(first?.items.map((item) => item.id)).toContain("exact-max-line");
+    expect(first?.historyNextCursor).toBeDefined();
+    const second = await reader.readWithDiagnostic(input, "recent", first?.historyNextCursor);
+    const ids = [...(second?.items ?? []), ...(first?.items ?? [])]
+      .filter((item) => item.kind === "user-message" || item.kind === "assistant-message")
+      .map((item) => item.id);
+
+    expect(ids).toEqual(["exact-max-older", "exact-max-line"]);
+    expect(ids.filter((id) => id === "exact-max-line")).toHaveLength(1);
+  });
+
+  it("stops with a bounded truncated page when a boundary line exceeds maxJsonLineBytes", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const pageBytes = 512;
+    const maxJsonLineBytes = 512;
+    const older = persistedMessage("oversized-older", "user", "更早消息");
+    const oversized = persistedMessage("oversized-line", "assistant", "x".repeat(900));
+    const newer = persistedMessage("oversized-newer", "assistant", "最新消息");
+    expect(Buffer.byteLength(oversized)).toBeGreaterThan(maxJsonLineBytes);
+    await writeFile(sessionPath, `${older}\n${oversized}\n${newer}\n`, "utf8");
+    const reader = new DesktopSessionConversationReader({
+      historyPageBytes: pageBytes,
+      maxJsonLineBytes,
+    });
+
+    const result = await reader.readWithDiagnostic(
+      { codexHome, sessionPath, threadId: THREAD_ID },
+      "recent",
+    );
+
+    expect(result?.historyNextCursor).toBeUndefined();
+    expect(result?.items.map((item) => item.id)).toContain("oversized-newer");
+    expect(result?.items.map((item) => item.id)).not.toContain("oversized-line");
+    expect(result?.diagnostic).toMatchObject({
+      reason: "overlong-line",
+      status: "truncated",
+    });
+  });
+
+  it("keeps a continuation on its captured snapshot when the active file appends", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const reader = new DesktopSessionConversationReader({
+      historyPageBytes: 1_024,
+      maxJsonLineBytes: 512,
+    });
+    await writeTwoPageConversation(sessionPath, 1_024);
+    const input = { codexHome, sessionPath, threadId: THREAD_ID };
+    const first = await reader.readWithDiagnostic(input, "recent");
+    await appendFile(
+      sessionPath,
+      `${persistedMessage("post-cursor", "assistant", "游标后的追加")}\n`,
+    );
+
+    const second = await reader.readWithDiagnostic(input, "recent", first?.historyNextCursor);
+
+    expect(second?.diagnostic.status).toBe("complete");
+    expect(second?.items.map((item) => item.id)).toContain("page-older");
+    expect(second?.items.map((item) => item.id)).not.toContain("post-cursor");
+  });
+
+  it.each(["replace", "shrink"] as const)(
+    "fails closed when a cursor snapshot file is %s",
+    async (mutation) => {
+      const { codexHome, sessionPath } = await fixture();
+      const reader = new DesktopSessionConversationReader({
+        historyPageBytes: 1_024,
+        maxJsonLineBytes: 512,
+      });
+      await writeTwoPageConversation(sessionPath, 1_024);
+      const input = { codexHome, sessionPath, threadId: THREAD_ID };
+      const first = await reader.readWithDiagnostic(input, "recent");
+      if (mutation === "replace") {
+        const replacementPath = `${sessionPath}.replacement`;
+        await writeTwoPageConversation(replacementPath, 1_024);
+        await rm(sessionPath);
+        await rename(replacementPath, sessionPath);
+      } else {
+        const handle = await open(sessionPath, "r+");
+        try {
+          await handle.truncate(128);
+        } finally {
+          await handle.close();
+        }
+      }
+
+      const second = await reader.readWithDiagnostic(input, "recent", first?.historyNextCursor);
+
+      expect(second?.historyNextCursor).toBeUndefined();
+      expect(second?.items).toEqual([
+        expect.objectContaining({ id: `persisted-history-diagnostic-${THREAD_ID}` }),
+      ]);
+      expect(second?.diagnostic).toMatchObject({ status: "failed" });
+    },
+  );
+
+  it("fails closed for malformed and cross-thread persisted cursors", async () => {
+    const { codexHome, sessionPath } = await fixture();
+    const reader = new DesktopSessionConversationReader({
+      historyPageBytes: 1_024,
+      maxJsonLineBytes: 512,
+    });
+    await writeTwoPageConversation(sessionPath, 1_024);
+    const input = { codexHome, sessionPath, threadId: THREAD_ID };
+    const first = await reader.readWithDiagnostic(input, "recent");
+    const malformed = await reader.readWithDiagnostic(
+      input,
+      "recent",
+      `${PERSISTED_CONVERSATION_CURSOR_PREFIX}not-base64-json`,
+    );
+
+    const otherPath = path.join(
+      path.dirname(sessionPath),
+      `rollout-other-${OTHER_THREAD_ID}.jsonl`,
+    );
+    await writeTwoPageConversation(otherPath, 1_024);
+    const crossThread = await reader.readWithDiagnostic(
+      { codexHome, sessionPath: otherPath, threadId: OTHER_THREAD_ID },
+      "recent",
+      first?.historyNextCursor,
+    );
+
+    for (const result of [malformed, crossThread]) {
+      expect(result?.historyNextCursor).toBeUndefined();
+      expect(result?.diagnostic).toMatchObject({ status: "failed" });
+    }
   });
 
   it("pairs persisted tool calls with outputs and updates a running call in place", async () => {

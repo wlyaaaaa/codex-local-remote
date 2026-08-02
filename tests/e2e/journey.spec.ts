@@ -1,7 +1,14 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  EVENT_STREAM_OFFLINE_CONFIRM_MS,
+  EVENT_STREAM_OFFLINE_GRACE_MS,
+} from "../../apps/web/src/api.js";
 import { login } from "./helpers.js";
 import { openSharedThread, SharedRuntime } from "./shared-runtime.js";
+
+const confirmedDisconnectTimeoutMs =
+  EVENT_STREAM_OFFLINE_GRACE_MS + EVENT_STREAM_OFFLINE_CONFIRM_MS + 5_000;
 
 test.describe("单密码登录与完整远程旅程", () => {
   test("Desktop 置顶顺序在手机端独立于最近对话显示", async ({ page }) => {
@@ -95,7 +102,10 @@ test.describe("单密码登录与完整远程旅程", () => {
       await openSharedThread(page);
       await expect(page.getByTestId("thread-view")).toBeVisible();
       await runtime.setOnline(false);
-      await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible();
+      await expect(page.getByText("实时更新已中断", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible({
+        timeout: confirmedDisconnectTimeoutMs,
+      });
 
       const composer = page.getByTestId("turn-composer");
       await composer.focus();
@@ -133,7 +143,10 @@ test.describe("单密码登录与完整远程旅程", () => {
       await openSharedThread(page);
       await expect(page.getByTestId("thread-view")).toBeVisible();
       await runtime.setOnline(false);
-      await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible();
+      await expect(page.getByText("实时更新已中断", { exact: true })).toHaveCount(0);
+      await expect(page.getByText("实时更新已中断", { exact: true }).first()).toBeVisible({
+        timeout: confirmedDisconnectTimeoutMs,
+      });
 
       const composer = page.getByTestId("turn-composer");
       await composer.focus();

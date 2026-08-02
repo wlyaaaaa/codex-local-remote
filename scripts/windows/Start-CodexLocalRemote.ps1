@@ -2981,7 +2981,15 @@ try {
                             ) `
                             -ExpectedSelectedRuntimeRoot (
                                 [string]$desktopOwnerRuntime.CurrentRoot
-                            )
+                            ) `
+                            -LaunchCorrelationId $(if (
+                                [string]$initialDesiredMode.IntentId -cmatch
+                                    '^[a-f0-9]{32}$'
+                            ) {
+                                [string]$initialDesiredMode.IntentId
+                            } else {
+                                ''
+                            })
                     }
                 $suppressedRootProperty =
                     $initialDesktopLaunch.PSObject.Properties[

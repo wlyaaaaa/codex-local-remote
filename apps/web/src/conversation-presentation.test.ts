@@ -333,7 +333,7 @@ describe("conversation presentation", () => {
     expect(latestReasoningText("__Reviewing changes__")).toBe("Reviewing changes");
     expect(currentLivePhase(items, "turn-live")).toEqual({
       kind: "reasoning",
-      text: "正在思考",
+      text: "Implementing the final fix",
     });
   });
 

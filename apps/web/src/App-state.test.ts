@@ -604,7 +604,37 @@ describe("持续目标首次加载", () => {
         },
       }),
     ).toBe(true);
-    expect(helpers.shouldCommitThreadGoalLoad(true, { goal: null })).toBe(false);
+    expect(helpers.shouldCommitThreadGoalLoad(true, { goal: null })).toBe(true);
+  });
+
+  it("目标编辑器关闭时接受轮询到的远端目标更新", () => {
+    const goalResult = {
+      goal: {
+        threadId: "thread-goal",
+        objective: "由另一端更新后的真实目标",
+        status: "active" as const,
+        tokensUsed: 1,
+        timeUsedSeconds: 2,
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:01:00.000Z",
+      },
+    };
+    expect(helpers.shouldCommitThreadGoalLoad(true, goalResult, false, false)).toBe(true);
+    expect(helpers.shouldCommitThreadGoalLoad(true, goalResult, true, false)).toBe(false);
+    expect(helpers.shouldCommitThreadGoalLoad(true, goalResult, false, true)).toBe(false);
+  });
+
+  it("文件根位置仅显示规范根标签，不重复盘符名称", () => {
+    expect(helpers.fileRootDisplayLabel({ name: "C:", rootLabel: "C:\\" })).toBe("C:\\");
+    expect(helpers.fileRootDisplayLabel({ name: "V:", rootLabel: "V:\\" })).toBe("V:\\");
+  });
+
+  it("附件面板的移除动作只更新选择，不产生关闭信号", () => {
+    const items = [
+      { kind: "file" as const, projectId: "project", relativePath: "one.txt" },
+      { kind: "file" as const, projectId: "project", relativePath: "two.txt" },
+    ];
+    expect(helpers.removeAttachmentReference(items, items[0]!)).toEqual([items[1]]);
   });
 });
 
@@ -1094,22 +1124,19 @@ describe("持久会话历史完整性提示", () => {
     ).toContain("读取失败");
   });
 
-  it("根任务最近窗口与向上分页合并提示，绝不声称已经全量", () => {
-    const notice = helpers.persistedConversationHistoryNotice({
-      historyNextCursor: "older-page",
-      persistedHistoryIntegrity: {
-        ...verifiedComplete,
-        observedCount: 8,
-        reason: "recent-window",
-        scope: "recent",
-        status: "partial",
-      },
-    });
-
-    expect(notice).toContain("最近");
-    expect(notice).toContain("向上加载更早记录");
-    expect(notice).toContain("尚未确认完整");
-    expect(notice).not.toContain("已显示全部");
+  it("根任务最近窗口是内部渐进来源时保持静默，由分页控件表达可用动作", () => {
+    expect(
+      helpers.persistedConversationHistoryNotice({
+        historyNextCursor: "older-page",
+        persistedHistoryIntegrity: {
+          ...verifiedComplete,
+          observedCount: 8,
+          reason: "recent-window",
+          scope: "recent",
+          status: "partial",
+        },
+      }),
+    ).toBe("");
   });
 
   it("有更早页时，缺失或畸形完整性元数据也保持未确认完整", () => {
@@ -1650,6 +1677,10 @@ describe("Desktop 运行时健康门禁", () => {
     expect(helpers.shouldShowConversationLoading(false, 0)).toBe(true);
     expect(helpers.shouldShowConversationLoading(false, 1)).toBe(true);
     expect(helpers.shouldShowConversationLoading(true, 0)).toBe(false);
+    expect(helpers.shouldShowConversationLoading(true, 10, false)).toBe(true);
+    expect(helpers.shouldShowConversationLoading(true, 10, true)).toBe(false);
+    expect(helpers.conversationPositionIsReady("thread-b", "thread-a")).toBe(false);
+    expect(helpers.conversationPositionIsReady("thread-b", "thread-b")).toBe(true);
   });
 });
 
@@ -1681,12 +1712,19 @@ describe("任务初始滚动位置", () => {
     expect(helpers.conversationScrollWasUserDriven(0, 1_000)).toBe(false);
   });
 
-  it("输入框默认一行，只有明确聚焦才展开，滚动到底也必须收回", () => {
+  it("空输入框可随交互收起，但草稿、附件、发送与打开面板会阻止隐式收起", () => {
     expect(helpers.composerExpandedAfterIntent("thread-change")).toBe(false);
     expect(helpers.composerExpandedAfterIntent("focus")).toBe(true);
     expect(helpers.composerExpandedAfterIntent("conversation-scroll")).toBe(false);
     expect(helpers.composerExpandedAfterIntent("blur")).toBe(false);
     expect(helpers.composerExpandedAfterIntent("submit")).toBe(false);
+    expect(helpers.composerCanSafelyCollapse("", 0, false, false)).toBe(true);
+    expect(helpers.composerCanSafelyCollapse("未发送草稿", 0, false, false)).toBe(false);
+    expect(helpers.composerCanSafelyCollapse("", 1, false, false)).toBe(false);
+    expect(helpers.composerCanSafelyCollapse("", 0, true, false)).toBe(false);
+    expect(helpers.composerCanSafelyCollapse("", 0, false, true)).toBe(false);
+    expect(helpers.composerExpandedAfterIntent("blur", false)).toBe(true);
+    expect(helpers.composerExpandedAfterIntent("thread-change", false)).toBe(true);
   });
 
   it("收起时把多行草稿压成一行并明确省略剩余内容", () => {
@@ -1721,6 +1759,7 @@ describe("任务初始滚动位置", () => {
       mode: "managed" as const,
       state: "running" as const,
       updatedAt: "2026-07-27T00:00:00.000Z",
+      historyLoadPolicy: "explicit" as const,
       historyNextCursor: "page-2",
       items: [
         { id: "shared", kind: "user-message" as const, text: "当前页起点" },
@@ -1736,6 +1775,7 @@ describe("任务初始滚动位置", () => {
     };
     const olderPage = {
       ...current,
+      historyLoadPolicy: "explicit" as const,
       historyNextCursor: "page-3",
       items: [{ id: "old", kind: "user-message" as const, text: "更早内容" }, current.items[0]!],
     };

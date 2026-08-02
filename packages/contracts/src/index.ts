@@ -131,8 +131,29 @@ export interface DailyTokenUsage {
   tokens: string;
 }
 
+export type CodexAccountType = "apiKey" | "chatgpt" | "amazonBedrock";
+
+/** A deliberately bounded identity projection; it never carries credentials or auth sessions. */
+export interface CodexAccountIdentity {
+  type: CodexAccountType;
+  email?: string;
+}
+
+export type UsageAvailabilityState = "available" | "temporarily-unavailable";
+
+export interface UsageAvailability {
+  /** Availability of account/read for this snapshot. */
+  account: UsageAvailabilityState;
+  /** Availability of account/rateLimits/read for this snapshot. */
+  rateLimits: UsageAvailabilityState;
+  /** Availability of account/usage/read for this snapshot. */
+  tokenUsage: UsageAvailabilityState;
+}
+
 export interface UsageSnapshot {
   updatedAt: string;
+  availability?: UsageAvailability;
+  codexAccount?: CodexAccountIdentity;
   plan?: string;
   windows: UsageWindow[];
   credits?: UsageCredits[];
@@ -280,6 +301,8 @@ export type ConversationItem = ConversationItemContext &
 export interface ThreadDetail extends ThreadSummary {
   items: ConversationItem[];
   historyNextCursor?: string;
+  /** Older history is fetched only after an explicit user request when set to `explicit`. */
+  historyLoadPolicy?: "automatic" | "explicit";
   /**
    * Evidence about the supplemental Desktop session history merged into this
    * response. Absence remains supported for older Sidecars.
@@ -319,7 +342,11 @@ export interface PersistedConversationHistoryIntegrity {
 export interface PersistedConversationReadResult {
   items: ConversationItem[];
   integrity: PersistedConversationHistoryIntegrity;
+  historyNextCursor?: string;
 }
+
+/** Namespace for opaque Sidecar-owned persisted JSONL history cursors. */
+export const PERSISTED_CONVERSATION_CURSOR_PREFIX = "persisted-jsonl-v1.";
 
 export interface ThreadSettingsInput {
   model?: string | null;

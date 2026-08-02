@@ -65,6 +65,19 @@ describe("用户消息纯文本", () => {
     expect(stripInjectedMessageScaffolding(message)).toBe("请修复真实问题");
   });
 
+  it("成对隐藏宿主图片包装标签，但保留用户单独输入的相似字面量", () => {
+    const hostWrapped = [
+      '<image name=[Image #1] path="C:\\Users\\example\\proof.png">',
+      "</image>",
+      "请检查图片内容",
+    ].join("\n");
+
+    expect(stripInjectedMessageScaffolding(hostWrapped)).toBe("请检查图片内容");
+    expect(stripInjectedMessageScaffolding("请解释下面的字面量：\n</image>\n不要删除")).toBe(
+      "请解释下面的字面量：\n</image>\n不要删除",
+    );
+  });
+
   it("隐藏内部委派包装并保留相邻的真实用户正文", () => {
     const delegation = [
       "<codex_delegation>",

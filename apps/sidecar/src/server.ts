@@ -74,6 +74,9 @@ const SESSION_COOKIE = "codex_remote_session";
 const PRODUCT_NAME = "Codex Local Remote";
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,128}$/u;
 const RECENT_THREAD_DETAIL_CACHE_CAPACITY = 8;
+const EVENT_STREAM_MAX_FRAME_BYTES = 4 * 1024 * 1024;
+const EVENT_STREAM_MAX_QUEUED_BYTES = 4 * 1024 * 1024;
+const EVENT_STREAM_MAX_QUEUED_EVENTS = 256;
 
 export interface SidecarDomainApi {
   compactThread(threadId: string): Promise<void>;
@@ -137,6 +140,25 @@ interface AuthenticatedRequest {
 interface CachedCommand {
   body?: unknown;
   status: number;
+}
+
+interface EventStreamWriterOptions {
+  canWrite?: () => boolean;
+  createOverflowEvent?: () => RemoteEvent;
+  maxFrameBytes?: number;
+  maxQueuedBytes?: number;
+  maxQueuedEvents?: number;
+  onFailure: (reason: EventStreamWriterFailure) => void;
+  stream: FastifyReply["raw"];
+  streamInstanceId: string;
+}
+
+export type EventStreamWriterFailure = "overflow" | "transport";
+
+export interface EventStreamWriter {
+  close(): void;
+  writeEvent(event: RemoteEvent): boolean;
+  writeKeepalive(): boolean;
 }
 
 interface CachedThreadDetail {
@@ -1378,11 +1400,20 @@ function openEventStream(
       clearInterval(heartbeat);
       heartbeat = undefined;
     }
+    raw.off("close", closeStream);
     unsubscribe();
+    writer.close();
     if (!raw.destroyed && !raw.writableEnded) {
       raw.end();
     }
   };
+  const writer = createEventStreamWriter({
+    canWrite: () => state.isSessionActive(sessionTokenDigest, Date.now()),
+    createOverflowEvent: () => events.createResetEvent(),
+    onFailure: closeStream,
+    stream: raw,
+    streamInstanceId,
+  });
   const writeAuthenticatedEvent = (event: RemoteEvent): boolean => {
     if (!eventMatchesSubscription(event, threadId)) {
       return true;
@@ -1391,11 +1422,7 @@ function openEventStream(
       closeStream();
       return false;
     }
-    if (!writeEvent(raw, event, streamInstanceId)) {
-      closeStream();
-      return false;
-    }
-    return true;
+    return writer.writeEvent(event);
   };
   unsubscribe = events.subscribe((event) => {
     writeAuthenticatedEvent(event);
@@ -1427,9 +1454,7 @@ function openEventStream(
       closeStream();
       return;
     }
-    if (!raw.destroyed && !raw.writableEnded && !raw.write(": keepalive\n\n")) {
-      closeStream();
-    }
+    writer.writeKeepalive();
   }, 25_000);
   heartbeat.unref();
 }
@@ -1471,19 +1496,186 @@ function parseEventStreamCursor(
   return { instanceId: match[1] ?? "", sequence };
 }
 
-export function writeEvent(
-  stream: FastifyReply["raw"],
-  event: RemoteEvent,
-  streamInstanceId: string,
-): boolean {
-  if (stream.destroyed || stream.writableEnded) {
-    return false;
+export function createEventStreamWriter(options: EventStreamWriterOptions): EventStreamWriter {
+  const {
+    canWrite = () => true,
+    createOverflowEvent,
+    maxFrameBytes = EVENT_STREAM_MAX_FRAME_BYTES,
+    maxQueuedBytes = EVENT_STREAM_MAX_QUEUED_BYTES,
+    maxQueuedEvents = EVENT_STREAM_MAX_QUEUED_EVENTS,
+    onFailure,
+    stream,
+    streamInstanceId,
+  } = options;
+  if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 1) {
+    throw new RangeError("SSE frame byte limit must be a positive integer");
   }
-  try {
-    return stream.write(`id: ${streamInstanceId}:${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
-  } catch {
-    return false;
+  if (!Number.isSafeInteger(maxQueuedBytes) || maxQueuedBytes < 1) {
+    throw new RangeError("SSE queued byte limit must be a positive integer");
   }
+  if (!Number.isSafeInteger(maxQueuedEvents) || maxQueuedEvents < 1) {
+    throw new RangeError("SSE queued event limit must be a positive integer");
+  }
+
+  const queue: Array<{ bytes: number; frame: string }> = [];
+  let closed = false;
+  let queuedBytes = 0;
+  let resetThroughSequence: number | undefined;
+  let waitingForDrain = false;
+
+  const clearQueue = () => {
+    queue.length = 0;
+    queuedBytes = 0;
+  };
+  const close = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    if (waitingForDrain) {
+      stream.off("drain", drainQueue);
+      waitingForDrain = false;
+    }
+    clearQueue();
+  };
+  const fail = (reason: EventStreamWriterFailure): false => {
+    if (!closed) {
+      close();
+      onFailure(reason);
+    }
+    return false;
+  };
+  const writeNow = (frame: string): "drain" | "failed" | "ready" => {
+    if (closed || stream.destroyed || stream.writableEnded) {
+      return "failed";
+    }
+    try {
+      if (!canWrite()) {
+        return "failed";
+      }
+      return stream.write(frame) ? "ready" : "drain";
+    } catch {
+      return "failed";
+    }
+  };
+  const waitForDrain = () => {
+    waitingForDrain = true;
+    stream.once("drain", drainQueue);
+  };
+  const recoverOverflow = (): boolean => {
+    if (createOverflowEvent === undefined || closed || stream.destroyed || stream.writableEnded) {
+      return fail("overflow");
+    }
+    let reset: RemoteEvent;
+    let frame: string;
+    try {
+      if (!canWrite()) {
+        return fail("transport");
+      }
+      reset = createOverflowEvent();
+      frame = formatEventStreamEvent(reset, streamInstanceId);
+    } catch {
+      return fail("overflow");
+    }
+    const bytes = Buffer.byteLength(frame, "utf8");
+    if (bytes > maxFrameBytes || bytes > maxQueuedBytes) {
+      return fail("overflow");
+    }
+
+    clearQueue();
+    resetThroughSequence = Math.max(resetThroughSequence ?? 0, reset.seq);
+    if (waitingForDrain) {
+      queue.push({ bytes, frame });
+      queuedBytes = bytes;
+      return true;
+    }
+
+    const result = writeNow(frame);
+    if (result === "failed") {
+      return fail("transport");
+    }
+    if (result === "drain") {
+      waitForDrain();
+    }
+    return true;
+  };
+  const enqueue = (frame: string): boolean => {
+    const bytes = Buffer.byteLength(frame, "utf8");
+    if (queue.length >= maxQueuedEvents || bytes > maxQueuedBytes - queuedBytes) {
+      return recoverOverflow();
+    }
+    queue.push({ bytes, frame });
+    queuedBytes += bytes;
+    return true;
+  };
+  function drainQueue(): void {
+    waitingForDrain = false;
+    while (queue.length > 0) {
+      const pending = queue.shift();
+      if (pending === undefined) {
+        break;
+      }
+      queuedBytes -= pending.bytes;
+      const result = writeNow(pending.frame);
+      if (result === "failed") {
+        fail("transport");
+        return;
+      }
+      if (result === "drain") {
+        waitForDrain();
+        return;
+      }
+    }
+  }
+  const writeFrame = (frame: string): boolean => {
+    if (closed) {
+      return false;
+    }
+    if (Buffer.byteLength(frame, "utf8") > maxFrameBytes) {
+      return recoverOverflow();
+    }
+    if (waitingForDrain) {
+      return enqueue(frame);
+    }
+    const result = writeNow(frame);
+    if (result === "failed") {
+      return fail("transport");
+    }
+    if (result === "drain") {
+      waitForDrain();
+    }
+    return true;
+  };
+
+  return {
+    close,
+    writeEvent(event: RemoteEvent): boolean {
+      if (
+        resetThroughSequence !== undefined &&
+        event.type !== "connection.ready" &&
+        event.seq <= resetThroughSequence
+      ) {
+        return true;
+      }
+      try {
+        return writeFrame(formatEventStreamEvent(event, streamInstanceId));
+      } catch {
+        return fail("transport");
+      }
+    },
+    writeKeepalive(): boolean {
+      if (waitingForDrain) {
+        // Pending event data already keeps the connection active; do not spend bounded queue space
+        // on heartbeat comments that carry no cursor or product state.
+        return true;
+      }
+      return writeFrame(": keepalive\n\n");
+    },
+  };
+}
+
+function formatEventStreamEvent(event: RemoteEvent, streamInstanceId: string): string {
+  return `id: ${streamInstanceId}:${event.seq}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 function setSecurityHeaders(reply: FastifyReply): void {

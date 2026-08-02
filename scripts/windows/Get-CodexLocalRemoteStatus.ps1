@@ -1634,167 +1634,59 @@ try {
         -Path $desktopLaunchReceiptPath `
         -MinimumBytes 2 `
         -MaximumBytes 65536) {
-        $desktopLaunchReceipt = Read-StatusJsonText `
-            -Path $desktopLaunchReceiptPath |
-                ConvertFrom-Json -Depth 10 -ErrorAction Stop
-        $desktopLaunchCommonReady = (
-            $desktopLaunchReceipt.Status -is [string] -and
-            [string]$desktopLaunchReceipt.Status -cin @(
-                'already-running',
-                'launched-native',
-                'launched-remote',
-                'remote-launch-unverified'
-            ) -and
-            ($desktopLaunchReceipt.RemoteEnabled -is [bool] -or
-                $null -eq $desktopLaunchReceipt.RemoteEnabled) -and
-            (Test-NonNegativeInteger `
-                -Value $desktopLaunchReceipt.RemoteFallbackAttempts) -and
-            (Test-NonNegativeInteger `
-                -Value $desktopLaunchReceipt.RemoteStopAttempts) -and
-            ($null -eq $desktopLaunchReceipt.DesktopProcessId -or
-                (Test-StatusPositiveInteger `
-                    -Value $desktopLaunchReceipt.DesktopProcessId)) -and
-            -not [string]::IsNullOrWhiteSpace(
-                [string]$desktopLaunchReceipt.RemoteDecision
-            ) -and
-            (Test-StatusRecordedAtUtc `
-                -Value $desktopLaunchReceipt.RecordedAtUtc)
-        )
-        $desktopLaunchV1Ready = (
-            (Test-StatusExactProperties `
-                -Value $desktopLaunchReceipt `
-                -Names @(
-                    'DesktopProcessId',
-                    'RecordedAtUtc',
-                    'RemoteDecision',
-                    'RemoteEnabled',
-                    'RemoteFallbackAttempts',
-                    'RemoteStopAttempts',
-                    'Signature',
-                    'Status',
-                    'Version'
-                )) -and
-            [string]$desktopLaunchReceipt.Signature -ceq
-                'codex-local-remote/desktop-launch/v1' -and
-            (Test-NonNegativeInteger -Value $desktopLaunchReceipt.Version) -and
-            [int]$desktopLaunchReceipt.Version -eq 1 -and
-            $desktopLaunchCommonReady
-        )
-        $desktopLaunchV2Ready = (
-            (Test-StatusExactProperties `
-                -Value $desktopLaunchReceipt `
-                -Names @(
-                    'CorrelationId',
-                    'DesktopProcessId',
-                    'FeedbackFailureCode',
-                    'FeedbackStatus',
-                    'RecordedAtUtc',
-                    'RemoteDecision',
-                    'RemoteEnabled',
-                    'RemoteFailureCode',
-                    'RemoteFailureStage',
-                    'RemoteFallbackAttempts',
-                    'RemoteStopAttempts',
-                    'Signature',
-                    'Status',
-                    'Version'
-                )) -and
-            [string]$desktopLaunchReceipt.Signature -ceq
-                'codex-local-remote/desktop-launch/v2' -and
-            (Test-NonNegativeInteger -Value $desktopLaunchReceipt.Version) -and
-            [int]$desktopLaunchReceipt.Version -eq 2 -and
-            $desktopLaunchCommonReady -and
-            $desktopLaunchReceipt.RemoteDecision -is [string] -and
-            [string]$desktopLaunchReceipt.RemoteDecision -cin @(
-                'broker-reports-desktop-connected',
-                'created-desktop-identity-unavailable',
-                'created-desktop-identity-unverified',
-                'existing-desktop-preserved',
-                'existing-desktop-takeover-identity-unverified',
-                'existing-desktop-takeover-runtime-unverified',
-                'existing-desktop-takeover-state-drifted',
-                'existing-native-desktop-relaunched-remote',
-                'remote-attach-failed-process-preserved',
-                'remote-attached',
-                'remote-attached-root-process-set-unverified',
-                'remote-attached-then-unverified-process-preserved',
-                'remote-broker-lost-before-attach',
-                'remote-desktop-exited-before-attach',
-                'remote-desktop-exited-before-identity',
-                'remote-desktop-launch-failed',
-                'remote-endpoint-unavailable',
-                'remote-health-check-failed',
-                'remote-not-ready',
-                'remote-ready',
-                'remote-start-failed'
-            ) -and
-            ($null -eq $desktopLaunchReceipt.RemoteFailureStage -or (
-                $desktopLaunchReceipt.RemoteFailureStage -is [string] -and
-                [string]$desktopLaunchReceipt.RemoteFailureStage -cin @(
-                    'remote-health-check',
-                    'runtime-handoff',
-                    'remote-readiness',
-                    'remote-endpoint',
-                    'desktop-start',
-                    'desktop-attach',
-                    'desktop-cleanup',
-                    'unexpected'
-                )
-            )) -and
-            ($null -eq $desktopLaunchReceipt.RemoteFailureCode -or (
-                $desktopLaunchReceipt.RemoteFailureCode -is [string] -and
-                [string]$desktopLaunchReceipt.RemoteFailureCode -cin @(
-                    'health-check-failed',
-                    'runtime-generation-unverified',
-                    'desktop-running',
-                    'handoff-request-invalid',
-                    'handoff-launch-denied',
-                    'handoff-launch-failed',
-                    'handoff-timeout',
-                    'handoff-result-invalid',
-                    'handoff-result-mismatch',
-                    'runtime-handoff-failed',
-                    'readiness-timeout',
-                    'endpoint-invalid',
-                    'desktop-start-failed',
-                    'desktop-attach-failed',
-                    'desktop-cleanup-failed',
-                    'unexpected'
-                )
-            )) -and
-            (($null -eq $desktopLaunchReceipt.RemoteFailureStage) -eq
-                ($null -eq $desktopLaunchReceipt.RemoteFailureCode)) -and
-            ($null -eq $desktopLaunchReceipt.CorrelationId -or (
-                $desktopLaunchReceipt.CorrelationId -is [string] -and
-                [string]$desktopLaunchReceipt.CorrelationId -cmatch
-                    '^[0-9a-f]{32}$'
-            )) -and
-            $desktopLaunchReceipt.FeedbackStatus -is [string] -and
-            [string]$desktopLaunchReceipt.FeedbackStatus -cin @(
-                'pending',
-                'rendered',
-                'render-failed',
-                'suppressed',
-                'filtered'
-            ) -and
-            ($null -eq $desktopLaunchReceipt.FeedbackFailureCode -or (
-                $desktopLaunchReceipt.FeedbackFailureCode -is [string] -and
-                [string]$desktopLaunchReceipt.FeedbackFailureCode -ceq
-                    'feedback-render-failed'
-            )) -and
-            (
-                (
-                    [string]$desktopLaunchReceipt.FeedbackStatus -ceq
-                        'render-failed' -and
-                    [string]$desktopLaunchReceipt.FeedbackFailureCode -ceq
-                        'feedback-render-failed'
-                ) -or (
-                    [string]$desktopLaunchReceipt.FeedbackStatus -cne
-                        'render-failed' -and
-                    $null -eq $desktopLaunchReceipt.FeedbackFailureCode
-                )
+        $desktopLaunchReceipt =
+            Read-CodexDesktopLaunchReceipt -DataDir $resolvedDataDir
+        $desktopLaunchV2Ready = $null -ne $desktopLaunchReceipt
+        $desktopLaunchV1Ready = $false
+        if (-not $desktopLaunchV2Ready) {
+            $desktopLaunchReceipt = Read-StatusJsonText `
+                -Path $desktopLaunchReceiptPath |
+                    ConvertFrom-Json -Depth 10 -ErrorAction Stop
+            $desktopLaunchCommonReady = (
+                $desktopLaunchReceipt.Status -is [string] -and
+                [string]$desktopLaunchReceipt.Status -cin @(
+                    'already-running',
+                    'launched-native',
+                    'launched-remote',
+                    'remote-launch-unverified'
+                ) -and
+                ($desktopLaunchReceipt.RemoteEnabled -is [bool] -or
+                    $null -eq $desktopLaunchReceipt.RemoteEnabled) -and
+                (Test-NonNegativeInteger `
+                    -Value $desktopLaunchReceipt.RemoteFallbackAttempts) -and
+                (Test-NonNegativeInteger `
+                    -Value $desktopLaunchReceipt.RemoteStopAttempts) -and
+                ($null -eq $desktopLaunchReceipt.DesktopProcessId -or
+                    (Test-StatusPositiveInteger `
+                        -Value $desktopLaunchReceipt.DesktopProcessId)) -and
+                -not [string]::IsNullOrWhiteSpace(
+                    [string]$desktopLaunchReceipt.RemoteDecision
+                ) -and
+                (Test-StatusRecordedAtUtc `
+                    -Value $desktopLaunchReceipt.RecordedAtUtc)
             )
-        )
+            $desktopLaunchV1Ready = (
+                (Test-StatusExactProperties `
+                    -Value $desktopLaunchReceipt `
+                    -Names @(
+                        'DesktopProcessId',
+                        'RecordedAtUtc',
+                        'RemoteDecision',
+                        'RemoteEnabled',
+                        'RemoteFallbackAttempts',
+                        'RemoteStopAttempts',
+                        'Signature',
+                        'Status',
+                        'Version'
+                    )) -and
+                [string]$desktopLaunchReceipt.Signature -ceq
+                    'codex-local-remote/desktop-launch/v1' -and
+                (Test-NonNegativeInteger `
+                    -Value $desktopLaunchReceipt.Version) -and
+                [int]$desktopLaunchReceipt.Version -eq 1 -and
+                $desktopLaunchCommonReady
+            )
+        }
         $desktopLaunchReceiptReady = (
             $desktopLaunchV1Ready -or $desktopLaunchV2Ready
         )

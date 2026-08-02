@@ -2152,6 +2152,209 @@ function Test-NonNegativeInteger {
     return [decimal]$Value -ge 0
 }
 
+function Test-CodexDesktopLaunchReceiptExactProperties {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $false
+    }
+    $expected = @(
+        'CorrelationId',
+        'DesktopProcessId',
+        'FeedbackFailureCode',
+        'FeedbackStatus',
+        'RecordedAtUtc',
+        'RemoteDecision',
+        'RemoteEnabled',
+        'RemoteFailureCode',
+        'RemoteFailureStage',
+        'RemoteFallbackAttempts',
+        'RemoteStopAttempts',
+        'Signature',
+        'Status',
+        'Version'
+    ) | Sort-Object
+    $actual = @($Value.PSObject.Properties.Name | Sort-Object)
+    return (
+        $actual.Count -eq $expected.Count -and
+        (($actual -join "`0") -ceq ($expected -join "`0"))
+    )
+}
+
+function Read-CodexDesktopLaunchReceipt {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir
+    )
+
+    try {
+        $path = Join-Path `
+            ([System.IO.Path]::GetFullPath($DataDir)) `
+            'desktop-launch-last.json'
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $null
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -lt 2 -or
+            [long]$item.Length -gt 65536) {
+            return $null
+        }
+        $rawBefore = Get-Content `
+            -LiteralPath $path `
+            -Raw `
+            -Encoding utf8 `
+            -ErrorAction Stop
+        $receipt = $rawBefore |
+            ConvertFrom-Json -Depth 10 -DateKind String -ErrorAction Stop
+        $rawAfter = Get-Content `
+            -LiteralPath $path `
+            -Raw `
+            -Encoding utf8 `
+            -ErrorAction Stop
+        if ($rawBefore -cne $rawAfter -or
+            -not (Test-CodexDesktopLaunchReceiptExactProperties `
+                -Value $receipt)) {
+            return $null
+        }
+
+        $recordedAtUtc = [DateTimeOffset]::MinValue
+        $recordedAtReady = [DateTimeOffset]::TryParse(
+            [string]$receipt.RecordedAtUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$recordedAtUtc
+        ) -and $recordedAtUtc.Offset -eq [TimeSpan]::Zero
+        $failureStageReady = (
+            $null -eq $receipt.RemoteFailureStage -or (
+                $receipt.RemoteFailureStage -is [string] -and
+                [string]$receipt.RemoteFailureStage -cin @(
+                    'remote-health-check',
+                    'runtime-handoff',
+                    'remote-readiness',
+                    'remote-endpoint',
+                    'desktop-start',
+                    'desktop-attach',
+                    'desktop-cleanup',
+                    'unexpected'
+                )
+            )
+        )
+        $failureCodeReady = (
+            $null -eq $receipt.RemoteFailureCode -or (
+                $receipt.RemoteFailureCode -is [string] -and
+                [string]$receipt.RemoteFailureCode -cin @(
+                    'health-check-failed',
+                    'runtime-generation-unverified',
+                    'desktop-running',
+                    'handoff-request-invalid',
+                    'handoff-launch-denied',
+                    'handoff-launch-failed',
+                    'handoff-timeout',
+                    'handoff-result-invalid',
+                    'handoff-result-mismatch',
+                    'runtime-handoff-failed',
+                    'readiness-timeout',
+                    'endpoint-invalid',
+                    'desktop-start-failed',
+                    'desktop-attach-failed',
+                    'desktop-cleanup-failed',
+                    'unexpected'
+                )
+            )
+        )
+        $feedbackReady = (
+            $receipt.FeedbackStatus -is [string] -and
+            [string]$receipt.FeedbackStatus -cin @(
+                'pending',
+                'rendered',
+                'render-failed',
+                'suppressed',
+                'filtered'
+            ) -and
+            ($null -eq $receipt.FeedbackFailureCode -or (
+                $receipt.FeedbackFailureCode -is [string] -and
+                [string]$receipt.FeedbackFailureCode -ceq
+                    'feedback-render-failed'
+            )) -and (
+                ([string]$receipt.FeedbackStatus -ceq 'render-failed' -and
+                    [string]$receipt.FeedbackFailureCode -ceq
+                        'feedback-render-failed') -or
+                ([string]$receipt.FeedbackStatus -cne 'render-failed' -and
+                    $null -eq $receipt.FeedbackFailureCode)
+            )
+        )
+        if ([string]$receipt.Signature -cne
+                'codex-local-remote/desktop-launch/v2' -or
+            -not (Test-NonNegativeInteger -Value $receipt.Version) -or
+            [int]$receipt.Version -ne 2 -or
+            $receipt.Status -isnot [string] -or
+            [string]$receipt.Status -cnotin @(
+                'already-running',
+                'launched-native',
+                'launched-remote',
+                'remote-launch-unverified'
+            ) -or
+            ($receipt.RemoteEnabled -isnot [bool] -and
+                $null -ne $receipt.RemoteEnabled) -or
+            -not (Test-NonNegativeInteger `
+                -Value $receipt.RemoteFallbackAttempts) -or
+            -not (Test-NonNegativeInteger `
+                -Value $receipt.RemoteStopAttempts) -or
+            ($null -ne $receipt.DesktopProcessId -and (
+                -not (Test-NonNegativeInteger `
+                    -Value $receipt.DesktopProcessId) -or
+                [int64]$receipt.DesktopProcessId -le 0
+            )) -or
+            $receipt.RemoteDecision -isnot [string] -or
+            [string]$receipt.RemoteDecision -cnotin @(
+                'broker-reports-desktop-connected',
+                'created-desktop-identity-unavailable',
+                'created-desktop-identity-unverified',
+                'existing-desktop-preserved',
+                'existing-desktop-takeover-identity-unverified',
+                'existing-desktop-takeover-runtime-unverified',
+                'existing-desktop-takeover-state-drifted',
+                'existing-native-desktop-relaunched-remote',
+                'remote-attach-failed-process-preserved',
+                'remote-attached',
+                'remote-attached-root-process-set-unverified',
+                'remote-attached-then-unverified-process-preserved',
+                'remote-broker-lost-before-attach',
+                'remote-desktop-exited-before-attach',
+                'remote-desktop-exited-before-identity',
+                'remote-desktop-launch-failed',
+                'remote-endpoint-unavailable',
+                'remote-health-check-failed',
+                'remote-not-ready',
+                'remote-ready',
+                'remote-start-failed'
+            ) -or
+            -not $recordedAtReady -or
+            -not $failureStageReady -or
+            -not $failureCodeReady -or
+            (($null -eq $receipt.RemoteFailureStage) -ne
+                ($null -eq $receipt.RemoteFailureCode)) -or
+            ($null -ne $receipt.CorrelationId -and (
+                $receipt.CorrelationId -isnot [string] -or
+                [string]$receipt.CorrelationId -cnotmatch
+                    '^[0-9a-f]{32}$'
+            )) -or
+            -not $feedbackReady) {
+            return $null
+        }
+        return $receipt
+    } catch {
+        return $null
+    }
+}
+
 function Test-ActiveCodexRuntimeMatchesCurrentDiscovery {
     [CmdletBinding()]
     param(
@@ -8445,6 +8648,7 @@ Export-ModuleMember -Function @(
     'Get-BrokerCapabilityWebSocketUrl',
     'Get-StringSha256',
     'Test-NonNegativeInteger',
+    'Read-CodexDesktopLaunchReceipt',
     'Test-ActiveCodexRuntimeMatchesCurrentDiscovery',
     'Get-BrokerReadinessDecision',
     'Assert-LoopbackWebSocketUrl',

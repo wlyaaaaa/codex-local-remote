@@ -116,9 +116,17 @@ import {
   workspaceEventNeedsRefresh,
 } from "./refresh";
 import {
+  DEFAULT_CURSOR_PAGINATION_LIMITS,
+  beginCursorPaginationPage,
+  completeCursorPaginationPage,
+  createCursorPaginationGuard,
+  isCursorPaginationGuardError,
+  loadGuardedCursorPage,
   mergeCursorItems,
   mergeRefreshedFirstPage,
   nextCursorAfterRefresh,
+  shouldAutoLoadCurrentThreads,
+  type CursorPaginationGuard,
   type CursorPage,
 } from "./pagination";
 import { defaultReasoningEffortForModel, normalizeReasoningEffortForModel } from "./model-effort";
@@ -163,6 +171,11 @@ import {
 } from "./locale";
 import { homeActivityThreads, isHomeActivityThread } from "./home-activity";
 import {
+  appendLiveEventBatch,
+  createLiveEventFrameBuffer,
+  type LiveEventFrameBuffer,
+} from "./live-event-buffer";
+import {
   applyThreadRemoteEvents,
   applyUsageRemoteEvents,
   cancelSubmittedTurnUserAlias,
@@ -203,6 +216,7 @@ import {
   ComposerToolsSheet,
   DeliveryModeSwitch,
   GoalSheet,
+  GoalInlineControl,
   InlineDecisionStack,
   PlanProgressControl,
   PlanModeSheet,
@@ -224,6 +238,7 @@ import {
   type ComposerCapabilities,
 } from "./composer-product";
 import {
+  codexAccountPresentation,
   contextPresentation,
   contextUsageOrbLabel,
   creditBalanceLabel,
@@ -232,14 +247,24 @@ import {
   remainingContextPercentLabel,
   remainingFromUsedPercent,
   remainingPercentLabel,
+  usageAvailabilityMessage,
   usageWindowForDisplay,
   usedPercentLabel,
 } from "./usage-display";
 import {
   INITIAL_CONVERSATION_ITEM_LIMIT,
+  conversationHistoryAnchorElementScrollTop,
+  conversationHistoryAwayAfterLoad,
+  conversationHistoryControlVisible,
+  conversationHistoryFlightBlocksRequest,
+  conversationHistoryScrollTop,
+  conversationHistoryShouldAutoLoad,
+  conversationItemLimitForThread,
   hiddenConversationItemCount,
+  loadConversationHistoryPages,
   nextConversationItemLimit,
   visibleConversationItems,
+  type ConversationHistoryLoadMode,
 } from "./conversation-window";
 import { reduceRuntimeNotice, type RuntimeNotice } from "./runtime-notice";
 import { dismissNotice, noticeDismissalKey, readNoticeDismissal } from "./notice-dismissal";
@@ -271,6 +296,7 @@ function useUiLocale() {
 
 type LoadState = "loading" | "ready" | "error";
 type MoreState = "idle" | "loading" | "error";
+type HistoryLoadIssue = { guarded: boolean; message: string };
 type DeferredLoadState = "idle" | LoadState;
 type ThreadActionMenuMode = "closed" | "menu" | "rename";
 type ThreadListMutation = { kind: "rename"; name: string } | { kind: "archive"; archived: boolean };
@@ -848,8 +874,9 @@ const effortLabels: Readonly<Record<string, string>> = {
   low: "低",
   medium: "中",
   high: "高",
+  max: "最高",
   xhigh: "极高",
-  ultra: "Ultra（最高）",
+  ultra: "Ultra",
 };
 
 function effortLabel(effort: ReasoningEffort): string {
@@ -1045,8 +1072,10 @@ export function shouldSeedThreadFromLateSummary(
 export function shouldCommitThreadGoalLoad(
   goalLoaded: boolean,
   goalResult: { goal: ThreadGoal | null } | undefined,
+  editorOpen = false,
+  goalBusy = false,
 ): goalResult is { goal: ThreadGoal | null } {
-  return !goalLoaded && goalResult !== undefined;
+  return goalResult !== undefined && (!goalLoaded || (!editorOpen && !goalBusy));
 }
 
 export function shouldReadThreadGoal(capabilities: ComposerCapabilities | undefined): boolean {
@@ -1056,8 +1085,13 @@ export function shouldReadThreadGoal(capabilities: ComposerCapabilities | undefi
 export function shouldShowConversationLoading(
   detailProjectionReady: boolean,
   _visibleItemCount: number,
+  positionReady = true,
 ): boolean {
-  return !detailProjectionReady;
+  return !detailProjectionReady || !positionReady;
+}
+
+export function conversationPositionIsReady(threadId: string, positionedThreadId: string): boolean {
+  return threadId === positionedThreadId;
 }
 
 export function initialConversationScrollTop(scrollHeight: number, clientHeight: number): number {
@@ -1132,8 +1166,20 @@ export type ComposerExpansionIntent =
   | "submit"
   | "thread-change";
 
-export function composerExpandedAfterIntent(intent: ComposerExpansionIntent): boolean {
-  return intent === "focus";
+export function composerExpandedAfterIntent(
+  intent: ComposerExpansionIntent,
+  canSafelyCollapse = true,
+): boolean {
+  return intent === "focus" || !canSafelyCollapse;
+}
+
+export function composerCanSafelyCollapse(
+  draft: string,
+  attachmentCount: number,
+  sheetOpen: boolean,
+  sending: boolean,
+): boolean {
+  return draft.length === 0 && attachmentCount === 0 && !sheetOpen && !sending;
 }
 
 export function collapsedComposerText(text: string, maxLength = 36): string {
@@ -1164,7 +1210,11 @@ export function prependConversationHistory(
 ): { added: number; detail: ThreadDetail } {
   const currentIds = new Set(current.items.map((item) => item.id));
   const olderItems = olderPage.items.filter((item) => !currentIds.has(item.id));
-  const { historyNextCursor: _previousCursor, ...currentWithoutCursor } = current;
+  const {
+    historyLoadPolicy: _previousLoadPolicy,
+    historyNextCursor: _previousCursor,
+    ...currentWithoutCursor
+  } = current;
   return {
     added: olderItems.length,
     detail: {
@@ -1172,6 +1222,9 @@ export function prependConversationHistory(
       ...(olderPage.historyNextCursor === undefined
         ? {}
         : { historyNextCursor: olderPage.historyNextCursor }),
+      ...(olderPage.historyLoadPolicy === undefined
+        ? {}
+        : { historyLoadPolicy: olderPage.historyLoadPolicy }),
       items: [...olderItems, ...current.items],
     },
   };
@@ -2119,6 +2172,13 @@ function UsageMini({
 }) {
   const window = usageWindowForDisplay(usage?.windows, preferredModel);
   if (!window) {
+    if (usage?.availability?.rateLimits === "temporarily-unavailable") {
+      return (
+        <div className="usage-mini">
+          <div className="mini-empty">额度与 Credits 暂时无法读取</div>
+        </div>
+      );
+    }
     return (
       <div className="usage-mini">
         <div className="mini-empty">时间窗口额度暂时无法读取</div>
@@ -2689,6 +2749,24 @@ function ThreadsPage({
       (filter === "snapshot" && thread.mode === "desktop-snapshot");
     return matchesQuery && matchesFilter;
   });
+  const paginationStatus =
+    archiveScope === "archived" ? (
+      <PaginationFooter
+        completeLabel="已显示全部归档对话"
+        error={visibleError}
+        hasMore={visibleNextCursor !== undefined}
+        label="加载更早的归档对话"
+        loading={visibleMoreState === "loading"}
+        onLoadMore={visibleLoadMore}
+      />
+    ) : visibleError ? (
+      <Notice icon="alert" title="当前任务同步未完成" tone="warning">
+        <span>{visibleError}</span>
+        <Button disabled={visibleMoreState === "loading"} icon="refresh" onClick={visibleLoadMore}>
+          重试同步
+        </Button>
+      </Notice>
+    ) : null;
 
   function setThreadBusy(threadId: string, busy: boolean) {
     setBusyThreadIds((current) => {
@@ -3130,16 +3208,7 @@ function ThreadsPage({
                 );
               })}
             </Card>
-            <PaginationFooter
-              completeLabel={
-                archiveScope === "archived" ? "已显示全部归档对话" : "已显示全部当前对话"
-              }
-              error={visibleError}
-              hasMore={visibleNextCursor !== undefined}
-              label={archiveScope === "archived" ? "加载更早的归档对话" : "加载更早的当前对话"}
-              loading={visibleMoreState === "loading"}
-              onLoadMore={visibleLoadMore}
-            />
+            {paginationStatus}
           </>
         ) : (
           <>
@@ -3162,16 +3231,7 @@ function ThreadsPage({
                 }
               />
             </Card>
-            <PaginationFooter
-              completeLabel={
-                archiveScope === "archived" ? "已显示全部归档对话" : "已显示全部当前对话"
-              }
-              error={visibleError}
-              hasMore={visibleNextCursor !== undefined}
-              label={archiveScope === "archived" ? "加载更早的归档对话" : "加载更早的当前对话"}
-              loading={visibleMoreState === "loading"}
-              onLoadMore={visibleLoadMore}
-            />
+            {paginationStatus}
           </>
         )}
       </div>
@@ -4397,128 +4457,6 @@ function ModelControls({
   );
 }
 
-function AccessAndReviewerSheet({
-  approvalPolicy,
-  approvalPolicies,
-  approvalReviewer,
-  approvalReviewers,
-  busy,
-  onApply,
-  onApprovalPolicy,
-  onApprovalReviewer,
-  onClose,
-  onPermission,
-  open,
-  permissionProfileId,
-  permissionProfiles,
-}: {
-  approvalPolicy: string;
-  approvalPolicies: ApprovalPolicyOption[];
-  approvalReviewer: string;
-  approvalReviewers: ApprovalReviewerOption[];
-  busy: boolean;
-  onApply: () => void;
-  onApprovalPolicy: (id: string) => void;
-  onApprovalReviewer: (id: string) => void;
-  onClose: () => void;
-  onPermission: (id: string) => void;
-  open: boolean;
-  permissionProfileId: string;
-  permissionProfiles: PermissionProfileOption[];
-}) {
-  return (
-    <Sheet
-      description="这里只显示当前 Codex 提供的选项；运行中的回复不会变更。"
-      footer={
-        <Button disabled={busy} onClick={onApply} variant="primary">
-          {busy ? "正在保存…" : "保存设置"}
-        </Button>
-      }
-      onClose={onClose}
-      open={open}
-      title="权限与审批"
-    >
-      {permissionProfiles.length > 0 ? (
-        <section className="composer-sheet-section">
-          <h3>文件与命令权限</h3>
-          <div className="composer-option-list">
-            {permissionProfiles.map((profile) => (
-              <button
-                className={`composer-option ${
-                  profile.id === permissionProfileId ? "is-selected" : ""
-                }`}
-                data-testid={`permission-profile-${profile.id}`}
-                disabled={!profile.allowed || busy}
-                key={profile.id}
-                onClick={() => onPermission(profile.id)}
-                type="button"
-              >
-                <span>
-                  <strong>{permissionProfileLabel(profile.id)}</strong>
-                  <small>
-                    {profile.description ??
-                      `${profile.id} · ` +
-                        (profile.allowed ? "Codex 当前允许使用" : "Codex 当前不允许使用")}
-                  </small>
-                </span>
-                {profile.id === permissionProfileId ? <Icon name="check" size={17} /> : null}
-              </button>
-            ))}
-          </div>
-        </section>
-      ) : null}
-      {approvalPolicies.length > 0 ? (
-        <section className="composer-sheet-section">
-          <h3>何时请求你确认</h3>
-          <div className="composer-option-list">
-            {approvalPolicies.map((policy) => (
-              <button
-                className={`composer-option ${policy.id === approvalPolicy ? "is-selected" : ""}`}
-                data-testid={`approval-policy-${policy.id}`}
-                disabled={busy}
-                key={policy.id}
-                onClick={() => onApprovalPolicy(policy.id)}
-                type="button"
-              >
-                <span>
-                  <strong>{approvalPolicyLabel(policy.id)}</strong>
-                  <small>{approvalPolicyDescription(policy.id)}</small>
-                </span>
-                {policy.id === approvalPolicy ? <Icon name="check" size={17} /> : null}
-              </button>
-            ))}
-          </div>
-        </section>
-      ) : null}
-      {approvalReviewers.length > 0 ? (
-        <section className="composer-sheet-section">
-          <h3>审批方式</h3>
-          <div className="composer-option-list">
-            {approvalReviewers.map((reviewer) => (
-              <button
-                className={`composer-option ${
-                  reviewer.id === approvalReviewer ? "is-selected" : ""
-                }`}
-                data-testid={`approval-reviewer-${reviewer.id}`}
-                disabled={busy}
-                key={reviewer.id}
-                onClick={() => onApprovalReviewer(reviewer.id)}
-                type="button"
-              >
-                <span>
-                  <strong>{approvalReviewerLabel(reviewer.id)}</strong>
-                  <small>{approvalReviewerDescription(reviewer.id)}</small>
-                </span>
-                {reviewer.id === approvalReviewer ? <Icon name="check" size={17} /> : null}
-              </button>
-            ))}
-          </div>
-        </section>
-      ) : null}
-    </Sheet>
-  );
-}
-
 type ConversationPageProps = {
   apiClient: ApiClient;
   approvals: ApprovalRequest[];
@@ -4744,12 +4682,13 @@ export function persistedConversationHistoryNotice({
     }`;
   }
   if (
-    persistedHistoryIntegrity.scope === "recent" ||
+    persistedHistoryIntegrity.status === "partial" &&
+    persistedHistoryIntegrity.scope === "recent" &&
     persistedHistoryIntegrity.reason === "recent-window"
   ) {
-    return `当前仅显示最近窗口内的已验证记录；${
-      hasEarlierPage ? "可向上加载更早记录，历史尚未确认完整。" : "持久历史尚未确认完整。"
-    }`;
+    // A recent Desktop tail is an intentional supplemental source, not a
+    // user-facing history failure. Native or local pagination owns completeness.
+    return "";
   }
   return `持久历史不完整；当前仅显示已验证记录。${hasEarlierPage ? " 可向上加载更早记录。" : ""}`;
 }
@@ -4829,7 +4768,7 @@ function ConversationPageInstance({
   const [queueBusyId, setQueueBusyId] = useState("");
   const [queueError, setQueueError] = useState("");
   const [composerSheet, setComposerSheet] = useState<
-    "" | "settings" | "permission" | "tools" | "goal" | "plan" | "attachments"
+    "" | "settings" | "tools" | "goal" | "plan" | "attachments"
   >("");
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [resumeBusy, setResumeBusy] = useState(false);
@@ -4850,10 +4789,18 @@ function ConversationPageInstance({
   const [runtimeNotice, setRuntimeNotice] = useState<RuntimeNotice>();
   const [visibleItemLimit, setVisibleItemLimit] = useState(INITIAL_CONVERSATION_ITEM_LIMIT);
   const [conversationAway, setConversationAway] = useState(false);
-  const [composerExpanded, setComposerExpanded] = useState(false);
-  const composerExpandedRef = useRef(false);
+  const [positionedConversationThreadId, setPositionedConversationThreadId] = useState("");
+  const initiallyExpandedComposer = !composerCanSafelyCollapse(
+    initialDraft,
+    attachments.length,
+    false,
+    false,
+  );
+  const [composerExpanded, setComposerExpanded] = useState(initiallyExpandedComposer);
+  const composerExpandedRef = useRef(initiallyExpandedComposer);
   const [historyNextCursor, setHistoryNextCursor] = useState<string>();
   const [historyMoreState, setHistoryMoreState] = useState<MoreState>("idle");
+  const [historyLoadIssue, setHistoryLoadIssue] = useState<HistoryLoadIssue>();
   const [actionError, setActionError] = useState("");
   const [actionStatus, setActionStatus] = useState<
     | "steer-accepted"
@@ -4874,14 +4821,35 @@ function ConversationPageInstance({
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const composerCollapseTimerRef = useRef<number | undefined>(undefined);
   const composerPointerActiveRef = useRef(false);
+  const composerDraftRef = useRef(draft);
+  const composerAttachmentsRef = useRef(attachments);
+  const composerSheetRef = useRef(composerSheet);
+  const composerSendingRef = useRef(sending);
   const conversationScrollRef = useRef<HTMLDivElement>(null);
   const conversationStreamRef = useRef<HTMLDivElement>(null);
+  const conversationItemsRef = useRef<HTMLDivElement>(null);
   const conversationAwayRef = useRef(false);
   const lastConversationScrollTopRef = useRef(0);
   const conversationUserScrollIntentAtRef = useRef(0);
   const historyExtendedRef = useRef(false);
-  const historyLoadInFlightRef = useRef<Promise<void> | undefined>(undefined);
+  const historyLoadInFlightRef = useRef<
+    { cursor: string; promise: Promise<void>; threadId: string } | undefined
+  >(undefined);
+  const loadEarlierConversationHistoryRef = useRef<
+    ((mode: ConversationHistoryLoadMode) => Promise<void> | undefined) | undefined
+  >(undefined);
   const historyRevealScheduledRef = useRef(false);
+  const historyScrollAdjustmentRef = useRef<
+    | {
+        mode: ConversationHistoryLoadMode;
+        previousHeight: number;
+        previousTop: number;
+        wasAway: boolean;
+        anchorElement?: HTMLElement;
+        anchorTop?: number;
+      }
+    | undefined
+  >(undefined);
   const initialScrollThreadRef = useRef("");
   const handledLiveDelivery = useRef(0);
   const latestLiveDeliveryRef = useRef(liveEvents.at(-1)?.deliveryId ?? 0);
@@ -4909,6 +4877,8 @@ function ConversationPageInstance({
   const usageButtonRef = useRef<HTMLButtonElement>(null);
   const usagePanelRef = useRef<HTMLElement>(null);
   const goalLoadedRef = useRef(false);
+  const goalEditorOpenRef = useRef(false);
+  const goalBusyRef = useRef(false);
   const productSettingsDirtyRef = useRef(false);
   const productSettingsGenerationRef = useRef(0);
   const collaborationModeDirtyRef = useRef(false);
@@ -4936,18 +4906,37 @@ function ConversationPageInstance({
     .join("");
   currentIdRef.current = id;
   conversationAwayRef.current = conversationAway;
+  composerDraftRef.current = draft;
+  composerAttachmentsRef.current = attachments;
+  composerSheetRef.current = composerSheet;
+  composerSendingRef.current = sending;
   latestLiveDeliveryRef.current = liveEvents.at(-1)?.deliveryId ?? 0;
   routeSeedRef.current = routeSeed;
   routeInitialPromptRef.current = routeInitialPrompt;
   modelsRef.current = models;
   summaryRef.current = summary;
+  goalEditorOpenRef.current = composerSheet === "goal";
+  goalBusyRef.current = goalBusy;
+
+  useEffect(
+    () => () => {
+      currentIdRef.current = "";
+    },
+    [],
+  );
   const presentationItems = useMemo(
     () => (thread ? contextCompactionItemsForDisplay(thread) : []),
     [thread],
   );
+  const effectiveVisibleItemLimit = conversationItemLimitForThread(
+    presentationItems.length,
+    visibleItemLimit,
+    thread?.state,
+    thread?.activeTurnId,
+  );
   const visibleItems = useMemo(
     () =>
-      visibleConversationItems(presentationItems, visibleItemLimit, (item) => {
+      visibleConversationItems(presentationItems, effectiveVisibleItemLimit, (item) => {
         if (
           item.kind === "user-message" ||
           item.kind === "assistant-message" ||
@@ -4959,7 +4948,7 @@ function ConversationPageInstance({
         }
         return item.kind === "tool" && item.operation === "context-compaction";
       }),
-    [presentationItems, visibleItemLimit],
+    [effectiveVisibleItemLimit, presentationItems],
   );
   const presentationIdentity = conversationPresentationIdentity(
     id,
@@ -4970,6 +4959,7 @@ function ConversationPageInstance({
     thread?.items.length ?? 0,
     visibleItems.length,
   );
+  const conversationPositionReady = conversationPositionIsReady(id, positionedConversationThreadId);
 
   const finishContextCompaction = useCallback(
     (attemptKey: string, resolution: Exclude<ContextCompactionResolution, "pending">) => {
@@ -5210,7 +5200,14 @@ function ConversationPageInstance({
           }
           setApprovalPolicies(approvalPolicyResult);
           setApprovalReviewers(approvalReviewerResult);
-          if (shouldCommitThreadGoalLoad(goalLoadedRef.current, goalResult)) {
+          if (
+            shouldCommitThreadGoalLoad(
+              goalLoadedRef.current,
+              goalResult,
+              goalEditorOpenRef.current,
+              goalBusyRef.current,
+            )
+          ) {
             setGoalDraft(goalResult?.goal?.objective ?? "");
             setThreadGoal(goalResult?.goal ?? undefined);
             goalLoadedRef.current = true;
@@ -5298,9 +5295,11 @@ function ConversationPageInstance({
     setVisibleItemLimit(INITIAL_CONVERSATION_ITEM_LIMIT);
     setHistoryNextCursor(undefined);
     setHistoryMoreState("idle");
+    setHistoryLoadIssue(undefined);
     historyExtendedRef.current = false;
     historyLoadInFlightRef.current = undefined;
     historyRevealScheduledRef.current = false;
+    historyScrollAdjustmentRef.current = undefined;
     conversationAwayRef.current = false;
     lastConversationScrollTopRef.current = 0;
     conversationUserScrollIntentAtRef.current = 0;
@@ -5723,15 +5722,43 @@ function ConversationPageInstance({
   useEffect(() => {
     initialScrollThreadRef.current = "";
     setDraftCopyState("idle");
-    setComposerExpansion(composerExpandedAfterIntent("thread-change"));
-    setAttachments(readConversationAttachments(browserLocalStorage(), id));
+    const restoredAttachments = readConversationAttachments(browserLocalStorage(), id);
+    setComposerExpansion(
+      composerExpandedAfterIntent(
+        "thread-change",
+        composerCanSafelyCollapse(
+          composerDraftRef.current,
+          restoredAttachments.length,
+          false,
+          false,
+        ),
+      ),
+    );
+    setAttachments(restoredAttachments);
   }, [id]);
+
+  useLayoutEffect(() => {
+    if (composerCanSafelyCollapse(draft, attachments.length, Boolean(composerSheet), sending)) {
+      return;
+    }
+    setComposerExpansion(true);
+  }, [attachments.length, composerSheet, draft, sending]);
 
   useEffect(() => {
     const collapseOutsideComposer = (event: PointerEvent) => {
       if (!composerExpandedRef.current) return;
       const target = event.target;
       if (target instanceof Node && composerShellRef.current?.contains(target)) return;
+      if (
+        !composerCanSafelyCollapse(
+          composerDraftRef.current,
+          composerAttachmentsRef.current.length,
+          Boolean(composerSheetRef.current),
+          composerSendingRef.current,
+        )
+      ) {
+        return;
+      }
       composerExpandedRef.current = false;
       setComposerExpanded(false);
     };
@@ -5750,16 +5777,54 @@ function ConversationPageInstance({
     lastConversationScrollTopRef.current = element.scrollTop;
     conversationAwayRef.current = false;
     setConversationAway(false);
+    setPositionedConversationThreadId(id);
   }, [detailProjectionReady, id, state]);
 
   useLayoutEffect(() => {
     const scroll = conversationScrollRef.current;
-    if (!scroll || state !== "ready" || !detailProjectionReady || conversationAwayRef.current) {
+    if (
+      !scroll ||
+      state !== "ready" ||
+      !detailProjectionReady ||
+      !conversationPositionReady ||
+      conversationAwayRef.current
+    ) {
       return;
     }
     scroll.scrollTop = initialConversationScrollTop(scroll.scrollHeight, scroll.clientHeight);
     lastConversationScrollTopRef.current = scroll.scrollTop;
-  }, [detailProjectionReady, state, visibleItems.length]);
+  }, [conversationPositionReady, detailProjectionReady, state, visibleItems.length]);
+
+  useLayoutEffect(() => {
+    const adjustment = historyScrollAdjustmentRef.current;
+    const scroll = conversationScrollRef.current;
+    if (!adjustment || !scroll) return;
+    historyScrollAdjustmentRef.current = undefined;
+    historyRevealScheduledRef.current = false;
+    const nextAnchorTop = adjustment.anchorElement?.isConnected
+      ? adjustment.anchorElement.getBoundingClientRect().top
+      : undefined;
+    scroll.scrollTop =
+      adjustment.mode !== "explicit" &&
+      adjustment.wasAway &&
+      adjustment.anchorTop !== undefined &&
+      nextAnchorTop !== undefined
+        ? conversationHistoryAnchorElementScrollTop(
+            scroll.scrollTop,
+            adjustment.anchorTop,
+            nextAnchorTop,
+          )
+        : conversationHistoryScrollTop(
+            adjustment.mode,
+            adjustment.previousTop,
+            adjustment.previousHeight,
+            scroll.scrollHeight,
+          );
+    lastConversationScrollTopRef.current = scroll.scrollTop;
+    const nextAway = conversationHistoryAwayAfterLoad(adjustment.mode, adjustment.wasAway);
+    conversationAwayRef.current = nextAway;
+    setConversationAway(nextAway);
+  });
 
   useEffect(() => {
     const scroll = conversationScrollRef.current;
@@ -5794,7 +5859,7 @@ function ConversationPageInstance({
     lastConversationScrollTopRef.current = element.scrollTop;
     if (!userDriven) return;
     if (movedUp && element.scrollTop <= 96) {
-      revealEarlierConversationItems();
+      revealEarlierConversationItems("scroll");
     }
     if (nextAway === conversationAwayRef.current) return;
     conversationAwayRef.current = nextAway;
@@ -5807,7 +5872,16 @@ function ConversationPageInstance({
     if (activeElement instanceof HTMLElement && activeElement.closest(".composer-shell")) {
       activeElement.blur();
     }
-    setComposerExpansion(composerExpandedAfterIntent("conversation-scroll"));
+    if (
+      composerCanSafelyCollapse(
+        composerDraftRef.current,
+        composerAttachmentsRef.current.length,
+        Boolean(composerSheetRef.current),
+        composerSendingRef.current,
+      )
+    ) {
+      setComposerExpansion(composerExpandedAfterIntent("conversation-scroll", true));
+    }
   }
 
   function refreshUsageDetails() {
@@ -5865,9 +5939,9 @@ function ConversationPageInstance({
     }
   }
 
-  function revealEarlierConversationItems() {
+  function revealEarlierConversationItems(mode: ConversationHistoryLoadMode) {
     if (hiddenItemCount <= 0) {
-      void loadEarlierConversationHistory();
+      void loadEarlierConversationHistory(mode);
       return;
     }
     if (historyRevealScheduledRef.current) return;
@@ -5875,73 +5949,149 @@ function ConversationPageInstance({
     const scroll = conversationScrollRef.current;
     const previousHeight = scroll?.scrollHeight ?? 0;
     const previousTop = scroll?.scrollTop ?? 0;
+    const wasAway = conversationAwayRef.current;
+    const anchorElement = conversationItemsRef.current?.firstElementChild as HTMLElement | null;
+    historyScrollAdjustmentRef.current = {
+      ...(anchorElement
+        ? { anchorElement, anchorTop: anchorElement.getBoundingClientRect().top }
+        : {}),
+      mode,
+      previousHeight,
+      previousTop,
+      wasAway,
+    };
     conversationAwayRef.current = true;
     setConversationAway(true);
     setVisibleItemLimit((current) =>
       nextConversationItemLimit(current, threadRef.current?.items.length ?? current),
     );
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        historyRevealScheduledRef.current = false;
-        if (!scroll) return;
-        scroll.scrollTop = conversationHistoryAnchorTop(
-          previousTop,
-          previousHeight,
-          scroll.scrollHeight,
-        );
-        lastConversationScrollTopRef.current = scroll.scrollTop;
-      });
-    });
   }
 
-  function loadEarlierConversationHistory() {
-    if (!historyNextCursor || historyLoadInFlightRef.current) {
-      return historyLoadInFlightRef.current;
-    }
+  function loadEarlierConversationHistory(mode: ConversationHistoryLoadMode) {
+    if (!historyNextCursor) return undefined;
     const requestedThreadId = id;
     const cursor = historyNextCursor;
+    const currentFlight = historyLoadInFlightRef.current;
+    if (conversationHistoryFlightBlocksRequest(currentFlight, requestedThreadId)) {
+      return currentFlight?.promise;
+    }
     const scroll = conversationScrollRef.current;
     const previousHeight = scroll?.scrollHeight ?? 0;
     const previousTop = scroll?.scrollTop ?? 0;
+    const wasAway = conversationAwayRef.current;
+    const guardedRecovery = mode === "explicit" && historyLoadIssue?.guarded === true;
+    let paginationGuard = createCursorPaginationGuard();
+    let resultingCursor: string | undefined = cursor;
     conversationAwayRef.current = true;
     setConversationAway(true);
     setHistoryMoreState("loading");
-    const flight = apiClient
-      .thread(id, cursor)
-      .then((olderPage) => {
-        if (currentIdRef.current !== requestedThreadId || !threadRef.current) return;
+    setHistoryLoadIssue(undefined);
+    const flight = loadConversationHistoryPages({
+      initialCursor: cursor,
+      isCurrent: (threadId) => currentIdRef.current === threadId && threadRef.current !== undefined,
+      loadPage: async (threadId, pageCursor) => {
+        if (mode === "automatic") {
+          paginationGuard = beginCursorPaginationPage(paginationGuard, pageCursor);
+        }
+        return apiClient.thread(threadId, pageCursor);
+      },
+      maxPages: mode === "automatic" ? DEFAULT_CURSOR_PAGINATION_LIMITS.maxPages : 1,
+      mode,
+      onPage: (olderPage) => {
+        if (!threadRef.current) return;
         const merged = prependConversationHistory(threadRef.current, olderPage);
+        if (mode === "automatic") {
+          paginationGuard = completeCursorPaginationPage(paginationGuard, {
+            addedItems: merged.added,
+            ...(olderPage.historyNextCursor === undefined
+              ? {}
+              : { nextCursor: olderPage.historyNextCursor }),
+            receivedItems: olderPage.items.length,
+          });
+        }
+        const currentScroll = conversationScrollRef.current;
+        const anchorElement = conversationItemsRef.current?.firstElementChild as HTMLElement | null;
+        historyScrollAdjustmentRef.current = {
+          ...(anchorElement
+            ? { anchorElement, anchorTop: anchorElement.getBoundingClientRect().top }
+            : {}),
+          mode,
+          previousHeight: currentScroll?.scrollHeight ?? previousHeight,
+          previousTop: currentScroll?.scrollTop ?? previousTop,
+          wasAway,
+        };
         historyExtendedRef.current = true;
         threadRef.current = merged.detail;
         setThread(merged.detail);
+        resultingCursor = olderPage.historyNextCursor;
         setHistoryNextCursor(olderPage.historyNextCursor);
-        if (merged.added > 0) {
-          setVisibleItemLimit((current) => current + merged.added);
-        }
-        window.requestAnimationFrame(() => {
-          window.requestAnimationFrame(() => {
-            if (!scroll) return;
-            scroll.scrollTop = conversationHistoryAnchorTop(
-              previousTop,
-              previousHeight,
-              scroll.scrollHeight,
-            );
-            lastConversationScrollTopRef.current = scroll.scrollTop;
+        if (merged.added > 0) setVisibleItemLimit((current) => current + merged.added);
+      },
+      threadId: requestedThreadId,
+    })
+      .then(() => {
+        if (currentIdRef.current !== requestedThreadId) return;
+        if (guardedRecovery && resultingCursor) {
+          setHistoryLoadIssue({
+            guarded: true,
+            message: "自动加载仍处于安全暂停状态；可继续逐页加载更早记录。",
           });
-        });
+          setHistoryMoreState("error");
+          return;
+        }
+        setHistoryLoadIssue(undefined);
         setHistoryMoreState("idle");
       })
-      .catch(() => {
-        if (currentIdRef.current === requestedThreadId) setHistoryMoreState("error");
+      .catch((cause: unknown) => {
+        if (currentIdRef.current === requestedThreadId) {
+          conversationAwayRef.current = wasAway;
+          setConversationAway(wasAway);
+          const guarded = isCursorPaginationGuardError(cause) || guardedRecovery;
+          setHistoryLoadIssue({
+            guarded,
+            message: isCursorPaginationGuardError(cause)
+              ? `${cause.message}；可点此逐页继续。`
+              : guardedRecovery
+                ? "逐页加载失败；请检查连接后重试。"
+                : "加载更早记录失败；请检查连接后重试。",
+          });
+          setHistoryMoreState("error");
+        }
       });
-    historyLoadInFlightRef.current = flight;
+    const request = { cursor, promise: flight, threadId: requestedThreadId };
+    historyLoadInFlightRef.current = request;
     void flight.finally(() => {
-      if (historyLoadInFlightRef.current === flight) {
+      if (historyLoadInFlightRef.current === request) {
         historyLoadInFlightRef.current = undefined;
       }
     });
     return flight;
   }
+
+  loadEarlierConversationHistoryRef.current = loadEarlierConversationHistory;
+
+  useEffect(() => {
+    if (
+      state !== "ready" ||
+      !detailProjectionReady ||
+      !conversationHistoryShouldAutoLoad(
+        thread?.state,
+        thread?.activeTurnId,
+        historyNextCursor,
+        thread?.historyLoadPolicy,
+      )
+    ) {
+      return;
+    }
+    void loadEarlierConversationHistoryRef.current?.("automatic");
+  }, [
+    detailProjectionReady,
+    historyNextCursor,
+    state,
+    thread?.activeTurnId,
+    thread?.historyLoadPolicy,
+    thread?.state,
+  ]);
 
   function nextTurnProductSettings(
     overrides: {
@@ -5998,6 +6148,7 @@ function ConversationPageInstance({
     }
     setSending(true);
     setActionError("");
+    let submitted = false;
     try {
       const prompt = draft.trim();
       let currentThread = threadRef.current ?? thread;
@@ -6144,7 +6295,7 @@ function ConversationPageInstance({
       }
       setDraft("");
       setAttachments([]);
-      setComposerExpansion(composerExpandedAfterIntent("submit"));
+      submitted = true;
       clearConversationDraft(id);
       writeConversationAttachments(browserLocalStorage(), id, []);
       window.setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 20);
@@ -6157,6 +6308,7 @@ function ConversationPageInstance({
       }
     } finally {
       setSending(false);
+      if (submitted) setComposerExpansion(composerExpandedAfterIntent("submit"));
     }
   }
 
@@ -6669,7 +6821,15 @@ function ConversationPageInstance({
     }
     composerCollapseTimerRef.current = window.setTimeout(() => {
       composerCollapseTimerRef.current = undefined;
-      if (!container.contains(document.activeElement)) {
+      if (
+        !container.contains(document.activeElement) &&
+        composerCanSafelyCollapse(
+          composerDraftRef.current,
+          composerAttachmentsRef.current.length,
+          Boolean(composerSheetRef.current),
+          composerSendingRef.current,
+        )
+      ) {
         setComposerExpansion(false);
       }
     }, 0);
@@ -6689,8 +6849,15 @@ function ConversationPageInstance({
   }
 
   const subagentHistoryNotice = subagentHistoryIntegrityNotice(subagentHistoryIntegrity);
-  const persistedHistoryNotice = persistedConversationHistoryNotice({
+  const automaticHistoryLoad = conversationHistoryShouldAutoLoad(
+    thread.state,
+    thread.activeTurnId,
     historyNextCursor,
+    thread.historyLoadPolicy,
+  );
+  const persistedHistoryNotice = persistedConversationHistoryNotice({
+    historyNextCursor:
+      automaticHistoryLoad && historyMoreState !== "error" ? undefined : historyNextCursor,
     persistedHistoryIntegrity: thread.persistedHistoryIntegrity,
   });
 
@@ -7000,7 +7167,11 @@ function ConversationPageInstance({
         ref={conversationScrollRef}
       >
         <div className="conversation-stream" ref={conversationStreamRef}>
-          {shouldShowConversationLoading(detailProjectionReady, visibleItems.length) ? (
+          {shouldShowConversationLoading(
+            detailProjectionReady,
+            visibleItems.length,
+            conversationPositionReady,
+          ) ? (
             <div
               aria-live="polite"
               className="conversation-loading"
@@ -7014,63 +7185,99 @@ function ConversationPageInstance({
               </div>
             </div>
           ) : null}
-          {persistedHistoryNotice ? (
-            <div
-              aria-label="对话历史完整性"
-              aria-live="polite"
-              className="mini-empty"
-              data-testid="persisted-history-integrity"
-              role="status"
-            >
-              {persistedHistoryNotice}
+          <div
+            aria-hidden={!conversationPositionReady}
+            style={{ visibility: conversationPositionReady ? "visible" : "hidden" }}
+          >
+            {persistedHistoryNotice ? (
+              <div
+                aria-label="对话历史完整性"
+                aria-live="polite"
+                className="mini-empty"
+                data-testid="persisted-history-integrity"
+                role="status"
+              >
+                {persistedHistoryNotice}
+              </div>
+            ) : null}
+            {historyLoadIssue ? (
+              <div
+                aria-live={historyLoadIssue.guarded ? "polite" : "assertive"}
+                className="mini-empty"
+                data-testid="conversation-history-load-issue"
+                role={historyLoadIssue.guarded ? "status" : "alert"}
+              >
+                {historyLoadIssue.message}
+              </div>
+            ) : null}
+            {conversationHistoryControlVisible(
+              thread.state,
+              thread.activeTurnId,
+              historyNextCursor,
+              hiddenItemCount,
+              historyMoreState,
+              thread.historyLoadPolicy,
+            ) ? (
+              <button
+                className="conversation-history-more"
+                data-testid="conversation-history-more"
+                disabled={historyMoreState === "loading"}
+                onClick={() =>
+                  historyMoreState === "error" && historyLoadIssue?.guarded
+                    ? void loadEarlierConversationHistory("explicit")
+                    : historyMoreState === "error" && automaticHistoryLoad
+                      ? void loadEarlierConversationHistory("automatic")
+                      : revealEarlierConversationItems("explicit")
+                }
+                type="button"
+              >
+                <Icon name="clock" size={16} />
+                {historyMoreState === "loading"
+                  ? automaticHistoryLoad
+                    ? "正在加载完整历史…"
+                    : "正在向上加载更早记录…"
+                  : historyMoreState === "error"
+                    ? historyLoadIssue?.guarded
+                      ? "逐页继续加载"
+                      : "加载失败，点此重试"
+                    : hiddenItemCount > 0
+                      ? `显示更早内容（还有 ${hiddenItemCount} 项）`
+                      : "向上加载更早记录"}
+              </button>
+            ) : null}
+            <div ref={conversationItemsRef}>
+              <ConversationItems
+                {...(thread.activeTurnId === undefined
+                  ? {}
+                  : { activeTurnId: thread.activeTurnId })}
+                apiClient={apiClient}
+                items={visibleItems}
+                key={presentationIdentity}
+                online={online}
+                presentationIdentity={presentationIdentity}
+                {...(thread.projectId === undefined ? {} : { projectId: thread.projectId })}
+                showLivePhase={!isSnapshot && thread.state === "running"}
+                subagents={subagents}
+              />
             </div>
-          ) : null}
-          {hiddenItemCount > 0 || historyNextCursor ? (
-            <button
-              className="conversation-history-more"
-              data-testid="conversation-history-more"
-              disabled={historyMoreState === "loading"}
-              onClick={revealEarlierConversationItems}
-              type="button"
-            >
-              <Icon name="clock" size={16} />
-              {historyMoreState === "loading"
-                ? "正在向上加载更早记录…"
-                : historyMoreState === "error"
-                  ? "加载失败，点此重试"
-                  : hiddenItemCount > 0
-                    ? `显示更早内容（还有 ${hiddenItemCount} 项）`
-                    : "向上加载更早记录"}
-            </button>
-          ) : null}
-          <ConversationItems
-            {...(thread.activeTurnId === undefined ? {} : { activeTurnId: thread.activeTurnId })}
-            apiClient={apiClient}
-            items={visibleItems}
-            key={presentationIdentity}
-            online={online}
-            presentationIdentity={presentationIdentity}
-            {...(thread.projectId === undefined ? {} : { projectId: thread.projectId })}
-            showLivePhase={!isSnapshot && thread.state === "running"}
-            subagents={subagents}
-          />
-          {thread.state === "failed" ? (
-            <Notice
-              action={
-                <Button
-                  onClick={() => setDraft("请检查失败原因并从安全的位置继续。")}
-                  size="compact"
-                >
-                  准备恢复指令
-                </Button>
-              }
-              icon="alert"
-              title="这一轮没有完成"
-              tone="danger"
-            >
-              查看上方失败步骤，补充要求后可以开始新一轮。
-            </Notice>
-          ) : null}
+            {thread.state === "failed" ? (
+              <Notice
+                action={
+                  <Button
+                    onClick={() => setDraft("请检查失败原因并从安全的位置继续。")}
+                    size="compact"
+                  >
+                    准备恢复指令
+                  </Button>
+                }
+                icon="alert"
+                title="这一轮没有完成"
+                tone="danger"
+              >
+                查看上方失败步骤，补充要求后可以开始新一轮。
+              </Notice>
+            ) : null}
+          </div>
           <div ref={endRef} />
         </div>
       </div>
@@ -7127,6 +7334,7 @@ function ConversationPageInstance({
                     ) : null}
                     {collaborationModeSupported ? (
                       <button
+                        aria-label={`协作模式：${selectedCollaborationModeLabel}`}
                         className="composer-mode-button"
                         data-testid="composer-mode-open"
                         onClick={() => setComposerSheet("plan")}
@@ -7143,21 +7351,13 @@ function ConversationPageInstance({
               }
               goal={
                 threadGoal ? (
-                  <button
-                    className="composer-goal-button"
-                    data-testid="composer-goal-open"
-                    onClick={() => setComposerSheet("goal")}
-                    title={threadGoal.objective}
-                    type="button"
-                  >
-                    <Icon name="target" size={15} />
-                    <span>{threadGoal.objective}</span>
-                    <small>
-                      {threadGoal.status === "active"
-                        ? "进行中"
-                        : runtimeOptionLabel(threadGoal.status)}
-                    </small>
-                  </button>
+                  <GoalInlineControl
+                    busy={goalBusy}
+                    goal={threadGoal}
+                    onClear={() => void clearGoal()}
+                    onOpen={() => setComposerSheet("goal")}
+                    onStatusChange={(status) => void setGoalStatus(status)}
+                  />
                 ) : undefined
               }
             />
@@ -7354,39 +7554,6 @@ function ConversationPageInstance({
         open={composerSheet === "settings"}
         serviceTier={serviceTiersSupported ? serviceTier : null}
         serviceTiersSupported={serviceTiersSupported}
-      />
-      <AccessAndReviewerSheet
-        approvalPolicy={approvalPolicy}
-        approvalPolicies={approvalPoliciesSupported ? approvalPolicies : []}
-        approvalReviewer={approvalReviewer}
-        approvalReviewers={approvalReviewersSupported ? approvalReviewers : []}
-        busy={settingsBusy}
-        onApply={() =>
-          void persistNextTurnSettings({
-            ...(permissionProfilesSupported ? { permissionProfileId } : {}),
-            ...(approvalPoliciesSupported ? { approvalPolicy } : {}),
-            ...(approvalReviewersSupported ? { approvalsReviewer: approvalReviewer } : {}),
-          })
-        }
-        onApprovalPolicy={(policy) => {
-          productSettingsGenerationRef.current += 1;
-          productSettingsDirtyRef.current = true;
-          setApprovalPolicy(policy);
-        }}
-        onApprovalReviewer={(reviewer) => {
-          productSettingsGenerationRef.current += 1;
-          productSettingsDirtyRef.current = true;
-          setApprovalReviewer(reviewer);
-        }}
-        onClose={() => setComposerSheet("")}
-        onPermission={(profileId) => {
-          productSettingsGenerationRef.current += 1;
-          productSettingsDirtyRef.current = true;
-          setPermissionProfileId(profileId);
-        }}
-        open={composerSheet === "permission"}
-        permissionProfileId={permissionProfileId}
-        permissionProfiles={permissionProfilesSupported ? permissionProfiles : []}
       />
       <ComposerToolsSheet
         canAttach
@@ -8016,6 +8183,14 @@ function attachmentReferenceKey(reference: LocalInputReference): string {
   return `${reference.projectId ?? reference.uploadId}:${reference.kind}:${reference.relativePath.toLocaleLowerCase("en-US")}`;
 }
 
+export function removeAttachmentReference(
+  attachments: readonly LocalInputReference[],
+  reference: LocalInputReference,
+): LocalInputReference[] {
+  const key = attachmentReferenceKey(reference);
+  return attachments.filter((item) => attachmentReferenceKey(item) !== key);
+}
+
 function attachmentName(reference: LocalInputReference): string {
   return reference.relativePath.split("/").filter(Boolean).at(-1) ?? reference.relativePath;
 }
@@ -8036,7 +8211,12 @@ function AttachmentChips({
           <span>{attachmentName(reference)}</span>
           <button
             aria-label={`移除 ${attachmentName(reference)}`}
-            onClick={() => onRemove(reference)}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onRemove(reference);
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
             type="button"
           >
             <Icon name="close" size={13} />
@@ -8267,11 +8447,7 @@ function AttachmentPickerSheet({
           <AttachmentChips
             attachments={draft}
             onRemove={(reference) =>
-              setDraft((current) =>
-                current.filter(
-                  (item) => attachmentReferenceKey(item) !== attachmentReferenceKey(reference),
-                ),
-              )
+              setDraft((current) => removeAttachmentReference(current, reference))
             }
           />
           {projectId ? (
@@ -8634,6 +8810,10 @@ function fileManagerJoinPath(parent: string, name: string): string {
     .join("/");
 }
 
+export function fileRootDisplayLabel(root: Pick<FileRoot, "name" | "rootLabel">): string {
+  return root.rootLabel;
+}
+
 function FileManagerOperationSheet({
   busy,
   error,
@@ -8734,7 +8914,7 @@ function FileManagerOperationSheet({
               >
                 {hostRoots.map((root) => (
                   <option key={root.id} value={root.id}>
-                    {root.name} · {root.rootLabel}
+                    {fileRootDisplayLabel(root)}
                   </option>
                 ))}
               </select>
@@ -9037,7 +9217,7 @@ function FileBrowserPage({
                 <optgroup label="这台电脑">
                   {hostRoots.map((root) => (
                     <option key={root.id} value={root.id}>
-                      {root.name} · {root.rootLabel}
+                      {fileRootDisplayLabel(root)}
                     </option>
                   ))}
                 </optgroup>
@@ -9356,6 +9536,10 @@ function SettingsPage({
   const [busy, setBusy] = useState(false);
   const diagnostics = data.diagnostics;
   const caps = diagnostics?.capabilities;
+  const codexAccount = codexAccountPresentation(data.usage);
+  const usageUnavailable = usageAvailabilityMessage(data.usage);
+  const rateLimitsUnavailable = data.usage?.availability?.rateLimits === "temporarily-unavailable";
+  const tokenUsageUnavailable = data.usage?.availability?.tokenUsage === "temporarily-unavailable";
 
   return (
     <>
@@ -9429,7 +9613,26 @@ function SettingsPage({
           <section>
             <h2>额度与上下文</h2>
             <Card className="settings-card usage-settings">
-              {data.usage?.windows.length ? (
+              <div className="settings-row" data-testid="codex-account-identity">
+                <span className="settings-row__icon">
+                  <Icon name="user" size={19} />
+                </span>
+                <span>
+                  <strong>Codex 登录账号</strong>
+                  <small>{codexAccount.detail}</small>
+                </span>
+                <StatusPill tone={codexAccount.tone}>{codexAccount.status}</StatusPill>
+              </div>
+              {usageUnavailable ? (
+                <Notice icon="alert" title="部分账户数据暂不可用" tone="warning">
+                  {usageUnavailable}
+                </Notice>
+              ) : null}
+              {rateLimitsUnavailable ? (
+                <div className="mini-empty" data-testid="usage-unavailable">
+                  额度与 Credits 暂时无法读取
+                </div>
+              ) : data.usage?.windows.length ? (
                 data.usage.windows.map((window) => (
                   <div className="usage-window" data-testid="usage-window" key={window.id}>
                     <div>
@@ -9458,13 +9661,15 @@ function SettingsPage({
                 ))
               ) : (
                 <div className="mini-empty" data-testid="usage-unavailable">
-                  额度暂时无法读取
+                  当前账户没有可显示的额度窗口
                 </div>
               )}
-              <div className="usage-subsection">
-                <h3>Credits</h3>
-                <CreditsList credits={data.usage?.credits} />
-              </div>
+              {!rateLimitsUnavailable ? (
+                <div className="usage-subsection">
+                  <h3>Credits</h3>
+                  <CreditsList credits={data.usage?.credits} />
+                </div>
+              ) : null}
               <details className="account-usage-details">
                 <summary>
                   <span>
@@ -9473,56 +9678,62 @@ function SettingsPage({
                   </span>
                   <Icon name="chevron-down" size={17} />
                 </summary>
-                <div className="account-usage-stats">
-                  <div>
-                    <span>累计 tokens</span>
-                    <strong>
-                      {data.usage?.tokenUsageSummary?.lifetimeTokens ?? "暂时无法读取"}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>单日峰值</span>
-                    <strong>
-                      {data.usage?.tokenUsageSummary?.peakDailyTokens ?? "暂时无法读取"}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>最长运行</span>
-                    <strong>
-                      {data.usage?.tokenUsageSummary?.longestRunningTurnSec === undefined
-                        ? "暂时无法读取"
-                        : `${data.usage.tokenUsageSummary.longestRunningTurnSec} 秒`}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>当前连续使用</span>
-                    <strong>
-                      {data.usage?.tokenUsageSummary?.currentStreakDays === undefined
-                        ? "暂时无法读取"
-                        : `${data.usage.tokenUsageSummary.currentStreakDays} 天`}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>最长连续使用</span>
-                    <strong>
-                      {data.usage?.tokenUsageSummary?.longestStreakDays === undefined
-                        ? "暂时无法读取"
-                        : `${data.usage.tokenUsageSummary.longestStreakDays} 天`}
-                    </strong>
-                  </div>
-                </div>
-                {data.usage?.dailyUsageBuckets?.length ? (
-                  <div className="daily-usage-list">
-                    <strong>最近每日用量</strong>
-                    {data.usage.dailyUsageBuckets.slice(-7).map((bucket) => (
-                      <div key={bucket.startDate}>
-                        <time dateTime={bucket.startDate}>{shortDate(bucket.startDate)}</time>
-                        <span>{bucket.tokens} tokens</span>
-                      </div>
-                    ))}
-                  </div>
+                {tokenUsageUnavailable ? (
+                  <div className="mini-empty">Token 用量暂时无法读取</div>
                 ) : (
-                  <div className="mini-empty">每日用量暂时无法读取</div>
+                  <>
+                    <div className="account-usage-stats">
+                      <div>
+                        <span>累计 tokens</span>
+                        <strong>
+                          {data.usage?.tokenUsageSummary?.lifetimeTokens ?? "暂无记录"}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>单日峰值</span>
+                        <strong>
+                          {data.usage?.tokenUsageSummary?.peakDailyTokens ?? "暂无记录"}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>最长运行</span>
+                        <strong>
+                          {data.usage?.tokenUsageSummary?.longestRunningTurnSec === undefined
+                            ? "暂无记录"
+                            : `${data.usage.tokenUsageSummary.longestRunningTurnSec} 秒`}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>当前连续使用</span>
+                        <strong>
+                          {data.usage?.tokenUsageSummary?.currentStreakDays === undefined
+                            ? "暂无记录"
+                            : `${data.usage.tokenUsageSummary.currentStreakDays} 天`}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>最长连续使用</span>
+                        <strong>
+                          {data.usage?.tokenUsageSummary?.longestStreakDays === undefined
+                            ? "暂无记录"
+                            : `${data.usage.tokenUsageSummary.longestStreakDays} 天`}
+                        </strong>
+                      </div>
+                    </div>
+                    {data.usage?.dailyUsageBuckets?.length ? (
+                      <div className="daily-usage-list">
+                        <strong>最近每日用量</strong>
+                        {data.usage.dailyUsageBuckets.slice(-7).map((bucket) => (
+                          <div key={bucket.startDate}>
+                            <time dateTime={bucket.startDate}>{shortDate(bucket.startDate)}</time>
+                            <span>{bucket.tokens} tokens</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="mini-empty">暂无每日用量记录</div>
+                    )}
+                  </>
                 )}
               </details>
             </Card>
@@ -9834,10 +10045,12 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   const loadInFlight = useRef<Promise<void> | undefined>(undefined);
   const initialReplayComplete = useRef(false);
   const liveDeliverySequence = useRef(0);
+  const liveEventBufferRef = useRef<LiveEventFrameBuffer<LiveEventEnvelope> | undefined>(undefined);
   const threadsRef = useRef<ThreadSummary[]>([]);
   const threadsNextCursorRef = useRef<string | undefined>(undefined);
   const threadsExtendedRef = useRef(false);
   const threadTailIdsRef = useRef(new Set<string>());
+  const threadsPaginationGuardRef = useRef<CursorPaginationGuard | undefined>(undefined);
   const workspaceReadyRef = useRef(false);
   const threadsMoreInFlightRef = useRef(false);
   const archivedThreadsRef = useRef<ThreadSummary[]>([]);
@@ -9850,6 +10063,29 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
   const isDesktop = useMediaQuery("(min-width: 1100px)");
   const runningThreadCount = data.threads.filter((thread) => thread.state === "running").length;
   const eventThreadIdRef = useRef(eventThreadId);
+
+  const queueLiveEvent = useCallback((envelope: LiveEventEnvelope) => {
+    if (liveEventBufferRef.current === undefined) {
+      liveEventBufferRef.current = createLiveEventFrameBuffer({
+        cancelFrame: (frameId) => window.cancelAnimationFrame(frameId),
+        commit: (incoming, resetsRetainedState) =>
+          setLiveEvents((current) =>
+            appendLiveEventBatch(resetsRetainedState ? [] : current, incoming, MAX_LIVE_EVENTS),
+          ),
+        limit: MAX_LIVE_EVENTS,
+        scheduleFrame: (callback) => window.requestAnimationFrame(callback),
+      });
+    }
+    liveEventBufferRef.current.enqueue(envelope);
+  }, []);
+
+  useEffect(
+    () => () => {
+      liveEventBufferRef.current?.dispose();
+      liveEventBufferRef.current = undefined;
+    },
+    [],
+  );
   eventThreadIdRef.current = eventThreadId;
   const bootstrapEventCursor = workspaceBootstrapEventCursor(eventSnapshotCursor, eventThreadId);
   const rememberSnapshotEventCursor = useCallback((threadId: string, cursor: string) => {
@@ -9927,11 +10163,20 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
           if (!workspaceReadyRef.current) {
             threadTailIdsRef.current.clear();
           }
+          const preserveCurrentPagination =
+            threadsExtendedRef.current || threadsMoreInFlightRef.current;
           const nextCursor = nextCursorAfterRefresh(
             threadsNextCursorRef.current,
             threadsPage.nextCursor,
-            threadsExtendedRef.current || threadsMoreInFlightRef.current,
+            preserveCurrentPagination,
           );
+          if (!preserveCurrentPagination) {
+            threadsPaginationGuardRef.current = nextCursor
+              ? createCursorPaginationGuard()
+              : undefined;
+          } else if (!nextCursor) {
+            threadsPaginationGuardRef.current = undefined;
+          }
           threadsRef.current = threads;
           threadsNextCursorRef.current = nextCursor;
           setThreadsNextCursor(nextCursor);
@@ -10034,36 +10279,71 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
     void load();
   }, [load]);
 
-  async function loadMoreThreads() {
-    const cursor = threadsNextCursorRef.current;
-    if (!cursor || threadsMoreInFlightRef.current) return;
-    threadsMoreInFlightRef.current = true;
-    setThreadsMoreState("loading");
-    setThreadsMoreError("");
-    try {
-      const page = await api.threads({ archived: false, cursor });
-      const threads = mergeCursorItems(
-        threadsRef.current,
-        page.items,
-        (thread) => thread.id,
-        "append",
-      );
-      threadsRef.current = threads;
-      threadsExtendedRef.current = true;
-      for (const thread of page.items) {
-        threadTailIdsRef.current.add(thread.id);
+  const loadMoreThreads = useCallback(
+    async (mode: "automatic" | "manual") => {
+      const cursor = threadsNextCursorRef.current;
+      if (!cursor || threadsMoreInFlightRef.current) return;
+      threadsMoreInFlightRef.current = true;
+      setThreadsMoreState("loading");
+      setThreadsMoreError("");
+      try {
+        let page: CursorPage<ThreadSummary>;
+        if (mode === "automatic") {
+          const result = await loadGuardedCursorPage<CursorPage<ThreadSummary>>({
+            countAddedItems: (incoming) => {
+              const currentIds = new Set(threadsRef.current.map((thread) => thread.id));
+              return new Set(
+                incoming.items
+                  .filter((thread) => !currentIds.has(thread.id))
+                  .map((thread) => thread.id),
+              ).size;
+            },
+            cursor,
+            guard: threadsPaginationGuardRef.current ?? createCursorPaginationGuard(),
+            loadPage: (pageCursor) => api.threads({ archived: false, cursor: pageCursor }),
+          });
+          page = result.page;
+          threadsPaginationGuardRef.current = result.guard;
+        } else {
+          threadsPaginationGuardRef.current = undefined;
+          page = await api.threads({ archived: false, cursor });
+        }
+        const threads = mergeCursorItems(
+          threadsRef.current,
+          page.items,
+          (thread) => thread.id,
+          "append",
+        );
+        threadsRef.current = threads;
+        threadsExtendedRef.current = true;
+        for (const thread of page.items) {
+          threadTailIdsRef.current.add(thread.id);
+        }
+        threadsNextCursorRef.current = page.nextCursor;
+        threadsPaginationGuardRef.current = page.nextCursor
+          ? (threadsPaginationGuardRef.current ?? createCursorPaginationGuard())
+          : undefined;
+        setThreadsNextCursor(page.nextCursor);
+        setData((current) => ({ ...current, threads }));
+        setThreadsMoreState("idle");
+      } catch (loadError) {
+        setThreadsMoreError(
+          isCursorPaginationGuardError(loadError)
+            ? `${loadError.message}；点“重试同步”可逐页恢复，然后继续自动同步。`
+            : errorMessage(loadError),
+        );
+        setThreadsMoreState("error");
+      } finally {
+        threadsMoreInFlightRef.current = false;
       }
-      threadsNextCursorRef.current = page.nextCursor;
-      setThreadsNextCursor(page.nextCursor);
-      setData((current) => ({ ...current, threads }));
-      setThreadsMoreState("idle");
-    } catch (loadError) {
-      setThreadsMoreError(errorMessage(loadError));
-      setThreadsMoreState("error");
-    } finally {
-      threadsMoreInFlightRef.current = false;
-    }
-  }
+    },
+    [api],
+  );
+
+  useEffect(() => {
+    if (!shouldAutoLoadCurrentThreads(state, threadsNextCursor, threadsMoreState)) return;
+    void loadMoreThreads("automatic");
+  }, [loadMoreThreads, state, threadsMoreState, threadsNextCursor]);
 
   async function loadArchivedPage(cursor?: string) {
     if (archivedInFlightRef.current) return;
@@ -10132,6 +10412,9 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
     threadsRef.current = current;
     archivedThreadsRef.current = archived;
     threadsNextCursorRef.current = currentReadback.nextCursor;
+    threadsPaginationGuardRef.current = currentReadback.nextCursor
+      ? createCursorPaginationGuard()
+      : undefined;
     archivedNextCursorRef.current = archivedReadback.nextCursor;
     setData((workspace) => ({ ...workspace, threads: current }));
     setArchivedThreads(archived);
@@ -10260,11 +10543,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
           setData((current) => ({ ...current, threads: reconciled.current }));
           setArchivedThreads(reconciled.archived);
         }
-        setLiveEvents((current) => {
-          if (event.type === "connection.reset") return [envelope];
-          const next = [...current, envelope];
-          return next.length > MAX_LIVE_EVENTS ? next.slice(next.length - MAX_LIVE_EVENTS) : next;
-        });
+        queueLiveEvent(envelope);
         if (workspaceEventNeedsRefresh(event)) {
           if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
           refreshTimer.current = window.setTimeout(() => void load(), 500);
@@ -10282,7 +10561,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
         recoveryTimer.current = undefined;
       }
     };
-  }, [bootstrapEventCursor, eventThreadId, load]);
+  }, [bootstrapEventCursor, eventThreadId, load, queueLiveEvent]);
 
   async function logout() {
     await api.logout();
@@ -10351,7 +10630,7 @@ function Workspace({ session, onLoggedOut }: { session: AuthSession; onLoggedOut
                 online={online}
                 onOpenApproval={openApproval}
                 onLoadArchived={() => void loadArchivedPage()}
-                onLoadMore={() => void loadMoreThreads()}
+                onLoadMore={() => void loadMoreThreads("manual")}
                 onLoadMoreArchived={() => void loadArchivedPage(archivedNextCursorRef.current)}
                 onThreadConvergenceRetry={retryThreadListConvergence}
                 onThreadMutation={mutateThreadList}

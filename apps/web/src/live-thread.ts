@@ -30,6 +30,8 @@ export type ThreadRemoteEventProjectionState = {
   replayBaselineByItem: Map<string, string>;
   submittedTurnUserAliasByThread: Map<string, SubmittedTurnUserAlias[]>;
   consumedLiveUserAliasIds: Set<string>;
+  projectedLiveUserItemIds: Set<string>;
+  consumedSnapshotUserAliasIds: Set<string>;
 };
 
 type SubmittedTurnUserAlias = {
@@ -143,6 +145,8 @@ export function createThreadRemoteEventProjectionState(): ThreadRemoteEventProje
     replayBaselineByItem: new Map(),
     submittedTurnUserAliasByThread: new Map(),
     consumedLiveUserAliasIds: new Set(),
+    projectedLiveUserItemIds: new Set(),
+    consumedSnapshotUserAliasIds: new Set(),
   };
 }
 
@@ -604,6 +608,9 @@ function applyThreadItem(
     if (projection.consumedLiveUserAliasIds.has(liveAliasKey)) {
       continue;
     }
+    if (item.kind === "user-message" && !items.some((candidate) => candidate.id === item.id)) {
+      projection.projectedLiveUserItemIds.add(liveAliasKey);
+    }
     const isLocalRemoteSteerAlias =
       item.kind === "user-message" && payload.localRemoteAlias === "steer";
     const submittedAliases = projection.submittedTurnUserAliasByThread.get(thread.id) ?? [];
@@ -615,6 +622,9 @@ function applyThreadItem(
       submittedAliasIndex < 0 ? undefined : submittedAliases[submittedAliasIndex];
     const matchesSubmittedAlias = submittedAlias !== undefined;
     if (isLocalRemoteSteerAlias && matchesSubmittedAlias) {
+      if (submittedAlias.remoteAlias !== true && submittedAlias.itemId.length > 0) {
+        projection.consumedSnapshotUserAliasIds.add(`${thread.id}:${submittedAlias.itemId}`);
+      }
       projection.consumedLiveUserAliasIds.add(liveAliasKey);
       continue;
     }
@@ -629,6 +639,9 @@ function applyThreadItem(
         },
       ]);
     } else if (matchesSubmittedAlias && submittedAlias !== undefined) {
+      if (submittedAlias.remoteAlias !== true && submittedAlias.itemId.length > 0) {
+        projection.consumedSnapshotUserAliasIds.add(`${thread.id}:${submittedAlias.itemId}`);
+      }
       const nextAliases = [...submittedAliases];
       if (submittedAlias.pending === true) {
         nextAliases[submittedAliasIndex] = {
@@ -644,16 +657,23 @@ function applyThreadItem(
       projection.consumedLiveUserAliasIds.add(liveAliasKey);
       continue;
     }
-    const lastItem = items.at(-1);
-    if (
-      item.kind === "user-message" &&
-      lastItem?.kind === "user-message" &&
-      lastItem.text === item.text &&
-      !(isLocalRemoteSteerAlias && lastItem.id.startsWith("pending-steer-"))
-    ) {
-      // A turn/start response (or the optimistic steer row) already contains
-      // the user text, while app-server lifecycle notifications use a
-      // different transient item id for the same message.
+    const snapshotAlias =
+      item.kind === "user-message" && !isLocalRemoteSteerAlias && item.turnId !== undefined
+        ? items.find((candidate) => {
+            const candidateKey = `${thread.id}:${candidate.id}`;
+            return (
+              candidate.kind === "user-message" &&
+              candidate.id !== item.id &&
+              candidate.turnId === item.turnId &&
+              candidate.text === item.text &&
+              !projection.projectedLiveUserItemIds.has(candidateKey) &&
+              !projection.consumedSnapshotUserAliasIds.has(candidateKey)
+            );
+          })
+        : undefined;
+    if (snapshotAlias) {
+      projection.consumedSnapshotUserAliasIds.add(`${thread.id}:${snapshotAlias.id}`);
+      projection.consumedLiveUserAliasIds.add(liveAliasKey);
       continue;
     }
     const index = items.findIndex((candidate) => candidate.id === item.id);
@@ -820,6 +840,12 @@ function clearReplayDeltaState(
   for (const key of projection.consumedLiveUserAliasIds) {
     if (key.startsWith(prefix)) projection.consumedLiveUserAliasIds.delete(key);
   }
+  for (const key of projection.projectedLiveUserItemIds) {
+    if (key.startsWith(prefix)) projection.projectedLiveUserItemIds.delete(key);
+  }
+  for (const key of projection.consumedSnapshotUserAliasIds) {
+    if (key.startsWith(prefix)) projection.consumedSnapshotUserAliasIds.delete(key);
+  }
 }
 
 function resetThreadRemoteEventProjection(projection: ThreadRemoteEventProjectionState): void {
@@ -830,6 +856,8 @@ function resetThreadRemoteEventProjection(projection: ThreadRemoteEventProjectio
   projection.replayBaselineByItem.clear();
   projection.submittedTurnUserAliasByThread.clear();
   projection.consumedLiveUserAliasIds.clear();
+  projection.projectedLiveUserItemIds.clear();
+  projection.consumedSnapshotUserAliasIds.clear();
 }
 
 function upsertThreadSummary(

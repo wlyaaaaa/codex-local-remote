@@ -3,6 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { PERSISTED_CONVERSATION_CURSOR_PREFIX } from "@codex-local-remote/contracts";
 import type {
   AccountTokenUsageSummary,
   ApprovalPolicyOption,
@@ -142,6 +143,7 @@ interface ThreadHistoryReadDiagnostic {
 
 export interface PersistedThreadHead {
   activeTurnId?: string;
+  controlState?: "active" | "idle" | "unknown";
   sourceBytes: number;
 }
 
@@ -271,6 +273,7 @@ export interface CodexDomainServiceOptions {
     threadId: string,
     sessionPath?: string,
     scope?: PersistedConversationHistoryScope,
+    historyCursor?: string,
   ) => Promise<ConversationItem[] | PersistedConversationReadResult>;
   readPersistedRuntimeSettings?: (
     threadId: string,
@@ -378,6 +381,7 @@ export class CodexDomainService {
         threadId: string,
         sessionPath?: string,
         scope?: PersistedConversationHistoryScope,
+        historyCursor?: string,
       ) => Promise<ConversationItem[] | PersistedConversationReadResult>)
     | undefined;
   readonly #readPersistedRuntimeSettings:
@@ -751,6 +755,7 @@ export class CodexDomainService {
     const degradations: ServiceDegradation[] = [];
     const account =
       accountResult.status === "fulfilled" ? asRecord(asRecord(accountResult.value).account) : {};
+    const codexAccount = projectCodexAccountIdentity(account);
     if (accountResult.status === "rejected") {
       degradations.push(usageDegradation("暂时无法读取账户套餐信息。"));
     }
@@ -779,7 +784,15 @@ export class CodexDomainService {
     return {
       data: {
         updatedAt,
+        availability: {
+          account: accountResult.status === "fulfilled" ? "available" : "temporarily-unavailable",
+          rateLimits:
+            rateLimitResult.status === "fulfilled" ? "available" : "temporarily-unavailable",
+          tokenUsage:
+            tokenUsageResult.status === "fulfilled" ? "available" : "temporarily-unavailable",
+        },
         windows,
+        ...(codexAccount === undefined ? {} : { codexAccount }),
         ...(plan === undefined ? {} : { plan }),
         ...(credits === undefined ? {} : { credits }),
         ...(tokenUsageSummary === undefined ? {} : { tokenUsageSummary }),
@@ -1021,6 +1034,14 @@ export class CodexDomainService {
     options: { historyCursor?: string; includeTurns?: boolean } = {},
   ): Promise<ThreadDetail> {
     requireNonEmpty(threadId, "对话 id");
+    const localHistoryCursor = options.historyCursor?.startsWith(
+      PERSISTED_CONVERSATION_CURSOR_PREFIX,
+    )
+      ? options.historyCursor
+      : undefined;
+    if (localHistoryCursor !== undefined && this.#readPersistedConversationItems === undefined) {
+      throw new DomainError("FEATURE_UNAVAILABLE", "当前 Sidecar 无法继续读取本机历史页", 409);
+    }
     await this.#refreshPinnedThreadIds();
     if (this.#managedThreads.has(threadId)) {
       await this.#ensureSharedThread(threadId);
@@ -1029,15 +1050,30 @@ export class CodexDomainService {
       await this.#hydrateSharedThreadAncestors([threadId]);
       await this.#promoteSharedTopLevelThread(threadId);
     }
-    if (this.#isControllableThread(threadId) && this.#restoredThreadsNeedingRefresh.has(threadId)) {
+    if (
+      options.historyCursor === undefined &&
+      this.#isControllableThread(threadId) &&
+      this.#restoredThreadsNeedingRefresh.has(threadId)
+    ) {
       const restored = await this.#refreshRestoredThread(threadId);
       if (restored) {
         return this.#withControlState(restored);
       }
     }
     let persistedThreadHead: PersistedThreadHead | undefined;
+    let bypassAppServerHistory = false;
     let response: Record<string, unknown>;
-    if (
+    if (localHistoryCursor !== undefined) {
+      const cachedThread = this.#sharedThreadSnapshots.get(threadId);
+      const cachedSessionPath = asString(cachedThread?.path);
+      response =
+        asString(cachedThread?.id) === threadId
+          ? {
+              thread: cachedThread,
+              ...(cachedSessionPath === undefined ? {} : { path: cachedSessionPath }),
+            }
+          : await this.#readThreadForDisplay(threadId, false);
+    } else if (
       this.#sharedAppServer &&
       this.#readPersistedThreadHead !== undefined &&
       options.historyCursor === undefined
@@ -1055,7 +1091,7 @@ export class CodexDomainService {
       const shellThread = asRecord(shellResponse.thread);
       const shellSessionPath = asString(shellThread.path) ?? asString(shellResponse.path);
       persistedThreadHead = await this.#readPersistedThreadHeadSafely(threadId, shellSessionPath);
-      const bypassAppServerHistory =
+      bypassAppServerHistory =
         options.includeTurns !== false &&
         (persistedThreadHead?.sourceBytes ?? 0) >= MAX_APP_SERVER_HISTORY_SESSION_BYTES;
       response =
@@ -1094,44 +1130,82 @@ export class CodexDomainService {
     if (
       this.#readPersistedConversationItems !== undefined &&
       options.includeTurns !== false &&
-      options.historyCursor === undefined
+      (options.historyCursor === undefined || localHistoryCursor !== undefined)
     ) {
       const persistedHistoryScope: PersistedConversationHistoryScope =
-        asString(thread.parentThreadId) === undefined ? "recent" : "complete";
+        bypassAppServerHistory || localHistoryCursor !== undefined
+          ? "recent"
+          : asString(thread.parentThreadId) === undefined
+            ? "recent"
+            : "complete";
       try {
-        const persistedResult = await this.#readPersistedConversationItems(
-          threadId,
-          sessionPath,
-          persistedHistoryScope,
-        );
+        const persistedResult =
+          localHistoryCursor === undefined
+            ? await this.#readPersistedConversationItems(
+                threadId,
+                sessionPath,
+                persistedHistoryScope,
+              )
+            : await this.#readPersistedConversationItems(
+                threadId,
+                sessionPath,
+                persistedHistoryScope,
+                localHistoryCursor,
+              );
         const persistedItems = Array.isArray(persistedResult)
           ? persistedResult
           : persistedResult.items;
+        const persistedNextCursor = Array.isArray(persistedResult)
+          ? undefined
+          : persistedResult.historyNextCursor;
         detail = {
           ...detail,
-          items: mergePersistedConversationItems(detail.items, persistedItems),
+          items:
+            localHistoryCursor === undefined
+              ? mergePersistedConversationItems(detail.items, persistedItems)
+              : persistedItems,
           ...(Array.isArray(persistedResult)
             ? {}
             : { persistedHistoryIntegrity: persistedResult.integrity }),
         };
+        if (bypassAppServerHistory || localHistoryCursor !== undefined) {
+          const { historyNextCursor: _nativeHistoryCursor, ...detailWithoutNativeCursor } = detail;
+          detail = {
+            ...detailWithoutNativeCursor,
+            ...(persistedNextCursor === undefined
+              ? {}
+              : { historyNextCursor: persistedNextCursor }),
+            historyLoadPolicy: "explicit",
+          };
+        }
       } catch {
-        detail = {
-          ...detail,
-          persistedHistoryIntegrity: {
-            observedCount: 0,
-            reason: "read-failed",
-            scope: persistedHistoryScope,
-            status: "failed",
-          },
+        const failedIntegrity = {
+          observedCount: 0,
+          reason: "read-failed" as const,
+          scope: persistedHistoryScope,
+          status: "failed" as const,
         };
+        if (bypassAppServerHistory || localHistoryCursor !== undefined) {
+          const { historyNextCursor: _historyNextCursor, ...detailWithoutCursor } = detail;
+          detail = {
+            ...detailWithoutCursor,
+            ...(localHistoryCursor === undefined ? {} : { items: [] }),
+            historyLoadPolicy: "explicit",
+            persistedHistoryIntegrity: failedIntegrity,
+          };
+        } else {
+          detail = { ...detail, persistedHistoryIntegrity: failedIntegrity };
+        }
       }
     }
     if (isInitialTurnSafelyTerminal(thread)) {
       void this.#notifyManagedThreadAfterInitialTurn(threadId);
     }
     if (this.#sharedAppServer) {
-      detail = await this.#recoverSharedActiveTurn(detail, sessionPath, persistedThreadHead);
-      this.#markExistingActiveTurnUncontrollable(detail);
+      if (localHistoryCursor === undefined) {
+        detail = await this.#recoverSharedActiveTurn(detail, sessionPath, persistedThreadHead);
+        this.#markExistingActiveTurnUncontrollable(detail);
+      }
     }
     return this.#withControlState(detail);
   }
@@ -1229,10 +1303,6 @@ export class CodexDomainService {
       }
     }
 
-    if (historyCursor !== undefined) {
-      throw new DomainError("FEATURE_UNAVAILABLE", "当前 Codex 版本暂时不能继续加载更早对话", 409);
-    }
-
     if (!this.#protocolClientMethods.has("thread/turns/list")) {
       throw new DomainError(
         "FEATURE_UNAVAILABLE",
@@ -1249,6 +1319,7 @@ export class CodexDomainService {
             threadId,
           }),
         this.#gateway.request("thread/turns/list", {
+          ...(historyCursor === undefined ? {} : { cursor: historyCursor }),
           itemsView: "full",
           limit: 12,
           sortDirection: "desc",
@@ -1262,6 +1333,7 @@ export class CodexDomainService {
       const historyNextCursor = asString(turnPage.nextCursor);
       return {
         ...shell,
+        ...(historyNextCursor === undefined ? {} : { historyNextCursor }),
         historyReadDiagnostic: {
           observedCount: recentTurns.length,
           status: historyNextCursor === undefined ? "exhausted" : "more-available",
@@ -3180,6 +3252,22 @@ export class CodexDomainService {
     const persistedHead =
       suppliedPersistedHead ?? (await this.#readPersistedThreadHeadSafely(detail.id, sessionPath));
     turnId ??= persistedHead?.activeTurnId;
+    const persistedControlState = persistedHead?.controlState;
+    if (persistedControlState === "idle") {
+      this.#orphanedActiveTurns.delete(detail.id);
+      return detail;
+    }
+    if (
+      turnId === undefined &&
+      (persistedControlState === "unknown" || persistedControlState === "active")
+    ) {
+      // The bounded lifecycle reader could not prove which turn is active.
+      // Preserve that uncertainty across the normal projection pass so every
+      // mutating control fails closed until a later stable read proves active
+      // or idle. A small session may still recover the concrete id from the
+      // app-server below; huge sessions deliberately stay off that path.
+      this.#orphanedActiveTurns.add(detail.id);
+    }
     const appServerHistoryUnsafe =
       (persistedHead?.sourceBytes ?? 0) >= MAX_APP_SERVER_HISTORY_SESSION_BYTES;
     if (turnId === undefined && !appServerHistoryUnsafe) {
@@ -3228,9 +3316,16 @@ export class CodexDomainService {
       if (head === undefined) return undefined;
       const sourceBytes = asSafeUnsignedInteger(head.sourceBytes);
       const activeTurnId = boundedPlainString(head.activeTurnId, 512);
+      const controlState =
+        head.controlState === "active" ||
+        head.controlState === "idle" ||
+        head.controlState === "unknown"
+          ? head.controlState
+          : undefined;
       if (sourceBytes === undefined) return undefined;
       return {
         ...(activeTurnId === undefined ? {} : { activeTurnId }),
+        ...(controlState === undefined ? {} : { controlState }),
         sourceBytes,
       };
     } catch {
@@ -3249,11 +3344,24 @@ export class CodexDomainService {
       }
     } else {
       this.#activeTurns.delete(detail.id);
-      this.#orphanedActiveTurns.delete(detail.id);
+      if (detail.state !== "running" && detail.state !== "waiting-for-approval") {
+        this.#orphanedActiveTurns.delete(detail.id);
+      }
     }
   }
 
   #withControlState(detail: ThreadDetail): ThreadDetail {
+    if (this.#orphanedActiveTurns.has(detail.id)) {
+      return {
+        ...detail,
+        availableActions: {
+          changeModelNextTurn: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+        },
+      };
+    }
     if (this.#compactingThreads.has(detail.id)) {
       return {
         ...detail,
@@ -4371,6 +4479,38 @@ function usageDegradation(message: string): ServiceDegradation {
     feature: "usage",
     message,
   };
+}
+
+function projectCodexAccountIdentity(
+  rawAccount: unknown,
+): NonNullable<UsageSnapshot["codexAccount"]> | undefined {
+  const account = asRecord(rawAccount);
+  const type = asString(account.type);
+  if (type !== "apiKey" && type !== "chatgpt" && type !== "amazonBedrock") {
+    return undefined;
+  }
+  if (type !== "chatgpt") {
+    return { type };
+  }
+  const email = boundedAccountEmail(account.email);
+  return email === undefined ? { type } : { email, type };
+}
+
+function boundedAccountEmail(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 320 ||
+    value.trim() !== value
+  ) {
+    return undefined;
+  }
+  return [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || codePoint === 0x7f;
+  })
+    ? undefined
+    : value;
 }
 
 function collaborationDisplayName(id: string): string {

@@ -884,7 +884,14 @@ describe("实时任务事件投影", () => {
     const seeded = detail({
       state: "running",
       activeTurnId: "turn-1",
-      items: [{ id: "item-12", kind: "user-message", text: "同一条真实消息" }],
+      items: [
+        {
+          id: "item-12",
+          kind: "user-message",
+          text: "同一条真实消息",
+          turnId: "turn-1",
+        },
+      ],
     });
     const projected = applyThreadRemoteEvents(seeded, [
       event(
@@ -920,7 +927,96 @@ describe("实时任务事件投影", () => {
     ]);
 
     expect(projected.items).toEqual([
-      { id: "item-12", kind: "user-message", text: "同一条真实消息" },
+      {
+        id: "item-12",
+        kind: "user-message",
+        text: "同一条真实消息",
+        turnId: "turn-1",
+      },
+    ]);
+  });
+
+  it("相邻同文用户事件属于不同 turn 时保留两次真实发送", () => {
+    const prompt = "继续检查";
+    const projected = applyThreadRemoteEvents(
+      detail({
+        state: "running",
+        activeTurnId: "turn-current",
+        items: [
+          {
+            id: "previous-user",
+            kind: "user-message",
+            text: prompt,
+            turnId: "turn-previous",
+          },
+        ],
+      }),
+      [
+        event(
+          1,
+          "thread.item",
+          {
+            item: [{ id: "current-live-user", kind: "user-message", text: prompt }],
+            lifecycle: "started",
+          },
+          { threadId: "thread-1", turnId: "turn-current" },
+        ),
+      ],
+    );
+
+    expect(
+      projected.items.filter((item) => item.kind === "user-message").map((item) => item.id),
+    ).toEqual(["previous-user", "current-live-user"]);
+  });
+
+  it("Desktop 快照按当前 turn 一对一吞掉越过思考到达的实时别名", () => {
+    const prompt = "请继续做完整审计";
+    const projected = applyThreadRemoteEvents(
+      detail({
+        state: "running",
+        activeTurnId: "turn-current",
+        items: [
+          {
+            id: "persisted-current-user",
+            kind: "user-message",
+            text: prompt,
+            turnId: "turn-current",
+          },
+          {
+            id: "current-reasoning",
+            kind: "reasoning-summary",
+            text: "正在审计",
+            turnId: "turn-current",
+          },
+        ],
+      }),
+      [
+        event(
+          1,
+          "thread.item",
+          {
+            item: [{ id: "desktop-live-alias", kind: "user-message", text: prompt }],
+            lifecycle: "started",
+          },
+          { threadId: "thread-1", turnId: "turn-current" },
+        ),
+        event(
+          2,
+          "thread.item",
+          {
+            item: [{ id: "desktop-real-repeat", kind: "user-message", text: prompt }],
+            lifecycle: "started",
+          },
+          { threadId: "thread-1", turnId: "turn-current" },
+        ),
+      ],
+      { projection: createThreadRemoteEventProjectionState() },
+    );
+
+    expect(projected.items.map((item) => item.id)).toEqual([
+      "persisted-current-user",
+      "current-reasoning",
+      "desktop-real-repeat",
     ]);
   });
 

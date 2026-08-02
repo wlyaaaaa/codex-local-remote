@@ -2516,6 +2516,36 @@ a:focus-visible {
   font-weight: 500;
 }
 
+.live-phase--reasoning {
+  animation: live-reasoning-shimmer 2.2s linear infinite;
+  background-image: linear-gradient(
+    105deg,
+    var(--text-primary) 0%,
+    var(--text-primary) 38%,
+    rgb(255 255 255 / 98%) 50%,
+    var(--text-primary) 62%,
+    var(--text-primary) 100%
+  );
+  background-position: 120% 0;
+  background-size: 240% 100%;
+  background-clip: text;
+  color: var(--text-primary);
+  max-width: 100%;
+  width: fit-content;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+@keyframes live-reasoning-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+
+  to {
+    background-position: -120% 0;
+  }
+}
+
 .work-log {
   border-top: 1px solid var(--border);
   margin: 8px 0 18px;
@@ -3497,7 +3527,7 @@ details.file-change {
   font-size: 0.6875rem;
   gap: 6px;
   max-width: min(250px, 78vw);
-  min-height: 32px;
+  min-height: 44px;
   padding: 3px 4px 3px 9px;
 }
 
@@ -3515,8 +3545,8 @@ details.file-change {
   color: var(--text-tertiary);
   cursor: pointer;
   display: inline-flex;
-  flex: 0 0 28px;
-  height: 28px;
+  flex: 0 0 44px;
+  height: 44px;
   justify-content: center;
   padding: 0;
 }
@@ -3832,33 +3862,82 @@ button.attachment-picker__entry,
   white-space: nowrap;
 }
 
-.composer-goal-button {
+.composer-goal {
   align-items: center;
   background: var(--green-50);
-  border: 0;
   border-radius: 13px 13px 0 0;
   color: var(--green-900);
-  cursor: pointer;
   display: flex;
   flex: 1 1 auto;
-  font: 650 0.6875rem/1.2 var(--font-ui);
-  gap: 5px;
-  min-height: 44px;
+  min-height: 52px;
   min-width: 0;
-  padding: 0 12px;
   width: 100%;
 }
 
-.composer-goal-button > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
+.composer-goal__summary {
+  align-items: flex-start;
+  align-self: stretch;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  flex: 1 1 auto;
+  font: 650 0.75rem/1.38 var(--font-ui);
+  gap: 7px;
+  min-height: 52px;
+  min-width: 0;
+  padding: 8px 10px 8px 12px;
+  text-align: left;
+}
+
+.composer-goal__summary > svg {
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
+
+.composer-goal__summary > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.composer-goal__summary small {
+  color: var(--green-700);
+  font-size: 0.625rem;
+}
+
+.composer-goal__summary strong {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.composer-goal__actions {
+  align-items: stretch;
+  align-self: stretch;
+  display: flex;
+  flex: 0 0 auto;
+}
+
+.composer-goal__actions button {
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--green-100);
+  color: var(--green-800);
+  cursor: pointer;
+  font: 700 0.6875rem/1 var(--font-ui);
+  min-height: 44px;
+  min-width: 52px;
+  padding: 0 9px;
   white-space: nowrap;
 }
 
-.composer-goal-button > small {
-  color: var(--green-700);
-  flex: 0 0 auto;
-  font-size: 0.5625rem;
+.composer-goal__actions button:hover {
+  background: rgb(255 255 255 / 72%);
+}
+
+.composer-goal__actions button:last-child {
+  color: var(--danger);
 }
 
 .delivery-switch {
@@ -3875,6 +3954,10 @@ button.attachment-picker__entry,
   font-size: 0.6875rem;
   font-weight: 650;
   margin-right: 3px;
+}
+
+.delivery-switch__compact-label {
+  display: none;
 }
 
 .delivery-switch button {
@@ -3913,6 +3996,10 @@ button.attachment-picker__entry,
   list-style: none;
   min-height: 44px;
   padding: 3px 8px 3px 5px;
+}
+
+.composer-plan-progress > summary strong {
+  white-space: nowrap;
 }
 
 .composer-plan-progress > summary::-webkit-details-marker {
@@ -6585,6 +6672,97 @@ button.attachment-picker__entry,
     min-height: 61px;
   }
 
+  .composer-shell--collapsed .composer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .composer-shell--collapsed .composer textarea {
+    grid-column: 1;
+    grid-row: 1;
+    min-width: 0;
+    padding: 10px 8px 10px 12px;
+    width: 100%;
+  }
+
+  .composer-shell--collapsed .composer__footer {
+    grid-column: 2;
+    grid-row: 1;
+    inset: auto;
+    justify-content: flex-end;
+    position: static;
+  }
+
+  .composer__context-bar {
+    gap: 2px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  .composer__context-bar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .delivery-switch {
+    flex: 0 1 auto;
+    padding: 0 2px;
+  }
+
+  .delivery-switch__label,
+  .delivery-switch__full-label {
+    display: none;
+  }
+
+  .delivery-switch__compact-label {
+    display: inline;
+  }
+
+  .delivery-switch button {
+    min-width: 44px;
+    padding-left: 8px;
+    padding-right: 8px;
+    white-space: nowrap;
+  }
+
+  .composer-mode-button {
+    flex: 0 0 44px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .composer-mode-button > span,
+  .composer-mode-button > svg:last-child {
+    display: none;
+  }
+
+  .composer-plan-progress {
+    margin-left: auto;
+    margin-right: 4px;
+  }
+
+  .composer-plan-progress > summary {
+    gap: 5px;
+    padding-left: 4px;
+    padding-right: 6px;
+  }
+
+  .composer-plan-progress__ring {
+    height: 23px;
+    width: 23px;
+  }
+
+  .composer-goal__summary {
+    padding-left: 9px;
+    padding-right: 6px;
+  }
+
+  .composer-goal__actions button {
+    min-width: 48px;
+    padding-left: 7px;
+    padding-right: 7px;
+  }
+
   .composer__footer {
     gap: 4px;
     padding-left: 5px;
@@ -6766,6 +6944,12 @@ button.attachment-picker__entry,
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .live-phase--reasoning {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+  }
+
   .thread-row__state--running,
   .streaming-label i,
   .subagent-row__line--running,

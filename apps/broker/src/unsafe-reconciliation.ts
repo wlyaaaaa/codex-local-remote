@@ -45,7 +45,7 @@ export async function reconcileBrokerLifecycle(
   const connection = await connect(endpoint, timeoutMs);
   try {
     await initializeAppServer(connection, {
-      clientVersion: "0.1.2-handoff-reconciler",
+      clientVersion: "0.1.3-handoff-reconciler",
       timeoutMs: remainingTimeoutMs(deadlineAtMs),
     });
     const seenCursors = new Set<string>();

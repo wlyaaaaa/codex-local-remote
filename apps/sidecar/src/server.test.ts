@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
@@ -25,9 +26,9 @@ import { setupPassword } from "./auth.js";
 import { BrowserUploadStore } from "./browser-uploads.js";
 import { HostFileStore } from "./host-files.js";
 import {
+  createEventStreamWriter,
   createSidecarServer,
   eventMatchesSubscription,
-  writeEvent,
   type SidecarDomainApi,
 } from "./server.js";
 import { SidecarStateStore } from "./state-store.js";
@@ -130,16 +131,17 @@ async function createFixture(
       turnId: "turn-next",
     }),
   );
+  const getUsage = vi.fn<SidecarDomainApi["getUsage"]>(async () => ({
+    data: { updatedAt: "2026-07-25T00:00:00.000Z", windows: [] },
+    degradations: [],
+  }));
   const domain = {
     clearThreadGoal: vi.fn(async () => undefined),
     compactThread,
     createThread,
     getThread,
     getThreadGoal: vi.fn(async () => undefined),
-    getUsage: vi.fn(async () => ({
-      data: { updatedAt: "2026-07-25T00:00:00.000Z", windows: [] },
-      degradations: [],
-    })),
+    getUsage,
     interruptTurn: vi.fn(async () => ({
       state: "idle" as const,
       threadId: "thread-new",
@@ -450,41 +452,290 @@ async function login(fixture: Awaited<ReturnType<typeof createFixture>>): Promis
 }
 
 describe("SSE backpressure", () => {
-  const event: RemoteEvent = {
+  const event = (seq: number, payload: unknown = { state: "running" }): RemoteEvent => ({
     emittedAt: "2026-07-26T00:00:00.000Z",
-    payload: { state: "running" },
+    payload,
     schemaVersion: 1,
-    seq: 7,
+    seq,
     threadId: "thread-1",
     type: "turn.state",
-  };
-
-  it("returns false when the response buffer is full so the caller can close and replay", () => {
-    const write = vi.fn(() => false);
-    const stream = {
-      destroyed: false,
-      writableEnded: false,
-      write,
-    } as never;
-
-    expect(writeEvent(stream, event, "instance")).toBe(false);
-    expect(write).toHaveBeenCalledOnce();
   });
 
-  it("does not write after the stream is destroyed or ended", () => {
-    const write = vi.fn(() => true);
+  class BackpressuredResponse extends EventEmitter {
+    destroyed = false;
+    writableEnded = false;
+    readonly writes: string[] = [];
+    readonly #writeResults: boolean[];
 
+    constructor(writeResults: boolean[]) {
+      super();
+      this.#writeResults = [...writeResults];
+    }
+
+    write(frame: string): boolean {
+      this.writes.push(frame);
+      return this.#writeResults.shift() ?? true;
+    }
+  }
+
+  it("keeps the connection open and drains queued events once in sequence order", () => {
+    const stream = new BackpressuredResponse([false, false, true]);
+    const close = vi.fn();
+    const writer = createEventStreamWriter({
+      maxQueuedBytes: 4_096,
+      maxQueuedEvents: 4,
+      onFailure: close,
+      stream: stream as never,
+      streamInstanceId: "instance",
+    });
+
+    expect(writer.writeEvent(event(7))).toBe(true);
+    expect(writer.writeEvent(event(8))).toBe(true);
+    expect(writer.writeEvent(event(9))).toBe(true);
+    expect(stream.writes).toHaveLength(1);
+    expect(stream.listenerCount("drain")).toBe(1);
+    expect(close).not.toHaveBeenCalled();
+
+    stream.emit("drain");
+    expect(stream.writes).toHaveLength(2);
+    expect(stream.listenerCount("drain")).toBe(1);
+    expect(close).not.toHaveBeenCalled();
+
+    stream.emit("drain");
+    expect(stream.writes).toHaveLength(3);
+    expect(stream.writes.map((frame) => frame.match(/^id: ([^\n]+)/u)?.[1])).toEqual([
+      "instance:7",
+      "instance:8",
+      "instance:9",
+    ]);
+    expect(new Set(stream.writes).size).toBe(3);
+    expect(stream.listenerCount("drain")).toBe(0);
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { maxQueuedBytes: 4_096, maxQueuedEvents: 1, reason: "event count" },
+    { maxQueuedBytes: 1, maxQueuedEvents: 4, reason: "encoded bytes" },
+  ])("closes only on bounded queue overflow by $reason", (limits) => {
+    const stream = new BackpressuredResponse([false]);
+    const close = vi.fn();
+    const writer = createEventStreamWriter({
+      ...limits,
+      onFailure: close,
+      stream: stream as never,
+      streamInstanceId: "instance",
+    });
+
+    expect(writer.writeEvent(event(7))).toBe(true);
+    const firstQueued = writer.writeEvent(event(8));
+    const overflowed = firstQueued ? writer.writeEvent(event(9)) : firstQueued;
+
+    expect(overflowed).toBe(false);
+    expect(close).toHaveBeenCalledExactlyOnceWith("overflow");
+    expect(stream.listenerCount("drain")).toBe(0);
+    stream.emit("drain");
+    expect(stream.writes).toHaveLength(1);
+  });
+
+  it("rejects one oversized frame before it can bypass the per-client byte bound", () => {
+    const stream = new BackpressuredResponse([true]);
+    const close = vi.fn();
+    const writer = createEventStreamWriter({
+      maxFrameBytes: 256,
+      maxQueuedBytes: 4_096,
+      maxQueuedEvents: 4,
+      onFailure: close,
+      stream: stream as never,
+      streamInstanceId: "instance",
+    });
+
+    expect(writer.writeEvent(event(7, { text: "x".repeat(1_024) }))).toBe(false);
+    expect(close).toHaveBeenCalledExactlyOnceWith("overflow");
+    expect(stream.writes).toHaveLength(0);
+    expect(stream.listenerCount("drain")).toBe(0);
+  });
+
+  it("coalesces an overflowed queue into one reset cursor and writes it after drain", () => {
+    const stream = new BackpressuredResponse([false, true]);
+    const close = vi.fn();
+    const reset: RemoteEvent = {
+      emittedAt: "2026-07-26T00:00:00.000Z",
+      payload: {
+        latestSequence: 9,
+        oldestAvailableSequence: 2,
+        reason: "events-expired",
+      },
+      schemaVersion: 1,
+      seq: 9,
+      type: "connection.reset",
+    };
+    const writer = createEventStreamWriter({
+      createOverflowEvent: () => reset,
+      maxFrameBytes: 4_096,
+      maxQueuedBytes: 4_096,
+      maxQueuedEvents: 1,
+      onFailure: close,
+      stream: stream as never,
+      streamInstanceId: "instance",
+    });
+
+    expect(writer.writeEvent(event(7))).toBe(true);
+    expect(writer.writeEvent(event(8))).toBe(true);
+    expect(writer.writeEvent(event(9))).toBe(true);
+    expect(stream.writes).toHaveLength(1);
+    expect(close).not.toHaveBeenCalled();
+    expect(stream.listenerCount("drain")).toBe(1);
+
+    stream.emit("drain");
+
+    expect(stream.writes.map((frame) => parseSseFrames(frame)[0]?.event.type)).toEqual([
+      "turn.state",
+      "connection.reset",
+    ]);
+    expect(stream.writes.map((frame) => parseSseFrames(frame)[0]?.id)).toEqual([
+      "instance:7",
+      "instance:9",
+    ]);
+    expect(close).not.toHaveBeenCalled();
+    expect(stream.listenerCount("drain")).toBe(0);
+  });
+
+  it("replaces one oversized event with a reset cursor instead of reconnecting forever", () => {
+    const stream = new BackpressuredResponse([true]);
+    const close = vi.fn();
+    const reset: RemoteEvent = {
+      emittedAt: "2026-07-26T00:00:00.000Z",
+      payload: {
+        latestSequence: 9,
+        oldestAvailableSequence: 1,
+        reason: "events-expired",
+      },
+      schemaVersion: 1,
+      seq: 9,
+      type: "connection.reset",
+    };
+    const writer = createEventStreamWriter({
+      createOverflowEvent: () => reset,
+      maxFrameBytes: 512,
+      maxQueuedBytes: 4_096,
+      maxQueuedEvents: 4,
+      onFailure: close,
+      stream: stream as never,
+      streamInstanceId: "instance",
+    });
+
+    expect(writer.writeEvent(event(7, { text: "x".repeat(1_024) }))).toBe(true);
+    expect(writer.writeEvent(event(8))).toBe(true);
     expect(
-      writeEvent({ destroyed: true, writableEnded: false, write } as never, event, "instance"),
-    ).toBe(false);
-    expect(
-      writeEvent({ destroyed: false, writableEnded: true, write } as never, event, "instance"),
-    ).toBe(false);
-    expect(write).not.toHaveBeenCalled();
+      writer.writeEvent({
+        emittedAt: "2026-07-26T00:00:00.000Z",
+        payload: { latestSequence: 9 },
+        schemaVersion: 1,
+        seq: 9,
+        type: "connection.ready",
+      }),
+    ).toBe(true);
+    expect(stream.writes.flatMap((frame) => parseSseFrames(frame))).toMatchObject([
+      { event: { seq: 9, type: "connection.reset" }, id: "instance:9" },
+      { event: { seq: 9, type: "connection.ready" }, id: "instance:9" },
+    ]);
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("removes drain listeners and discards queued frames when the connection closes", () => {
+    const stream = new BackpressuredResponse([false]);
+    const writer = createEventStreamWriter({
+      maxQueuedBytes: 4_096,
+      maxQueuedEvents: 4,
+      onFailure: vi.fn(),
+      stream: stream as never,
+      streamInstanceId: "instance",
+    });
+
+    expect(writer.writeEvent(event(7))).toBe(true);
+    expect(writer.writeEvent(event(8))).toBe(true);
+    expect(stream.listenerCount("drain")).toBe(1);
+
+    writer.close();
+    expect(stream.listenerCount("drain")).toBe(0);
+    stream.emit("drain");
+    expect(stream.writes).toHaveLength(1);
+    expect(writer.writeEvent(event(9))).toBe(false);
+  });
+
+  it("does not drain queued events after the session becomes inactive", () => {
+    const stream = new BackpressuredResponse([false, true]);
+    const close = vi.fn();
+    let active = true;
+    const writer = createEventStreamWriter({
+      canWrite: () => active,
+      maxQueuedBytes: 4_096,
+      maxQueuedEvents: 4,
+      onFailure: close,
+      stream: stream as never,
+      streamInstanceId: "instance",
+    });
+
+    expect(writer.writeEvent(event(7))).toBe(true);
+    expect(writer.writeEvent(event(8))).toBe(true);
+    active = false;
+    stream.emit("drain");
+
+    expect(stream.writes).toHaveLength(1);
+    expect(close).toHaveBeenCalledOnce();
+    expect(stream.listenerCount("drain")).toBe(0);
   });
 });
 
 describe("sidecar REST surface", () => {
+  it("returns the safe Codex account identity and component availability contract", async () => {
+    const fixture = await createFixture();
+    fixture.domain.getUsage.mockResolvedValueOnce({
+      data: {
+        availability: {
+          account: "available",
+          rateLimits: "temporarily-unavailable",
+          tokenUsage: "available",
+        },
+        codexAccount: {
+          email: "owner@example.com",
+          type: "chatgpt",
+        },
+        plan: "plus",
+        tokenUsageSummary: { lifetimeTokens: "12345" },
+        updatedAt: "2026-08-01T00:00:00.000Z",
+        windows: [],
+      },
+      degradations: [],
+    });
+    const authenticated = await login(fixture);
+
+    const response = await fixture.app.inject({
+      headers: { cookie: authenticated.cookie },
+      method: "GET",
+      url: "/codex-remote/api/v1/usage?threadId=thread-usage",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.domain.getUsage).toHaveBeenCalledWith("thread-usage");
+    expect(response.json()).toEqual({
+      availability: {
+        account: "available",
+        rateLimits: "temporarily-unavailable",
+        tokenUsage: "available",
+      },
+      codexAccount: {
+        email: "owner@example.com",
+        type: "chatgpt",
+      },
+      plan: "plus",
+      tokenUsageSummary: { lifetimeTokens: "12345" },
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      windows: [],
+    });
+    await fixture.app.close();
+  });
+
   it("atomically reserves login capacity before asynchronous password verification", async () => {
     const fixture = await createFixture();
     let releaseVerification: ((accepted: boolean) => void) | undefined;

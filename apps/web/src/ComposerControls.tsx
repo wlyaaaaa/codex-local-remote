@@ -6,6 +6,7 @@ import type {
   ModelOption,
   QueuedTurnItem,
   ReasoningEffort,
+  ThreadGoal,
   ThreadGoalStatus,
 } from "@codex-local-remote/contracts";
 import { Button, Icon, Sheet, type IconName } from "@codex-local-remote/ui";
@@ -26,8 +27,9 @@ const effortLabels: Readonly<Record<string, string>> = {
   low: "低",
   medium: "中",
   high: "高",
+  max: "最高",
   xhigh: "极高",
-  ultra: "Ultra（最高）",
+  ultra: "Ultra",
 };
 
 export function reasoningEffortLabel(effort: ReasoningEffort | undefined): string {
@@ -53,6 +55,63 @@ export function ComposerContextRows({
   );
 }
 
+const goalStatusLabels: Readonly<Record<ThreadGoalStatus, string>> = {
+  active: "进行中",
+  paused: "已暂停",
+  blocked: "受阻",
+  usageLimited: "用量受限",
+  budgetLimited: "预算受限",
+  complete: "已完成",
+};
+
+export function GoalInlineControl({
+  busy,
+  goal,
+  onClear,
+  onOpen,
+  onStatusChange,
+}: {
+  busy: boolean;
+  goal: ThreadGoal;
+  onClear: () => void;
+  onOpen: () => void;
+  onStatusChange: (status: "active" | "paused") => void;
+}) {
+  const active = goal.status === "active";
+  const paused = goal.status === "paused";
+  const statusAction = active ? "暂停" : paused ? "继续" : "开始";
+  return (
+    <div className="composer-goal" data-testid="composer-goal">
+      <button
+        aria-label={`编辑任务目标：${goal.objective}`}
+        className="composer-goal__summary"
+        data-testid="composer-goal-open"
+        onClick={onOpen}
+        type="button"
+      >
+        <Icon name="target" size={16} />
+        <span>
+          <small>{goalStatusLabels[goal.status]}</small>
+          <strong>{goal.objective}</strong>
+        </span>
+      </button>
+      <div className="composer-goal__actions">
+        <button
+          aria-label={`${statusAction}任务目标`}
+          disabled={busy}
+          onClick={() => onStatusChange(active ? "paused" : "active")}
+          type="button"
+        >
+          {statusAction}
+        </button>
+        <button aria-label="删除任务目标" disabled={busy} onClick={onClear} type="button">
+          删除
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function DeliveryModeSwitch({
   mode,
   queueSupported,
@@ -64,14 +123,15 @@ export function DeliveryModeSwitch({
 }) {
   return (
     <div className="delivery-switch" data-testid="delivery-mode">
-      <span>发送到</span>
+      <span className="delivery-switch__label">发送到</span>
       <button
         aria-pressed={mode === "steer"}
         data-testid="delivery-steer"
         onClick={() => onChange("steer")}
         type="button"
       >
-        当前回复
+        <span className="delivery-switch__full-label">当前回复</span>
+        <span className="delivery-switch__compact-label">当前</span>
       </button>
       {queueSupported ? (
         <button
@@ -527,13 +587,13 @@ export function GoalSheet({
           <Button disabled={busy || !value.trim()} onClick={onSave} variant="primary">
             {hasGoal ? "保存修改" : "保存目标"}
           </Button>
-          {hasGoal && (status === "active" || status === "paused") ? (
+          {hasGoal ? (
             <Button
               disabled={busy}
               onClick={() => onStatusChange(status === "active" ? "paused" : "active")}
               variant="ghost"
             >
-              {status === "active" ? "暂停目标" : "继续目标"}
+              {status === "active" ? "暂停目标" : status === "paused" ? "继续目标" : "开始目标"}
             </Button>
           ) : null}
           {hasGoal ? (

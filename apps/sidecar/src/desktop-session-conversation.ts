@@ -2,6 +2,7 @@ import type { BigIntStats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 
+import { PERSISTED_CONVERSATION_CURSOR_PREFIX } from "@codex-local-remote/contracts";
 import type {
   ConversationAttachment,
   ConversationItem,
@@ -13,7 +14,11 @@ const DEFAULT_READ_CHUNK_BYTES = 256 * 1024;
 const DEFAULT_MAX_JSON_LINE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_PROJECTED_ITEMS = 50_000;
 const DEFAULT_MAX_PROJECTED_TEXT_BYTES = 64 * 1024 * 1024;
-const RECENT_TAIL_BYTES = 8 * 1024 * 1024;
+const DEFAULT_HISTORY_PAGE_BYTES = 8 * 1024 * 1024;
+const RECENT_TAIL_BYTES = DEFAULT_HISTORY_PAGE_BYTES;
+const CONTROL_SCAN_PAGE_BYTES = 8 * 1024 * 1024;
+const MAX_CONTROL_SCAN_BYTES = 64 * 1024 * 1024;
+const MAX_CONTROL_TERMINAL_TURN_IDS = 50_000;
 const MAX_USER_ATTACHMENTS = 32;
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
@@ -24,6 +29,7 @@ export interface DesktopSessionConversationInput {
 }
 
 export interface DesktopSessionConversationReaderOptions {
+  historyPageBytes?: number;
   maxJsonLineBytes?: number;
   maxProjectedItems?: number;
   maxProjectedTextBytes?: number;
@@ -47,15 +53,18 @@ export interface DesktopSessionConversationReadDiagnostic {
 
 export interface DesktopSessionConversationReadResult {
   diagnostic: DesktopSessionConversationReadDiagnostic;
+  historyNextCursor?: string;
   items: ConversationItem[];
 }
 
 export interface DesktopSessionControlHead {
   activeTurnId?: string;
+  controlState: "active" | "idle" | "unknown";
   sourceBytes: number;
 }
 
 interface ResolvedReaderOptions {
+  historyPageBytes: number;
   maxJsonLineBytes: number;
   maxProjectedItems: number;
   maxProjectedTextBytes: number;
@@ -92,6 +101,9 @@ interface PendingToolCall {
 
 interface CachedConversation {
   diagnostic: DesktopSessionConversationReadDiagnostic;
+  dev: bigint;
+  historyNextCursor?: string;
+  ino: bigint;
   items: ConversationItem[];
   modifiedAtNs: bigint;
   path: string;
@@ -100,6 +112,8 @@ interface CachedConversation {
 }
 
 interface CachedRuntimeSettings {
+  dev: bigint;
+  ino: bigint;
   modifiedAtNs: bigint;
   path: string;
   runtimeSettings?: ThreadSettingsInput;
@@ -108,7 +122,16 @@ interface CachedRuntimeSettings {
 
 interface StreamResult {
   diagnostic: DesktopSessionConversationReadDiagnostic;
+  historyNextCursor?: string;
   stable: boolean;
+}
+
+interface PersistedConversationCursorState {
+  capturedSize: bigint;
+  dev: bigint;
+  endOffset: bigint;
+  ino: bigint;
+  threadId: string;
 }
 
 interface StableTailResult {
@@ -116,6 +139,13 @@ interface StableTailResult {
   lines: string[];
   stable: boolean;
   unterminatedLine: boolean;
+}
+
+interface StableControlProjection {
+  activeTurnId?: string;
+  capturedBytes: bigint;
+  controlState: DesktopSessionControlHead["controlState"];
+  stable: boolean;
 }
 
 type ConversationReadScope = "complete" | "recent";
@@ -134,6 +164,7 @@ export class DesktopSessionConversationReader {
 
   constructor(options: DesktopSessionConversationReaderOptions = {}) {
     this.#options = {
+      historyPageBytes: positiveInteger(options.historyPageBytes, DEFAULT_HISTORY_PAGE_BYTES),
       maxJsonLineBytes: positiveInteger(options.maxJsonLineBytes, DEFAULT_MAX_JSON_LINE_BYTES),
       maxProjectedItems: positiveInteger(options.maxProjectedItems, DEFAULT_MAX_PROJECTED_ITEMS),
       maxProjectedTextBytes: positiveInteger(
@@ -149,28 +180,36 @@ export class DesktopSessionConversationReader {
     return result?.items ?? [];
   }
 
-  async readRecent(input: DesktopSessionConversationInput): Promise<ConversationItem[]> {
-    const result = await this.readWithDiagnostic(input, "recent");
+  async readRecent(
+    input: DesktopSessionConversationInput,
+    historyCursor?: string,
+  ): Promise<ConversationItem[]> {
+    const result = await this.readWithDiagnostic(input, "recent", historyCursor);
     return result?.items ?? [];
   }
 
   async readDiagnostic(
     input: DesktopSessionConversationInput,
     scope: ConversationReadScope = "complete",
+    historyCursor?: string,
   ): Promise<DesktopSessionConversationReadDiagnostic | undefined> {
-    const result = await this.readWithDiagnostic(input, scope);
+    const result = await this.readWithDiagnostic(input, scope, historyCursor);
     return result?.diagnostic;
   }
 
   async readWithDiagnostic(
     input: DesktopSessionConversationInput,
     scope: ConversationReadScope = "complete",
+    historyCursor?: string,
   ): Promise<DesktopSessionConversationReadResult | undefined> {
-    const snapshot = await this.#readSnapshot(input, scope);
+    const snapshot = await this.#readSnapshot(input, scope, historyCursor);
     return snapshot === undefined
       ? undefined
       : {
           diagnostic: structuredClone(snapshot.diagnostic),
+          ...(snapshot.historyNextCursor === undefined
+            ? {}
+            : { historyNextCursor: snapshot.historyNextCursor }),
           items: snapshot.items.map(cloneConversationItem),
         };
   }
@@ -190,6 +229,8 @@ export class DesktopSessionConversationReader {
     if (
       cached !== undefined &&
       sameLocalPath(cached.path, location.path) &&
+      cached.dev === metadata.dev &&
+      cached.ino === metadata.ino &&
       cached.modifiedAtNs === metadata.mtimeNs &&
       cached.size === metadata.size
     ) {
@@ -201,6 +242,8 @@ export class DesktopSessionConversationReader {
     if (!tail.stable) return undefined;
     const runtimeSettings = projectPersistedRuntimeSettings(tail.lines);
     this.#runtimeSettingsCache.set(input.threadId, {
+      dev: metadata.dev,
+      ino: metadata.ino,
       modifiedAtNs: metadata.mtimeNs,
       path: location.path,
       ...(runtimeSettings === undefined ? {} : { runtimeSettings }),
@@ -222,21 +265,34 @@ export class DesktopSessionConversationReader {
     }
     const sourceBytes = Number(metadata.size);
     if (!Number.isSafeInteger(sourceBytes) || sourceBytes < 0) return undefined;
-    let tail = await readStableTailLines(location.path, location.sessionsRoot);
-    if (!tail.stable) {
-      tail = await readStableTailLines(location.path, location.sessionsRoot);
+    let control = await readStableControlProjection(
+      location.path,
+      location.sessionsRoot,
+      this.#options.maxJsonLineBytes,
+    );
+    if (!control.stable) {
+      control = await readStableControlProjection(
+        location.path,
+        location.sessionsRoot,
+        this.#options.maxJsonLineBytes,
+      );
     }
-    if (!tail.stable) return { sourceBytes };
-    const activeTurnId = projectPersistedActiveTurnId(tail.lines);
+    if (!control.stable) return { controlState: "unknown", sourceBytes };
+    const stableSourceBytes = Number(control.capturedBytes);
+    if (!Number.isSafeInteger(stableSourceBytes) || stableSourceBytes < 0) {
+      return { controlState: "unknown", sourceBytes };
+    }
     return {
-      ...(activeTurnId === undefined ? {} : { activeTurnId }),
-      sourceBytes,
+      ...(control.activeTurnId === undefined ? {} : { activeTurnId: control.activeTurnId }),
+      controlState: control.controlState,
+      sourceBytes: stableSourceBytes,
     };
   }
 
   async #readSnapshot(
     input: DesktopSessionConversationInput,
     scope: ConversationReadScope,
+    historyCursor?: string,
   ): Promise<CachedConversation | undefined> {
     const location = await resolveSessionLocation(input);
     if (location === undefined) return undefined;
@@ -248,10 +304,12 @@ export class DesktopSessionConversationReader {
       return undefined;
     }
     const cacheKey = `${input.threadId}:${scope}`;
-    const cached = this.#cache.get(cacheKey);
+    const cached = historyCursor === undefined ? this.#cache.get(cacheKey) : undefined;
     if (
       cached !== undefined &&
       sameLocalPath(cached.path, location.path) &&
+      cached.dev === metadata.dev &&
+      cached.ino === metadata.ino &&
       cached.modifiedAtNs === metadata.mtimeNs &&
       cached.size === metadata.size
     ) {
@@ -261,16 +319,23 @@ export class DesktopSessionConversationReader {
     const readProjection = async () => {
       const projection = new PersistedConversationProjection(input.threadId, this.#options);
       const stream =
-        scope === "complete"
+        scope === "complete" && historyCursor === undefined
           ? await streamStableJsonLines(
               location.path,
               location.sessionsRoot,
               this.#options,
               (line) => projection.accept(line),
             )
-          : await streamStableTailJsonLines(location.path, location.sessionsRoot, (line) =>
-              projection.accept(line),
-            );
+          : scope === "recent"
+            ? await streamStableBackwardPageJsonLines(
+                location.path,
+                location.sessionsRoot,
+                input.threadId,
+                historyCursor,
+                this.#options,
+                (line) => projection.accept(line),
+              )
+            : failedStream("read-failed", 0n, 0n);
       return { projection, stream };
     };
     let attempt = await readProjection();
@@ -283,6 +348,11 @@ export class DesktopSessionConversationReader {
       : failedProjection(input.threadId, stream.diagnostic);
     const snapshot: CachedConversation = {
       diagnostic: projected.diagnostic,
+      dev: metadata.dev,
+      ...(stream.historyNextCursor === undefined
+        ? {}
+        : { historyNextCursor: stream.historyNextCursor }),
+      ino: metadata.ino,
       items: projected.items,
       modifiedAtNs: metadata.mtimeNs,
       path: location.path,
@@ -291,7 +361,7 @@ export class DesktopSessionConversationReader {
         : { runtimeSettings: projected.runtimeSettings }),
       size: metadata.size,
     };
-    if (stream.stable) {
+    if (stream.stable && historyCursor === undefined) {
       this.#cache.set(cacheKey, snapshot);
     }
     return snapshot;
@@ -964,22 +1034,6 @@ function projectPersistedRuntimeSettings(
   return latest;
 }
 
-function projectPersistedActiveTurnId(lines: readonly string[]): string | undefined {
-  let latest: string | undefined;
-  for (const line of lines) {
-    let value: unknown;
-    try {
-      value = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const record = asRecord(value);
-    const turnId = persistedTurnId(asRecord(record.payload));
-    if (turnId !== undefined) latest = turnId;
-  }
-  return latest;
-}
-
 function projectTurnContextSettings(
   payload: Record<string, unknown>,
 ): ThreadSettingsInput | undefined {
@@ -1339,35 +1393,452 @@ async function resolveSessionLocation(
   return { path: requestedPath, sessionsRoot };
 }
 
-async function streamStableTailJsonLines(
+async function streamStableBackwardPageJsonLines(
   requestedPath: string,
   sessionsRoot: string,
+  threadId: string,
+  historyCursor: string | undefined,
+  options: ResolvedReaderOptions,
   accept: (line: string) => boolean,
 ): Promise<StreamResult> {
-  const tail = await readStableTailLines(requestedPath, sessionsRoot);
-  if (!tail.stable) return failedStream("unstable-file", tail.capturedBytes, 0n);
+  const cursorState =
+    historyCursor === undefined ? undefined : decodePersistedConversationCursor(historyCursor);
+  if (
+    historyCursor !== undefined &&
+    (cursorState === undefined || cursorState.threadId !== threadId)
+  ) {
+    return failedStream("read-failed", 0n, 0n);
+  }
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let capturedBytes = 0n;
+  let processedBytes = 0n;
   let skippedLines = 0;
   let partialReason: HistoryPartialReason | undefined;
-  for (const line of tail.lines) {
-    if (accept(line)) continue;
-    skippedLines += 1;
-    partialReason = preferHistoryPartialReason(partialReason, "invalid-json");
+  try {
+    const before = await lstat(requestedPath, { bigint: true });
+    const canonicalBeforeOpen = normalizeLocalAbsolutePath(await realpath(requestedPath));
+    if (
+      canonicalBeforeOpen === undefined ||
+      !isRegularFile(before) ||
+      !sameLocalPath(requestedPath, canonicalBeforeOpen) ||
+      !isPathInside(sessionsRoot, canonicalBeforeOpen)
+    ) {
+      return failedStream("unstable-file", capturedBytes, processedBytes);
+    }
+    handle = await open(requestedPath, "r");
+    const handleBeforeRead = await handle.stat({ bigint: true });
+    if (!isRegularFile(handleBeforeRead) || !sameFileIdentity(before, handleBeforeRead)) {
+      return failedStream("unstable-file", capturedBytes, processedBytes);
+    }
+
+    const capturedSize = cursorState?.capturedSize ?? handleBeforeRead.size;
+    const endOffset = cursorState?.endOffset ?? capturedSize;
+    if (
+      cursorState !== undefined &&
+      (handleBeforeRead.dev !== cursorState.dev ||
+        handleBeforeRead.ino !== cursorState.ino ||
+        handleBeforeRead.size < capturedSize ||
+        endOffset <= 0n ||
+        endOffset > capturedSize)
+    ) {
+      return failedStream("unstable-file", capturedBytes, processedBytes);
+    }
+
+    const pageBytes = BigInt(options.historyPageBytes);
+    const nominalStart = endOffset > pageBytes ? endOffset - pageBytes : 0n;
+    const alignmentBytes = BigInt(options.maxJsonLineBytes) + 1n;
+    const readStart = nominalStart > alignmentBytes ? nominalStart - alignmentBytes : 0n;
+    const readLengthBigInt = endOffset - readStart;
+    if (readLengthBigInt > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return failedStream("read-failed", capturedBytes, processedBytes);
+    }
+    const readLength = Number(readLengthBigInt);
+    capturedBytes = endOffset - nominalStart;
+    const buffer = Buffer.allocUnsafe(readLength);
+    let bytesRead = 0;
+    while (bytesRead < readLength) {
+      const result = await handle.read(
+        buffer,
+        bytesRead,
+        readLength - bytesRead,
+        readStart + BigInt(bytesRead),
+      );
+      if (result.bytesRead <= 0 || result.bytesRead > readLength - bytesRead) {
+        return failedStream("read-failed", capturedBytes, processedBytes);
+      }
+      bytesRead += result.bytesRead;
+    }
+    processedBytes = capturedBytes;
+
+    let contentEnd = buffer.length;
+    if (buffer.length > 0 && buffer[buffer.length - 1] !== 10) {
+      if (cursorState !== undefined) {
+        return failedStream("read-failed", capturedBytes, processedBytes);
+      }
+      skippedLines += 1;
+      partialReason = preferHistoryPartialReason(partialReason, "unterminated-line");
+      const finalLineFeed = buffer.lastIndexOf(10);
+      contentEnd = finalLineFeed < 0 ? 0 : finalLineFeed + 1;
+    }
+
+    const nominalStartIndex = Number(nominalStart - readStart);
+    let contentStart = nominalStartIndex;
+    let pageStart = 0n;
+    if (nominalStart > 0n) {
+      if (nominalStartIndex > 0 && buffer[nominalStartIndex - 1] === 10) {
+        pageStart = nominalStart;
+      } else {
+        const precedingLineFeed = buffer.lastIndexOf(10, nominalStartIndex - 1);
+        if (precedingLineFeed >= 0) {
+          contentStart = precedingLineFeed + 1;
+          pageStart = readStart + BigInt(contentStart);
+        } else if (readStart === 0n) {
+          contentStart = 0;
+          pageStart = 0n;
+        } else {
+          skippedLines += 1;
+          partialReason = preferHistoryPartialReason(partialReason, "overlong-line");
+          const firstLineFeed = buffer.indexOf(10, nominalStartIndex);
+          contentStart =
+            firstLineFeed < 0 || firstLineFeed >= contentEnd ? contentEnd : firstLineFeed + 1;
+          pageStart = endOffset;
+        }
+      }
+    }
+    if (contentStart > contentEnd) contentStart = contentEnd;
+
+    if (contentStart < contentEnd) {
+      let lineStart = contentStart;
+      for (let index = contentStart; index < contentEnd; index += 1) {
+        if (buffer[index] !== 10) continue;
+        let lineEnd = index;
+        if (lineEnd > lineStart && buffer[lineEnd - 1] === 13) lineEnd -= 1;
+        const lineBytes = lineEnd - lineStart;
+        if (lineBytes > options.maxJsonLineBytes) {
+          skippedLines += 1;
+          partialReason = preferHistoryPartialReason(partialReason, "overlong-line");
+        } else if (lineBytes > 0) {
+          const line = buffer.subarray(lineStart, lineEnd).toString("utf8");
+          if (line.trim().length > 0 && !accept(line)) {
+            skippedLines += 1;
+            partialReason = preferHistoryPartialReason(partialReason, "invalid-json");
+          }
+        }
+        lineStart = index + 1;
+      }
+    }
+
+    const afterRead = await lstat(requestedPath, { bigint: true });
+    const handleAfterRead = await handle.stat({ bigint: true });
+    const canonicalAfterRead = normalizeLocalAbsolutePath(await realpath(requestedPath));
+    const commonSnapshotValid =
+      canonicalAfterRead !== undefined &&
+      isRegularFile(afterRead) &&
+      isRegularFile(handleAfterRead) &&
+      sameLocalPath(requestedPath, canonicalAfterRead) &&
+      sameFileIdentity(afterRead, handleAfterRead);
+    const snapshotValid =
+      cursorState === undefined
+        ? commonSnapshotValid &&
+          sameFileSnapshot(handleBeforeRead, afterRead) &&
+          sameFileSnapshot(afterRead, handleAfterRead) &&
+          afterRead.size === capturedSize
+        : commonSnapshotValid &&
+          afterRead.dev === cursorState.dev &&
+          afterRead.ino === cursorState.ino &&
+          afterRead.size >= capturedSize &&
+          handleAfterRead.size >= capturedSize;
+    if (!snapshotValid) {
+      return failedStream("unstable-file", capturedBytes, processedBytes);
+    }
+
+    const historyNextCursor =
+      pageStart > 0n && pageStart < endOffset
+        ? encodePersistedConversationCursor({
+            capturedSize,
+            dev: handleBeforeRead.dev,
+            endOffset: pageStart,
+            ino: handleBeforeRead.ino,
+            threadId,
+          })
+        : undefined;
+    return {
+      diagnostic: {
+        capturedBytes: capturedBytes.toString(),
+        processedBytes: processedBytes.toString(),
+        ...(partialReason === undefined ? {} : { reason: partialReason }),
+        skippedItems: 0,
+        skippedLines,
+        status: partialReason === undefined ? "complete" : "truncated",
+      },
+      ...(historyNextCursor === undefined ? {} : { historyNextCursor }),
+      stable: true,
+    };
+  } catch {
+    return failedStream("read-failed", capturedBytes, processedBytes);
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
-  if (tail.unterminatedLine) {
-    skippedLines += 1;
-    partialReason = preferHistoryPartialReason(partialReason, "unterminated-line");
+}
+
+function encodePersistedConversationCursor(state: PersistedConversationCursorState): string {
+  const payload = JSON.stringify({
+    capturedSize: state.capturedSize.toString(),
+    dev: state.dev.toString(),
+    endOffset: state.endOffset.toString(),
+    ino: state.ino.toString(),
+    threadId: state.threadId,
+    version: 1,
+  });
+  return `${PERSISTED_CONVERSATION_CURSOR_PREFIX}${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+function decodePersistedConversationCursor(
+  cursor: string,
+): PersistedConversationCursorState | undefined {
+  if (!cursor.startsWith(PERSISTED_CONVERSATION_CURSOR_PREFIX)) return undefined;
+  const encoded = cursor.slice(PERSISTED_CONVERSATION_CURSOR_PREFIX.length);
+  if (encoded.length === 0 || encoded.length > 2_048 || !/^[A-Za-z0-9_-]+$/u.test(encoded)) {
+    return undefined;
   }
-  return {
-    diagnostic: {
-      capturedBytes: tail.capturedBytes.toString(),
-      processedBytes: tail.capturedBytes.toString(),
-      ...(partialReason === undefined ? {} : { reason: partialReason }),
-      skippedItems: 0,
-      skippedLines,
-      status: partialReason === undefined ? "complete" : "truncated",
-    },
-    stable: true,
-  };
+  let decoded: Buffer;
+  try {
+    decoded = Buffer.from(encoded, "base64url");
+  } catch {
+    return undefined;
+  }
+  if (decoded.toString("base64url") !== encoded) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded.toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  const record = asRecord(parsed);
+  const expectedKeys = ["capturedSize", "dev", "endOffset", "ino", "threadId", "version"];
+  if (
+    Object.keys(record).sort().join("\0") !== expectedKeys.sort().join("\0") ||
+    record.version !== 1
+  ) {
+    return undefined;
+  }
+  const threadId = asString(record.threadId);
+  const capturedSize = parseCursorBigInt(record.capturedSize);
+  const dev = parseCursorBigInt(record.dev);
+  const endOffset = parseCursorBigInt(record.endOffset);
+  const ino = parseCursorBigInt(record.ino);
+  if (
+    threadId === undefined ||
+    !THREAD_ID_PATTERN.test(threadId) ||
+    capturedSize === undefined ||
+    dev === undefined ||
+    endOffset === undefined ||
+    ino === undefined ||
+    capturedSize <= 0n ||
+    endOffset <= 0n ||
+    endOffset > capturedSize
+  ) {
+    return undefined;
+  }
+  return { capturedSize, dev, endOffset, ino, threadId };
+}
+
+function parseCursorBigInt(value: unknown): bigint | undefined {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return undefined;
+  try {
+    return BigInt(value);
+  } catch {
+    return undefined;
+  }
+}
+
+type PersistedControlLine =
+  | { kind: "ignore" }
+  | { kind: "start"; turnId: string }
+  | { kind: "terminal"; turnId?: string }
+  | { kind: "unknown" };
+
+async function readStableControlProjection(
+  requestedPath: string,
+  sessionsRoot: string,
+  maxJsonLineBytes: number,
+): Promise<StableControlProjection> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let capturedBytes = 0n;
+  const unknown = (stable: boolean): StableControlProjection => ({
+    capturedBytes,
+    controlState: "unknown",
+    stable,
+  });
+  try {
+    const before = await lstat(requestedPath, { bigint: true });
+    const canonicalBeforeOpen = normalizeLocalAbsolutePath(await realpath(requestedPath));
+    if (
+      canonicalBeforeOpen === undefined ||
+      !isRegularFile(before) ||
+      !sameLocalPath(requestedPath, canonicalBeforeOpen) ||
+      !isPathInside(sessionsRoot, canonicalBeforeOpen)
+    ) {
+      return unknown(false);
+    }
+    handle = await open(requestedPath, "r");
+    const handleBeforeRead = await handle.stat({ bigint: true });
+    if (!isRegularFile(handleBeforeRead) || !sameFileIdentity(before, handleBeforeRead)) {
+      return unknown(false);
+    }
+
+    capturedBytes = handleBeforeRead.size;
+    const scanFloor =
+      capturedBytes > BigInt(MAX_CONTROL_SCAN_BYTES)
+        ? capturedBytes - BigInt(MAX_CONTROL_SCAN_BYTES)
+        : 0n;
+    let position = capturedBytes;
+    let carry = Buffer.alloc(0);
+    let projected: Omit<StableControlProjection, "capturedBytes" | "stable"> | undefined;
+    const terminalTurnIds = new Set<string>();
+
+    while (projected === undefined && position > scanFloor) {
+      const readingNewestPage = position === capturedBytes;
+      const pageStartCandidate = position - BigInt(CONTROL_SCAN_PAGE_BYTES);
+      const pageStart = pageStartCandidate > scanFloor ? pageStartCandidate : scanFloor;
+      const pageLength = Number(position - pageStart);
+      const page = Buffer.allocUnsafe(pageLength);
+      let pageBytesRead = 0;
+      while (pageBytesRead < pageLength) {
+        const result = await handle.read(
+          page,
+          pageBytesRead,
+          pageLength - pageBytesRead,
+          pageStart + BigInt(pageBytesRead),
+        );
+        if (result.bytesRead <= 0 || result.bytesRead > pageLength - pageBytesRead) {
+          return unknown(false);
+        }
+        pageBytesRead += result.bytesRead;
+      }
+      position = pageStart;
+
+      if (readingNewestPage && page[page.length - 1] !== 10) {
+        projected = { controlState: "unknown" };
+        break;
+      }
+
+      const combined = carry.length === 0 ? page : Buffer.concat([page, carry]);
+      const firstLineFeed = combined.indexOf(10);
+      if (firstLineFeed < 0) {
+        if (combined.length > maxJsonLineBytes) {
+          projected = { controlState: "unknown" };
+        } else {
+          carry = combined;
+        }
+        continue;
+      }
+
+      const reachedFileStart = pageStart === 0n;
+      let lineFeed = combined.lastIndexOf(10);
+      while (lineFeed >= 0) {
+        const precedingLineFeed = lineFeed === 0 ? -1 : combined.lastIndexOf(10, lineFeed - 1);
+        if (precedingLineFeed < 0 && !reachedFileStart) break;
+        const lineStart = precedingLineFeed + 1;
+        let lineEnd = lineFeed;
+        lineFeed = precedingLineFeed;
+        if (lineEnd > lineStart && combined[lineEnd - 1] === 13) lineEnd -= 1;
+        const lineBytes = lineEnd - lineStart;
+        if (lineBytes === 0) continue;
+        if (lineBytes > maxJsonLineBytes) {
+          projected = { controlState: "unknown" };
+          break;
+        }
+        const controlLine = projectPersistedControlLine(
+          combined.subarray(lineStart, lineEnd).toString("utf8"),
+        );
+        if (controlLine.kind === "ignore") continue;
+        if (controlLine.kind === "unknown") {
+          projected = { controlState: "unknown" };
+          break;
+        }
+        if (controlLine.kind === "terminal") {
+          if (controlLine.turnId === undefined) {
+            projected = { controlState: "idle" };
+            break;
+          }
+          if (
+            terminalTurnIds.size >= MAX_CONTROL_TERMINAL_TURN_IDS &&
+            !terminalTurnIds.has(controlLine.turnId)
+          ) {
+            projected = { controlState: "unknown" };
+            break;
+          }
+          terminalTurnIds.add(controlLine.turnId);
+          continue;
+        }
+        projected = terminalTurnIds.has(controlLine.turnId)
+          ? { controlState: "idle" }
+          : { activeTurnId: controlLine.turnId, controlState: "active" };
+        break;
+      }
+
+      if (!reachedFileStart && projected === undefined) {
+        if (firstLineFeed > maxJsonLineBytes) {
+          projected = { controlState: "unknown" };
+        } else {
+          carry = Buffer.from(combined.subarray(0, firstLineFeed + 1));
+        }
+      } else {
+        carry = Buffer.alloc(0);
+      }
+    }
+
+    if (projected === undefined) {
+      projected = position === 0n ? { controlState: "idle" } : { controlState: "unknown" };
+    }
+
+    const afterRead = await lstat(requestedPath, { bigint: true });
+    const handleAfterRead = await handle.stat({ bigint: true });
+    const canonicalAfterRead = normalizeLocalAbsolutePath(await realpath(requestedPath));
+    if (
+      canonicalAfterRead === undefined ||
+      !isRegularFile(afterRead) ||
+      !isRegularFile(handleAfterRead) ||
+      !sameFileSnapshot(handleBeforeRead, afterRead) ||
+      !sameFileSnapshot(afterRead, handleAfterRead) ||
+      !sameLocalPath(requestedPath, canonicalAfterRead) ||
+      afterRead.size !== capturedBytes
+    ) {
+      return unknown(false);
+    }
+    return { capturedBytes, ...projected, stable: true };
+  } catch {
+    return unknown(false);
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function projectPersistedControlLine(line: string): PersistedControlLine {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return { kind: "unknown" };
+  }
+  const record = asRecord(value);
+  const payload = asRecord(record.payload);
+  if (record.type === "turn_context") {
+    const turnId = persistedTurnId(payload);
+    return turnId === undefined ? { kind: "unknown" } : { kind: "start", turnId };
+  }
+  if (record.type !== "event_msg") return { kind: "ignore" };
+  const eventType = asString(payload.type);
+  const turnId = persistedTurnId(payload);
+  if (eventType === "task_started") {
+    return turnId === undefined ? { kind: "unknown" } : { kind: "start", turnId };
+  }
+  if (eventType === "task_complete" || eventType === "turn_aborted") {
+    return { kind: "terminal", ...(turnId === undefined ? {} : { turnId }) };
+  }
+  return { kind: "ignore" };
 }
 
 async function readStableTailLines(
