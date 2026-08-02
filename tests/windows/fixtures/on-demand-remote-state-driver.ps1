@@ -42,16 +42,18 @@ $functionAsts = @(
                 'Get-OnDemandRemoteState',
                 'Get-OnDemandCachedRuntimeValidation',
                 'Get-OnDemandCachedBrokerPayloadCompatibility',
+                'Get-OnDemandExactProcessInspection',
                 'Test-OnDemandReceiptProcessIdentity'
             )
         },
         $true
     )
 )
-if ($functionAsts.Count -ne 4) {
+if ($functionAsts.Count -ne 5) {
     throw 'The on-demand remote-state helpers were not found exactly once.'
 }
 foreach ($functionName in @(
+    'Get-OnDemandExactProcessInspection',
     'Test-OnDemandReceiptProcessIdentity',
     'Get-OnDemandCachedRuntimeValidation',
     'Get-OnDemandCachedBrokerPayloadCompatibility',
@@ -191,13 +193,49 @@ function Get-CimInstance {
         } else {
             638000000000000000
         }
-        CommandLine = if ($isSidecar) { 'sidecar-command' } else { 'bootstrap-command' }
-        ExecutablePath = if ($isSidecar) {
+        CommandLine = if ($global:OnDemandRemoteStateScenario -cin @(
+                'PreviousSupersededCimRedacted',
+                'PreviousSupersededNativeCommandLineFailure'
+            )) {
+            $null
+        } elseif ($isSidecar) {
+            'sidecar-command'
+        } else {
+            'bootstrap-command'
+        }
+        ExecutablePath = if ($global:OnDemandRemoteStateScenario -cin @(
+                'PreviousSupersededCimRedacted',
+                'PreviousSupersededNativeCommandLineFailure'
+            )) {
+            $null
+        } elseif ($isSidecar) {
             'C:\Program Files\nodejs\node.exe'
         } else {
             'C:\Program Files\PowerShell\7\pwsh.exe'
         }
     }
+}
+
+function Get-CodexLocalRemoteProcessImagePath {
+    param([int]$ProcessId)
+
+    if ($ProcessId -eq 4103) {
+        return 'C:\Program Files\nodejs\node.exe'
+    }
+    return 'C:\Program Files\PowerShell\7\pwsh.exe'
+}
+
+function Get-CodexLocalRemoteProcessCommandLine {
+    param([int]$ProcessId)
+
+    if ($global:OnDemandRemoteStateScenario -ceq
+        'PreviousSupersededNativeCommandLineFailure') {
+        throw 'fixture native command-line query failed'
+    }
+    if ($ProcessId -eq 4103) {
+        return 'sidecar-command'
+    }
+    return 'bootstrap-command'
 }
 
 function Get-ProcessCreationIdentity {
@@ -279,7 +317,8 @@ function Test-ManagedSidecarProcess {
         [string]$ExpectedSidecarCliPath,
         [int]$Port,
         [string]$BasePath,
-        [string]$DataDir
+        [string]$DataDir,
+        [string]$MaintenanceTokenFilePath
     )
 
     $null = @(
@@ -289,7 +328,8 @@ function Test-ManagedSidecarProcess {
         $ExpectedSidecarCliPath,
         $Port,
         $BasePath,
-        $DataDir
+        $DataDir,
+        $MaintenanceTokenFilePath
     )
     if ($global:OnDemandRemoteStateScenario -ceq
         'PreviousSupersededFinalReceiptDrift') {
@@ -620,6 +660,12 @@ function Invoke-RemoteStateCase {
     PreviousSupersededAdoptedCompatibleBusy =
         Invoke-RemoteStateCase `
             -Scenario 'PreviousSupersededAdoptedCompatibleBusy'
+    PreviousSupersededCimRedacted =
+        Invoke-RemoteStateCase `
+            -Scenario 'PreviousSupersededCimRedacted'
+    PreviousSupersededNativeCommandLineFailure =
+        Invoke-RemoteStateCase `
+            -Scenario 'PreviousSupersededNativeCommandLineFailure'
     PreviousSupersededSupervisorManifestMismatch =
         Invoke-RemoteStateCase `
             -Scenario 'PreviousSupersededSupervisorManifestMismatch'

@@ -69,7 +69,8 @@ windowsOnly("Stop-CodexLocalRemoteSidecar fresh-owner hardening", () => {
       CommandLine:
         `"${resolve(nodePath)}" "${resolve(sidecarCliPath)}" serve ` +
         `--host 127.0.0.1 --port ${testPort} --base-path /codex-remote ` +
-        `--data-dir "${resolve(dataDir)}"`,
+        `--data-dir "${resolve(dataDir)}" --maintenance-token-file ` +
+        `"${resolve(dataDir, "sidecar-maintenance-token.txt")}"`,
     };
   }
 
@@ -261,6 +262,20 @@ windowsOnly("Stop-CodexLocalRemoteSidecar fresh-owner hardening", () => {
     expect(execution.status).not.toBe(0);
     expect(outcome.Succeeded).toBe(false);
     expect(outcome.Error).toContain(scenario.error);
+    expect(outcome.StopIds).toEqual([]);
+  });
+
+  it("fails closed when the Sidecar uses a different maintenance token path", () => {
+    const owner = managedProcess();
+    owner.CommandLine = owner.CommandLine.replace(
+      resolve(dataDir, "sidecar-maintenance-token.txt"),
+      resolve(dataDir, "foreign-maintenance-token.txt"),
+    );
+    const { execution, outcome } = runScenario([[listener(owner.ProcessId)]], [owner]);
+
+    expect(execution.status).not.toBe(0);
+    expect(outcome.Succeeded).toBe(false);
+    expect(outcome.Error).toContain("command-line-mismatch");
     expect(outcome.StopIds).toEqual([]);
   });
 

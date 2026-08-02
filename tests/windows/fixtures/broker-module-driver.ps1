@@ -11,6 +11,7 @@ param(
         'classify-process',
         'classify-bootstrap-contract',
         'classify-sidecar',
+        'process-command-line',
         'classify-desktop',
         'assert-force-cli',
         'environment-backup',
@@ -43,6 +44,8 @@ param(
     [string]$CommandLine,
 
     [string]$ExecutablePath,
+
+    [string]$MaintenanceTokenFilePath,
 
     [ValidateSet('true', 'false')]
     [string]$PreviousValueExists = 'false',
@@ -132,15 +135,25 @@ switch ($Operation) {
             ConvertTo-Json -Compress -Depth 20
     }
     'classify-sidecar' {
-        Test-ManagedSidecarProcess `
-            -CommandLine $CommandLine `
-            -ExecutablePath $ExecutablePath `
-            -ExpectedNodePath $NodePath `
-            -ExpectedSidecarCliPath $CodexPath `
-            -Port 18790 `
-            -BasePath '/codex-remote' `
-            -DataDir $DataDir |
+        $parameters = @{
+            CommandLine = $CommandLine
+            ExecutablePath = $ExecutablePath
+            ExpectedNodePath = $NodePath
+            ExpectedSidecarCliPath = $CodexPath
+            Port = 18790
+            BasePath = '/codex-remote'
+            DataDir = $DataDir
+        }
+        if ($PSBoundParameters.ContainsKey('MaintenanceTokenFilePath')) {
+            $parameters.MaintenanceTokenFilePath = $MaintenanceTokenFilePath
+        }
+        Test-ManagedSidecarProcess @parameters |
             ConvertTo-Json -Compress -Depth 20
+    }
+    'process-command-line' {
+        [pscustomobject]@{
+            CommandLine = Get-CodexLocalRemoteProcessCommandLine -ProcessId $PID
+        } | ConvertTo-Json -Compress -Depth 5
     }
     'assert-force-cli' {
         Assert-ForceCliDisabled

@@ -113,6 +113,16 @@ describe("Windows infrastructure-first on-demand handoff", () => {
 
   it("proves the exact prepared transport before reporting that only attach remains", () => {
     const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+    const transportSnapshot = functionBlock(
+      handoff,
+      "Get-OnDemandPreparedTransportSnapshot",
+      "Prepare-OnDemandSelectedRemoteRuntime",
+    );
+    const processInspection = functionBlock(
+      handoff,
+      "Get-OnDemandExactProcessInspection",
+      "Test-OnDemandReceiptProcessIdentity",
+    );
     const readyGate = functionBlock(
       handoff,
       "Assert-OnDemandPreparedInfrastructureReadyForAttach",
@@ -126,6 +136,13 @@ describe("Windows infrastructure-first on-demand handoff", () => {
     expect(readyGate).toContain("BrokerProcessId");
     expect(readyGate).toContain("UpstreamProcessId");
     expect(readyGate).toContain("SidecarProcessId");
+    expect(transportSnapshot).toContain("Get-OnDemandExactProcessInspection");
+    expect(transportSnapshot).toContain("MaintenanceTokenFilePath");
+    expect(transportSnapshot).toContain("ParentProcessId");
+    expect(transportSnapshot).toContain("Get-OnDemandManagedPortListeners");
+    expect(transportSnapshot).toContain("OwningProcess");
+    expect(transportSnapshot).toContain("$rawFinal -cne $rawBefore");
+    expect(processInspection).toContain("Get-CodexLocalRemoteProcessCommandLine");
     expect(calls?.length ?? 0).toBeGreaterThanOrEqual(3);
     expect(handoff).toContain("-Outcome 'preclose-drift'");
   });

@@ -34,6 +34,9 @@ Assert-CanonicalBasePath -BasePath $BasePath
 $resolvedNode = [System.IO.Path]::GetFullPath($NodePath)
 $resolvedCli = [System.IO.Path]::GetFullPath($ExpectedSidecarCliPath)
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+$sidecarMaintenanceTokenPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $resolvedDataDir 'sidecar-maintenance-token.txt')
+)
 
 function Get-SidecarListeners {
     return $(if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
@@ -108,7 +111,8 @@ function Get-ManagedSidecarOwnerSnapshot {
             -ExpectedSidecarCliPath $resolvedCli `
             -Port $Port `
             -BasePath $BasePath `
-            -DataDir $resolvedDataDir
+            -DataDir $resolvedDataDir `
+            -MaintenanceTokenFilePath $sidecarMaintenanceTokenPath
         if (-not $ownership.IsManaged) {
             throw "TCP port $Port owner PID $processId is not the exact managed Sidecar ($($ownership.Reason)); refusing to stop it."
         }

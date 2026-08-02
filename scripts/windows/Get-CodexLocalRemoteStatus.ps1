@@ -110,6 +110,9 @@ $sidecarCli = [System.IO.Path]::GetFullPath(
 )
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
 $capabilityTokenPath = Get-BrokerCapabilityTokenPath -DataDir $resolvedDataDir
+$sidecarMaintenanceTokenPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $resolvedDataDir 'sidecar-maintenance-token.txt')
+)
 $upstreamTokenPath = [System.IO.Path]::GetFullPath(
     (Join-Path $resolvedDataDir 'app-server-upstream.token')
 )
@@ -144,6 +147,28 @@ function Read-StatusJsonText {
         throw "Status receipt '$Path' is not an ordinary bounded file."
     }
     return Get-Content -LiteralPath $Path -Raw -Encoding utf8 -ErrorAction Stop
+}
+
+function Get-StatusManagedProcessOwnershipEvidence {
+    param([Parameter(Mandatory)][object]$Process)
+
+    $processId = [int]$Process.ProcessId
+    $commandLine = [string]$Process.CommandLine
+    $executablePath = [string]$Process.ExecutablePath
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        $commandLine = Get-CodexLocalRemoteProcessCommandLine -ProcessId $processId
+    }
+    if ([string]::IsNullOrWhiteSpace($executablePath)) {
+        $executablePath = Get-CodexLocalRemoteProcessImagePath -ProcessId $processId
+    }
+    if ([string]::IsNullOrWhiteSpace($commandLine) -or
+        [string]::IsNullOrWhiteSpace($executablePath)) {
+        throw "PID $processId has no exact process ownership evidence."
+    }
+    return [pscustomobject]@{
+        CommandLine = $commandLine
+        ExecutablePath = $executablePath
+    }
 }
 
 function Get-StatusUniqueCodexDesktopRootIdentityKey {
@@ -746,11 +771,14 @@ function Test-LiveRuntimeReceiptProcess {
             }
         }
 
+        $processEvidence = Get-StatusManagedProcessOwnershipEvidence `
+            -Process $process
+
         $ownership = switch ($Kind) {
             'Bootstrap' {
                 Test-ManagedBootstrapProcess `
-                    -CommandLine ([string]$process.CommandLine) `
-                    -ExecutablePath ([string]$process.ExecutablePath) `
+                    -CommandLine $processEvidence.CommandLine `
+                    -ExecutablePath $processEvidence.ExecutablePath `
                     -TaskName $TaskName `
                     -NodePath $NodePath `
                     -PwshPath $PwshPath `
@@ -770,8 +798,8 @@ function Test-LiveRuntimeReceiptProcess {
                     [System.IO.Path]::GetFullPath($BrokerCliPath)
                 }
                 Test-ManagedBrokerProcess `
-                    -CommandLine ([string]$process.CommandLine) `
-                    -ExecutablePath ([string]$process.ExecutablePath) `
+                    -CommandLine $processEvidence.CommandLine `
+                    -ExecutablePath $processEvidence.ExecutablePath `
                     -ExpectedNodePath $NodePath `
                     -ExpectedBrokerCliPath $receiptBrokerCliPath `
                     -BrokerPort $BrokerPort `
@@ -782,18 +810,19 @@ function Test-LiveRuntimeReceiptProcess {
             }
             'Sidecar' {
                 Test-ManagedSidecarProcess `
-                    -CommandLine ([string]$process.CommandLine) `
-                    -ExecutablePath ([string]$process.ExecutablePath) `
+                    -CommandLine $processEvidence.CommandLine `
+                    -ExecutablePath $processEvidence.ExecutablePath `
                     -ExpectedNodePath $NodePath `
                     -ExpectedSidecarCliPath $sidecarCli `
                     -Port $Port `
                     -BasePath $BasePath `
-                    -DataDir $resolvedDataDir
+                    -DataDir $resolvedDataDir `
+                    -MaintenanceTokenFilePath $sidecarMaintenanceTokenPath
             }
             'Upstream' {
                 Test-ManagedAppServerProcess `
-                    -CommandLine ([string]$process.CommandLine) `
-                    -ExecutablePath ([string]$process.ExecutablePath) `
+                    -CommandLine $processEvidence.CommandLine `
+                    -ExecutablePath $processEvidence.ExecutablePath `
                     -ExpectedCodexPath $CodexPath `
                     -WebSocketUrl (Get-BrokerWebSocketUrl -Port $BrokerUpstreamPort) `
                     -TokenFilePath $upstreamTokenPath
@@ -953,15 +982,22 @@ if ($null -ne $sidecarPid -and -not [string]::IsNullOrWhiteSpace($NodePath)) {
         -Filter "ProcessId = $sidecarPid" `
         -ErrorAction SilentlyContinue
     if ($null -ne $sidecarProcess) {
-        $sidecarOwnership = Test-ManagedSidecarProcess `
-            -CommandLine ([string]$sidecarProcess.CommandLine) `
-            -ExecutablePath ([string]$sidecarProcess.ExecutablePath) `
-            -ExpectedNodePath $NodePath `
-            -ExpectedSidecarCliPath $sidecarCli `
-            -Port $Port `
-            -BasePath $BasePath `
-            -DataDir $resolvedDataDir
-        $sidecarOwned = [bool]$sidecarOwnership.IsManaged
+        try {
+            $sidecarEvidence = Get-StatusManagedProcessOwnershipEvidence `
+                -Process $sidecarProcess
+            $sidecarOwnership = Test-ManagedSidecarProcess `
+                -CommandLine $sidecarEvidence.CommandLine `
+                -ExecutablePath $sidecarEvidence.ExecutablePath `
+                -ExpectedNodePath $NodePath `
+                -ExpectedSidecarCliPath $sidecarCli `
+                -Port $Port `
+                -BasePath $BasePath `
+                -DataDir $resolvedDataDir `
+                -MaintenanceTokenFilePath $sidecarMaintenanceTokenPath
+            $sidecarOwned = [bool]$sidecarOwnership.IsManaged
+        } catch {
+            $sidecarOwned = $false
+        }
     }
 }
 $sidecarReady = $sidecarListenerReady -and $sidecarOwned
@@ -1049,13 +1085,19 @@ if ($null -ne $upstreamPid -and -not [string]::IsNullOrWhiteSpace($CodexPath)) {
         -Filter "ProcessId = $upstreamPid" `
         -ErrorAction SilentlyContinue
     if ($null -ne $upstreamProcess) {
-        $upstreamOwnership = Test-ManagedAppServerProcess `
-            -CommandLine ([string]$upstreamProcess.CommandLine) `
-            -ExecutablePath ([string]$upstreamProcess.ExecutablePath) `
-            -ExpectedCodexPath $CodexPath `
-            -WebSocketUrl $upstreamUrl `
-            -TokenFilePath $upstreamTokenPath
-        $upstreamOwned = [bool]$upstreamOwnership.IsManaged
+        try {
+            $upstreamEvidence = Get-StatusManagedProcessOwnershipEvidence `
+                -Process $upstreamProcess
+            $upstreamOwnership = Test-ManagedAppServerProcess `
+                -CommandLine $upstreamEvidence.CommandLine `
+                -ExecutablePath $upstreamEvidence.ExecutablePath `
+                -ExpectedCodexPath $CodexPath `
+                -WebSocketUrl $upstreamUrl `
+                -TokenFilePath $upstreamTokenPath
+            $upstreamOwned = [bool]$upstreamOwnership.IsManaged
+        } catch {
+            $upstreamOwned = $false
+        }
     }
 }
 $brokerUpstreamReady = $upstreamLoopbackOnly -and $upstreamOwned
@@ -1342,9 +1384,11 @@ try {
     if ($null -eq $brokerProcess) {
         throw 'The Broker listener process is unavailable.'
     }
+    $brokerEvidence = Get-StatusManagedProcessOwnershipEvidence `
+        -Process $brokerProcess
     $brokerOwnership = Test-ManagedBrokerProcess `
-        -CommandLine ([string]$brokerProcess.CommandLine) `
-        -ExecutablePath ([string]$brokerProcess.ExecutablePath) `
+        -CommandLine $brokerEvidence.CommandLine `
+        -ExecutablePath $brokerEvidence.ExecutablePath `
         -ExpectedNodePath $NodePath `
         -ExpectedBrokerCliPath $expectedBrokerCliPath `
         -BrokerPort $BrokerPort `

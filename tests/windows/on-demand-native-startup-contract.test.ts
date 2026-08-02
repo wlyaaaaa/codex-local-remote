@@ -183,6 +183,8 @@ describe("Windows native-default on-demand Remote contract", () => {
         PreviousAdoptedCompatible: "ready-compatible",
         PreviousSupersededAdoptedCompatible: "runtime-transition",
         PreviousSupersededAdoptedCompatibleBusy: "runtime-transition-busy",
+        PreviousSupersededCimRedacted: "runtime-transition",
+        PreviousSupersededNativeCommandLineFailure: "unverified",
         PreviousSupersededSupervisorManifestMismatch: "unverified",
         PreviousSupersededSupervisorPayloadMismatch: "unverified",
         PreviousSupersededSupervisorRootMismatch: "unverified",

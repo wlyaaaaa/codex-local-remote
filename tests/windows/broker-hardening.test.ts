@@ -352,6 +352,96 @@ windowsOnly("Windows shared app-server broker hardening", () => {
     });
   });
 
+  it.each([
+    {
+      label: "the exact maintenance token path",
+      commandTokenName: "sidecar-maintenance-token.txt",
+      passExpectedPath: true,
+      expected: true,
+    },
+    {
+      label: "a different maintenance token path",
+      commandTokenName: "foreign-maintenance-token.txt",
+      passExpectedPath: true,
+      expected: false,
+    },
+    {
+      label: "an unexpected maintenance token argument in legacy mode",
+      commandTokenName: "sidecar-maintenance-token.txt",
+      passExpectedPath: false,
+      expected: false,
+    },
+  ])(
+    "classifies a Sidecar command with $label",
+    ({ commandTokenName, passExpectedPath, expected }) => {
+      const sidecarCli = join(installRoot, "apps", "sidecar", "dist", "cli.js");
+      const maintenanceTokenPath = join(dataDir, "sidecar-maintenance-token.txt");
+      const commandTokenPath = join(dataDir, commandTokenName);
+      const command =
+        `"${nodePath}" "${sidecarCli}" serve --host 127.0.0.1 --port 18790 ` +
+        `--base-path /codex-remote --data-dir "${dataDir}" ` +
+        `--maintenance-token-file "${commandTokenPath}"`;
+      const result = runDriver([
+        "-Operation",
+        "classify-sidecar",
+        "-NodePath",
+        nodePath,
+        "-CodexPath",
+        sidecarCli,
+        "-DataDir",
+        dataDir,
+        "-ExecutablePath",
+        nodePath,
+        "-CommandLine",
+        command,
+        ...(passExpectedPath ? ["-MaintenanceTokenFilePath", maintenanceTokenPath] : []),
+      ]);
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        IsManaged: expected,
+        Reason: expected ? "exact-managed-command" : "command-line-mismatch",
+      });
+    },
+  );
+
+  it("rejects a token-bound Sidecar contract when the maintenance token argument is missing", () => {
+    const sidecarCli = join(installRoot, "apps", "sidecar", "dist", "cli.js");
+    const maintenanceTokenPath = join(dataDir, "sidecar-maintenance-token.txt");
+    const command = `"${nodePath}" "${sidecarCli}" serve --host 127.0.0.1 --port 18790 --base-path /codex-remote --data-dir "${dataDir}"`;
+    const result = runDriver([
+      "-Operation",
+      "classify-sidecar",
+      "-NodePath",
+      nodePath,
+      "-CodexPath",
+      sidecarCli,
+      "-DataDir",
+      dataDir,
+      "-ExecutablePath",
+      nodePath,
+      "-CommandLine",
+      command,
+      "-MaintenanceTokenFilePath",
+      maintenanceTokenPath,
+    ]);
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      IsManaged: false,
+      Reason: "command-line-mismatch",
+    });
+  });
+
+  it("reads the current process command line through the bounded native query", () => {
+    const result = runDriver(["-Operation", "process-command-line"]);
+
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { CommandLine: string };
+    expect(parsed.CommandLine).toContain("broker-module-driver.ps1");
+    expect(parsed.CommandLine).toContain("process-command-line");
+  });
+
   it("creates one fixed high-entropy token atomically and reuses it on reinstall", () => {
     const first = runDriver(["-Operation", "ensure-token", "-DataDir", dataDir]);
     expect(first.status).toBe(0);

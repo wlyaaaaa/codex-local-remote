@@ -90,6 +90,9 @@ $sidecarCli = [System.IO.Path]::GetFullPath(
 $capabilityTokenPath = [System.IO.Path]::GetFullPath(
     (Join-Path $resolvedDataDir 'broker-capability.token')
 )
+$sidecarMaintenanceTokenPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $resolvedDataDir 'sidecar-maintenance-token.txt')
+)
 $upstreamTokenPath = [System.IO.Path]::GetFullPath(
     (Join-Path $resolvedDataDir 'app-server-upstream.token')
 )
@@ -261,6 +264,8 @@ $sidecarCommand = @(
     '/codex-remote'
     '--data-dir'
     (ConvertTo-WindowsCommandLineArgument -Value $resolvedDataDir)
+    '--maintenance-token-file'
+    (ConvertTo-WindowsCommandLineArgument -Value $sidecarMaintenanceTokenPath)
 ) -join ' '
 $upstreamCommand = @(
     (ConvertTo-WindowsCommandLineArgument -Value $resolvedCodex)

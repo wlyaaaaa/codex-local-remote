@@ -2877,14 +2877,7 @@ function Open-ProcessIdentityHandle {
     }
 }
 
-function Get-CodexLocalRemoteProcessImagePath {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateRange(1, 2147483647)]
-        [int]$ProcessId
-    )
-
+function Initialize-CodexLocalRemoteNativeProcessQuery {
     if ($null -eq ('CodexLocalRemote.NativeProcessQuery' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -2893,6 +2886,13 @@ using System.Text;
 
 namespace CodexLocalRemote {
     public static class NativeProcessQuery {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct UNICODE_STRING {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr OpenProcess(
             uint desiredAccess,
@@ -2907,6 +2907,14 @@ namespace CodexLocalRemote {
             StringBuilder imagePath,
             ref int size);
 
+        [DllImport("ntdll.dll")]
+        public static extern uint NtQueryInformationProcess(
+            IntPtr processHandle,
+            int processInformationClass,
+            IntPtr processInformation,
+            uint processInformationLength,
+            out uint returnLength);
+
         [DllImport("kernel32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool CloseHandle(IntPtr handle);
@@ -2914,6 +2922,17 @@ namespace CodexLocalRemote {
 }
 '@
     }
+}
+
+function Get-CodexLocalRemoteProcessImagePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$ProcessId
+    )
+
+    Initialize-CodexLocalRemoteNativeProcessQuery
 
     $queryLimitedInformation = [uint32]0x1000
     $handle = [CodexLocalRemote.NativeProcessQuery]::OpenProcess(
@@ -2937,6 +2956,99 @@ namespace CodexLocalRemote {
         }
         return [System.IO.Path]::GetFullPath($buffer.ToString())
     } finally {
+        $null = [CodexLocalRemote.NativeProcessQuery]::CloseHandle($handle)
+    }
+}
+
+function Get-CodexLocalRemoteProcessCommandLine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$ProcessId
+    )
+
+    Initialize-CodexLocalRemoteNativeProcessQuery
+    $queryLimitedInformation = [uint32]0x1000
+    $handle = [CodexLocalRemote.NativeProcessQuery]::OpenProcess(
+        $queryLimitedInformation,
+        $false,
+        $ProcessId
+    )
+    if ($handle -eq [IntPtr]::Zero) {
+        throw "PID $ProcessId command line could not be opened for limited query."
+    }
+
+    $buffer = [IntPtr]::Zero
+    try {
+        $processCommandLineInformation = 60
+        [uint32]$requiredLength = 0
+        [uint32]$initialStatus =
+            [CodexLocalRemote.NativeProcessQuery]::NtQueryInformationProcess(
+                $handle,
+                $processCommandLineInformation,
+                [IntPtr]::Zero,
+                0,
+                [ref]$requiredLength
+            )
+        $boundedProbeStatuses = @(
+            [Convert]::ToUInt32('80000005', 16),
+            [Convert]::ToUInt32('C0000004', 16),
+            [Convert]::ToUInt32('C0000023', 16)
+        )
+        $headerLength = [System.Runtime.InteropServices.Marshal]::SizeOf(
+            [type][CodexLocalRemote.NativeProcessQuery+UNICODE_STRING]
+        )
+        $maximumCommandLineInformationBytes = [uint32](1024 * 1024)
+        if ($initialStatus -notin $boundedProbeStatuses -or
+            $requiredLength -lt $headerLength -or
+            $requiredLength -gt $maximumCommandLineInformationBytes) {
+            throw "PID $ProcessId command line size probe was not a bounded native query."
+        }
+
+        $buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(
+            [int]$requiredLength
+        )
+        [uint32]$returnedLength = 0
+        [uint32]$queryStatus =
+            [CodexLocalRemote.NativeProcessQuery]::NtQueryInformationProcess(
+                $handle,
+                $processCommandLineInformation,
+                $buffer,
+                $requiredLength,
+                [ref]$returnedLength
+            )
+        if ($queryStatus -ne 0 -or $returnedLength -gt $requiredLength) {
+            throw "PID $ProcessId command line could not be queried exactly."
+        }
+
+        $value = [System.Runtime.InteropServices.Marshal]::PtrToStructure(
+            $buffer,
+            [type][CodexLocalRemote.NativeProcessQuery+UNICODE_STRING]
+        )
+        if ($value.Length -eq 0 -or
+            $value.Length % 2 -ne 0 -or
+            $value.MaximumLength % 2 -ne 0 -or
+            $value.MaximumLength -lt $value.Length -or
+            $value.MaximumLength -gt $requiredLength) {
+            throw "PID $ProcessId command line returned an invalid UNICODE_STRING length."
+        }
+        $allocationStart = $buffer.ToInt64()
+        $allocationEnd = $allocationStart + [int64]$requiredLength
+        $stringStart = $value.Buffer.ToInt64()
+        if ($allocationEnd -lt $allocationStart -or
+            $stringStart -lt $allocationStart -or
+            $stringStart -gt ($allocationEnd - [int64]$value.MaximumLength)) {
+            throw "PID $ProcessId command line returned an out-of-bounds UNICODE_STRING pointer."
+        }
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringUni(
+            $value.Buffer,
+            [int]($value.Length / 2)
+        )
+    } finally {
+        if ($buffer -ne [IntPtr]::Zero) {
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
+        }
         $null = [CodexLocalRemote.NativeProcessQuery]::CloseHandle($handle)
     }
 }
@@ -3307,7 +3419,9 @@ function Test-ManagedSidecarProcess {
         [string]$BasePath,
 
         [Parameter(Mandatory)]
-        [string]$DataDir
+        [string]$DataDir,
+
+        [string]$MaintenanceTokenFilePath
     )
 
     Assert-CanonicalBasePath -BasePath $BasePath
@@ -3334,6 +3448,16 @@ function Test-ManagedSidecarProcess {
     # ownership while remaining compatible with Codex's frequently changing
     # versioned install directory.
     $codexSchemaSource = '(?:\s+--codex-path\s+(?:"[A-Za-z]:\\[^"]+"|[A-Za-z]:\\\S+))?'
+    $maintenanceToken = if (
+        $PSBoundParameters.ContainsKey('MaintenanceTokenFilePath')
+    ) {
+        $resolvedMaintenanceToken = [regex]::Escape(
+            [System.IO.Path]::GetFullPath($MaintenanceTokenFilePath)
+        )
+        "\s+--maintenance-token-file\s+(?:`"$resolvedMaintenanceToken`"|$resolvedMaintenanceToken)"
+    } else {
+        ''
+    }
     $pattern = (
         "^(?:`"$node`"|$node)\s+" +
         "(?:`"$cli`"|$cli)\s+serve" +
@@ -3341,7 +3465,9 @@ function Test-ManagedSidecarProcess {
         "\s+--port\s+$Port" +
         "\s+--base-path\s+(?:`"$base`"|$base)" +
         $codexSchemaSource +
-        "\s+--data-dir\s+(?:`"$data`"|$data)\s*$"
+        "\s+--data-dir\s+(?:`"$data`"|$data)" +
+        $maintenanceToken +
+        "\s*$"
     )
     if ($CommandLine -notmatch $pattern) {
         return [pscustomobject]@{
@@ -9267,6 +9393,7 @@ Export-ModuleMember -Function @(
     'Get-ManagedIpv4Listeners',
     'Get-ProcessCreationIdentity',
     'Get-CodexLocalRemoteProcessImagePath',
+    'Get-CodexLocalRemoteProcessCommandLine',
     'Open-ProcessIdentityHandle',
     'Stop-ProcessIdentityHandle',
     'Open-ProcessTreeIdentitySnapshot',

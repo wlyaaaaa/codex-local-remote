@@ -17,6 +17,17 @@ upstream listener handle.
   ports before Remote mode is re-armed.
 - Uses full-tree termination for exact managed Broker/app-server shutdowns so
   inherited Windows handles do not outlive their owner.
+- Reads image paths and command lines through bounded native
+  `PROCESS_QUERY_LIMITED_INFORMATION` queries when Windows redacts those CIM
+  fields across the scheduled task's higher integrity boundary. The result is
+  still checked against the exact immutable-runtime command contract; an
+  unreadable or mismatched process remains fail-closed.
+- Binds the prepared Sidecar to its recorded Bootstrap parent, process-start
+  identity and unique loopback listener before Desktop is closed, then rechecks
+  the unchanged receipt and listener after the identity handle is open.
+- Includes the v0.1.5 Sidecar maintenance-token argument in the exact ownership
+  contract. The legacy no-token contract remains distinct and cannot accept an
+  unexpected token path.
 
 ## Compatibility recovery
 

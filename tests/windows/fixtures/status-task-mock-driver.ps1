@@ -97,10 +97,14 @@ $sidecarCli = [System.IO.Path]::GetFullPath(
     (Join-Path ([System.IO.Path]::GetFullPath($InstallRoot)) 'apps\sidecar\dist\cli.js')
 )
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+$sidecarMaintenanceTokenPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $resolvedDataDir 'sidecar-maintenance-token.txt')
+)
 $managedSidecarCommandLine = (
     "`"$NodePath`" `"$sidecarCli`" serve" +
     " --host 127.0.0.1 --port 18790" +
-    " --base-path /codex-remote --data-dir `"$resolvedDataDir`""
+    " --base-path /codex-remote --data-dir `"$resolvedDataDir`"" +
+    " --maintenance-token-file `"$sidecarMaintenanceTokenPath`""
 )
 $task = [pscustomobject]@{
     TaskName = $taskName

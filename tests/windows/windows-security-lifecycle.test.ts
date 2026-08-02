@@ -404,6 +404,15 @@ describe("Windows capability and lifecycle safety contract", () => {
     expect(stop).not.toMatch(/Stop-Process\s+-Id/u);
   });
 
+  it("binds current Sidecar status and stop ownership to the exact maintenance token path", () => {
+    const status = windowsScript("Get-CodexLocalRemoteStatus.ps1");
+    const stop = windowsScript("Stop-CodexLocalRemoteSidecar.ps1");
+    for (const script of [status, stop]) {
+      expect(script).toContain("sidecar-maintenance-token.txt");
+      expect(script).toContain("-MaintenanceTokenFilePath $sidecarMaintenanceTokenPath");
+    }
+  });
+
   it("stops an exact managed Sidecar before removing broker state or its task", () => {
     const removal = windowsScript("Unregister-CodexLocalRemoteStartup.ps1");
     expect(removal).toContain("Stop-CodexLocalRemoteSidecar.ps1");

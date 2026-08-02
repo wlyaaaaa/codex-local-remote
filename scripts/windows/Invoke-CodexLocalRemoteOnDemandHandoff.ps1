@@ -372,6 +372,41 @@ function Get-OnDemandTaskProcessContext {
     }
 }
 
+function Get-OnDemandExactProcessInspection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Process
+    )
+
+    if (-not (Test-NonNegativeInteger -Value $Process.ProcessId) -or
+        [int]$Process.ProcessId -lt 1) {
+        throw 'The process inspection has no positive PID.'
+    }
+    $processId = [int]$Process.ProcessId
+    $executablePath = [string]$Process.ExecutablePath
+    if ([string]::IsNullOrWhiteSpace($executablePath)) {
+        $executablePath =
+            Get-CodexLocalRemoteProcessImagePath -ProcessId $processId
+    }
+    $commandLine = [string]$Process.CommandLine
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        $commandLine =
+            Get-CodexLocalRemoteProcessCommandLine -ProcessId $processId
+    }
+    if ([string]::IsNullOrWhiteSpace($executablePath) -or
+        [string]::IsNullOrWhiteSpace($commandLine)) {
+        throw "PID $processId could not be inspected exactly."
+    }
+    return [pscustomobject]@{
+        ProcessId = $processId
+        ParentProcessId = [int]$Process.ParentProcessId
+        CreationDate = $Process.CreationDate
+        ExecutablePath = [System.IO.Path]::GetFullPath($executablePath)
+        CommandLine = $commandLine
+    }
+}
+
 function Test-OnDemandReceiptProcessIdentity {
     param(
         [Parameter(Mandatory)]
@@ -426,7 +461,8 @@ function Test-OnDemandReceiptProcessIdentity {
                     $ExpectedParentProcessId)) {
             return $false
         }
-        $process = $processes[0]
+        $process =
+            Get-OnDemandExactProcessInspection -Process $processes[0]
         $creation = Get-ProcessCreationIdentity `
             -CreationDate $process.CreationDate
         if ([long]$creation.CreationDateUtcTicks -ne
@@ -1519,7 +1555,12 @@ function Get-OnDemandRemoteState {
                                                     [string]$ProcessContext.
                                                         BasePath
                                                 ) `
-                                                -DataDir $resolvedDataDir
+                                                -DataDir $resolvedDataDir `
+                                                -MaintenanceTokenFilePath (
+                                                    Join-Path `
+                                                        $resolvedDataDir `
+                                                        'sidecar-maintenance-token.txt'
+                                                )
                                         }
                                 $rawFinal = Get-Content `
                                     -LiteralPath $receiptPath `
@@ -2244,6 +2285,10 @@ function Get-OnDemandPreparedTransportSnapshot {
         [string]$receipt.Signature -cne
             'codex-local-remote/app-server-broker/v3' -or
         [int]$receipt.Version -ne 3 -or
+        $null -eq $receipt.Bootstrap -or
+        -not (Test-NonNegativeInteger `
+            -Value $receipt.Bootstrap.ProcessId) -or
+        [int]$receipt.Bootstrap.ProcessId -le 0 -or
         $null -eq $receipt.Sidecar -or
         -not (Test-NonNegativeInteger `
             -Value $receipt.Sidecar.ProcessId) -or
@@ -2254,10 +2299,28 @@ function Get-OnDemandPreparedTransportSnapshot {
             )) {
         throw 'Prepared transport receipt changed or lacks exact Sidecar identity.'
     }
-    $sidecarProcess = Get-CimInstance `
-        Win32_Process `
-        -Filter "ProcessId = $([int]$receipt.Sidecar.ProcessId)" `
-        -ErrorAction Stop
+    $sidecarProcess =
+        Get-OnDemandExactProcessInspection -Process (
+            Get-CimInstance `
+                Win32_Process `
+                -Filter "ProcessId = $([int]$receipt.Sidecar.ProcessId)" `
+                -ErrorAction Stop
+        )
+    if ([int]$sidecarProcess.ParentProcessId -ne
+        [int]$receipt.Bootstrap.ProcessId) {
+        throw 'Prepared transport Sidecar is not a child of the recorded Bootstrap.'
+    }
+    $sidecarListeners = @(
+        Get-OnDemandManagedPortListeners `
+            -Ports @([int]$Configuration.SidecarPort)
+    )
+    if ($sidecarListeners.Count -ne 1 -or
+        -not (Test-IsLoopbackListenerAddress `
+            -Address ([string]$sidecarListeners[0].LocalAddress)) -or
+        [int]$sidecarListeners[0].OwningProcess -ne
+            [int]$receipt.Sidecar.ProcessId) {
+        throw 'Prepared transport Sidecar does not own one exact loopback listener.'
+    }
     $sidecarOwnership = Test-ManagedSidecarProcess `
         -CommandLine ([string]$sidecarProcess.CommandLine) `
         -ExecutablePath ([string]$sidecarProcess.ExecutablePath) `
@@ -2269,7 +2332,10 @@ function Get-OnDemandPreparedTransportSnapshot {
         ) `
         -Port ([int]$Configuration.SidecarPort) `
         -BasePath ([string]$Configuration.BasePath) `
-        -DataDir $resolvedDataDir
+        -DataDir $resolvedDataDir `
+        -MaintenanceTokenFilePath (
+            Join-Path $resolvedDataDir 'sidecar-maintenance-token.txt'
+        )
     if (-not [bool]$sidecarOwnership.IsManaged) {
         throw 'Prepared transport Sidecar process is not the exact managed owner.'
     }
@@ -2285,6 +2351,20 @@ function Get-OnDemandPreparedTransportSnapshot {
             [long]$receipt.Sidecar.ProcessStartTimeUtcTicks
         )
     try {
+        $rawFinal =
+            Get-Content -LiteralPath $receiptPath -Raw -Encoding utf8
+        $finalSidecarListeners = @(
+            Get-OnDemandManagedPortListeners `
+                -Ports @([int]$Configuration.SidecarPort)
+        )
+        if ($rawFinal -cne $rawBefore -or
+            $finalSidecarListeners.Count -ne 1 -or
+            [string]$finalSidecarListeners[0].LocalAddress -cne
+                [string]$sidecarListeners[0].LocalAddress -or
+            [int]$finalSidecarListeners[0].OwningProcess -ne
+                [int]$receipt.Sidecar.ProcessId) {
+            throw 'Prepared transport Sidecar receipt or listener changed during capture.'
+        }
         return [pscustomobject]@{
             RemoteState = $remoteState
             Readiness = $script:onDemandLastReadiness
@@ -3240,7 +3320,11 @@ function Open-OnDemandManagedUpstreamProcessTree {
     if ($processes.Count -ne 1) {
         throw 'Managed upstream disappeared before process-tree capture.'
     }
-    $process = $processes[0]
+    $process =
+        Get-OnDemandExactProcessInspection -Process $processes[0]
+    if ([int]$process.ParentProcessId -ne [int]$receipt.Broker.ProcessId) {
+        throw 'Managed upstream is not a child of the recorded Broker.'
+    }
     $creation = Get-ProcessCreationIdentity -CreationDate $process.CreationDate
     if ([long]$creation.CreationDateUtcTicks -ne
         [long]$upstream.CreationDateUtcTicks) {
