@@ -82,6 +82,7 @@ $script:preparedAttachIntent = $null
 $script:desiredModeBeforeOpen = $null
 $script:openDesiredModeIntentId = $null
 $script:openDesiredModeWasCreated = $false
+$script:deferredIntentIdForCompensation = $ExpectedDesiredModeIntentId
 $controlMutexIdentity = $resolvedDataDir.ToUpperInvariant()
 $controlMutexDigest = [Convert]::ToHexString(
     [System.Security.Cryptography.SHA256]::HashData(
@@ -1654,11 +1655,14 @@ function Test-OnDemandDeferredOpenIntent {
 
         [Parameter(Mandatory)]
         [ValidatePattern('^[a-f0-9]{32}$')]
-        [string]$ExpectedIntentId
+        [string]$ExpectedIntentId,
+
+        [ValidateSet('Remote', 'Native')]
+        [string]$ExpectedMode = 'Remote'
     )
 
     return (
-        [string]$DesiredMode.Mode -ceq 'Remote' -and
+        [string]$DesiredMode.Mode -ceq $ExpectedMode -and
         [string]$DesiredMode.IntentId -ceq $ExpectedIntentId -and
         [string]$DesiredMode.RuntimeVersionId -ceq
             [string]$Runtime.CurrentVersionId -and
@@ -2984,6 +2988,7 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
             "Ready or Running startup task, not '$($StartupTask.State)'."
         )
     }
+    $startupTaskWasRunning = [string]$StartupTask.State -ceq 'Running'
     if ($DesktopRoots.Count -ne 1) {
         throw (
             'The deferred Desktop restart barrier requires exactly one ' +
@@ -3005,9 +3010,26 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
         throw 'The deferred Open authorization was cancelled before Desktop shutdown.'
     }
 
+    # A superseded supervisor can only drain through its existing Native-mode
+    # contract. Own that temporary transition under the same control mutex,
+    # then re-arm Remote only after the old task has exited. This keeps the
+    # handoff compatible with already-installed older supervisors.
+    $shutdownIntent = Set-CodexLocalRemoteDesiredMode `
+        -DataDir $resolvedDataDir `
+        -Mode Native `
+        -RuntimeVersionId ([string]$Runtime.CurrentVersionId) `
+        -RuntimeRoot ([string]$Runtime.CurrentRoot)
+    if (-not (Test-OnDemandDeferredOpenIntent `
+        -DesiredMode $shutdownIntent `
+        -Runtime $Runtime `
+        -ExpectedIntentId ([string]$shutdownIntent.IntentId) `
+        -ExpectedMode Native)) {
+        throw 'The authorized Desktop shutdown intent failed exact read-back.'
+    }
+
     # The caller already owns the per-DataDir OnDemandControl mutex. Keep the
-    # exact intent check, package-identity stop, task drain, and subsequent
-    # installed Open in that same outer critical section.
+    # two exact intent checks, package-identity stop, task drain, Remote
+    # re-arm, and subsequent installed Open in that same critical section.
     $script:nativeDesktopWasClosedForOpen = $true
     Stop-OnDemandDesktopRoot `
         -DesktopRoot $DesktopRoots[0] `
@@ -3020,12 +3042,42 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
 
     $desiredModeAfterStop =
         Get-CodexLocalRemoteDesiredMode -DataDir $resolvedDataDir
-    if (-not (Test-OnDemandDeferredOpenIntent `
-        -DesiredMode $desiredModeAfterStop `
-        -Runtime $Runtime `
-        -ExpectedIntentId $ExpectedIntentId)) {
+    $ownedShutdownIntentPreserved =
+        Test-OnDemandDeferredOpenIntent `
+            -DesiredMode $desiredModeAfterStop `
+            -Runtime $Runtime `
+            -ExpectedIntentId ([string]$shutdownIntent.IntentId) `
+            -ExpectedMode Native
+    $legacySupervisorDrainIntent = (
+        -not $ownedShutdownIntentPreserved -and
+        $startupTaskWasRunning -and
+        [string]$desiredModeAfterStop.Mode -ceq 'Native' -and
+        [string]$desiredModeAfterStop.IntentId -cmatch '^[a-f0-9]{32}$' -and
+        [string]$desiredModeAfterStop.RuntimeVersionId -ceq
+            [string]$Runtime.CurrentVersionId -and
+        (Test-OnDemandRuntimePathEqual `
+            -Left ([string]$desiredModeAfterStop.RuntimeRoot) `
+            -Right ([string]$Runtime.CurrentRoot))
+    )
+    if (-not ($ownedShutdownIntentPreserved -or
+            $legacySupervisorDrainIntent)) {
         throw 'The deferred Open authorization was cancelled during Desktop shutdown.'
     }
+    $rearmedIntent = Set-CodexLocalRemoteDesiredMode `
+        -DataDir $resolvedDataDir `
+        -Mode Remote `
+        -RuntimeVersionId ([string]$Runtime.CurrentVersionId) `
+        -RuntimeRoot ([string]$Runtime.CurrentRoot)
+    if (-not (Test-OnDemandDeferredOpenIntent `
+        -DesiredMode $rearmedIntent `
+        -Runtime $Runtime `
+        -ExpectedIntentId ([string]$rearmedIntent.IntentId))) {
+        throw 'The authorized Remote re-arm intent failed exact read-back.'
+    }
+    $script:deferredIntentIdForCompensation =
+        [string]$rearmedIntent.IntentId
+    $script:openDesiredModeIntentId = [string]$rearmedIntent.IntentId
+    $script:openDesiredModeWasCreated = $true
     return $readyTask
 }
 
@@ -4007,7 +4059,9 @@ try {
                  -BrokerPort ([int]$configuration.BrokerPort) `
                  -DesktopExecutablePath $expectedDesktopPath `
                  -TaskStartAttempted $remoteTaskStartAttemptedForOpen `
-                 -DeferredIntentId $ExpectedDesiredModeIntentId
+                 -DeferredIntentId (
+                    [string]$script:deferredIntentIdForCompensation
+                 )
             $nativeModeConfirmedAfterFailure = (
                 ([string]$openFailureCompensation.Status -ceq
                     'native-restored' -and

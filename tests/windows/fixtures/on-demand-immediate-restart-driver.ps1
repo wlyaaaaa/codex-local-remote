@@ -7,7 +7,12 @@ param(
     [ValidateSet(
         'barrier-current',
         'barrier-cancelled',
-        'barrier-superseded',
+        'barrier-legacy-native-rewrite',
+        'barrier-remote-superseded',
+        'barrier-native-runtime-superseded',
+        'barrier-ready-native-superseded',
+        'barrier-rearm-failure',
+        'barrier-rearm-external-remote',
         'stop-exact',
         'stop-empty-path',
         'stop-wrong-path',
@@ -31,7 +36,8 @@ foreach ($functionName in @(
     'Assert-OnDemandDesktopRootExecutable',
     'Stop-OnDemandDesktopRoot',
     'Test-OnDemandDeferredOpenIntent',
-    'Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier'
+    'Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier',
+    'Invoke-OnDemandOpenCompensation'
 )) {
     $functionAst = $ast.FindAll(
         {
@@ -54,9 +60,18 @@ $DesktopExitTimeoutSeconds = 6
 $script:nativeDesktopWasClosedForOpen = $false
 $script:CloseCalls = 0
 $script:CompensationCalls = 0
+$script:CompensationError = ''
+$script:CompensationStatus = ''
 $script:DesiredModeReadCalls = 0
+$script:DesiredModeWrites = [System.Collections.Generic.List[string]]::new()
+$script:DesiredMode = 'Remote'
+$script:DesiredIntentId = 'a' * 32
+$script:DesiredRuntimeVersionId = 'b' * 64
+$script:DesiredRuntimeRoot = 'C:\fixture\runtime'
+$script:deferredIntentIdForCompensation = 'a' * 32
 $script:DrainCalls = 0
 $script:IdentityOpenCalls = 0
+$script:NativeStartCalls = 0
 $script:OpenContinuationCalls = 0
 $script:StopCalls = 0
 $script:WaitCalls = 0
@@ -123,16 +138,44 @@ function Get-CodexLocalRemoteDesiredMode {
     param([string]$DataDir)
     $null = $DataDir
     $script:DesiredModeReadCalls++
-    $isCurrent = switch ($Mode) {
-        'barrier-cancelled' { $false }
-        'barrier-superseded' { $script:DesiredModeReadCalls -eq 1 }
-        default { $true }
+    if ($Mode -ceq 'barrier-cancelled' -and
+        $script:DesiredModeReadCalls -eq 1) {
+        $script:DesiredMode = 'Native'
+        $script:DesiredIntentId = 'e' * 32
     }
     return [pscustomobject]@{
-        Mode = if ($isCurrent) { 'Remote' } else { 'Native' }
-        IntentId = if ($isCurrent) { 'a' * 32 } else { 'c' * 32 }
-        RuntimeVersionId = 'b' * 64
-        RuntimeRoot = 'C:\fixture\runtime'
+        Mode = [string]$script:DesiredMode
+        IntentId = [string]$script:DesiredIntentId
+        RuntimeVersionId = [string]$script:DesiredRuntimeVersionId
+        RuntimeRoot = [string]$script:DesiredRuntimeRoot
+    }
+}
+
+function Set-CodexLocalRemoteDesiredMode {
+    param(
+        [string]$DataDir,
+        [string]$Mode,
+        [string]$RuntimeVersionId,
+        [string]$RuntimeRoot
+    )
+    $null = $DataDir
+    $script:DesiredModeWrites.Add($Mode)
+    $intentId = if ($Mode -ceq 'Remote') {
+        'd' * 32
+    } elseif ($script:DesiredModeWrites.Count -eq 1) {
+        'c' * 32
+    } else {
+        'f' * 32
+    }
+    $script:DesiredMode = $Mode
+    $script:DesiredIntentId = $intentId
+    $script:DesiredRuntimeVersionId = $RuntimeVersionId
+    $script:DesiredRuntimeRoot = $RuntimeRoot
+    return [pscustomobject]@{
+        Mode = $Mode
+        IntentId = $intentId
+        RuntimeVersionId = $RuntimeVersionId
+        RuntimeRoot = $RuntimeRoot
     }
 }
 
@@ -160,7 +203,47 @@ function Wait-OnDemandTaskState {
     $null = $ExpectedState
     $null = $TimeoutSeconds
     $script:WaitCalls++
+    switch ($Mode) {
+        'barrier-legacy-native-rewrite' {
+            $script:DesiredMode = 'Native'
+            $script:DesiredIntentId = 'e' * 32
+        }
+        'barrier-remote-superseded' {
+            $script:DesiredMode = 'Remote'
+            $script:DesiredIntentId = 'e' * 32
+        }
+        'barrier-native-runtime-superseded' {
+            $script:DesiredMode = 'Native'
+            $script:DesiredIntentId = 'e' * 32
+            $script:DesiredRuntimeVersionId = '9' * 64
+            $script:DesiredRuntimeRoot = 'C:\fixture\other-runtime'
+        }
+        'barrier-ready-native-superseded' {
+            $script:DesiredMode = 'Native'
+            $script:DesiredIntentId = 'e' * 32
+        }
+    }
     return [pscustomobject]@{ State = 'Ready' }
+}
+
+function Get-CodexLocalRemoteNativeDesktopRootCandidates {
+    param([string]$DesktopExecutablePath)
+    $null = $DesktopExecutablePath
+    return @()
+}
+
+function Get-OnDemandIndependentStdioProcesses {
+    return @()
+}
+
+function Start-OnDemandNativeDesktop {
+    param(
+        [string]$RuntimeRoot,
+        [string]$DesktopExecutablePath
+    )
+    $null = $RuntimeRoot
+    $null = $DesktopExecutablePath
+    $script:NativeStartCalls++
 }
 
 $succeeded = $false
@@ -202,21 +285,59 @@ try {
             ExecutablePath = $expectedDesktopPath
         }
         try {
+            $startupTaskState = if (
+                $Mode -ceq 'barrier-ready-native-superseded'
+            ) {
+                'Ready'
+            } else {
+                'Running'
+            }
             $null = Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier `
                 -Runtime $runtime `
-                -StartupTask ([pscustomobject]@{ State = 'Running' }) `
+                -StartupTask ([pscustomobject]@{ State = $startupTaskState }) `
                 -DesktopRoots @($desktopRoot) `
                 -IndependentStdioProcesses @() `
                 -ExpectedDesktopPath $expectedDesktopPath `
                 -ExpectedIntentId ('a' * 32) `
                 -Name 'Codex Local Remote' `
                 -TaskDrainTimeoutSeconds 120
+            if ($Mode -ceq 'barrier-rearm-external-remote') {
+                $script:DesiredMode = 'Remote'
+                $script:DesiredIntentId = '8' * 32
+            }
+            if ($Mode -cin @(
+                'barrier-rearm-failure',
+                'barrier-rearm-external-remote'
+            )) {
+                throw 'simulated failure after Remote re-arm'
+            }
             $script:OpenContinuationCalls++
         } catch {
+            $failure = $_
             if ($script:nativeDesktopWasClosedForOpen) {
                 $script:CompensationCalls++
+                if ($Mode -cin @(
+                    'barrier-rearm-failure',
+                    'barrier-rearm-external-remote'
+                )) {
+                    try {
+                        $compensation = Invoke-OnDemandOpenCompensation `
+                            -Runtime $runtime `
+                            -Name 'Codex Local Remote' `
+                            -BrokerPort 18791 `
+                            -DesktopExecutablePath $expectedDesktopPath `
+                            -TaskStartAttempted $false `
+                            -DeferredIntentId (
+                                [string]$script:deferredIntentIdForCompensation
+                            )
+                        $script:CompensationStatus =
+                            [string]$compensation.Status
+                    } catch {
+                        $script:CompensationError = $_.Exception.Message
+                    }
+                }
             }
-            throw
+            throw $failure
         }
     }
     $succeeded = $true
@@ -227,11 +348,19 @@ try {
 [pscustomobject]@{
     CloseCalls = $script:CloseCalls
     CompensationCalls = $script:CompensationCalls
+    CompensationError = $script:CompensationError
+    CompensationStatus = $script:CompensationStatus
+    CurrentDesiredIntentId = [string]$script:DesiredIntentId
+    CurrentDesiredMode = [string]$script:DesiredMode
     DesiredModeReadCalls = $script:DesiredModeReadCalls
+    DesiredModeWrites = @($script:DesiredModeWrites)
+    DeferredCompensationIntentId =
+        [string]$script:deferredIntentIdForCompensation
     DrainCalls = $script:DrainCalls
     Error = $errorText
     IdentityOpenCalls = $script:IdentityOpenCalls
     NativeDesktopWasClosed = [bool]$script:nativeDesktopWasClosedForOpen
+    NativeStartCalls = $script:NativeStartCalls
     OpenContinuationCalls = $script:OpenContinuationCalls
     StopCalls = $script:StopCalls
     WaitCalls = $script:WaitCalls

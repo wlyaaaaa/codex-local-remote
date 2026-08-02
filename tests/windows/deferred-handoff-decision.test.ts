@@ -187,7 +187,12 @@ function inspectImmediateRestart(
   mode:
     | "barrier-current"
     | "barrier-cancelled"
-    | "barrier-superseded"
+    | "barrier-legacy-native-rewrite"
+    | "barrier-remote-superseded"
+    | "barrier-native-runtime-superseded"
+    | "barrier-ready-native-superseded"
+    | "barrier-rearm-failure"
+    | "barrier-rearm-external-remote"
     | "stop-exact"
     | "stop-empty-path"
     | "stop-wrong-path"
@@ -195,11 +200,18 @@ function inspectImmediateRestart(
 ): {
   CloseCalls: number;
   CompensationCalls: number;
+  CompensationError: string;
+  CompensationStatus: string;
+  CurrentDesiredIntentId: string;
+  CurrentDesiredMode: string;
   DesiredModeReadCalls: number;
+  DesiredModeWrites: string[];
+  DeferredCompensationIntentId: string;
   DrainCalls: number;
   Error: string;
   IdentityOpenCalls: number;
   NativeDesktopWasClosed: boolean;
+  NativeStartCalls: number;
   OpenContinuationCalls: number;
   StopCalls: number;
   WaitCalls: number;
@@ -224,11 +236,18 @@ function inspectImmediateRestart(
   return JSON.parse(result.stdout) as {
     CloseCalls: number;
     CompensationCalls: number;
+    CompensationError: string;
+    CompensationStatus: string;
+    CurrentDesiredIntentId: string;
+    CurrentDesiredMode: string;
     DesiredModeReadCalls: number;
+    DesiredModeWrites: string[];
+    DeferredCompensationIntentId: string;
     DrainCalls: number;
     Error: string;
     IdentityOpenCalls: number;
     NativeDesktopWasClosed: boolean;
+    NativeStartCalls: number;
     OpenContinuationCalls: number;
     StopCalls: number;
     WaitCalls: number;
@@ -361,6 +380,7 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
     expect(inspectImmediateRestart("barrier-cancelled")).toMatchObject({
       CompensationCalls: 0,
       DesiredModeReadCalls: 1,
+      DesiredModeWrites: [],
       DrainCalls: 0,
       NativeDesktopWasClosed: false,
       OpenContinuationCalls: 0,
@@ -371,6 +391,8 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
     expect(inspectImmediateRestart("barrier-current")).toMatchObject({
       CompensationCalls: 0,
       DesiredModeReadCalls: 2,
+      DesiredModeWrites: ["Native", "Remote"],
+      DeferredCompensationIntentId: "d".repeat(32),
       DrainCalls: 1,
       NativeDesktopWasClosed: true,
       OpenContinuationCalls: 1,
@@ -378,14 +400,65 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
       WaitCalls: 1,
       Succeeded: true,
     });
-    expect(inspectImmediateRestart("barrier-superseded")).toMatchObject({
+    expect(inspectImmediateRestart("barrier-legacy-native-rewrite")).toMatchObject({
+      CompensationCalls: 0,
+      CurrentDesiredIntentId: "d".repeat(32),
+      CurrentDesiredMode: "Remote",
+      DesiredModeReadCalls: 2,
+      DesiredModeWrites: ["Native", "Remote"],
+      DeferredCompensationIntentId: "d".repeat(32),
+      DrainCalls: 1,
+      NativeDesktopWasClosed: true,
+      OpenContinuationCalls: 1,
+      StopCalls: 1,
+      WaitCalls: 1,
+      Succeeded: true,
+    });
+    expect(inspectImmediateRestart("barrier-remote-superseded")).toMatchObject({
       CompensationCalls: 1,
       DesiredModeReadCalls: 2,
+      DesiredModeWrites: ["Native"],
       DrainCalls: 1,
       NativeDesktopWasClosed: true,
       OpenContinuationCalls: 0,
       StopCalls: 1,
       WaitCalls: 1,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("barrier-native-runtime-superseded")).toMatchObject({
+      CompensationCalls: 1,
+      DesiredModeWrites: ["Native"],
+      OpenContinuationCalls: 0,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("barrier-ready-native-superseded")).toMatchObject({
+      CompensationCalls: 1,
+      DesiredModeWrites: ["Native"],
+      OpenContinuationCalls: 0,
+      Succeeded: false,
+    });
+  });
+
+  it("compensates a post-rearm failure using only the rearmed Remote intent", () => {
+    expect(inspectImmediateRestart("barrier-rearm-failure")).toMatchObject({
+      CompensationCalls: 1,
+      CompensationError: "",
+      CompensationStatus: "native-restored",
+      CurrentDesiredIntentId: "f".repeat(32),
+      CurrentDesiredMode: "Native",
+      DeferredCompensationIntentId: "d".repeat(32),
+      DesiredModeWrites: ["Native", "Remote", "Native"],
+      NativeStartCalls: 1,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("barrier-rearm-external-remote")).toMatchObject({
+      CompensationCalls: 1,
+      CompensationStatus: "",
+      CurrentDesiredIntentId: "8".repeat(32),
+      CurrentDesiredMode: "Remote",
+      DeferredCompensationIntentId: "d".repeat(32),
+      DesiredModeWrites: ["Native", "Remote"],
+      NativeStartCalls: 0,
       Succeeded: false,
     });
   });
