@@ -2892,16 +2892,16 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 namespace CodexLocalRemote {
-    internal static class NativeProcessQuery {
+    public static class NativeProcessQuery {
         [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern IntPtr OpenProcess(
+        public static extern IntPtr OpenProcess(
             uint desiredAccess,
             bool inheritHandle,
             int processId);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        internal static extern bool QueryFullProcessImageName(
+        public static extern bool QueryFullProcessImageName(
             IntPtr processHandle,
             int flags,
             StringBuilder imagePath,
@@ -2909,7 +2909,7 @@ namespace CodexLocalRemote {
 
         [DllImport("kernel32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
-        internal static extern bool CloseHandle(IntPtr handle);
+        public static extern bool CloseHandle(IntPtr handle);
     }
 }
 '@

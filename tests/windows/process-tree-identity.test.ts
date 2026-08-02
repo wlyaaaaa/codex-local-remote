@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -32,6 +32,7 @@ interface Outcome {
   StopTreeFlags: boolean[];
   DisposeIds: number[];
   ExportedCommands?: string[];
+  ImagePath?: string;
 }
 
 windowsOnly("Windows process-tree startup identity snapshots", () => {
@@ -80,7 +81,12 @@ windowsOnly("Windows process-tree startup identity snapshots", () => {
   }
 
   function runScenario(
-    mode: "exports" | "root-exits-after-open" | "root-creation-drift" | "child-predates-parent",
+    mode:
+      | "exports"
+      | "native-image-query"
+      | "root-exits-after-open"
+      | "root-creation-drift"
+      | "child-predates-parent",
     processes = processTree(mode === "child-predates-parent"),
   ) {
     writeFileSync(
@@ -122,6 +128,14 @@ windowsOnly("Windows process-tree startup identity snapshots", () => {
       "Open-ProcessTreeIdentitySnapshot",
       "Stop-ProcessTreeIdentitySnapshot",
     ]);
+  });
+
+  it("queries a real process image through the exported native helper", () => {
+    const { execution, outcome } = runScenario("native-image-query");
+
+    expect(execution.status).toBe(0);
+    expect(outcome.Succeeded).toBe(true);
+    expect(basename(outcome.ImagePath ?? "").toLowerCase()).toBe("pwsh.exe");
   });
 
   it("captures one exact two-level tree and still retires surviving descendants leaf-to-root after the root exits", () => {

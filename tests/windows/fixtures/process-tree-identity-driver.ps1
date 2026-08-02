@@ -9,6 +9,7 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet(
         'exports',
+        'native-image-query',
         'root-exits-after-open',
         'root-creation-drift',
         'child-predates-parent'
@@ -92,6 +93,21 @@ function Get-Process {
 }
 
 $module = Import-Module $ModulePath -Force -PassThru
+if ($Mode -ceq 'native-image-query') {
+    $imagePath = Get-CodexLocalRemoteProcessImagePath -ProcessId $PID
+    [pscustomobject]@{
+        Succeeded = -not [string]::IsNullOrWhiteSpace($imagePath)
+        Error = $null
+        Members = @()
+        OpenIds = @()
+        StopIds = @()
+        StopTreeFlags = @()
+        DisposeIds = @()
+        ImagePath = $imagePath
+    } | ConvertTo-Json -Compress -Depth 20
+    Remove-Module $module -Force -ErrorAction SilentlyContinue
+    exit 0
+}
 if ($Mode -ceq 'exports') {
     $requiredCommands = @(
         'Close-ProcessTreeIdentitySnapshot',
