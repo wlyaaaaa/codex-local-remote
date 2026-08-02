@@ -19,6 +19,10 @@ param(
         'pre-takeover',
         'visible-pre-takeover',
         'localized-description',
+        'codepage-description',
+        'codepage-non-elevated',
+        'codepage-minimized',
+        'codepage-foreign-drift',
         'foreign-drift'
     )]
     [string]$Shape,
@@ -143,15 +147,31 @@ $sourceDefinition = if ($RootKind -ceq 'candidate') {
     $previousDefinition
 }
 $actualArguments = [string]$sourceDefinition.Arguments
-$actualWindowStyle = if ($Shape -ceq 'minimized') {
+$actualWindowStyle = if ($Shape -cin @(
+        'minimized',
+        'codepage-minimized'
+    )) {
     7
 } else {
     [int]$sourceDefinition.WindowStyle
 }
-$actualRunAsUser = $Shape -cne 'non-elevated'
-$actualDescription = if ($Shape -ceq 'localized-description') {
+$actualRunAsUser = $Shape -cnotin @(
+    'non-elevated',
+    'codepage-non-elevated'
+)
+$actualDescription = if ($Shape -cin @(
+        'localized-description',
+        'codepage-description',
+        'codepage-non-elevated',
+        'codepage-minimized',
+        'codepage-foreign-drift'
+    )) {
     $historicalPrefix = 'Codex Remote (' +
-        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '') +
+        $(if ($Shape -clike 'codepage-*') {
+            '????'
+        } else {
+            (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '')
+        }) +
         ')'
     $historicalPrefix +
         ([string]$sourceDefinition.Description).Substring(
@@ -176,7 +196,7 @@ if ($Shape -cin @(
         ' -TakeOverExistingNativeDesktop'
     )
 }
-if ($Shape -ceq 'foreign-drift') {
+if ($Shape -cin @('foreign-drift', 'codepage-foreign-drift')) {
     $actualArguments = $actualArguments.Replace(
         '-BrokerPort 18791',
         '-BrokerPort 19999'
@@ -211,6 +231,7 @@ $functionNames = @(
     'Set-ManagedLauncherShortcutRunAsUser',
     'Test-ManagedLauncherShortcut',
     'Get-LegacyLocalizedManagedLauncherShortcutDefinition',
+    'Get-LegacyCodePageManagedLauncherShortcutDefinition',
     'Test-LegacyNonElevatedManagedLauncherShortcut',
     'Test-LegacyMinimizedManagedLauncherShortcut',
     'Test-LegacyVisibleManagedLauncherShortcut',

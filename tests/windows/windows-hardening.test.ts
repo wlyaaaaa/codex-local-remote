@@ -63,6 +63,11 @@ interface ShortcutOwnershipResult {
     | "visible"
     | "pre-takeover"
     | "visible-pre-takeover"
+    | "localized-description"
+    | "codepage-description"
+    | "codepage-non-elevated"
+    | "codepage-minimized"
+    | "codepage-foreign-drift"
     | "foreign-drift";
   IconDrift: boolean;
   PathKind: "file" | "directory" | "dangling-reparse" | "missing";
@@ -431,6 +436,7 @@ windowsOnly("Windows script hardening", () => {
     ["candidate", "pre-takeover"],
     ["candidate", "visible-pre-takeover"],
     ["candidate", "localized-description"],
+    ["candidate", "codepage-description"],
     ["previous", "exact"],
     ["previous", "minimized"],
     ["previous", "non-elevated"],
@@ -438,6 +444,7 @@ windowsOnly("Windows script hardening", () => {
     ["previous", "pre-takeover"],
     ["previous", "visible-pre-takeover"],
     ["previous", "localized-description"],
+    ["previous", "codepage-description"],
   ] as const)("accepts a read-only %s-root %s launcher preflight", (rootKind, shape) => {
     expect(shortcutOwnership(rootKind, shape)).toMatchObject({
       RootKind: rootKind,
@@ -478,6 +485,25 @@ windowsOnly("Windows script hardening", () => {
     });
     expect(result.Failure).toContain("not the exact managed Codex Remote entry");
   });
+
+  it.each([
+    ["codepage-description", true],
+    ["codepage-non-elevated", false],
+    ["codepage-minimized", false],
+    ["codepage-foreign-drift", false],
+  ] as const)(
+    "rejects the code-page alias when another ownership field drifts in %s",
+    (shape, iconDrift) => {
+      const result = shortcutOwnership("previous", shape, iconDrift);
+      expect(result).toMatchObject({
+        Accepted: false,
+        HashUnchanged: true,
+        LengthUnchanged: true,
+        LastWriteTimeUnchanged: true,
+      });
+      expect(result.Failure).toContain("not the exact managed Codex Remote entry");
+    },
+  );
 
   it("upgrades a managed launcher through a no-overwrite preimage transaction", () => {
     const result = shortcutOwnership("previous", "pre-takeover", false, "file", "install", "none");
@@ -1419,7 +1445,7 @@ windowsOnly("Windows script hardening", () => {
     expect(managedTask(upgraded).Actions[0]?.Arguments).toContain("-TakeOverExistingNativeDesktop");
     expect(managedTask(upgraded).State).toBe("Running");
     expect(upgraded.Operations).toEqual(["register"]);
-  });
+  }, 30_000);
 
   it("upgrades an exact pre-headless V3 task without stopping its running generation", () => {
     const installRoot = join(sandbox, "pre headless v3 install");

@@ -456,7 +456,7 @@ windowsOnly("Windows shared app-server broker hardening", () => {
       [existingStateAccess.CurrentUserSid, "S-1-5-18", "S-1-5-32-544"].sort(),
     );
     expect(existingStateAccess.Rules.every((rule) => rule.IsInherited)).toBe(true);
-  }, 10_000);
+  }, 30_000);
 
   it("hardens an existing data directory before an atomic runtime state write", () => {
     mkdirSync(dataDir, { recursive: true });

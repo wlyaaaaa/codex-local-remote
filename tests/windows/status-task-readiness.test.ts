@@ -149,6 +149,31 @@ windowsOnly("Windows scheduled-task readiness status", () => {
     });
   });
 
+  it("recognizes only the historical description degraded by a non-Chinese code page", () => {
+    const status = getStatus("launcher-codepage-description");
+    expect(status).toMatchObject({
+      LauncherScriptReady: true,
+      LauncherShortcutReady: true,
+      LauncherIconReady: true,
+      LauncherConfigured: true,
+    });
+  });
+
+  it.each([
+    "launcher-codepage-non-elevated",
+    "launcher-codepage-minimized",
+    "launcher-codepage-foreign-arguments",
+  ])("rejects a code-page alias with another ownership drift in %s mode", (mode) => {
+    const status = getStatus(mode);
+    expect(status).toMatchObject({
+      LauncherScriptReady: true,
+      LauncherShortcutReady: false,
+      LauncherIconReady: true,
+      LauncherConfigured: false,
+      LaunchMode: "native-only",
+    });
+  });
+
   it.each(["launcher-non-elevated", "launcher-minimized"])(
     "rejects a managed-looking launcher that lacks the current privilege or window contract in %s mode",
     (mode) => {

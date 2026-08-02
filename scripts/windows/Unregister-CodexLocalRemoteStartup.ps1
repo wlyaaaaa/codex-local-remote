@@ -575,6 +575,31 @@ function Get-LegacyLocalizedManagedLauncherShortcutDefinition {
     return [pscustomobject]$properties
 }
 
+function Get-LegacyCodePageManagedLauncherShortcutDefinition {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    # WScript.Shell can persist the four historical Chinese characters as
+    # question marks when the runner's active code page cannot represent them.
+    $safeLaunchText =
+        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '')
+    $localizedPrefix = "Codex Remote ($safeLaunchText)"
+    $description = [string]$Definition.Description
+    if (-not $description.StartsWith(
+            "$localizedPrefix - ",
+            [System.StringComparison]::Ordinal
+        )) {
+        return $null
+    }
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = 'Codex Remote (????)' +
+        $description.Substring($localizedPrefix.Length)
+    return [pscustomobject]$properties
+}
+
 function Test-NonElevatedManagedLauncherShortcut {
     param([Parameter(Mandatory)][object]$Definition)
 
@@ -716,11 +741,24 @@ function Test-RecognizedManagedLauncherShortcut {
 
     foreach ($definition in $Definitions) {
         $recognizedDefinitions = @($definition)
+        $strictCodePageDefinitions = @()
         $historicalLocalized =
             Get-LegacyLocalizedManagedLauncherShortcutDefinition `
                 -Definition $definition
         if ($null -ne $historicalLocalized) {
             $recognizedDefinitions += $historicalLocalized
+            $codePageDegraded =
+                Get-LegacyCodePageManagedLauncherShortcutDefinition `
+                    -Definition $historicalLocalized
+            if ($null -ne $codePageDegraded) {
+                $strictCodePageDefinitions += $codePageDegraded
+            }
+        }
+        foreach ($strictDefinition in $strictCodePageDefinitions) {
+            if (Test-ManagedLauncherShortcut `
+                    -Definition $strictDefinition) {
+                return $true
+            }
         }
         foreach ($recognizedDefinition in $recognizedDefinitions) {
             if ((Test-ManagedLauncherShortcut `

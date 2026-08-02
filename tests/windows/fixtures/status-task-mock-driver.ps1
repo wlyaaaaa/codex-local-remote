@@ -37,6 +37,10 @@ param(
         'launcher-legacy-takeover',
         'launcher-non-elevated',
         'launcher-minimized',
+        'launcher-codepage-description',
+        'launcher-codepage-non-elevated',
+        'launcher-codepage-minimized',
+        'launcher-codepage-foreign-arguments',
         'valid-launch-receipt',
         'invalid-launch-receipt',
         'valid-launch-receipt-v2',
@@ -544,8 +548,23 @@ try {
     } else {
         'Codex Remote - Explicitly opens Remote through the stable control dispatcher.'
     }
+    if ($Mode -clike 'launcher-codepage-*') {
+        $launcherShortcut.Description =
+            'Codex Remote (????)' +
+            $launcherShortcut.Description.Substring('Codex Remote'.Length)
+    }
+    if ($Mode -ceq 'launcher-codepage-foreign-arguments') {
+        $launcherShortcut.Arguments =
+            $launcherShortcut.Arguments.Replace(
+                '-Operation Open',
+                '-Operation Close'
+            )
+    }
     $launcherShortcut.IconLocation = "$($managedIcon.IconPath),0"
-    $launcherShortcut.WindowStyle = if ($Mode -ceq 'launcher-minimized') {
+    $launcherShortcut.WindowStyle = if ($Mode -cin @(
+            'launcher-minimized',
+            'launcher-codepage-minimized'
+        )) {
         7
     } else {
         1
@@ -557,7 +576,10 @@ try {
     )
     $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
 }
-if ($Mode -cne 'launcher-non-elevated') {
+if ($Mode -cnotin @(
+        'launcher-non-elevated',
+        'launcher-codepage-non-elevated'
+    )) {
     $stream = [System.IO.File]::Open(
         $launcherShortcutPath,
         [System.IO.FileMode]::Open,

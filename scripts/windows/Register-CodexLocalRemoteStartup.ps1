@@ -1041,6 +1041,31 @@ function Get-LegacyLocalizedManagedLauncherShortcutDefinition {
     return [pscustomobject]$properties
 }
 
+function Get-LegacyCodePageManagedLauncherShortcutDefinition {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    # WScript.Shell can persist the four historical Chinese characters as
+    # question marks when the runner's active code page cannot represent them.
+    $safeLaunchText =
+        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '')
+    $localizedPrefix = "Codex Remote ($safeLaunchText)"
+    $description = [string]$Definition.Description
+    if (-not $description.StartsWith(
+            "$localizedPrefix - ",
+            [System.StringComparison]::Ordinal
+        )) {
+        return $null
+    }
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = 'Codex Remote (????)' +
+        $description.Substring($localizedPrefix.Length)
+    return [pscustomobject]$properties
+}
+
 function Test-LegacyNonElevatedManagedLauncherShortcut {
     param(
         [Parameter(Mandatory)][object]$Definition,
@@ -1279,6 +1304,8 @@ function Assert-ManagedLauncherShortcutOwnership {
     )
     $recognizedDefinitions =
         [System.Collections.Generic.List[object]]::new()
+    $strictCodePageDefinitions =
+        [System.Collections.Generic.List[object]]::new()
     foreach ($candidate in $definitions) {
         $recognizedDefinitions.Add($candidate)
         $historicalLocalized =
@@ -1286,6 +1313,19 @@ function Assert-ManagedLauncherShortcutOwnership {
                 -Definition $candidate
         if ($null -ne $historicalLocalized) {
             $recognizedDefinitions.Add($historicalLocalized)
+            $codePageDegraded =
+                Get-LegacyCodePageManagedLauncherShortcutDefinition `
+                    -Definition $historicalLocalized
+            if ($null -ne $codePageDegraded) {
+                $strictCodePageDefinitions.Add($codePageDegraded)
+            }
+        }
+    }
+    foreach ($candidate in $strictCodePageDefinitions) {
+        if (Test-ManagedLauncherShortcut `
+                -Definition $candidate `
+                -Path $shortcutPath) {
+            return
         }
     }
     foreach ($candidate in $recognizedDefinitions) {

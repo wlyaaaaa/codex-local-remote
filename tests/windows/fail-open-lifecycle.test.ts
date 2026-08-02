@@ -134,6 +134,25 @@ windowsOnly("Windows fail-open lifecycle", () => {
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
   }
 
+  function writeCodePageDegradedShortcutDescription(path: string) {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SHORTCUT_PATH); $s.Description='Codex Remote (????)'+$s.Description.Substring('Codex Remote'.Length); $s.Save()",
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        env: { ...process.env, SHORTCUT_PATH: path },
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  }
+
   function writeLegacyRuntimeShortcut(path: string) {
     const legacyLauncher = join(installRoot, "scripts", "windows", "Launch-CodexWithRemote.ps1");
     const legacyArguments =
@@ -438,6 +457,30 @@ windowsOnly("Windows fail-open lifecycle", () => {
       LauncherShortcut: "removed",
     });
     expect(existsSync(shortcutPath)).toBe(false);
+  });
+
+  it("unregisters the historical description degraded by a non-Chinese code page", () => {
+    register();
+    const shortcutPath = join(dataDir, "Codex Remote safe launch.lnk");
+    writeCodePageDegradedShortcutDescription(shortcutPath);
+
+    const removal = runLifecycle("unregister");
+    expect(removal).toMatchObject({
+      Status: "removed",
+      LauncherShortcut: "removed",
+    });
+    expect(existsSync(shortcutPath)).toBe(false);
+  });
+
+  it("refuses to unregister a code-page alias whose privilege flag drifted", () => {
+    register();
+    const shortcutPath = join(dataDir, "Codex Remote safe launch.lnk");
+    writeCodePageDegradedShortcutDescription(shortcutPath);
+    clearShortcutRunAsUser(shortcutPath);
+
+    expect(() => runLifecycle("unregister")).toThrow(/not the exact managed Codex Remote entry/u);
+    expect(existsSync(shortcutPath)).toBe(true);
+    expect(readShortcut(shortcutPath).RunAsUser).toBe(false);
   });
 
   it("contains no normal registration path that writes the user override", () => {

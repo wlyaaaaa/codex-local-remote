@@ -74,6 +74,10 @@ viewer.
   `Open` caller in a long ambiguous wait. Desktop launch receipt validation is
   shared by status, deferred handoff and on-demand recovery so all paths apply
   the same closed schema and allowlists.
+- Migrates the exact historical localized launcher even when WScript persisted
+  its four Chinese description characters as `????` on a non-Chinese Windows
+  code page. Target, arguments, working directory, icon, window mode and
+  RunAs/link flags remain exact, so foreign shortcuts are still rejected.
 
 ## Upgrade
 

@@ -377,6 +377,79 @@ function Test-StatusLauncherShortcut {
     }
 }
 
+function Get-StatusLegacyLocalizedLauncherShortcutDefinition {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $canonicalPrefix = 'Codex Remote'
+    $description = [string]$Definition.Description
+    if (-not $description.StartsWith(
+            "$canonicalPrefix - ",
+            [System.StringComparison]::Ordinal
+        )) {
+        return $null
+    }
+
+    $safeLaunchText =
+        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '')
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = "Codex Remote ($safeLaunchText)" +
+        $description.Substring($canonicalPrefix.Length)
+    return [pscustomobject]$properties
+}
+
+function Get-StatusLegacyCodePageLauncherShortcutDefinition {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    # WScript.Shell can persist the four historical Chinese characters as
+    # question marks when the runner's active code page cannot represent them.
+    $safeLaunchText =
+        (([char[]]@(0x5B89, 0x5168, 0x542F, 0x52A8)) -join '')
+    $localizedPrefix = "Codex Remote ($safeLaunchText)"
+    $description = [string]$Definition.Description
+    if (-not $description.StartsWith(
+            "$localizedPrefix - ",
+            [System.StringComparison]::Ordinal
+        )) {
+        return $null
+    }
+
+    $properties = [ordered]@{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $properties[[string]$property.Name] = $property.Value
+    }
+    $properties.Description = 'Codex Remote (????)' +
+        $description.Substring($localizedPrefix.Length)
+    return [pscustomobject]$properties
+}
+
+function Test-StatusRecognizedLauncherShortcut {
+    param([Parameter(Mandatory)][object]$Definition)
+
+    $definitions = [System.Collections.Generic.List[object]]::new()
+    $definitions.Add($Definition)
+    $historicalLocalized =
+        Get-StatusLegacyLocalizedLauncherShortcutDefinition `
+            -Definition $Definition
+    if ($null -ne $historicalLocalized) {
+        $definitions.Add($historicalLocalized)
+        $codePageDegraded =
+            Get-StatusLegacyCodePageLauncherShortcutDefinition `
+                -Definition $historicalLocalized
+        if ($null -ne $codePageDegraded) {
+            $definitions.Add($codePageDegraded)
+        }
+    }
+    foreach ($candidate in $definitions) {
+        if (Test-StatusLauncherShortcut -Definition $candidate) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Test-DesktopRuntimeIdentityCurrent {
     param(
         [AllowNull()][object]$ActiveRuntime,
@@ -1546,7 +1619,7 @@ try {
         -Path ([string]$launcherDefinition.LauncherPath) `
         -MinimumBytes 128 `
         -MaximumBytes 1048576
-    $launcherShortcutReady = Test-StatusLauncherShortcut `
+    $launcherShortcutReady = Test-StatusRecognizedLauncherShortcut `
         -Definition $launcherDefinition
     $launcherConfigured = (
         $launcherScriptReady -and
