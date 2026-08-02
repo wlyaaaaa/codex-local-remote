@@ -276,6 +276,184 @@ function Get-OnDemandHandoffDecision {
     return 'handoff-native-desktop-once'
 }
 
+function Get-OnDemandTaskProcessContext {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Runtime,
+
+        [Parameter(Mandatory)]
+        [object]$StartupTask,
+
+        [Parameter(Mandatory)]
+        [object]$Configuration
+    )
+
+    $actions = @($StartupTask.Actions)
+    if ($actions.Count -ne 1) {
+        throw 'The verified startup task does not contain one action.'
+    }
+    $arguments = @(
+        ConvertFrom-WindowsCommandLine `
+            -CommandLine ([string]$actions[0].Arguments)
+    )
+    if ($arguments.Count -lt 3 -or
+        [string]$arguments[0] -cne '--headless') {
+        throw 'The verified startup task has no headless PowerShell action.'
+    }
+
+    function Get-RequiredTaskArgument {
+        param([Parameter(Mandatory)][string]$Name)
+
+        $indexes = @(
+            for ($index = 0; $index -lt $arguments.Count; $index++) {
+                if ([string]$arguments[$index] -ceq $Name) {
+                    $index
+                }
+            }
+        )
+        if ($indexes.Count -ne 1 -or
+            $indexes[0] + 1 -ge $arguments.Count) {
+            throw "The verified startup task does not contain one '$Name'."
+        }
+        return [string]$arguments[$indexes[0] + 1]
+    }
+
+    $pwshPath = [System.IO.Path]::GetFullPath([string]$arguments[1])
+    $nodePath = [System.IO.Path]::GetFullPath(
+        (Get-RequiredTaskArgument -Name '-NodePath')
+    )
+    $filePath = [System.IO.Path]::GetFullPath(
+        (Get-RequiredTaskArgument -Name '-File')
+    )
+    $installRoot = [System.IO.Path]::GetFullPath(
+        (Get-RequiredTaskArgument -Name '-InstallRoot')
+    )
+    $taskDataDir = [System.IO.Path]::GetFullPath(
+        (Get-RequiredTaskArgument -Name '-DataDir')
+    )
+    $expectedFilePath = [System.IO.Path]::GetFullPath(
+        (Join-Path `
+            ([string]$Runtime.CurrentRoot) `
+            'scripts\windows\Start-CodexLocalRemote.ps1')
+    )
+    if (-not [string]::Equals(
+        $filePath,
+        $expectedFilePath,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or -not [string]::Equals(
+        $installRoot,
+        [System.IO.Path]::GetFullPath([string]$Runtime.CurrentRoot),
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or -not [string]::Equals(
+        $taskDataDir,
+        $resolvedDataDir,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'The verified startup task process paths do not match Current.'
+    }
+
+    return [pscustomobject][ordered]@{
+        RuntimeVersionId = [string]$Runtime.CurrentVersionId
+        RuntimeRoot = [System.IO.Path]::GetFullPath(
+            [string]$Runtime.CurrentRoot
+        )
+        TaskName = [string]$Configuration.TaskName
+        NodePath = $nodePath
+        PwshPath = $pwshPath
+        SidecarPort = [int]$Configuration.SidecarPort
+        BrokerPort = [int]$Configuration.BrokerPort
+        BrokerUpstreamPort = [int]$Configuration.BrokerUpstreamPort
+        BasePath = [string]$Configuration.BasePath
+        DataDir = $resolvedDataDir
+    }
+}
+
+function Test-OnDemandReceiptProcessIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [object]$ReceiptProcess,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeInvocationId,
+
+        [ValidateRange(0, 2147483647)]
+        [int]$ExpectedParentProcessId = 0,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$TestOwnership
+    )
+
+    $identityHandle = $null
+    try {
+        foreach ($property in @(
+            'RuntimeInvocationId',
+            'ProcessId',
+            'CreationDate',
+            'CreationDateUtcTicks',
+            'ProcessStartTimeUtcTicks'
+        )) {
+            if ($null -eq $ReceiptProcess.PSObject.Properties[$property]) {
+                return $false
+            }
+        }
+        if ([string]$ReceiptProcess.RuntimeInvocationId -cne
+                $ExpectedRuntimeInvocationId -or
+            -not (Test-NonNegativeInteger -Value $ReceiptProcess.ProcessId) -or
+            [int]$ReceiptProcess.ProcessId -lt 1 -or
+            -not (Test-NonNegativeInteger `
+                -Value $ReceiptProcess.CreationDateUtcTicks) -or
+            [long]$ReceiptProcess.CreationDateUtcTicks -lt 1 -or
+            -not (Test-NonNegativeInteger `
+                -Value $ReceiptProcess.ProcessStartTimeUtcTicks) -or
+            [long]$ReceiptProcess.ProcessStartTimeUtcTicks -lt 1) {
+            return $false
+        }
+        $processes = @(
+            Get-CimInstance `
+                Win32_Process `
+                -Filter "ProcessId = $([int]$ReceiptProcess.ProcessId)" `
+                -ErrorAction Stop
+        )
+        if ($processes.Count -ne 1 -or
+            [int]$processes[0].ProcessId -ne
+                [int]$ReceiptProcess.ProcessId -or
+            ($ExpectedParentProcessId -gt 0 -and
+                [int]$processes[0].ParentProcessId -ne
+                    $ExpectedParentProcessId)) {
+            return $false
+        }
+        $process = $processes[0]
+        $creation = Get-ProcessCreationIdentity `
+            -CreationDate $process.CreationDate
+        if ([long]$creation.CreationDateUtcTicks -ne
+            [long]$ReceiptProcess.CreationDateUtcTicks) {
+            return $false
+        }
+        $identityHandle = Open-ProcessIdentityHandle `
+            -ProcessId ([int]$ReceiptProcess.ProcessId) `
+            -ExpectedCreationDateUtcTicks (
+                [long]$ReceiptProcess.CreationDateUtcTicks
+            ) `
+            -ExpectedStartTimeUtcTicks (
+                [long]$ReceiptProcess.ProcessStartTimeUtcTicks
+            )
+        $ownership = & $TestOwnership $process
+        return (
+            $null -ne $ownership -and
+            $ownership.IsManaged -is [bool] -and
+            [bool]$ownership.IsManaged
+        )
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $identityHandle -and
+            $null -ne $identityHandle.Process -and
+            $null -ne $identityHandle.Process.PSObject.Methods['Dispose']) {
+            $identityHandle.Process.Dispose()
+        }
+    }
+}
+
 function ConvertTo-OnDemandWindowsCommandLineArgument {
     param(
         [Parameter(Mandatory)]
@@ -646,6 +824,9 @@ function Get-OnDemandRemoteState {
         [ValidateRange(1, 65535)]
         [int]$BrokerPort,
 
+        [AllowNull()]
+        [object]$ProcessContext,
+
         [switch]$AllowActiveTurns,
 
         [switch]$AllowNativePreviousDesktop,
@@ -830,11 +1011,89 @@ function Get-OnDemandRemoteState {
                 [bool]$readiness.desktopConnected -and
                 -not [bool]$readiness.degraded
             )
-            $hasSupervisorAdoptionClaim = (
-                $receipt.SupervisorOnlyAdoptedPreviousBroker -is
-                    [bool] -and
-                [bool]$receipt.SupervisorOnlyAdoptedPreviousBroker
+            $hasSupervisorAdoptionFlag = (
+                $null -ne $receipt.PSObject.Properties[
+                    'SupervisorOnlyAdoptedPreviousBroker'
+                ] -and
+                $receipt.SupervisorOnlyAdoptedPreviousBroker -is [bool]
             )
+            if (-not $hasSupervisorAdoptionFlag) {
+                return 'unverified'
+            }
+            $hasSupervisorAdoptionClaim =
+                [bool]$receipt.SupervisorOnlyAdoptedPreviousBroker
+            $receiptBrokerMatchesPrevious = (
+                [string]$receipt.BrokerRuntimeVersionId -ceq
+                    [string]$Runtime.PreviousVersionId -and
+                [string]$receipt.BrokerRuntimeManifestSha256 -ceq
+                    [string]$Runtime.PreviousManifestSha256 -and
+                [string]::Equals(
+                    [System.IO.Path]::GetFullPath(
+                        [string]$receipt.BrokerRuntimeRoot
+                    ),
+                    [System.IO.Path]::GetFullPath(
+                        [string]$Runtime.PreviousRoot
+                    ),
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            )
+            $receiptSidecarMatchesPrevious = (
+                [string]$receipt.SidecarRuntimeVersionId -ceq
+                    [string]$Runtime.PreviousVersionId -and
+                [string]$receipt.SidecarRuntimeManifestSha256 -ceq
+                    [string]$Runtime.PreviousManifestSha256 -and
+                [string]::Equals(
+                    [System.IO.Path]::GetFullPath(
+                        [string]$receipt.SidecarRuntimeRoot
+                    ),
+                    [System.IO.Path]::GetFullPath(
+                        [string]$Runtime.PreviousRoot
+                    ),
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            )
+            $receiptSidecarRuntimeFieldsEmpty = (
+                [string]::IsNullOrWhiteSpace(
+                    [string]$receipt.SidecarRuntimeVersionId
+                ) -and
+                [string]::IsNullOrWhiteSpace(
+                    [string]$receipt.SidecarRuntimeRoot
+                ) -and
+                [string]::IsNullOrWhiteSpace(
+                    [string]$receipt.SidecarRuntimeManifestSha256
+                )
+            )
+            $ordinaryPreviousRuntimeReceipt = (
+                -not $hasSupervisorAdoptionClaim -and
+                [string]$receipt.SupervisorRuntimeVersionId -ceq
+                    [string]$Runtime.PreviousVersionId -and
+                [string]$receipt.SupervisorRuntimeManifestSha256 -ceq
+                    [string]$Runtime.PreviousManifestSha256 -and
+                [string]::Equals(
+                    [System.IO.Path]::GetFullPath(
+                        [string]$receipt.SupervisorRuntimeRoot
+                    ),
+                    [System.IO.Path]::GetFullPath(
+                        [string]$Runtime.PreviousRoot
+                    ),
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -and
+                $receiptBrokerMatchesPrevious -and
+                $(if ([bool]$readiness.sidecarConnected) {
+                    $receiptSidecarMatchesPrevious
+                } else {
+                    $receiptSidecarMatchesPrevious -or
+                        $receiptSidecarRuntimeFieldsEmpty
+                })
+            )
+            if (-not $hasSupervisorAdoptionClaim -and
+                -not $ordinaryPreviousRuntimeReceipt) {
+                return 'unverified'
+            }
+            if ($hasSupervisorAdoptionClaim -and
+                -not $AllowCompatibleSupervisorResume) {
+                return 'unverified'
+            }
             if ($AllowCompatibleSupervisorResume -and
                 ($supervisorResumeTransport -or
                     $hasSupervisorAdoptionClaim)) {
@@ -853,6 +1112,7 @@ function Get-OnDemandRemoteState {
                             [string]$Runtime.PreviousManifestSha256
                         )
                 if ($null -eq $payloadCompatibility -or
+                    $payloadCompatibility.IsCompatible -isnot [bool] -or
                     -not [bool]$payloadCompatibility.IsCompatible) {
                     return 'unverified'
                 }
@@ -884,24 +1144,8 @@ function Get-OnDemandRemoteState {
                         ),
                         [System.StringComparison]::OrdinalIgnoreCase
                     ) -and
-                    [string]$receipt.BrokerRuntimeVersionId -ceq
-                        [string]$Runtime.PreviousVersionId -and
-                    [string]$receipt.BrokerRuntimeManifestSha256 -ceq
-                        [string]$Runtime.PreviousManifestSha256 -and
-                    [string]::Equals(
-                        [System.IO.Path]::GetFullPath(
-                            [string]$receipt.BrokerRuntimeRoot
-                        ),
-                        [System.IO.Path]::GetFullPath(
-                            [string]$Runtime.PreviousRoot
-                        ),
-                        [System.StringComparison]::OrdinalIgnoreCase
-                    )
+                    $receiptBrokerMatchesPrevious
                 )
-                if ($hasSupervisorAdoptionClaim -and
-                    -not $adoptedPreviousBroker) {
-                    return 'unverified'
-                }
                 if ($adoptedPreviousBroker -and
                     [string]$receipt.Status -ceq 'ready' -and
                     [string]$readiness.status -ceq 'ready' -and
@@ -910,6 +1154,244 @@ function Get-OnDemandRemoteState {
                     [bool]$readiness.sidecarConnected -and
                     -not [bool]$readiness.degraded) {
                     return 'ready-compatible'
+                }
+                if ($hasSupervisorAdoptionClaim -and
+                    -not $adoptedPreviousBroker) {
+                    # A definition-only registration can supersede one
+                    # still-live immutable supervisor while preserving its
+                    # Previous Broker. Prove live C exactly, then expose only
+                    # the existing authorized runtime-transition path.
+                    $supersededSupervisorVersionId =
+                        [string]$receipt.SupervisorRuntimeVersionId
+                    $supersededSupervisorManifestSha256 =
+                        [string]$receipt.SupervisorRuntimeManifestSha256
+                    $supersededSupervisorIdentityIsComplete = (
+                        $supersededSupervisorVersionId -cmatch
+                            '^[a-f0-9]{64}$' -and
+                        $supersededSupervisorVersionId -cne
+                            [string]$Runtime.CurrentVersionId -and
+                        $supersededSupervisorVersionId -cne
+                            [string]$Runtime.PreviousVersionId -and
+                        $supersededSupervisorManifestSha256 -cmatch
+                            '^[a-f0-9]{64}$' -and
+                        [string]$receipt.SidecarRuntimeVersionId -ceq
+                            $supersededSupervisorVersionId -and
+                        [string]$receipt.SidecarRuntimeManifestSha256 -ceq
+                            $supersededSupervisorManifestSha256 -and
+                        $receiptBrokerMatchesPrevious
+                    )
+                    if ($supersededSupervisorIdentityIsComplete) {
+                        $supersededSupervisorRoot =
+                            [System.IO.Path]::GetFullPath(
+                                [string]$receipt.SupervisorRuntimeRoot
+                            )
+                        $expectedSupersededSupervisorRoot =
+                            [System.IO.Path]::GetFullPath(
+                                (Join-Path `
+                                    (Join-Path `
+                                        $resolvedDataDir `
+                                        'RuntimeVersions') `
+                                    $supersededSupervisorVersionId)
+                            )
+                        $sidecarRuntimeRoot =
+                            [System.IO.Path]::GetFullPath(
+                                [string]$receipt.SidecarRuntimeRoot
+                            )
+                        if ([string]::Equals(
+                            $supersededSupervisorRoot,
+                            $expectedSupersededSupervisorRoot,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        ) -and [string]::Equals(
+                            $sidecarRuntimeRoot,
+                            $supersededSupervisorRoot,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )) {
+                            $supersededSupervisorRuntimeCheck =
+                                Test-CodexLocalRemoteRuntimeVersion `
+                                    -RuntimeRoot $supersededSupervisorRoot `
+                                    -ExpectedVersionId (
+                                        $supersededSupervisorVersionId
+                                    )
+                            $supersededSupervisorPayloadCompatibility =
+                                Test-CodexLocalRemoteBrokerPayloadCompatibility `
+                                    -CurrentRuntimeRoot (
+                                        $supersededSupervisorRoot
+                                    ) `
+                                    -CurrentVersionId (
+                                        $supersededSupervisorVersionId
+                                    ) `
+                                    -CurrentManifestSha256 (
+                                        $supersededSupervisorManifestSha256
+                                    ) `
+                                    -ActiveRuntimeRoot (
+                                        $activeBrokerRuntimeRoot
+                                    ) `
+                                    -ActiveVersionId $activeBrokerVersionId `
+                                    -ActiveManifestSha256 (
+                                        [string]$Runtime.PreviousManifestSha256
+                                    )
+                            $checkedSupervisorManifestSha256 =
+                                [string]$supersededSupervisorRuntimeCheck.ManifestSha256
+                            $checkedSupervisorCompatibilityId =
+                                [string]$supersededSupervisorRuntimeCheck.BrokerSidecarCompatibilityId
+                            $supersededPayloadIsCompatible = (
+                                $null -ne
+                                    $supersededSupervisorPayloadCompatibility -and
+                                $supersededSupervisorPayloadCompatibility.
+                                    IsCompatible -is [bool] -and
+                                [bool]$supersededSupervisorPayloadCompatibility.IsCompatible
+                            )
+                            $supersededSupervisorAdoption = (
+                                [bool](
+                                    $supersededSupervisorRuntimeCheck.IsValid
+                                ) -and
+                                $checkedSupervisorManifestSha256 -ceq
+                                    $supersededSupervisorManifestSha256 -and
+                                $checkedSupervisorCompatibilityId -ceq
+                                    $activeBrokerCompatibilityId -and
+                                $supersededPayloadIsCompatible
+                            )
+                            $supersededReadyTransport = (
+                                $supersededSupervisorAdoption -and
+                                $null -ne $ProcessContext -and
+                                [string]$ProcessContext.RuntimeVersionId -ceq
+                                    [string]$Runtime.CurrentVersionId -and
+                                [string]::Equals(
+                                    [System.IO.Path]::GetFullPath(
+                                        [string]$ProcessContext.RuntimeRoot
+                                    ),
+                                    [System.IO.Path]::GetFullPath(
+                                        [string]$Runtime.CurrentRoot
+                                    ),
+                                    [System.StringComparison]::OrdinalIgnoreCase
+                                ) -and
+                                [string]$receipt.NodePath -and
+                                [string]::Equals(
+                                    [System.IO.Path]::GetFullPath(
+                                        [string]$receipt.NodePath
+                                    ),
+                                    [System.IO.Path]::GetFullPath(
+                                        [string]$ProcessContext.NodePath
+                                    ),
+                                    [System.StringComparison]::OrdinalIgnoreCase
+                                ) -and
+                                [string]$receipt.Status -ceq 'ready' -and
+                                [string]$readiness.status -ceq 'ready' -and
+                                [bool]$readiness.appServerReady -and
+                                [bool]$readiness.desktopConnected -and
+                                [bool]$readiness.sidecarConnected -and
+                                -not [bool]$readiness.degraded -and
+                                [int]$readiness.unknownCount -eq 0 -and
+                                $null -ne $receipt.Bootstrap -and
+                                $null -ne $receipt.Sidecar
+                            )
+                            if ($supersededReadyTransport) {
+                                $bootstrapIsLive =
+                                    Test-OnDemandReceiptProcessIdentity `
+                                        -ReceiptProcess $receipt.Bootstrap `
+                                        -ExpectedRuntimeInvocationId (
+                                            [string]$receipt.
+                                                RuntimeInvocationId
+                                        ) `
+                                        -TestOwnership {
+                                            param($process)
+                                            Test-ManagedBootstrapProcess `
+                                                -CommandLine (
+                                                    [string]$process.CommandLine
+                                                ) `
+                                                -ExecutablePath (
+                                                    [string]$process.
+                                                        ExecutablePath
+                                                ) `
+                                                -TaskName (
+                                                    [string]$ProcessContext.
+                                                        TaskName
+                                                ) `
+                                                -NodePath (
+                                                    [string]$ProcessContext.
+                                                        NodePath
+                                                ) `
+                                                -PwshPath (
+                                                    [string]$ProcessContext.
+                                                        PwshPath
+                                                ) `
+                                                -InstallRoot (
+                                                    $supersededSupervisorRoot
+                                                ) `
+                                                -DataDir $resolvedDataDir `
+                                                -Port (
+                                                    [int]$ProcessContext.
+                                                        SidecarPort
+                                                ) `
+                                                -BrokerPort (
+                                                    [int]$ProcessContext.
+                                                        BrokerPort
+                                                ) `
+                                                -BrokerUpstreamPort (
+                                                    [int]$ProcessContext.
+                                                        BrokerUpstreamPort
+                                                ) `
+                                                -BasePath (
+                                                    [string]$ProcessContext.
+                                                        BasePath
+                                                )
+                                        }
+                                $sidecarIsLive =
+                                    Test-OnDemandReceiptProcessIdentity `
+                                        -ReceiptProcess $receipt.Sidecar `
+                                        -ExpectedRuntimeInvocationId (
+                                            [string]$receipt.
+                                                RuntimeInvocationId
+                                        ) `
+                                        -ExpectedParentProcessId (
+                                            [int]$receipt.Bootstrap.ProcessId
+                                        ) `
+                                        -TestOwnership {
+                                            param($process)
+                                            Test-ManagedSidecarProcess `
+                                                -CommandLine (
+                                                    [string]$process.CommandLine
+                                                ) `
+                                                -ExecutablePath (
+                                                    [string]$process.
+                                                        ExecutablePath
+                                                ) `
+                                                -ExpectedNodePath (
+                                                    [string]$ProcessContext.
+                                                        NodePath
+                                                ) `
+                                                -ExpectedSidecarCliPath (
+                                                    Join-Path `
+                                                        $supersededSupervisorRoot `
+                                                        'apps\sidecar\dist\cli.js'
+                                                ) `
+                                                -Port (
+                                                    [int]$ProcessContext.
+                                                        SidecarPort
+                                                ) `
+                                                -BasePath (
+                                                    [string]$ProcessContext.
+                                                        BasePath
+                                                ) `
+                                                -DataDir $resolvedDataDir
+                                        }
+                                $rawFinal = Get-Content `
+                                    -LiteralPath $receiptPath `
+                                    -Raw `
+                                    -Encoding utf8
+                                if ($bootstrapIsLive -and
+                                    $sidecarIsLive -and
+                                    $rawFinal -ceq $rawBefore) {
+                                    if ([int]$readiness.unsafeThreadCount -gt
+                                        0) {
+                                        return 'runtime-transition-busy'
+                                    }
+                                    return 'runtime-transition'
+                                }
+                            }
+                        }
+                    }
+                    return 'unverified'
                 }
                 if ($supervisorResumeTransport) {
                     return 'supervisor-repairable'
@@ -2738,6 +3220,14 @@ try {
             )
         }
     }
+    $processContext = try {
+        Get-OnDemandTaskProcessContext `
+            -Runtime $runtime `
+            -StartupTask $startupTask `
+            -Configuration $configuration
+    } catch {
+        $null
+    }
     $allowNativePreviousDesktop = (
         $Operation -ceq 'Open' -and
         $AllowDesktopRestart -and
@@ -2750,6 +3240,7 @@ try {
         Get-OnDemandRemoteState `
             -Runtime $runtime `
             -BrokerPort ([int]$configuration.BrokerPort) `
+            -ProcessContext $processContext `
             -AllowActiveTurns:($Operation -ceq 'Open' -and $AllowDesktopRestart) `
             -AllowNativePreviousDesktop:$allowNativePreviousDesktop `
             -AllowCompatibleSupervisorResume:(
@@ -2760,6 +3251,7 @@ try {
             Get-OnDemandRemoteState `
                 -Runtime $runtime `
                 -BrokerPort ([int]$configuration.BrokerPort) `
+                -ProcessContext $processContext `
                 -AllowCompatibleSupervisorResume
         } else {
             'inactive'
@@ -3097,6 +3589,7 @@ try {
             $remoteState = Get-OnDemandRemoteState `
                 -Runtime $runtime `
                 -BrokerPort ([int]$configuration.BrokerPort) `
+                -ProcessContext $processContext `
                 -AllowCompatibleSupervisorResume
             if ($remoteState -cnotin @(
                 'background-repairable',
@@ -3453,6 +3946,7 @@ try {
         $remoteState = Get-OnDemandRemoteState `
             -Runtime $runtime `
             -BrokerPort ([int]$configuration.BrokerPort) `
+            -ProcessContext $processContext `
             -AllowCompatibleSupervisorResume:(
                 $decision -ceq 'resume-compatible-supervisor'
             )
