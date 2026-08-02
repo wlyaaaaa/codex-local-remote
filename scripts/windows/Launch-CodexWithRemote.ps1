@@ -7811,21 +7811,26 @@ if (-not $DefinitionOnly) {
             [bool]$launchResult.RemoteEnabled) {
             try {
                 $connectionProof = $connectionProofProperty.Value
-                $null = Write-CodexDesktopOwnerConnectionProof `
+                $null = Invoke-WithCodexDesktopOwnerMutex `
                     -DataDir $resolvedDataDir `
-                    -RuntimeInvocationId (
-                        [string]$connectionProof.RuntimeInvocationId
-                    ) `
-                    -ProcessId ([int]$connectionProof.ProcessId) `
-                    -StartTimeUtcTicks (
-                        [long]$connectionProof.StartTimeUtcTicks
-                    ) `
-                    -ExecutablePath (
-                        [string]$connectionProof.ExecutablePath
-                    ) `
-                    -LaunchNonceDigest (
-                        [string]$connectionProof.LaunchNonceDigest
-                    )
+                    -TimeoutSeconds 5 `
+                    -Action {
+                        Write-CodexDesktopOwnerConnectionProof `
+                            -DataDir $resolvedDataDir `
+                            -RuntimeInvocationId (
+                                [string]$connectionProof.RuntimeInvocationId
+                            ) `
+                            -ProcessId ([int]$connectionProof.ProcessId) `
+                            -StartTimeUtcTicks (
+                                [long]$connectionProof.StartTimeUtcTicks
+                            ) `
+                            -ExecutablePath (
+                                [string]$connectionProof.ExecutablePath
+                            ) `
+                            -LaunchNonceDigest (
+                                [string]$connectionProof.LaunchNonceDigest
+                            )
+                    }
             } catch {
                 $launchResult.Status = 'remote-launch-unverified'
                 $launchResult.RemoteEnabled = $false
@@ -7833,10 +7838,20 @@ if (-not $DefinitionOnly) {
                     'remote-owner-proof-write-failed'
             }
         }
-        if (-not [bool]$launchResult.RemoteEnabled) {
+        # An inconclusive or failed Remote observation does not prove that the
+        # previously bound Desktop disconnected. Preserve its proof so a
+        # later exact readiness check can validate or reject that binding.
+        # Only an explicitly launched native Desktop proves this invocation
+        # replaced the Remote owner with a native process.
+        if ([string]$launchResult.Status -ceq 'launched-native') {
             try {
-                Remove-CodexDesktopOwnerConnectionProof `
-                    -DataDir $resolvedDataDir
+                $null = Invoke-WithCodexDesktopOwnerMutex `
+                    -DataDir $resolvedDataDir `
+                    -TimeoutSeconds 5 `
+                    -Action {
+                        Remove-CodexDesktopOwnerConnectionProof `
+                            -DataDir $resolvedDataDir
+                    }
             } catch {
                 # A stale proof can only keep formal readiness false after
                 # its exact process/runtime binding no longer matches.

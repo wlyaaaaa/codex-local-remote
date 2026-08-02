@@ -1469,6 +1469,741 @@ function Get-PreviousBrokerAdoptionBinding {
     }
 }
 
+function Get-IndependentDesktopAppServerProcessIds {
+    [CmdletBinding()]
+    param()
+
+    $processIds = [System.Collections.Generic.List[int]]::new()
+    foreach ($candidate in @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "Name = 'codex.exe'" `
+            -ErrorAction Stop
+    )) {
+        if (-not (Test-NonNegativeInteger -Value $candidate.ProcessId) -or
+            [int]$candidate.ProcessId -lt 1) {
+            throw 'Independent Desktop app-server enumeration returned an invalid PID.'
+        }
+        $parent = Get-CimInstance `
+            Win32_Process `
+            -Filter "ProcessId = $([int]$candidate.ParentProcessId)" `
+            -ErrorAction Stop
+        if (Test-IndependentDesktopAppServer `
+            -CommandLine ([string]$candidate.CommandLine) `
+            -ParentProcessName ([string]$parent.Name)) {
+            $processIds.Add([int]$candidate.ProcessId)
+        }
+    }
+    return [int[]]$processIds.ToArray()
+}
+
+function Get-AdoptedDesktopOwnerProofBinding {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$RuntimeSnapshot,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$RootIdentityKey,
+
+        [AllowNull()]
+        [object]$Proof,
+
+        [AllowNull()]
+        [int[]]$IndependentStdioProcessIds,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$ExpectedBrokerProcessId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedRuntimeInvocationId
+    )
+
+    $reject = {
+        param([Parameter(Mandatory)][string]$Reason)
+        return [pscustomobject][ordered]@{
+            IsValid = $false
+            Reason = $Reason
+            RootIdentityKey = $null
+        }
+    }
+
+    try {
+        if ($ExpectedRuntimeInvocationId -cnotmatch '^[0-9a-f]{32}$' -or
+            $null -eq $RuntimeSnapshot -or
+            $null -eq $RuntimeSnapshot.Readiness -or
+            $null -eq $RuntimeSnapshot.Upstream -or
+            [string]$RuntimeSnapshot.RuntimeInvocationId -cne
+                $ExpectedRuntimeInvocationId -or
+            -not (Test-NonNegativeInteger `
+                -Value $RuntimeSnapshot.Upstream.ProcessId) -or
+            [int]$RuntimeSnapshot.Upstream.ProcessId -lt 1) {
+            return (& $reject `
+                'Adopted Broker runtime snapshot is missing or ambiguous.')
+        }
+        $readiness = $RuntimeSnapshot.Readiness
+        if ((Get-BrokerReadinessDecision `
+                -Readiness $readiness `
+                -Phase StrictRuntime) -cne 'Ready') {
+            return (& $reject `
+                'Adopted Broker is not in strict runtime readiness.')
+        }
+        if (-not (Test-BrokerReadinessRuntimeIdentity `
+                -Readiness $readiness `
+                -ExpectedBrokerProcessId $ExpectedBrokerProcessId `
+                -ExpectedUpstreamProcessId (
+                    [int]$RuntimeSnapshot.Upstream.ProcessId
+                ) `
+                -ExpectedRuntimeInvocationId (
+                    $ExpectedRuntimeInvocationId
+                ))) {
+            return (& $reject `
+                'Broker runtime identity is not exact for adopted Desktop owner proof.')
+        }
+        if (-not (Test-CodexDesktopNonceReadinessSnapshot `
+                -Readiness $readiness)) {
+            return (& $reject `
+                'Adopted Desktop nonce readiness evidence is invalid.')
+        }
+        $desktopLaunchNonceDigests = @(
+            $readiness.desktopLaunchNonceDigests
+        )
+        if (-not (Test-NonNegativeInteger `
+                -Value $readiness.desktopConnectionCount) -or
+            [int]$readiness.desktopConnectionCount -ne 1 -or
+            $desktopLaunchNonceDigests.Count -ne 1) {
+            return (& $reject `
+                'Adopted Broker must report exactly one Desktop connection and one nonce digest.')
+        }
+        if ($null -ne $IndependentStdioProcessIds -and
+            @($IndependentStdioProcessIds).Count -ne 0) {
+            return (& $reject `
+                'An independent stdio app-server prevents adopted Desktop owner proof reuse.')
+        }
+        if ([string]$RootIdentityKey -cnotmatch
+                '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9a-f]{64}$') {
+            return (& $reject `
+                'The adopted Desktop root process is missing or ambiguous.')
+        }
+        if ($null -eq $Proof) {
+            return (& $reject `
+                'Existing Desktop owner proof is missing or invalid and cannot be reconstructed safely during supervisor-only adoption.')
+        }
+        if (-not (Test-CodexDesktopOwnerConnectionProof `
+                -Readiness $readiness `
+                -Proof $Proof `
+                -ExpectedRuntimeInvocationId (
+                    $ExpectedRuntimeInvocationId
+                ) `
+                -RootIdentityKey $RootIdentityKey)) {
+            return (& $reject `
+                'Existing Desktop owner proof does not match the exact live Desktop and Broker identities.')
+        }
+
+        return [pscustomobject][ordered]@{
+            IsValid = $true
+            Reason = 'existing-owner-proof-preserved'
+            RootIdentityKey = $RootIdentityKey
+        }
+    } catch {
+        return (& $reject `
+            "Existing Desktop owner proof could not be verified: $($_.Exception.Message)")
+    }
+}
+
+function Get-BoundedBrokerReceiptSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $item = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$item.Length -lt 2 -or
+        [long]$item.Length -gt 65536) {
+        throw 'The Broker recovery receipt is not one ordinary bounded file.'
+    }
+    $bytesBefore = [System.IO.File]::ReadAllBytes($resolvedPath)
+    if ($bytesBefore.LongLength -ne [long]$item.Length) {
+        throw 'The Broker recovery receipt length changed before parsing.'
+    }
+    $rawBase64Before = [Convert]::ToBase64String($bytesBefore)
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $receipt = $strictUtf8.GetString($bytesBefore) |
+        ConvertFrom-Json -Depth 20 -DateKind String -ErrorAction Stop
+    $bytesAfter = [System.IO.File]::ReadAllBytes($resolvedPath)
+    $rawBase64After = [Convert]::ToBase64String($bytesAfter)
+    if ($rawBase64Before -cne $rawBase64After) {
+        throw 'The Broker recovery receipt changed while it was read.'
+    }
+    return [pscustomobject][ordered]@{
+        Path = $resolvedPath
+        RawBase64 = $rawBase64Before
+        Receipt = $receipt
+    }
+}
+
+function Get-UniqueCodexDesktopRootBinding {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object[]]$Processes,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedExecutablePath
+    )
+
+    $roots = @($Processes)
+    if ($roots.Count -ne 1) {
+        throw 'Owner proof recovery requires exactly one Desktop root.'
+    }
+    $root = $roots[0]
+    if ($null -eq $root.PSObject.Properties['ProcessId'] -or
+        -not (Test-NonNegativeInteger -Value $root.ProcessId) -or
+        [int]$root.ProcessId -lt 1 -or
+        $null -eq $root.PSObject.Properties['CreationDate'] -or
+        [string]::IsNullOrWhiteSpace([string]$root.CreationDate) -or
+        $null -eq $root.PSObject.Properties['ExecutablePath'] -or
+        [string]::IsNullOrWhiteSpace([string]$root.ExecutablePath)) {
+        throw 'The single Desktop root identity is incomplete.'
+    }
+    $resolvedExecutablePath = [System.IO.Path]::GetFullPath(
+        [string]$root.ExecutablePath
+    )
+    if (-not (Test-CodexDesktopOwnerRuntimePathEqual `
+            -Left $resolvedExecutablePath `
+            -Right $ExpectedExecutablePath)) {
+        throw 'The single Desktop root executable is not the selected runtime.'
+    }
+    $creationIdentity = Get-ProcessCreationIdentity `
+        -CreationDate $root.CreationDate
+    $identityHandle = Open-ProcessIdentityHandle `
+        -ProcessId ([int]$root.ProcessId) `
+        -ExpectedCreationDateUtcTicks (
+            [long]$creationIdentity.CreationDateUtcTicks
+        )
+    try {
+        $identityHandle.Process.Refresh()
+        if ($identityHandle.Process.HasExited -or
+            [int]$identityHandle.Process.Id -ne [int]$root.ProcessId -or
+            [int]$identityHandle.ProcessId -ne [int]$root.ProcessId -or
+            [long]$identityHandle.StartTimeUtcTicks -lt 1) {
+            throw 'The single Desktop root changed after its process handle opened.'
+        }
+        $handleExecutablePath = [System.IO.Path]::GetFullPath(
+            [string]$identityHandle.Process.MainModule.FileName
+        )
+        if (-not (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left $handleExecutablePath `
+                -Right $resolvedExecutablePath)) {
+            throw 'The held Desktop root process executable changed.'
+        }
+        $rootIdentityKey = Get-CodexDesktopOwnerRootIdentityKey `
+            -ProcessId ([int]$root.ProcessId) `
+            -StartTimeUtcTicks (
+                [long]$identityHandle.StartTimeUtcTicks
+            ) `
+            -ExecutablePath $resolvedExecutablePath
+        if ([string]$rootIdentityKey -cnotmatch
+                '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9a-f]{64}$') {
+            throw 'The single Desktop root identity key is invalid.'
+        }
+        return [pscustomobject][ordered]@{
+            ProcessId = [int]$root.ProcessId
+            StartTimeUtcTicks =
+                [long]$identityHandle.StartTimeUtcTicks
+            ExecutablePath = $resolvedExecutablePath
+            RootIdentityKey = [string]$rootIdentityKey
+        }
+    } finally {
+        $identityHandle.Process.Dispose()
+    }
+}
+
+function Get-AdoptedDesktopOwnerRecoveryObservation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DataDir,
+        [Parameter(Mandatory)][string]$BrokerReceiptPath,
+        [Parameter(Mandatory)][object]$SupervisorRuntimeIdentity,
+        [Parameter(Mandatory)][object]$SidecarRuntimeBinding,
+        [Parameter(Mandatory)][object]$BrokerRuntimeIdentity,
+        [Parameter(Mandatory)][string]$BrokerCliPath,
+        [Parameter(Mandatory)][string]$BrokerSidecarCompatibilityId,
+        [Parameter(Mandatory)][int]$ExpectedBrokerProcessId,
+        [Parameter(Mandatory)][int]$ExpectedSidecarProcessId,
+        [Parameter(Mandatory)][string]$ExpectedRuntimeInvocationId,
+        [Parameter(Mandatory)][string]$ExpectedDesktopExecutablePath
+    )
+
+    $reject = {
+        param([Parameter(Mandatory)][string]$Reason)
+        return [pscustomobject][ordered]@{
+            IsValid = $false
+            Reason = $Reason
+        }
+    }
+
+    try {
+        if ($ExpectedRuntimeInvocationId -cnotmatch '^[0-9a-f]{32}$' -or
+            $BrokerSidecarCompatibilityId -cne
+                'codex-local-remote/broker-sidecar/v1') {
+            return (& $reject `
+                'Adopted recovery identity inputs are invalid.')
+        }
+        $receiptAtStart =
+            Get-BoundedBrokerReceiptSnapshot -Path $BrokerReceiptPath
+        $receipt = $receiptAtStart.Receipt
+        $selectedRuntime =
+            Get-CodexLocalRemoteCurrentRuntime -DataDir $DataDir
+        if ($null -eq $selectedRuntime -or
+            [string]$selectedRuntime.CurrentVersionId -cne
+                [string]$SupervisorRuntimeIdentity.VersionId -or
+            [string]$selectedRuntime.CurrentManifestSha256 -cne
+                [string]$SupervisorRuntimeIdentity.ManifestSha256 -or
+            -not (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$selectedRuntime.CurrentRoot) `
+                -Right ([string]$SupervisorRuntimeIdentity.RuntimeRoot)) -or
+            [string]$selectedRuntime.CurrentVersionId -cne
+                [string]$SidecarRuntimeBinding.VersionId -or
+            [string]$selectedRuntime.CurrentManifestSha256 -cne
+                [string]$SidecarRuntimeBinding.ManifestSha256 -or
+            -not (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$selectedRuntime.CurrentRoot) `
+                -Right ([string]$SidecarRuntimeBinding.RuntimeRoot)) -or
+            [string]$selectedRuntime.PreviousVersionId -cne
+                [string]$BrokerRuntimeIdentity.VersionId -or
+            [string]$selectedRuntime.PreviousManifestSha256 -cne
+                [string]$BrokerRuntimeIdentity.ManifestSha256 -or
+            -not (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$selectedRuntime.PreviousRoot) `
+                -Right ([string]$BrokerRuntimeIdentity.RuntimeRoot)) -or
+            [string]$selectedRuntime.PreviousVersionId -ceq
+                [string]$selectedRuntime.CurrentVersionId) {
+            return (& $reject `
+                'Current Supervisor/Sidecar and exact Previous Broker pointer identity drifted.')
+        }
+        $expectedPointerBrokerCli = [System.IO.Path]::GetFullPath(
+            (Join-Path `
+                ([string]$selectedRuntime.PreviousRoot) `
+                'apps\broker\dist\cli.js')
+        )
+        if (-not (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left $BrokerCliPath `
+                -Right $expectedPointerBrokerCli)) {
+            return (& $reject `
+                'The adopted Broker CLI is not exact Pointer.Previous.')
+        }
+        $payloadCompatibility =
+            Test-CodexLocalRemoteBrokerPayloadCompatibility `
+                -CurrentRuntimeRoot (
+                    [string]$selectedRuntime.CurrentRoot
+                ) `
+                -CurrentVersionId (
+                    [string]$selectedRuntime.CurrentVersionId
+                ) `
+                -CurrentManifestSha256 (
+                    [string]$selectedRuntime.CurrentManifestSha256
+                ) `
+                -ActiveRuntimeRoot (
+                    [string]$selectedRuntime.PreviousRoot
+                ) `
+                -ActiveVersionId (
+                    [string]$selectedRuntime.PreviousVersionId
+                ) `
+                -ActiveManifestSha256 (
+                    [string]$selectedRuntime.PreviousManifestSha256
+                )
+        if ($null -eq $payloadCompatibility -or
+            -not [bool]$payloadCompatibility.IsCompatible) {
+            return (& $reject `
+                'Broker payload compatibility is not stable for owner proof recovery.')
+        }
+
+        $runtimeSnapshot = Get-VerifiedBrokerRuntimeSnapshot `
+            -ExpectedBrokerProcessId $ExpectedBrokerProcessId
+        if ($null -eq $runtimeSnapshot -or
+            $null -eq $runtimeSnapshot.Readiness -or
+            $null -eq $runtimeSnapshot.Upstream -or
+            [string]$runtimeSnapshot.RuntimeInvocationId -cne
+                $ExpectedRuntimeInvocationId -or
+            (Get-BrokerReadinessDecision `
+                -Readiness $runtimeSnapshot.Readiness `
+                -Phase StrictRuntime) -cne 'Ready' -or
+            -not (Test-BrokerReadinessRuntimeIdentity `
+                -Readiness $runtimeSnapshot.Readiness `
+                -ExpectedBrokerProcessId $ExpectedBrokerProcessId `
+                -ExpectedUpstreamProcessId (
+                    [int]$runtimeSnapshot.Upstream.ProcessId
+                ) `
+                -ExpectedRuntimeInvocationId (
+                    $ExpectedRuntimeInvocationId
+                ))) {
+            return (& $reject `
+                'Broker runtime identity is not exact for owner proof recovery.')
+        }
+        $readiness = $runtimeSnapshot.Readiness
+        if (-not (Test-CodexDesktopNonceReadinessSnapshot `
+                -Readiness $readiness) -or
+            -not (Test-NonNegativeInteger `
+                -Value $readiness.unknownCount) -or
+            [int]$readiness.unknownCount -ne 0 -or
+            -not (Test-NonNegativeInteger `
+                -Value $readiness.desktopConnectionCount) -or
+            [int]$readiness.desktopConnectionCount -ne 1) {
+            return (& $reject `
+                'Owner proof recovery requires one exact healthy Desktop connection.')
+        }
+        $launchNonceDigests = @($readiness.desktopLaunchNonceDigests)
+        if ($launchNonceDigests.Count -ne 1 -or
+            [string]$launchNonceDigests[0] -cnotmatch '^[0-9a-f]{64}$') {
+            return (& $reject `
+                'Owner proof recovery requires exactly one 64hex Desktop launch nonce digest.')
+        }
+        $independentStdioProcessIds = @(
+            Get-IndependentDesktopAppServerProcessIds
+        )
+        if ($independentStdioProcessIds.Count -ne 0) {
+            return (& $reject `
+                'An independent stdio app-server blocks owner proof recovery.')
+        }
+        $rootBinding = Get-UniqueCodexDesktopRootBinding `
+            -Processes @(Get-RunningCodexDesktopRootProcesses) `
+            -ExpectedExecutablePath $ExpectedDesktopExecutablePath
+
+        $receiptIdentityValid = (
+            [string]$receipt.Signature -ceq
+                'codex-local-remote/app-server-broker/v3' -and
+            [int]$receipt.Version -eq 3 -and
+            [string]$receipt.Status -ceq 'ready' -and
+            $receipt.SupervisorOnlyAdoptedPreviousBroker -is [bool] -and
+            [bool]$receipt.SupervisorOnlyAdoptedPreviousBroker -and
+            [string]$receipt.RuntimeInvocationId -ceq
+                $ExpectedRuntimeInvocationId -and
+            [string]$receipt.Broker.RuntimeInvocationId -ceq
+                $ExpectedRuntimeInvocationId -and
+            [string]$receipt.Upstream.RuntimeInvocationId -ceq
+                $ExpectedRuntimeInvocationId -and
+            [string]$receipt.Sidecar.RuntimeInvocationId -ceq
+                $ExpectedRuntimeInvocationId -and
+            (Test-NonNegativeInteger -Value $receipt.ProcessId) -and
+            [int]$receipt.ProcessId -eq $ExpectedBrokerProcessId -and
+            (Test-NonNegativeInteger -Value $receipt.Broker.ProcessId) -and
+            [int]$receipt.Broker.ProcessId -eq
+                $ExpectedBrokerProcessId -and
+            (Test-NonNegativeInteger -Value $receipt.Upstream.ProcessId) -and
+            [int]$receipt.Upstream.ProcessId -eq
+                [int]$runtimeSnapshot.Upstream.ProcessId -and
+            (Test-NonNegativeInteger -Value $receipt.Sidecar.ProcessId) -and
+            [int]$receipt.Sidecar.ProcessId -eq
+                $ExpectedSidecarProcessId -and
+            [string]$receipt.BrokerSidecarCompatibilityId -ceq
+                $BrokerSidecarCompatibilityId -and
+            [string]$receipt.SupervisorRuntimeVersionId -ceq
+                [string]$SupervisorRuntimeIdentity.VersionId -and
+            [string]$receipt.SupervisorRuntimeManifestSha256 -ceq
+                [string]$SupervisorRuntimeIdentity.ManifestSha256 -and
+            [string]$receipt.SidecarRuntimeVersionId -ceq
+                [string]$SidecarRuntimeBinding.VersionId -and
+            [string]$receipt.SidecarRuntimeManifestSha256 -ceq
+                [string]$SidecarRuntimeBinding.ManifestSha256 -and
+            [string]$receipt.BrokerRuntimeVersionId -ceq
+                [string]$BrokerRuntimeIdentity.VersionId -and
+            [string]$receipt.BrokerRuntimeManifestSha256 -ceq
+                [string]$BrokerRuntimeIdentity.ManifestSha256 -and
+            (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$receipt.SupervisorRuntimeRoot) `
+                -Right ([string]$SupervisorRuntimeIdentity.RuntimeRoot)) -and
+            (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$receipt.SidecarRuntimeRoot) `
+                -Right ([string]$SidecarRuntimeBinding.RuntimeRoot)) -and
+            (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$receipt.BrokerRuntimeRoot) `
+                -Right ([string]$BrokerRuntimeIdentity.RuntimeRoot)) -and
+            (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$receipt.BrokerCliPath) `
+                -Right $BrokerCliPath)
+        )
+        if (-not $receiptIdentityValid) {
+            return (& $reject `
+                'The raw Broker receipt does not bind the exact adopted runtime identities.')
+        }
+        $receiptAtEnd =
+            Get-BoundedBrokerReceiptSnapshot -Path $BrokerReceiptPath
+        if ([string]$receiptAtStart.RawBase64 -cne
+            [string]$receiptAtEnd.RawBase64) {
+            return (& $reject `
+                'Broker receipt raw bytes changed during one recovery observation.')
+        }
+        $pointerIdentity = [pscustomobject][ordered]@{
+            CurrentVersionId = [string]$selectedRuntime.CurrentVersionId
+            CurrentRoot = [System.IO.Path]::GetFullPath(
+                [string]$selectedRuntime.CurrentRoot
+            )
+            CurrentManifestSha256 =
+                [string]$selectedRuntime.CurrentManifestSha256
+            PreviousVersionId =
+                [string]$selectedRuntime.PreviousVersionId
+            PreviousRoot = [System.IO.Path]::GetFullPath(
+                [string]$selectedRuntime.PreviousRoot
+            )
+            PreviousManifestSha256 =
+                [string]$selectedRuntime.PreviousManifestSha256
+        } | ConvertTo-Json -Compress
+        return [pscustomobject][ordered]@{
+            IsValid = $true
+            Reason = 'strict-adopted-live-binding-observed'
+            ReceiptRawBase64 = [string]$receiptAtStart.RawBase64
+            PointerIdentity = [string]$pointerIdentity
+            PayloadCompatibilityReason =
+                [string]$payloadCompatibility.Reason
+            RuntimeInvocationId = $ExpectedRuntimeInvocationId
+            BrokerProcessId = $ExpectedBrokerProcessId
+            UpstreamProcessId = [int]$runtimeSnapshot.Upstream.ProcessId
+            SidecarProcessId = $ExpectedSidecarProcessId
+            RootProcessId = [int]$rootBinding.ProcessId
+            RootStartTimeUtcTicks =
+                [long]$rootBinding.StartTimeUtcTicks
+            RootExecutablePath = [string]$rootBinding.ExecutablePath
+            RootIdentityKey = [string]$rootBinding.RootIdentityKey
+            DesktopConnectionCount = 1
+            UnknownCount = 0
+            LaunchNonceDigest = [string]$launchNonceDigests[0]
+        }
+    } catch {
+        return (& $reject `
+            "Owner proof recovery observation failed: $($_.Exception.Message)")
+    }
+}
+
+function Test-AdoptedDesktopOwnerRecoveryObservationPair {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$First,
+        [AllowNull()][object]$Second
+    )
+
+    $reject = {
+        param([Parameter(Mandatory)][string]$Reason)
+        return [pscustomobject][ordered]@{
+            IsStable = $false
+            Reason = $Reason
+        }
+    }
+    if ($null -eq $First -or -not [bool]$First.IsValid) {
+        return (& $reject "First observation was blocked: $($First.Reason)")
+    }
+    if ($null -eq $Second -or -not [bool]$Second.IsValid) {
+        return (& $reject "Second observation was blocked: $($Second.Reason)")
+    }
+    if ([string]$First.ReceiptRawBase64 -cne
+        [string]$Second.ReceiptRawBase64) {
+        return (& $reject `
+            'Broker receipt raw bytes changed between recovery observations.')
+    }
+    if ([string]$First.PointerIdentity -cne
+        [string]$Second.PointerIdentity -or
+        [string]$First.PayloadCompatibilityReason -cne
+            [string]$Second.PayloadCompatibilityReason) {
+        return (& $reject `
+            'Pointer or payload compatibility identity changed between recovery observations.')
+    }
+    if ([string]$First.RuntimeInvocationId -cne
+            [string]$Second.RuntimeInvocationId -or
+        [int]$First.BrokerProcessId -ne
+            [int]$Second.BrokerProcessId -or
+        [int]$First.UpstreamProcessId -ne
+            [int]$Second.UpstreamProcessId -or
+        [int]$First.SidecarProcessId -ne
+            [int]$Second.SidecarProcessId) {
+        return (& $reject `
+            'Runtime invocation or Broker/upstream/Sidecar PIDs changed between recovery observations.')
+    }
+    if ([int]$First.RootProcessId -ne [int]$Second.RootProcessId -or
+        [long]$First.RootStartTimeUtcTicks -ne
+            [long]$Second.RootStartTimeUtcTicks -or
+        [string]$First.RootExecutablePath -cne
+            [string]$Second.RootExecutablePath -or
+        [string]$First.RootIdentityKey -cne
+            [string]$Second.RootIdentityKey) {
+        return (& $reject `
+            'Desktop root binding changed between recovery observations.')
+    }
+    if ([string]$First.LaunchNonceDigest -cne
+        [string]$Second.LaunchNonceDigest) {
+        return (& $reject `
+            'Desktop launch nonce digest changed between recovery observations.')
+    }
+    return [pscustomobject][ordered]@{
+        IsStable = $true
+        Reason = 'two-identical-strict-observations'
+    }
+}
+
+# The caller must hold the shared Desktop owner mutex for this entire recovery.
+function Invoke-AdoptedDesktopOwnerProofRecovery {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [bool]$SupervisorOnlyAdoptedPreviousBroker,
+        [Parameter(Mandatory)][string]$DataDir,
+        [Parameter(Mandatory)][string]$BrokerReceiptPath,
+        [Parameter(Mandatory)][object]$SupervisorRuntimeIdentity,
+        [Parameter(Mandatory)][object]$SidecarRuntimeBinding,
+        [Parameter(Mandatory)][object]$BrokerRuntimeIdentity,
+        [Parameter(Mandatory)][string]$BrokerCliPath,
+        [Parameter(Mandatory)][string]$BrokerSidecarCompatibilityId,
+        [Parameter(Mandatory)][int]$ExpectedBrokerProcessId,
+        [Parameter(Mandatory)][int]$ExpectedSidecarProcessId,
+        [Parameter(Mandatory)][string]$ExpectedRuntimeInvocationId,
+        [Parameter(Mandatory)][string]$ExpectedDesktopExecutablePath,
+        [ValidateRange(1, 1000)]
+        [int]$ObservationDelayMilliseconds = 150
+    )
+
+    $blocked = {
+        param([Parameter(Mandatory)][string]$Reason)
+        return [pscustomobject][ordered]@{
+            Status = 'blocked'
+            Reason = $Reason
+            Proof = $null
+        }
+    }
+    $testProofBinding = {
+        param(
+            [AllowNull()][object]$Proof,
+            [Parameter(Mandatory)][object]$Observation
+        )
+        return (
+            $null -ne $Proof -and
+            [string]$Proof.RuntimeInvocationId -ceq
+                $ExpectedRuntimeInvocationId -and
+            [int]$Proof.ProcessId -eq
+                [int]$Observation.RootProcessId -and
+            [long]$Proof.StartTimeUtcTicks -eq
+                [long]$Observation.RootStartTimeUtcTicks -and
+            (Test-CodexDesktopOwnerRuntimePathEqual `
+                -Left ([string]$Proof.ExecutablePath) `
+                -Right ([string]$Observation.RootExecutablePath)) -and
+            [string]$Proof.RootIdentityKey -ceq
+                [string]$Observation.RootIdentityKey -and
+            [string]$Proof.LaunchNonceDigest -ceq
+                [string]$Observation.LaunchNonceDigest
+        )
+    }
+    try {
+        if (-not $SupervisorOnlyAdoptedPreviousBroker) {
+            return (& $blocked `
+                'Owner proof recovery is limited to exact Previous Broker adoption.')
+        }
+        $proofPath = Get-CodexDesktopOwnerConnectionProofPath `
+            -DataDir $DataDir
+        if (Test-Path -LiteralPath $proofPath) {
+            return (& $blocked `
+                'Desktop owner proof is not absent; recovery will not overwrite it.')
+        }
+        $observationParameters = @{
+            DataDir = $DataDir
+            BrokerReceiptPath = $BrokerReceiptPath
+            SupervisorRuntimeIdentity = $SupervisorRuntimeIdentity
+            SidecarRuntimeBinding = $SidecarRuntimeBinding
+            BrokerRuntimeIdentity = $BrokerRuntimeIdentity
+            BrokerCliPath = $BrokerCliPath
+            BrokerSidecarCompatibilityId =
+                $BrokerSidecarCompatibilityId
+            ExpectedBrokerProcessId = $ExpectedBrokerProcessId
+            ExpectedSidecarProcessId = $ExpectedSidecarProcessId
+            ExpectedRuntimeInvocationId = $ExpectedRuntimeInvocationId
+            ExpectedDesktopExecutablePath =
+                $ExpectedDesktopExecutablePath
+        }
+        $firstObservation =
+            Get-AdoptedDesktopOwnerRecoveryObservation `
+                @observationParameters
+        if (-not [bool]$firstObservation.IsValid) {
+            return (& $blocked ([string]$firstObservation.Reason))
+        }
+        Start-Sleep -Milliseconds $ObservationDelayMilliseconds
+        if (Test-Path -LiteralPath $proofPath) {
+            return (& $blocked `
+                'Desktop owner proof appeared during recovery; it was preserved.')
+        }
+        $secondObservation =
+            Get-AdoptedDesktopOwnerRecoveryObservation `
+                @observationParameters
+        $pair = Test-AdoptedDesktopOwnerRecoveryObservationPair `
+            -First $firstObservation `
+            -Second $secondObservation
+        if (-not [bool]$pair.IsStable) {
+            return (& $blocked ([string]$pair.Reason))
+        }
+        if (Test-Path -LiteralPath $proofPath) {
+            return (& $blocked `
+                'Desktop owner proof appeared before the atomic recovery write; it was preserved.')
+        }
+        $null = Write-CodexDesktopOwnerConnectionProof `
+            -DataDir $DataDir `
+            -RuntimeInvocationId $ExpectedRuntimeInvocationId `
+            -ProcessId ([int]$secondObservation.RootProcessId) `
+            -StartTimeUtcTicks (
+                [long]$secondObservation.RootStartTimeUtcTicks
+            ) `
+            -ExecutablePath (
+                [string]$secondObservation.RootExecutablePath
+            ) `
+            -LaunchNonceDigest (
+                [string]$secondObservation.LaunchNonceDigest
+            )
+        $persistedProof = Read-CodexDesktopOwnerConnectionProof `
+            -DataDir $DataDir
+        if (-not (& $testProofBinding `
+                -Proof $persistedProof `
+                -Observation $secondObservation)) {
+            throw 'Persisted owner proof did not match the recovered binding.'
+        }
+        $postCommitObservation =
+            Get-AdoptedDesktopOwnerRecoveryObservation `
+                @observationParameters
+        $postCommitPair = Test-AdoptedDesktopOwnerRecoveryObservationPair `
+            -First $secondObservation `
+            -Second $postCommitObservation
+        $finalProof = Read-CodexDesktopOwnerConnectionProof `
+            -DataDir $DataDir
+        $finalProofMatches = & $testProofBinding `
+            -Proof $finalProof `
+            -Observation $secondObservation
+        if (-not [bool]$postCommitPair.IsStable -or
+            -not $finalProofMatches) {
+            if ($finalProofMatches) {
+                Remove-CodexDesktopOwnerConnectionProof `
+                    -DataDir $DataDir
+            }
+            $postCommitReason = if (-not [bool]$postCommitPair.IsStable) {
+                [string]$postCommitPair.Reason
+            } else {
+                'Persisted owner proof changed during post-commit validation.'
+            }
+            return (& $blocked `
+                "Owner proof post-commit validation failed: $postCommitReason")
+        }
+        return [pscustomobject][ordered]@{
+            Status = 'recovered'
+            Reason =
+                'missing-owner-proof-recovered-from-stable-live-binding'
+            Proof = $finalProof
+        }
+    } catch {
+        return (& $blocked `
+            "Owner proof recovery failed: $($_.Exception.Message)")
+    }
+}
+
 function Stop-ExactManagedBrokerAndOrphan {
     param(
         [AllowNull()]
@@ -2063,6 +2798,108 @@ try {
     }
     $desktopOwnerRuntime = Get-CodexLocalRemoteCurrentRuntime `
         -DataDir $resolvedDataDir
+    $adoptedDesktopOwnerProofBinding = $null
+    if ($brokerRuntimeAdoptedFromPrevious) {
+        try {
+            $adoptedDesktopOwnerProof =
+                Read-CodexDesktopOwnerConnectionProof `
+                    -DataDir $resolvedDataDir
+            $adoptedDesktopOwnerRecovery = $null
+            if ($null -eq $adoptedDesktopOwnerProof) {
+                $adoptedDesktopOwnerRecovery =
+                    Invoke-WithCodexDesktopOwnerMutex `
+                        -DataDir $resolvedDataDir `
+                        -TimeoutSeconds 5 `
+                        -Action {
+                            Invoke-AdoptedDesktopOwnerProofRecovery `
+                                -SupervisorOnlyAdoptedPreviousBroker (
+                                    $brokerRuntimeAdoptedFromPrevious
+                                ) `
+                                -DataDir $resolvedDataDir `
+                                -BrokerReceiptPath $brokerStatePath `
+                                -SupervisorRuntimeIdentity (
+                                    $supervisorRuntimeIdentity
+                                ) `
+                                -SidecarRuntimeBinding (
+                                    $activeSidecarRuntimeBinding
+                                ) `
+                                -BrokerRuntimeIdentity (
+                                    $activeBrokerRuntimeIdentity
+                                ) `
+                                -BrokerCliPath $brokerCli `
+                                -BrokerSidecarCompatibilityId (
+                                    $brokerSidecarCompatibilityId
+                                ) `
+                                -ExpectedBrokerProcessId $brokerPid `
+                                -ExpectedSidecarProcessId (
+                                    [int]$sidecarIdentityHandle.ProcessId
+                                ) `
+                                -ExpectedRuntimeInvocationId (
+                                    $runtimeInvocationId
+                                ) `
+                                -ExpectedDesktopExecutablePath (
+                                    [string](
+                                        $runtimeDiscovery.DesktopExecutablePath
+                                    )
+                                )
+                        }
+                if ([string]$adoptedDesktopOwnerRecovery.Status -ceq
+                    'recovered') {
+                    $adoptedDesktopOwnerProof =
+                        $adoptedDesktopOwnerRecovery.Proof
+                }
+            }
+            $adoptedDesktopRuntimeSnapshot =
+                Get-VerifiedBrokerRuntimeSnapshot `
+                    -ExpectedBrokerProcessId $brokerPid
+            $adoptedDesktopRootIdentityKey =
+                Get-UniqueCodexDesktopRootIdentityKey `
+                    -Processes @(
+                        Get-RunningCodexDesktopRootProcesses
+                    )
+            $adoptedIndependentStdioProcessIds = @(
+                Get-IndependentDesktopAppServerProcessIds
+            )
+            $adoptedDesktopOwnerProofBinding = if (
+                $null -ne $adoptedDesktopOwnerRecovery -and
+                [string]$adoptedDesktopOwnerRecovery.Status -cne
+                    'recovered'
+            ) {
+                [pscustomobject][ordered]@{
+                    IsValid = $false
+                    Reason = [string]$adoptedDesktopOwnerRecovery.Reason
+                    RootIdentityKey = $null
+                }
+            } else {
+                Get-AdoptedDesktopOwnerProofBinding `
+                    -RuntimeSnapshot $adoptedDesktopRuntimeSnapshot `
+                    -RootIdentityKey (
+                        [string]$adoptedDesktopRootIdentityKey
+                    ) `
+                    -Proof $adoptedDesktopOwnerProof `
+                    -IndependentStdioProcessIds (
+                        $adoptedIndependentStdioProcessIds
+                    ) `
+                    -ExpectedBrokerProcessId $brokerPid `
+                    -ExpectedRuntimeInvocationId $runtimeInvocationId
+            }
+        } catch {
+            $adoptedDesktopOwnerProofBinding =
+                [pscustomobject][ordered]@{
+                    IsValid = $false
+                    Reason = (
+                        'Existing Desktop owner proof could not be ' +
+                        "verified: $($_.Exception.Message)"
+                    )
+                    RootIdentityKey = $null
+                }
+        }
+        if (-not [bool]$adoptedDesktopOwnerProofBinding.IsValid) {
+            $desktopRuntimeHealthStatus = 'blocked'
+            $desktopRuntimeHealthMessage =
+                [string]$adoptedDesktopOwnerProofBinding.Reason
+        }
+    }
     if ($DesktopOwnerCoordinator) {
         $desktopOwnerState.StartupIntentPending = $false
         if ($null -ne $desktopHandoffPreparation -and
@@ -2075,7 +2912,27 @@ try {
                 'startup phase.'
             )
         }
-        if ($desktopHandoffPreparationPathPresent -and
+        if ($brokerRuntimeAdoptedFromPrevious) {
+            if ([bool]$adoptedDesktopOwnerProofBinding.IsValid) {
+                $initialDesktopLaunch = [pscustomobject]@{
+                    Status = 'adopted-existing-owner-proof'
+                    RootIdentityKey = [string](
+                        $adoptedDesktopOwnerProofBinding.RootIdentityKey
+                    )
+                }
+                $desktopOwnerState.LastVerifiedConnectedRootIdentityKey =
+                    [string](
+                        $adoptedDesktopOwnerProofBinding.RootIdentityKey
+                    )
+            } else {
+                $initialDesktopLaunch = [pscustomobject]@{
+                    Status = 'adopted-owner-proof-blocked'
+                    Reason = [string](
+                        $adoptedDesktopOwnerProofBinding.Reason
+                    )
+                }
+            }
+        } elseif ($desktopHandoffPreparationPathPresent -and
             $null -eq $desktopHandoffPreparation) {
             $initialDesktopLaunch = [pscustomobject]@{
                 Status = 'handoff-preparation-blocked'
@@ -2152,6 +3009,8 @@ try {
                 'launched-remote',
                 'already-running',
                 'remote-launch-unverified',
+                'adopted-existing-owner-proof',
+                'adopted-owner-proof-blocked',
                 'handoff-preparing',
                 'handoff-preparation-blocked'
             )) {
@@ -2761,9 +3620,13 @@ try {
                         $desktopOwnerDecision = Get-CodexDesktopOwnerDecision `
                             -DesktopConnected $desktopConnected `
                             -StartupIntentPending (
-                                $desktopOwnerState.StartupIntentPending
+                                $desktopOwnerState.StartupIntentPending -and
+                                -not $brokerRuntimeAdoptedFromPrevious
                             ) `
-                            -HasPendingIntent ($null -ne $pendingIntent) `
+                            -HasPendingIntent (
+                                $null -ne $pendingIntent -and
+                                -not $brokerRuntimeAdoptedFromPrevious
+                            ) `
                             -RootIdentityKey $desktopRootIdentityKey `
                             -LastAttemptedRootIdentityKey (
                                 $desktopOwnerState.LastAttemptedRootIdentityKey
@@ -3026,14 +3889,35 @@ try {
                 $currentDesktopOwnerProof =
                     Read-CodexDesktopOwnerConnectionProof `
                         -DataDir $resolvedDataDir
-                $desktopConnected = (
+                $currentAdoptedDesktopOwnerProofBinding = if (
+                    $brokerRuntimeAdoptedFromPrevious
+                ) {
+                    Get-AdoptedDesktopOwnerProofBinding `
+                        -RuntimeSnapshot $currentBrokerRuntimeSnapshot `
+                        -RootIdentityKey (
+                            [string]$currentDesktopRootIdentityKey
+                        ) `
+                        -Proof $currentDesktopOwnerProof `
+                        -IndependentStdioProcessIds @(
+                            Get-IndependentDesktopAppServerProcessIds
+                        ) `
+                        -ExpectedBrokerProcessId $brokerPid `
+                        -ExpectedRuntimeInvocationId $runtimeInvocationId
+                } else {
+                    $null
+                }
+                $desktopConnected = if (
+                    $brokerRuntimeAdoptedFromPrevious
+                ) {
+                    [bool]$currentAdoptedDesktopOwnerProofBinding.IsValid
+                } else {
                     $null -ne $currentBrokerRuntimeSnapshot -and
                     (Test-CodexDesktopOwnerConnectionProof `
                         -Readiness $currentBrokerRuntimeSnapshot.Readiness `
                         -Proof $currentDesktopOwnerProof `
                         -ExpectedRuntimeInvocationId $runtimeInvocationId `
                         -RootIdentityKey $currentDesktopRootIdentityKey)
-                )
+                }
                 $runtimeIdentityCurrent =
                     Test-DesktopRuntimeIdentityCurrent `
                         -ActiveRuntime $runtimeDiscovery `
@@ -3068,7 +3952,15 @@ try {
                     }
                 } elseif (-not $desktopConnected) {
                     $desktopRuntimeHealthStatus = 'blocked'
-                    $desktopRuntimeHealthMessage = 'The managed Broker is healthy, but Codex Desktop is not connected. Existing processes were preserved and new remote execution remains disabled.'
+                    $desktopRuntimeHealthMessage = if (
+                        $brokerRuntimeAdoptedFromPrevious
+                    ) {
+                        [string](
+                            $currentAdoptedDesktopOwnerProofBinding.Reason
+                        )
+                    } else {
+                        'The managed Broker is healthy, but Codex Desktop is not connected. Existing processes were preserved and new remote execution remains disabled.'
+                    }
                     $startupStage = 'runtime-check-blocked'
                     Write-StartupStatus `
                         -Status 'degraded' `

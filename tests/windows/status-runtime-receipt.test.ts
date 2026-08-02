@@ -107,6 +107,39 @@ windowsOnly("Windows runtime receipt status", () => {
     },
   );
 
+  it("accepts an exact Current supervisor and Sidecar supervising a byte-compatible Previous Broker", () => {
+    const result = getStatus("compatible-valid");
+    expect(result.Status).toMatchObject({
+      Degraded: false,
+      SidecarRequestReady: true,
+      DesktopRuntimeStatus: "current",
+      BootstrapIdentityReady: true,
+      BrokerIdentityReady: true,
+      SidecarIdentityReady: true,
+      UpstreamIdentityReady: true,
+      StartupInvocationReady: true,
+      RuntimeReceiptReady: true,
+      DesktopOwnerProofReady: true,
+    });
+    expect(result.TokenReadCount).toBe(0);
+    expect(result.OutputContainsTokenSentinel).toBe(false);
+  });
+
+  it.each([
+    "compatible-payload-mismatch",
+    "compatible-id-drift",
+    "compatible-adopted-current-broker",
+    "compatible-unflagged-previous-broker",
+    "compatible-broker-runtime-drift",
+    "compatible-broker-path-drift",
+  ])("fails closed for compatible receipt counterexample %s", (mode) => {
+    const result = getStatus(mode);
+    expect(result.Status.RuntimeReceiptReady).toBe(false);
+    expect(result.Status.Ready).toBe(false);
+    expect(result.TokenReadCount).toBe(0);
+    expect(result.OutputContainsTokenSentinel).toBe(false);
+  });
+
   it.each([
     "proof-missing",
     "proof-digest-mismatch",

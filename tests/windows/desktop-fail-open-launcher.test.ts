@@ -253,6 +253,37 @@ windowsOnly("Codex Desktop fail-open launcher", () => {
     expect(launcher).toContain("$launchResult.FeedbackStatus = 'filtered'");
   });
 
+  it("preserves an existing owner proof when a launch observation is inconclusive", () => {
+    const launcher = readFileSync(launcherPath, "utf8");
+
+    expect(launcher).not.toContain("if (-not [bool]$launchResult.RemoteEnabled)");
+    expect(launcher).toContain("if ([string]$launchResult.Status -ceq 'launched-native')");
+  });
+
+  it("serializes every owner-proof write and removal with the Desktop owner mutex", () => {
+    const launcher = readFileSync(launcherPath, "utf8");
+    const blockStart = launcher.lastIndexOf(
+      "if ($script:WindowsModuleAvailable)",
+      launcher.indexOf("$connectionProofProperty ="),
+    );
+    const blockEnd = launcher.indexOf(
+      "if ($script:WindowsModuleAvailable)",
+      launcher.indexOf("Remove-CodexDesktopOwnerConnectionProof", blockStart),
+    );
+    const proofBlock = launcher.slice(blockStart, blockEnd);
+    const writeStart = proofBlock.indexOf("Write-CodexDesktopOwnerConnectionProof");
+    const writeMutex = proofBlock.lastIndexOf("Invoke-WithCodexDesktopOwnerMutex", writeStart);
+    const removeStart = proofBlock.indexOf("Remove-CodexDesktopOwnerConnectionProof");
+    const removeMutex = proofBlock.lastIndexOf("Invoke-WithCodexDesktopOwnerMutex", removeStart);
+
+    expect(blockStart).toBeGreaterThan(-1);
+    expect(blockEnd).toBeGreaterThan(blockStart);
+    expect(writeStart).toBeGreaterThan(-1);
+    expect(writeMutex).toBeGreaterThan(-1);
+    expect(removeStart).toBeGreaterThan(writeStart);
+    expect(removeMutex).toBeGreaterThan(writeStart);
+  });
+
   it("renders one compact auto-dismiss receipt without relying on a suppressible tray balloon", () => {
     const launcher = readFileSync(launcherPath, "utf8");
     const start = launcher.indexOf("function Show-CodexRemoteLaunchFeedback");

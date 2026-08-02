@@ -66,11 +66,18 @@ if (-not [string]::IsNullOrWhiteSpace($UserEnvironmentFixturePath) -and
 }
 $effectiveInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
 $currentRuntimePackage = $null
-if ($env:CODEX_REMOTE_TEST_FIXTURE -cne '1') {
+if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1' -and
+    $null -ne (Get-Variable `
+        -Name CodexRemoteCurrentRuntimePackageFixture `
+        -Scope Global `
+        -ErrorAction SilentlyContinue)) {
+    $currentRuntimePackage =
+        $global:CodexRemoteCurrentRuntimePackageFixture
+} elseif ($env:CODEX_REMOTE_TEST_FIXTURE -cne '1') {
     $currentRuntimePackage = Get-CodexLocalRemoteCurrentRuntime -DataDir $DataDir
-    if ($null -ne $currentRuntimePackage) {
-        $effectiveInstallRoot = [string]$currentRuntimePackage.CurrentRoot
-    }
+}
+if ($null -ne $currentRuntimePackage) {
+    $effectiveInstallRoot = [string]$currentRuntimePackage.CurrentRoot
 }
 $immutableRuntimeReady = (
     $env:CODEX_REMOTE_TEST_FIXTURE -ceq '1' -or
@@ -636,7 +643,8 @@ function Test-LiveRuntimeReceiptProcess {
         [Parameter(Mandatory)][object]$Receipt,
         [Parameter(Mandatory)]
         [ValidateSet('Bootstrap', 'Broker', 'Sidecar', 'Upstream')]
-        [string]$Kind
+        [string]$Kind,
+        [AllowEmptyString()][string]$BrokerCliPath = ''
     )
 
     try {
@@ -681,11 +689,18 @@ function Test-LiveRuntimeReceiptProcess {
                     -BasePath $BasePath
             }
             'Broker' {
+                $receiptBrokerCliPath = if (
+                    [string]::IsNullOrWhiteSpace($BrokerCliPath)
+                ) {
+                    $brokerCli
+                } else {
+                    [System.IO.Path]::GetFullPath($BrokerCliPath)
+                }
                 Test-ManagedBrokerProcess `
                     -CommandLine ([string]$process.CommandLine) `
                     -ExecutablePath ([string]$process.ExecutablePath) `
                     -ExpectedNodePath $NodePath `
-                    -ExpectedBrokerCliPath $brokerCli `
+                    -ExpectedBrokerCliPath $receiptBrokerCliPath `
                     -BrokerPort $BrokerPort `
                     -UpstreamPort $BrokerUpstreamPort `
                     -ExpectedCodexPath $CodexPath `
@@ -897,6 +912,7 @@ $brokerPids = @(
 )
 $brokerPid = if ($brokerPids.Count -eq 1) { [int]$brokerPids[0] } else { $null }
 $brokerOwned = $false
+$brokerProcess = $null
 if ($null -ne $brokerPid -and
     -not [string]::IsNullOrWhiteSpace($NodePath) -and
     -not [string]::IsNullOrWhiteSpace($CodexPath)) {
@@ -904,21 +920,8 @@ if ($null -ne $brokerPid -and
         Win32_Process `
         -Filter "ProcessId = $brokerPid" `
         -ErrorAction SilentlyContinue
-    if ($null -ne $brokerProcess) {
-        $brokerOwnership = Test-ManagedBrokerProcess `
-            -CommandLine ([string]$brokerProcess.CommandLine) `
-            -ExecutablePath ([string]$brokerProcess.ExecutablePath) `
-            -ExpectedNodePath $NodePath `
-            -ExpectedBrokerCliPath $brokerCli `
-            -BrokerPort $BrokerPort `
-            -UpstreamPort $BrokerUpstreamPort `
-            -ExpectedCodexPath $CodexPath `
-            -DataDir $resolvedDataDir `
-            -CapabilityTokenFilePath $capabilityTokenPath
-        $brokerOwned = [bool]$brokerOwnership.IsManaged
-    }
 }
-$brokerProxyReady = $brokerLoopbackOnly -and $brokerOwned
+$brokerProxyReady = $false
 $brokerHealthReady = $false
 $brokerHealth = $null
 $desktopConnected = $false
@@ -983,7 +986,7 @@ if ($null -ne $upstreamPid -and -not [string]::IsNullOrWhiteSpace($CodexPath)) {
     }
 }
 $brokerUpstreamReady = $upstreamLoopbackOnly -and $upstreamOwned
-$brokerReady = $brokerProxyReady -and $brokerHealthReady -and $brokerUpstreamReady
+$brokerReady = $false
 
 $bootstrapIdentityReady = $false
 $brokerIdentityReady = $false
@@ -998,9 +1001,9 @@ try {
     $startupRawBefore = Read-StatusJsonText -Path $startupStatusPath
     $brokerRawBefore = Read-StatusJsonText -Path $brokerStatePath
     $startupReceipt = $startupRawBefore |
-        ConvertFrom-Json -Depth 20 -ErrorAction Stop
+        ConvertFrom-Json -Depth 20 -DateKind String -ErrorAction Stop
     $brokerReceipt = $brokerRawBefore |
-        ConvertFrom-Json -Depth 20 -ErrorAction Stop
+        ConvertFrom-Json -Depth 20 -DateKind String -ErrorAction Stop
 
     $startupCommonSchemaReady = (
         [string]$startupReceipt.Status -ceq 'ready' -and
@@ -1091,28 +1094,160 @@ try {
     if ($startupV3SchemaReady) {
         $activeDesktopRuntime = $startupReceipt.Runtime
     }
+    $legacyBrokerReceiptProperties = @(
+        'Signature',
+        'Version',
+        'Status',
+        'RuntimeInvocationId',
+        'Bootstrap',
+        'Broker',
+        'Sidecar',
+        'Upstream',
+        'ProcessId',
+        'CreationDate',
+        'CreationDateUtcTicks',
+        'ProcessStartTimeUtcTicks',
+        'NodePath',
+        'BrokerCliPath',
+        'CodexPath',
+        'StartedByThisInvocation',
+        'RecordedAtUtc'
+    )
+    $generationAwareBrokerReceiptProperties = @(
+        $legacyBrokerReceiptProperties + @(
+            'BrokerSidecarCompatibilityId',
+            'SupervisorRuntimeVersionId',
+            'SupervisorRuntimeRoot',
+            'SupervisorRuntimeManifestSha256',
+            'BrokerRuntimeVersionId',
+            'BrokerRuntimeRoot',
+            'BrokerRuntimeManifestSha256',
+            'SupervisorOnlyAdoptedPreviousBroker',
+            'SidecarRuntimeVersionId',
+            'SidecarRuntimeRoot',
+            'SidecarRuntimeManifestSha256',
+            'CodexRuntime'
+        )
+    )
+    $legacyBrokerSchema = Test-StatusExactProperties `
+        -Value $brokerReceipt `
+        -Names $legacyBrokerReceiptProperties
+    $generationAwareBrokerSchema = Test-StatusExactProperties `
+        -Value $brokerReceipt `
+        -Names $generationAwareBrokerReceiptProperties
+    $expectedBrokerCliPath = $brokerCli
+    $brokerRuntimeBindingReady = [bool]$legacyBrokerSchema
+    if ($generationAwareBrokerSchema) {
+        $adoptedPreviousBroker = (
+            $brokerReceipt.SupervisorOnlyAdoptedPreviousBroker -is [bool] -and
+            [bool]$brokerReceipt.SupervisorOnlyAdoptedPreviousBroker
+        )
+        $expectedCurrentVersionId = if ($null -eq $currentRuntimePackage) {
+            [string]$brokerReceipt.SupervisorRuntimeVersionId
+        } else {
+            [string]$currentRuntimePackage.CurrentVersionId
+        }
+        $expectedCurrentRoot = if ($null -eq $currentRuntimePackage) {
+            $effectiveInstallRoot
+        } else {
+            [string]$currentRuntimePackage.CurrentRoot
+        }
+        $expectedCurrentManifestSha256 = if ($null -eq $currentRuntimePackage) {
+            [string]$brokerReceipt.SupervisorRuntimeManifestSha256
+        } else {
+            [string]$currentRuntimePackage.CurrentManifestSha256
+        }
+        $expectedBrokerVersionId = if ($adoptedPreviousBroker -and
+            $null -ne $currentRuntimePackage) {
+            [string]$currentRuntimePackage.PreviousVersionId
+        } elseif ($adoptedPreviousBroker) {
+            [string]$brokerReceipt.BrokerRuntimeVersionId
+        } else {
+            $expectedCurrentVersionId
+        }
+        $expectedBrokerRoot = if ($adoptedPreviousBroker -and
+            $null -ne $currentRuntimePackage) {
+            [string]$currentRuntimePackage.PreviousRoot
+        } elseif ($adoptedPreviousBroker) {
+            [string]$brokerReceipt.BrokerRuntimeRoot
+        } else {
+            $expectedCurrentRoot
+        }
+        $expectedBrokerManifestSha256 = if ($adoptedPreviousBroker -and
+            $null -ne $currentRuntimePackage) {
+            [string]$currentRuntimePackage.PreviousManifestSha256
+        } elseif ($adoptedPreviousBroker) {
+            [string]$brokerReceipt.BrokerRuntimeManifestSha256
+        } else {
+            $expectedCurrentManifestSha256
+        }
+        $expectedBrokerCliPath = Join-Path `
+            $expectedBrokerRoot `
+            'apps\broker\dist\cli.js'
+        $brokerRuntimeBindingReady = (
+            $brokerReceipt.SupervisorOnlyAdoptedPreviousBroker -is [bool] -and
+            [string]$brokerReceipt.BrokerSidecarCompatibilityId -ceq
+                'codex-local-remote/broker-sidecar/v1' -and
+            $expectedCurrentVersionId -cmatch '^[a-f0-9]{64}$' -and
+            $expectedCurrentManifestSha256 -cmatch '^[a-f0-9]{64}$' -and
+            $expectedBrokerVersionId -cmatch '^[a-f0-9]{64}$' -and
+            $expectedBrokerManifestSha256 -cmatch '^[a-f0-9]{64}$' -and
+            [string]$brokerReceipt.SupervisorRuntimeVersionId -ceq
+                $expectedCurrentVersionId -and
+            [string]$brokerReceipt.SupervisorRuntimeManifestSha256 -ceq
+                $expectedCurrentManifestSha256 -and
+            (Test-StatusPathEqual `
+                -Actual $brokerReceipt.SupervisorRuntimeRoot `
+                -Expected $expectedCurrentRoot) -and
+            [string]$brokerReceipt.SidecarRuntimeVersionId -ceq
+                $expectedCurrentVersionId -and
+            [string]$brokerReceipt.SidecarRuntimeManifestSha256 -ceq
+                $expectedCurrentManifestSha256 -and
+            (Test-StatusPathEqual `
+                -Actual $brokerReceipt.SidecarRuntimeRoot `
+                -Expected $expectedCurrentRoot) -and
+            [string]$brokerReceipt.BrokerRuntimeVersionId -ceq
+                $expectedBrokerVersionId -and
+            [string]$brokerReceipt.BrokerRuntimeManifestSha256 -ceq
+                $expectedBrokerManifestSha256 -and
+            (Test-StatusPathEqual `
+                -Actual $brokerReceipt.BrokerRuntimeRoot `
+                -Expected $expectedBrokerRoot) -and
+            (Test-StatusPathEqual `
+                -Actual $brokerReceipt.BrokerCliPath `
+                -Expected $expectedBrokerCliPath) -and
+            (ConvertTo-CanonicalJson $brokerReceipt.CodexRuntime) -ceq
+                (ConvertTo-CanonicalJson $startupReceipt.Runtime)
+        )
+        if ($brokerRuntimeBindingReady -and $adoptedPreviousBroker) {
+            $payloadCompatibility = if (
+                $env:CODEX_REMOTE_TEST_FIXTURE -ceq '1' -and
+                $null -ne $global:CodexRemoteBrokerPayloadCompatibilityFixture
+            ) {
+                $global:CodexRemoteBrokerPayloadCompatibilityFixture
+            } else {
+                Test-CodexLocalRemoteBrokerPayloadCompatibility `
+                    -CurrentRuntimeRoot $expectedCurrentRoot `
+                    -CurrentVersionId $expectedCurrentVersionId `
+                    -CurrentManifestSha256 $expectedCurrentManifestSha256 `
+                    -ActiveRuntimeRoot $expectedBrokerRoot `
+                    -ActiveVersionId $expectedBrokerVersionId `
+                    -ActiveManifestSha256 $expectedBrokerManifestSha256
+            }
+            $brokerRuntimeBindingReady = (
+                $null -ne $payloadCompatibility -and
+                $payloadCompatibility.IsCompatible -is [bool] -and
+                [bool]$payloadCompatibility.IsCompatible -and
+                [string]$payloadCompatibility.Current.BrokerSidecarCompatibilityId -ceq
+                    [string]$brokerReceipt.BrokerSidecarCompatibilityId -and
+                [string]$payloadCompatibility.Active.BrokerSidecarCompatibilityId -ceq
+                    [string]$brokerReceipt.BrokerSidecarCompatibilityId
+            )
+        }
+    }
     $brokerSchemaReady = (
-        (Test-StatusExactProperties `
-            -Value $brokerReceipt `
-            -Names @(
-                'Signature',
-                'Version',
-                'Status',
-                'RuntimeInvocationId',
-                'Bootstrap',
-                'Broker',
-                'Sidecar',
-                'Upstream',
-                'ProcessId',
-                'CreationDate',
-                'CreationDateUtcTicks',
-                'ProcessStartTimeUtcTicks',
-                'NodePath',
-                'BrokerCliPath',
-                'CodexPath',
-                'StartedByThisInvocation',
-                'RecordedAtUtc'
-            )) -and
+        ($legacyBrokerSchema -or $generationAwareBrokerSchema) -and
+        $brokerRuntimeBindingReady -and
         [string]$brokerReceipt.Signature -ceq
             'codex-local-remote/app-server-broker/v3' -and
         (Test-NonNegativeInteger -Value $brokerReceipt.Version) -and
@@ -1122,11 +1257,35 @@ try {
         $brokerReceipt.StartedByThisInvocation -is [bool] -and
         (Test-StatusRecordedAtUtc -Value $brokerReceipt.RecordedAtUtc) -and
         (Test-StatusPathEqual -Actual $brokerReceipt.NodePath -Expected $NodePath) -and
-        (Test-StatusPathEqual -Actual $brokerReceipt.BrokerCliPath -Expected $brokerCli) -and
+        (Test-StatusPathEqual `
+            -Actual $brokerReceipt.BrokerCliPath `
+            -Expected $expectedBrokerCliPath) -and
         (Test-StatusPathEqual -Actual $brokerReceipt.CodexPath -Expected $CodexPath)
     )
     if (-not $startupSchemaReady -or -not $brokerSchemaReady) {
         throw 'Runtime receipt schema is not exact.'
+    }
+
+    if ($null -eq $brokerProcess) {
+        throw 'The Broker listener process is unavailable.'
+    }
+    $brokerOwnership = Test-ManagedBrokerProcess `
+        -CommandLine ([string]$brokerProcess.CommandLine) `
+        -ExecutablePath ([string]$brokerProcess.ExecutablePath) `
+        -ExpectedNodePath $NodePath `
+        -ExpectedBrokerCliPath $expectedBrokerCliPath `
+        -BrokerPort $BrokerPort `
+        -UpstreamPort $BrokerUpstreamPort `
+        -ExpectedCodexPath $CodexPath `
+        -DataDir $resolvedDataDir `
+        -CapabilityTokenFilePath $capabilityTokenPath
+    $brokerOwned = [bool]$brokerOwnership.IsManaged
+    $brokerProxyReady = $brokerLoopbackOnly -and $brokerOwned
+    $brokerReady = $brokerProxyReady -and
+        $brokerHealthReady -and
+        $brokerUpstreamReady
+    if (-not $brokerReady) {
+        throw 'The Broker runtime is not exact and ready.'
     }
 
     $runtimeInvocationId = [string]$brokerReceipt.RuntimeInvocationId
@@ -1197,7 +1356,8 @@ try {
             -Receipt $brokerReceipt.Broker) -and
         (Test-LiveRuntimeReceiptProcess `
             -Receipt $brokerReceipt.Broker `
-            -Kind Broker)
+            -Kind Broker `
+            -BrokerCliPath $expectedBrokerCliPath)
     )
     $sidecarLiveReady = (
         (Test-ReceiptListenerIdentity `

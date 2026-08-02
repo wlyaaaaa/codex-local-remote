@@ -28,6 +28,13 @@ param(
         'proof-runtime-mismatch',
         'proof-root-mismatch',
         'proof-unknown-client',
+        'compatible-valid',
+        'compatible-payload-mismatch',
+        'compatible-id-drift',
+        'compatible-adopted-current-broker',
+        'compatible-unflagged-previous-broker',
+        'compatible-broker-runtime-drift',
+        'compatible-broker-path-drift',
         'runtime-package-drift',
         'runtime-hash-drift',
         'runtime-blocked'
@@ -66,6 +73,17 @@ $resolvedPwsh = [System.IO.Path]::GetFullPath($PwshPath)
 $brokerCli = [System.IO.Path]::GetFullPath(
     (Join-Path $resolvedRoot 'apps\broker\dist\cli.js')
 )
+$previousRoot = [System.IO.Path]::GetFullPath(
+    (Join-Path $resolvedDataDir 'previous-runtime')
+)
+$previousBrokerCli = [System.IO.Path]::GetFullPath(
+    (Join-Path $previousRoot 'apps\broker\dist\cli.js')
+)
+$currentRuntimeVersionId = 'a' * 64
+$previousRuntimeVersionId = 'b' * 64
+$currentRuntimeManifestSha256 = 'c' * 64
+$previousRuntimeManifestSha256 = 'd' * 64
+$brokerSidecarCompatibilityId = 'codex-local-remote/broker-sidecar/v1'
 $sidecarCli = [System.IO.Path]::GetFullPath(
     (Join-Path $resolvedRoot 'apps\sidecar\dist\cli.js')
 )
@@ -192,7 +210,19 @@ $brokerReceipt = [ordered]@{
     ProcessStartTimeUtcTicks = $brokerProcessReceipt.ProcessStartTimeUtcTicks
     NodePath = $resolvedNode
     BrokerCliPath = $brokerCli
+    BrokerSidecarCompatibilityId = $brokerSidecarCompatibilityId
+    SupervisorRuntimeVersionId = $currentRuntimeVersionId
+    SupervisorRuntimeRoot = $resolvedRoot
+    SupervisorRuntimeManifestSha256 = $currentRuntimeManifestSha256
+    BrokerRuntimeVersionId = $currentRuntimeVersionId
+    BrokerRuntimeRoot = $resolvedRoot
+    BrokerRuntimeManifestSha256 = $currentRuntimeManifestSha256
+    SupervisorOnlyAdoptedPreviousBroker = $false
+    SidecarRuntimeVersionId = $currentRuntimeVersionId
+    SidecarRuntimeRoot = $resolvedRoot
+    SidecarRuntimeManifestSha256 = $currentRuntimeManifestSha256
     CodexPath = $resolvedCodex
+    CodexRuntime = $startupReceipt.Runtime
     StartedByThisInvocation = $true
     RecordedAtUtc = '2026-07-26T00:00:09.0000000Z'
 }
@@ -365,6 +395,49 @@ switch ($Mode) {
             ProcessStartTimeUtcTicks = $bootstrapReceipt.ProcessStartTimeUtcTicks
         }
     }
+    { $_ -in @(
+        'compatible-valid',
+        'compatible-payload-mismatch',
+        'compatible-id-drift',
+        'compatible-adopted-current-broker',
+        'compatible-unflagged-previous-broker',
+        'compatible-broker-runtime-drift',
+        'compatible-broker-path-drift'
+    ) } {
+        $brokerReceipt.BrokerCliPath = $previousBrokerCli
+        $brokerReceipt.BrokerRuntimeVersionId = $previousRuntimeVersionId
+        $brokerReceipt.BrokerRuntimeRoot = $previousRoot
+        $brokerReceipt.BrokerRuntimeManifestSha256 =
+            $previousRuntimeManifestSha256
+        $brokerReceipt.SupervisorOnlyAdoptedPreviousBroker = $true
+        $processes[4200].CommandLine = $brokerCommand.Replace(
+            $brokerCli,
+            $previousBrokerCli
+        )
+        if ($Mode -ceq 'compatible-broker-runtime-drift') {
+            $brokerReceipt.BrokerRuntimeVersionId = 'e' * 64
+        }
+        if ($Mode -ceq 'compatible-adopted-current-broker') {
+            $brokerReceipt.BrokerCliPath = $brokerCli
+            $brokerReceipt.BrokerRuntimeVersionId = $currentRuntimeVersionId
+            $brokerReceipt.BrokerRuntimeRoot = $resolvedRoot
+            $brokerReceipt.BrokerRuntimeManifestSha256 =
+                $currentRuntimeManifestSha256
+            $processes[4200].CommandLine = $brokerCommand
+        }
+        if ($Mode -ceq 'compatible-unflagged-previous-broker') {
+            $brokerReceipt.SupervisorOnlyAdoptedPreviousBroker = $false
+        }
+        if ($Mode -ceq 'compatible-id-drift') {
+            $brokerReceipt.BrokerSidecarCompatibilityId =
+                'codex-local-remote/broker-sidecar/v999'
+        }
+        if ($Mode -ceq 'compatible-broker-path-drift') {
+            $brokerReceipt.BrokerCliPath = Join-Path `
+                $resolvedDataDir `
+                'foreign\apps\broker\dist\cli.js'
+        }
+    }
 }
 
 $startupReceipt | ConvertTo-Json -Depth 20 |
@@ -393,6 +466,28 @@ if ($Mode -cne 'proof-missing') {
 $global:CodexRemoteTokenReadCount = 0
 $global:CodexRemoteStatusReadCount = @{}
 $global:CodexRemoteListenerReadCount = @{}
+$global:CodexRemoteCurrentRuntimePackageFixture = [pscustomobject]@{
+    CurrentVersionId = $currentRuntimeVersionId
+    CurrentRoot = $resolvedRoot
+    CurrentManifestSha256 = $currentRuntimeManifestSha256
+    PreviousVersionId = $previousRuntimeVersionId
+    PreviousRoot = $previousRoot
+    PreviousManifestSha256 = $previousRuntimeManifestSha256
+}
+$global:CodexRemoteBrokerPayloadCompatibilityFixture = [pscustomobject]@{
+    IsCompatible = $Mode -cne 'compatible-payload-mismatch'
+    Reason = if ($Mode -ceq 'compatible-payload-mismatch') {
+        'fixture-mismatch'
+    } else {
+        'fixture-compatible'
+    }
+    Current = [pscustomobject]@{
+        BrokerSidecarCompatibilityId = $brokerSidecarCompatibilityId
+    }
+    Active = [pscustomobject]@{
+        BrokerSidecarCompatibilityId = $brokerSidecarCompatibilityId
+    }
+}
 
 # The target imports the same already-loaded module with -Force. Prevent that
 # test-only re-import from resolving through the command mocks below.
@@ -486,6 +581,30 @@ function Get-Process {
     }
     $result | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
     return $result
+}
+
+function Open-ProcessIdentityHandle {
+    param(
+        [int]$ProcessId,
+        [long]$ExpectedCreationDateUtcTicks
+    )
+
+    if (-not $startTimes.ContainsKey($ProcessId)) {
+        throw "mock PID $ProcessId missing"
+    }
+    $startTimeUtcTicks =
+        $startTimes[$ProcessId].ToUniversalTime().Ticks
+    if ([Math]::Abs(
+        $startTimeUtcTicks - $ExpectedCreationDateUtcTicks
+    ) -gt [TimeSpan]::FromSeconds(2).Ticks) {
+        throw "mock PID $ProcessId creation identity mismatch"
+    }
+    $process = [pscustomobject]@{}
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+    return [pscustomobject]@{
+        StartTimeUtcTicks = $startTimeUtcTicks
+        Process = $process
+    }
 }
 
 function Invoke-RestMethod {
