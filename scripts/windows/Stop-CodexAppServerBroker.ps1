@@ -190,10 +190,165 @@ function Assert-HeldTargetFresh {
     return $true
 }
 
+function Open-RecordedOrphanConsoleHostTarget {
+    param(
+        [Parameter(Mandatory)]
+        [object]$RecordedUpstream,
+
+        [Parameter(Mandatory)]
+        [long]$RecordedCreationDateUtcTicks
+    )
+
+    $recordedProcessId = [int]$RecordedUpstream.ProcessId
+    if ($null -ne (Get-ProcessSnapshot -ProcessId $recordedProcessId)) {
+        throw 'Recorded upstream is still live; orphan compatibility cleanup is not applicable.'
+    }
+    $windowsRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+    if ([string]::IsNullOrWhiteSpace($windowsRoot)) {
+        throw 'SystemRoot is unavailable; recorded orphan cleanup cannot verify conhost.exe.'
+    }
+    $expectedImagePath = [System.IO.Path]::GetFullPath(
+        (Join-Path $windowsRoot 'System32\conhost.exe')
+    )
+    $maximumCreationTicks = $RecordedCreationDateUtcTicks +
+        [TimeSpan]::FromSeconds(2).Ticks
+    $eligible = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "ParentProcessId = $recordedProcessId" `
+            -ErrorAction Stop
+    )) {
+        if ([int]$candidate.ParentProcessId -ne $recordedProcessId -or
+            [string]$candidate.Name -ine 'conhost.exe') {
+            continue
+        }
+        $creation = Get-ProcessCreationIdentity `
+            -CreationDate $candidate.CreationDate
+        if ([long]$creation.CreationDateUtcTicks -lt
+                $RecordedCreationDateUtcTicks -or
+            [long]$creation.CreationDateUtcTicks -gt $maximumCreationTicks) {
+            continue
+        }
+        $imagePath = if (-not [string]::IsNullOrWhiteSpace(
+            [string]$candidate.ExecutablePath
+        )) {
+            [System.IO.Path]::GetFullPath([string]$candidate.ExecutablePath)
+        } elseif ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+            ''
+        } else {
+            Get-CodexLocalRemoteProcessImagePath `
+                -ProcessId ([int]$candidate.ProcessId)
+        }
+        if (-not [string]::Equals(
+            $imagePath,
+            $expectedImagePath,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            continue
+        }
+        $identityHandle = Open-ProcessIdentityHandle `
+            -ProcessId ([int]$candidate.ProcessId) `
+            -ExpectedCreationDateUtcTicks (
+                [long]$creation.CreationDateUtcTicks
+            )
+        $eligible.Add([pscustomobject]@{
+            ProcessId = [int]$candidate.ProcessId
+            ParentProcessId = $recordedProcessId
+            CreationDateUtcTicks = [long]$creation.CreationDateUtcTicks
+            ImagePath = $imagePath
+            IdentityHandle = $identityHandle
+        })
+    }
+    if ($eligible.Count -ne 1) {
+        foreach ($target in $eligible) {
+            $target.IdentityHandle.Process.Dispose()
+        }
+        throw (
+            'Recorded upstream is gone, but there is not exactly one ' +
+            'startup-bound System32 conhost descendant eligible for cleanup.'
+        )
+    }
+    return $eligible[0]
+}
+
+function Assert-RecordedOrphanConsoleHostFresh {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Target,
+
+        [Parameter(Mandatory)]
+        [int]$RecordedUpstreamProcessId,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedStateRaw
+    )
+
+    $currentStateRaw = Get-Content `
+        -LiteralPath $statePath `
+        -Raw `
+        -Encoding utf8
+    if ($currentStateRaw -cne $ExpectedStateRaw) {
+        throw 'Broker state changed before recorded orphan cleanup.'
+    }
+    $owner = Get-ExactListenerOwner -Port $BrokerUpstreamPort
+    if ($null -eq $owner -or
+        $owner.Status -cne 'single-loopback-owner' -or
+        [int]$owner.ProcessId -ne $RecordedUpstreamProcessId) {
+        throw 'Upstream listener ownership changed before recorded orphan cleanup.'
+    }
+    if ($null -ne (Get-ProcessSnapshot `
+        -ProcessId $RecordedUpstreamProcessId)) {
+        throw 'Recorded upstream PID reappeared before orphan cleanup.'
+    }
+    $candidate = @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "ParentProcessId = $RecordedUpstreamProcessId" `
+            -ErrorAction Stop |
+            Where-Object {
+                [int]$_.ProcessId -eq [int]$Target.ProcessId -and
+                [int]$_.ParentProcessId -eq $RecordedUpstreamProcessId -and
+                [string]$_.Name -ieq 'conhost.exe'
+            }
+    )
+    if ($candidate.Count -ne 1) {
+        throw 'Recorded orphan conhost identity changed before cleanup.'
+    }
+    $creation = Get-ProcessCreationIdentity `
+        -CreationDate $candidate[0].CreationDate
+    if ([long]$creation.CreationDateUtcTicks -ne
+        [long]$Target.CreationDateUtcTicks) {
+        throw 'Recorded orphan conhost creation identity changed before cleanup.'
+    }
+    $Target.IdentityHandle.Process.Refresh()
+    if ($Target.IdentityHandle.Process.HasExited -or
+        $Target.IdentityHandle.Process.StartTime.ToUniversalTime().Ticks -ne
+            [long]$Target.IdentityHandle.StartTimeUtcTicks) {
+        throw 'Recorded orphan conhost held handle is no longer fresh.'
+    }
+}
+
+function Wait-ExactListenerReleased {
+    param([Parameter(Mandatory)][int]$Port)
+
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+        if ($null -eq (Get-ExactListenerOwner -Port $Port)) {
+            return
+        }
+        if ($attempt -lt 39) {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    throw "TCP port $Port remained occupied after exact process-tree cleanup."
+}
+
 $stateExists = Test-Path -LiteralPath $statePath -PathType Leaf
 $state = $null
+$stateRaw = $null
 if ($stateExists) {
-    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -Depth 20
+    $stateRaw = Get-Content -LiteralPath $statePath -Raw -Encoding utf8
+    $state = $stateRaw | ConvertFrom-Json -Depth 20
     $requiredStateProperties = @(
         'Signature',
         'Version',
@@ -342,6 +497,7 @@ if ($null -ne $brokerTarget) {
 # otherwise identical argv as owned. Desktop stdio app-server and unrelated
 # ports are never enumerated.
 $upstreamTarget = $null
+$upstreamOrphanTarget = $null
 $upstreamStatus = 'not-found'
 $upstreamOwner = Get-ExactListenerOwner -Port $BrokerUpstreamPort
 if ($null -ne $upstreamOwner) {
@@ -351,10 +507,32 @@ if ($null -ne $upstreamOwner) {
     if ($upstreamOwner.Status -cne 'single-loopback-owner') {
         throw "TCP port $BrokerUpstreamPort has foreign or ambiguous ownership; refusing cleanup."
     }
-    $upstreamProcess = Get-ProcessSnapshot -ProcessId ([int]$upstreamOwner.ProcessId)
-    if ($null -eq $upstreamProcess) {
-        throw "Upstream listener PID $($upstreamOwner.ProcessId) disappeared during verification."
+    $recordedUpstream = $state.Upstream
+    if ($null -eq $recordedUpstream -or
+        [string]$recordedUpstream.RuntimeInvocationId -cne
+            [string]$state.RuntimeInvocationId -or
+        [int]$recordedUpstream.ProcessId -ne
+            [int]$upstreamOwner.ProcessId -or
+        [long]$recordedUpstream.CreationDateUtcTicks -le 0 -or
+        [long]$recordedUpstream.ProcessStartTimeUtcTicks -le 0) {
+        throw 'Managed upstream does not match the recorded startup identity.'
     }
+    $recordedUpstreamCreation = Get-ProcessCreationIdentity `
+        -CreationDate $recordedUpstream.CreationDate
+    if ([long]$recordedUpstreamCreation.CreationDateUtcTicks -ne
+        [long]$recordedUpstream.CreationDateUtcTicks) {
+        throw 'Managed upstream receipt has inconsistent CreationDate values.'
+    }
+    $upstreamProcess = Get-ProcessSnapshot `
+        -ProcessId ([int]$upstreamOwner.ProcessId)
+    if ($null -eq $upstreamProcess) {
+        $upstreamOrphanTarget = Open-RecordedOrphanConsoleHostTarget `
+            -RecordedUpstream $recordedUpstream `
+            -RecordedCreationDateUtcTicks (
+                [long]$recordedUpstream.CreationDateUtcTicks
+            )
+        $upstreamStatus = 'recorded-orphan-console-host'
+    } else {
     $upstreamOwnership = Test-ExactUpstreamProcess -Process $upstreamProcess
     if (-not $upstreamOwnership.IsManaged) {
         throw "TCP port $BrokerUpstreamPort is foreign ($($upstreamOwnership.Reason)); refusing cleanup."
@@ -381,6 +559,7 @@ if ($null -ne $upstreamOwner) {
         IdentityHandle = $upstreamIdentityHandle
     }
     $upstreamStatus = 'managed-orphan'
+    }
 }
 
 try {
@@ -401,7 +580,9 @@ try {
             -Kind Broker)) {
             throw 'Verified broker disappeared before stop; refusing to adopt any replacement.'
         }
-        $null = Stop-ProcessIdentityHandle -IdentityHandle $brokerTarget.IdentityHandle
+        $null = Stop-ProcessIdentityHandle `
+            -IdentityHandle $brokerTarget.IdentityHandle `
+            -IncludeDescendants
         if ($null -ne (Get-ExactListenerOwner -Port $BrokerPort)) {
             throw "TCP port $BrokerPort remained occupied after the held broker handle was stopped."
         }
@@ -414,12 +595,24 @@ try {
             -Kind Upstream
         if ($upstreamStillPresent) {
             $null = Stop-ProcessIdentityHandle `
-                -IdentityHandle $upstreamTarget.IdentityHandle
+                -IdentityHandle $upstreamTarget.IdentityHandle `
+                -IncludeDescendants
         }
         if ($null -ne (Get-ExactListenerOwner -Port $BrokerUpstreamPort)) {
             throw "TCP port $BrokerUpstreamPort remained occupied after exact upstream cleanup."
         }
         $upstreamStatus = if ($upstreamStillPresent) { 'stopped' } else { 'already-stopped' }
+    }
+    if ($null -ne $upstreamOrphanTarget) {
+        Assert-RecordedOrphanConsoleHostFresh `
+            -Target $upstreamOrphanTarget `
+            -RecordedUpstreamProcessId ([int]$state.Upstream.ProcessId) `
+            -ExpectedStateRaw $stateRaw
+        $null = Stop-ProcessIdentityHandle `
+            -IdentityHandle $upstreamOrphanTarget.IdentityHandle `
+            -IncludeDescendants
+        Wait-ExactListenerReleased -Port $BrokerUpstreamPort
+        $upstreamStatus = 'stopped-recorded-orphan-console-host'
     }
     if ($stateExists) {
         Remove-Item -LiteralPath $statePath -Force
@@ -441,5 +634,8 @@ try {
     }
     if ($null -ne $upstreamTarget) {
         $upstreamTarget.IdentityHandle.Process.Dispose()
+    }
+    if ($null -ne $upstreamOrphanTarget) {
+        $upstreamOrphanTarget.IdentityHandle.Process.Dispose()
     }
 }

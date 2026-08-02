@@ -213,6 +213,7 @@ function inspectImmediateRestart(
   NativeDesktopWasClosed: boolean;
   NativeStartCalls: number;
   OpenContinuationCalls: number;
+  PortWaitCalls: number;
   StopCalls: number;
   WaitCalls: number;
   Succeeded: boolean;
@@ -249,6 +250,7 @@ function inspectImmediateRestart(
     NativeDesktopWasClosed: boolean;
     NativeStartCalls: number;
     OpenContinuationCalls: number;
+    PortWaitCalls: number;
     StopCalls: number;
     WaitCalls: number;
     Succeeded: boolean;
@@ -396,6 +398,7 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
       DrainCalls: 1,
       NativeDesktopWasClosed: true,
       OpenContinuationCalls: 1,
+      PortWaitCalls: 1,
       StopCalls: 1,
       WaitCalls: 1,
       Succeeded: true,
@@ -410,6 +413,7 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
       DrainCalls: 1,
       NativeDesktopWasClosed: true,
       OpenContinuationCalls: 1,
+      PortWaitCalls: 1,
       StopCalls: 1,
       WaitCalls: 1,
       Succeeded: true,
@@ -421,6 +425,7 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
       DrainCalls: 1,
       NativeDesktopWasClosed: true,
       OpenContinuationCalls: 0,
+      PortWaitCalls: 1,
       StopCalls: 1,
       WaitCalls: 1,
       Succeeded: false,
@@ -435,6 +440,7 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
       CompensationCalls: 1,
       DesiredModeWrites: ["Native"],
       OpenContinuationCalls: 0,
+      PortWaitCalls: 1,
       Succeeded: false,
     });
   });

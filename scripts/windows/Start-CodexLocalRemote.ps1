@@ -2237,7 +2237,8 @@ function Stop-ExactManagedBrokerAndOrphan {
                     throw 'Broker ownership changed during exact managed recovery.'
                 }
                 $null = Stop-ProcessIdentityHandle `
-                    -IdentityHandle $identityHandle
+                    -IdentityHandle $identityHandle `
+                    -IncludeDescendants
             } finally {
                 $identityHandle.Process.Dispose()
             }
@@ -2265,7 +2266,9 @@ function Stop-ExactManagedBrokerAndOrphan {
                 [string]$fresh.CommandLine -cne [string]$upstream.CommandLine) {
                 throw 'Managed upstream ownership changed during exact recovery.'
             }
-            $null = Stop-ProcessIdentityHandle -IdentityHandle $identityHandle
+            $null = Stop-ProcessIdentityHandle `
+                -IdentityHandle $identityHandle `
+                -IncludeDescendants
         } finally {
             $identityHandle.Process.Dispose()
         }

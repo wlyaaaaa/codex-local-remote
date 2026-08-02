@@ -15,7 +15,7 @@
 **[Install with AI](docs/ai-install-prompt.md)** ·
 **[中文介绍](#中文介绍)** ·
 **[Latest release](https://github.com/wlyaaaaa/codex-local-remote/releases/latest)** ·
-**[v0.1.5 notes](docs/release-notes-v0.1.5.md)**
+**[v0.1.6 notes](docs/release-notes-v0.1.6.md)**
 
 ## Install with AI — one prompt
 

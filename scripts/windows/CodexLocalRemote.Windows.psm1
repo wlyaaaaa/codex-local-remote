@@ -2877,6 +2877,70 @@ function Open-ProcessIdentityHandle {
     }
 }
 
+function Get-CodexLocalRemoteProcessImagePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$ProcessId
+    )
+
+    if ($null -eq ('CodexLocalRemote.NativeProcessQuery' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace CodexLocalRemote {
+    internal static class NativeProcessQuery {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr OpenProcess(
+            uint desiredAccess,
+            bool inheritHandle,
+            int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool QueryFullProcessImageName(
+            IntPtr processHandle,
+            int flags,
+            StringBuilder imagePath,
+            ref int size);
+
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CloseHandle(IntPtr handle);
+    }
+}
+'@
+    }
+
+    $queryLimitedInformation = [uint32]0x1000
+    $handle = [CodexLocalRemote.NativeProcessQuery]::OpenProcess(
+        $queryLimitedInformation,
+        $false,
+        $ProcessId
+    )
+    if ($handle -eq [IntPtr]::Zero) {
+        throw "PID $ProcessId image path could not be opened for limited query."
+    }
+    try {
+        $buffer = [System.Text.StringBuilder]::new(32768)
+        $length = $buffer.Capacity
+        if (-not [CodexLocalRemote.NativeProcessQuery]::QueryFullProcessImageName(
+                $handle,
+                0,
+                $buffer,
+                [ref]$length
+            )) {
+            throw "PID $ProcessId image path could not be queried."
+        }
+        return [System.IO.Path]::GetFullPath($buffer.ToString())
+    } finally {
+        $null = [CodexLocalRemote.NativeProcessQuery]::CloseHandle($handle)
+    }
+}
+
 function Stop-ProcessIdentityHandle {
     [CmdletBinding()]
     param(
@@ -2884,7 +2948,9 @@ function Stop-ProcessIdentityHandle {
         [object]$IdentityHandle,
 
         [ValidateRange(1, 60000)]
-        [int]$TimeoutMilliseconds = 10000
+        [int]$TimeoutMilliseconds = 10000,
+
+        [switch]$IncludeDescendants
     )
 
     $process = $IdentityHandle.Process
@@ -2897,9 +2963,183 @@ function Stop-ProcessIdentityHandle {
             [long]$IdentityHandle.StartTimeUtcTicks) {
         throw "Held process handle no longer matches PID $($IdentityHandle.ProcessId) startup identity."
     }
-    $process.Kill()
+    if ($IncludeDescendants) {
+        $process.Kill($true)
+    } else {
+        $process.Kill()
+    }
     $null = $process.WaitForExit($TimeoutMilliseconds)
     return $true
+}
+
+function Open-ProcessTreeIdentitySnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$RootProcessId,
+
+        [Parameter(Mandatory)]
+        [long]$ExpectedRootCreationDateUtcTicks,
+
+        [long]$ExpectedRootStartTimeUtcTicks = 0
+    )
+
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $root = @(
+        $processes |
+            Where-Object { [int]$_.ProcessId -eq $RootProcessId }
+    )
+    if ($root.Count -ne 1) {
+        throw "Managed process-tree root PID $RootProcessId is not unique and live."
+    }
+    $rootCreation = Get-ProcessCreationIdentity `
+        -CreationDate $root[0].CreationDate
+    if ([long]$rootCreation.CreationDateUtcTicks -ne
+        $ExpectedRootCreationDateUtcTicks) {
+        throw "Managed process-tree root PID $RootProcessId changed creation identity."
+    }
+
+    $members = [System.Collections.Generic.List[object]]::new()
+    $openedHandles = [System.Collections.Generic.List[object]]::new()
+    $visited = [System.Collections.Generic.HashSet[int]]::new()
+    try {
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $queue.Enqueue([pscustomobject]@{
+            Process = $root[0]
+            Depth = 0
+            ParentCreationDateUtcTicks = 0L
+        })
+        while ($queue.Count -gt 0) {
+            $entry = $queue.Dequeue()
+            $process = $entry.Process
+            $processId = [int]$process.ProcessId
+            if (-not $visited.Add($processId)) {
+                throw "Managed process tree repeated PID $processId."
+            }
+            $creation = Get-ProcessCreationIdentity `
+                -CreationDate $process.CreationDate
+            if ([long]$entry.ParentCreationDateUtcTicks -gt 0 -and
+                [long]$creation.CreationDateUtcTicks -lt
+                    [long]$entry.ParentCreationDateUtcTicks) {
+                throw "Managed process-tree descendant PID $processId predates its parent."
+            }
+            $expectedStartTicks = if ($processId -eq $RootProcessId) {
+                $ExpectedRootStartTimeUtcTicks
+            } else {
+                0L
+            }
+            $identityHandle = Open-ProcessIdentityHandle `
+                -ProcessId $processId `
+                -ExpectedCreationDateUtcTicks (
+                    [long]$creation.CreationDateUtcTicks
+                ) `
+                -ExpectedStartTimeUtcTicks $expectedStartTicks
+            $openedHandles.Add($identityHandle)
+            $members.Add([pscustomobject]@{
+                ProcessId = $processId
+                ParentProcessId = [int]$process.ParentProcessId
+                Depth = [int]$entry.Depth
+                CreationDateUtcTicks = [long]$creation.CreationDateUtcTicks
+                IdentityHandle = $identityHandle
+            })
+            foreach ($child in @(
+                $processes |
+                    Where-Object {
+                        [int]$_.ParentProcessId -eq $processId -and
+                        [int]$_.ProcessId -ne $processId
+                    }
+            )) {
+                $queue.Enqueue([pscustomobject]@{
+                    Process = $child
+                    Depth = [int]$entry.Depth + 1
+                    ParentCreationDateUtcTicks =
+                        [long]$creation.CreationDateUtcTicks
+                })
+            }
+        }
+        $rootMember = @(
+            $members |
+                Where-Object { [int]$_.ProcessId -eq $RootProcessId }
+        )[0]
+        $rootMember.IdentityHandle.Process.Refresh()
+        if ($rootMember.IdentityHandle.Process.HasExited -or
+            $rootMember.IdentityHandle.Process.StartTime.ToUniversalTime().Ticks -ne
+                [long]$rootMember.IdentityHandle.StartTimeUtcTicks) {
+            throw 'Managed process-tree root exited or changed during identity capture.'
+        }
+        return [pscustomobject]@{
+            RootProcessId = $RootProcessId
+            Members = @($members)
+        }
+    } catch {
+        foreach ($identityHandle in $openedHandles) {
+            $identityHandle.Process.Dispose()
+        }
+        throw
+    }
+}
+
+function Stop-ProcessTreeIdentitySnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Snapshot,
+
+        [ValidateRange(1, 60000)]
+        [int]$TimeoutMilliseconds = 10000
+    )
+
+    $members = @($Snapshot.Members)
+    $root = @(
+        $members |
+            Where-Object {
+                [int]$_.ProcessId -eq [int]$Snapshot.RootProcessId
+            }
+    )
+    if ($root.Count -ne 1) {
+        throw 'Managed process-tree snapshot has no unique root identity.'
+    }
+    $root[0].IdentityHandle.Process.Refresh()
+    if (-not $root[0].IdentityHandle.Process.HasExited) {
+        $null = Stop-ProcessIdentityHandle `
+            -IdentityHandle $root[0].IdentityHandle `
+            -TimeoutMilliseconds $TimeoutMilliseconds `
+            -IncludeDescendants
+    }
+    foreach ($member in @(
+        $members |
+            Where-Object {
+                [int]$_.ProcessId -ne [int]$Snapshot.RootProcessId
+            } |
+            Sort-Object Depth -Descending
+    )) {
+        $member.IdentityHandle.Process.Refresh()
+        if (-not $member.IdentityHandle.Process.HasExited) {
+            $null = Stop-ProcessIdentityHandle `
+                -IdentityHandle $member.IdentityHandle `
+                -TimeoutMilliseconds $TimeoutMilliseconds `
+                -IncludeDescendants
+        }
+    }
+}
+
+function Close-ProcessTreeIdentitySnapshot {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Snapshot
+    )
+
+    if ($null -eq $Snapshot) {
+        return
+    }
+    foreach ($member in @($Snapshot.Members)) {
+        if ($null -ne $member.IdentityHandle -and
+            $null -ne $member.IdentityHandle.Process) {
+            $member.IdentityHandle.Process.Dispose()
+        }
+    }
 }
 
 function Test-ManagedAppServerProcess {
@@ -8835,8 +9075,12 @@ Export-ModuleMember -Function @(
     'Get-CodexLocalRemoteTcpListenerSnapshot',
     'Get-ManagedIpv4Listeners',
     'Get-ProcessCreationIdentity',
+    'Get-CodexLocalRemoteProcessImagePath',
     'Open-ProcessIdentityHandle',
     'Stop-ProcessIdentityHandle',
+    'Open-ProcessTreeIdentitySnapshot',
+    'Stop-ProcessTreeIdentitySnapshot',
+    'Close-ProcessTreeIdentitySnapshot',
     'Test-ManagedAppServerProcess',
     'Test-ManagedBrokerProcess',
     'Test-ManagedSidecarProcess',

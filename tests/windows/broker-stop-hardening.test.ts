@@ -20,6 +20,8 @@ interface ProcessSnapshot {
   CreationDate: string;
   ExecutablePath: string;
   CommandLine: string;
+  Name?: string;
+  ParentProcessId?: number;
 }
 
 interface Outcome {
@@ -96,6 +98,20 @@ windowsOnly("Windows broker stop process identity hardening", () => {
     };
   }
 
+  function inheritedConhost(overrides: Partial<ProcessSnapshot> = {}): ProcessSnapshot {
+    const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+    const executablePath = resolve(systemRoot, "System32", "conhost.exe");
+    return {
+      ProcessId: 5404,
+      ParentProcessId: upstreamPid,
+      Name: "conhost.exe",
+      CreationDate: "20260726010102.000000-000",
+      ExecutablePath: executablePath,
+      CommandLine: `"${executablePath}" 0x4`,
+      ...overrides,
+    };
+  }
+
   function writeState(
     process: ProcessSnapshot,
     creationOverride?: string,
@@ -157,6 +173,7 @@ windowsOnly("Windows broker stop process identity hardening", () => {
     sidecarConnected = false,
     unsafeThreadCount = 0,
     exitProcessIdsOnKill: number[] = [],
+    extraScenario: Record<string, unknown> = {},
   ) {
     writeFileSync(
       scenarioFile,
@@ -171,6 +188,7 @@ windowsOnly("Windows broker stop process identity hardening", () => {
           unsafeThreadCount,
         },
         ExitProcessIdsOnKill: exitProcessIdsOnKill,
+        ...extraScenario,
       }),
       "utf8",
     );
@@ -251,6 +269,96 @@ windowsOnly("Windows broker stop process identity hardening", () => {
       StateExists: false,
     });
     expect(outcome.Trace).toContain(`cascade-exit:${upstreamPid}`);
+  });
+
+  it("cleans the one exact inherited conhost when the receipt-bound upstream parent is dead but still owns the listener row", () => {
+    const owner = managedBroker();
+    const upstream = managedUpstream();
+    const conhost = inheritedConhost();
+    writeState(owner, undefined, upstream);
+
+    const { execution, outcome } = runScenario(
+      [[]],
+      [null, null, null, null],
+      [[listener(upstreamPid)], [listener(upstreamPid)], []],
+      false,
+      false,
+      0,
+      [],
+      { EnumeratedProcesses: [conhost] },
+    );
+
+    expect(execution.status).toBe(0);
+    expect(outcome.Succeeded).toBe(true);
+    expect(outcome.Result?.Status).toBe("completed");
+    expect(outcome.StopIds).toEqual([conhost.ProcessId]);
+    expect(outcome.Trace).toContain("upstream-listeners:2");
+    expect(outcome.StateExists).toBe(false);
+  });
+
+  it.each([
+    {
+      name: "parent PID",
+      child: () => inheritedConhost({ ParentProcessId: upstreamPid + 1 }),
+    },
+    {
+      name: "System32 executable path",
+      child: () =>
+        inheritedConhost({
+          ExecutablePath: resolve(sandbox, "Foreign", "conhost.exe"),
+        }),
+    },
+    {
+      name: "two-second creation window",
+      child: () => inheritedConhost({ CreationDate: "20260726010104.000000-000" }),
+    },
+  ])(
+    "fails closed when the inherited-listener candidate has the wrong $name",
+    ({ child: createChild }) => {
+      const owner = managedBroker();
+      const upstream = managedUpstream();
+      const child = createChild();
+      writeState(owner, undefined, upstream);
+
+      const { execution, outcome } = runScenario(
+        [[]],
+        [null, null, null, null],
+        [[listener(upstreamPid)], [listener(upstreamPid)]],
+        false,
+        false,
+        0,
+        [],
+        { EnumeratedProcesses: [child] },
+      );
+
+      expect(execution.status).not.toBe(0);
+      expect(outcome.Succeeded).toBe(false);
+      expect(outcome.StopIds).toEqual([]);
+      expect(outcome.StateExists).toBe(true);
+    },
+  );
+
+  it("fails closed if listener ownership drifts after the exact inherited conhost is proven", () => {
+    const owner = managedBroker();
+    const upstream = managedUpstream();
+    const conhost = inheritedConhost();
+    writeState(owner, undefined, upstream);
+
+    const { execution, outcome } = runScenario(
+      [[]],
+      [null, null, null, null],
+      [[listener(upstreamPid)], [listener(upstreamPid + 101)]],
+      false,
+      false,
+      0,
+      [],
+      { EnumeratedProcesses: [conhost] },
+    );
+
+    expect(execution.status).not.toBe(0);
+    expect(outcome.Succeeded).toBe(false);
+    expect(outcome.StopIds).toEqual([]);
+    expect(outcome.StateExists).toBe(true);
   });
 
   it("rejects a state CreationDate that does not match the live broker", () => {

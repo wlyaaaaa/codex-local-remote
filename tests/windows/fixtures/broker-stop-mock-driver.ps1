@@ -78,6 +78,29 @@ function Get-CimInstance {
         [object]$ErrorAction
     )
 
+    if ([string]::IsNullOrWhiteSpace($Filter) -or
+        $Filter -match '^\s*ParentProcessId\s*=') {
+        $enumerated = if ($null -eq
+            $global:CodexRemoteBrokerStopScenario.PSObject.Properties['EnumeratedProcesses']) {
+            @()
+        } else {
+            @($global:CodexRemoteBrokerStopScenario.EnumeratedProcesses)
+        }
+        $global:CodexRemoteBrokerStopTrace.Add(
+            "process-enumeration:$Filter"
+        )
+        if ($Filter -match '^\s*ParentProcessId\s*=\s*(\d+)\s*$') {
+            $parentProcessId = [int]$Matches[1]
+            return @(
+                $enumerated |
+                    Where-Object {
+                        [int]$_.ParentProcessId -eq $parentProcessId
+                    }
+            )
+        }
+        return $enumerated
+    }
+
     $index = $global:CodexRemoteBrokerProcessRead
     $snapshots = @($global:CodexRemoteBrokerStopScenario.ProcessSnapshots)
     if ($index -ge $snapshots.Count) {
@@ -95,7 +118,10 @@ function Get-Process {
     )
 
     $snapshot = @(
-        @($global:CodexRemoteBrokerStopScenario.ProcessSnapshots) |
+        @(
+            @($global:CodexRemoteBrokerStopScenario.ProcessSnapshots) +
+            @($global:CodexRemoteBrokerStopScenario.EnumeratedProcesses)
+        ) |
             Where-Object { $null -ne $_ -and [int]$_.ProcessId -eq $Id } |
             Select-Object -First 1
     )
@@ -112,8 +138,11 @@ function Get-Process {
     }
     $handle | Add-Member -MemberType ScriptMethod -Name Refresh -Value {}
     $handle | Add-Member -MemberType ScriptMethod -Name Kill -Value {
+        param([bool]$EntireProcessTree = $false)
         $global:CodexRemoteBrokerStopIds.Add([int]$this.Id)
-        $global:CodexRemoteBrokerStopTrace.Add("kill:$($this.Id)")
+        $global:CodexRemoteBrokerStopTrace.Add(
+            "kill:$($this.Id):tree=$EntireProcessTree"
+        )
         $this.HasExited = $true
         foreach ($exitId in @(
             $global:CodexRemoteBrokerStopScenario.ExitProcessIdsOnKill

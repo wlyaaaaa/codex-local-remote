@@ -73,6 +73,7 @@ $script:DrainCalls = 0
 $script:IdentityOpenCalls = 0
 $script:NativeStartCalls = 0
 $script:OpenContinuationCalls = 0
+$script:PortWaitCalls = 0
 $script:StopCalls = 0
 $script:WaitCalls = 0
 
@@ -231,6 +232,28 @@ function Wait-OnDemandTaskState {
     return [pscustomobject]@{ State = 'Ready' }
 }
 
+function Open-OnDemandManagedUpstreamProcessTree {
+    param([object]$Configuration)
+    $null = $Configuration
+    return [pscustomobject]@{ RootProcessId = 4321; Members = @() }
+}
+
+function Stop-ProcessTreeIdentitySnapshot {
+    param([object]$Snapshot)
+    $null = $Snapshot
+}
+
+function Wait-OnDemandManagedPortsReleased {
+    param([int[]]$Ports)
+    $null = $Ports
+    $script:PortWaitCalls++
+}
+
+function Close-ProcessTreeIdentitySnapshot {
+    param([object]$Snapshot)
+    $null = $Snapshot
+}
+
 function Get-CodexLocalRemoteNativeDesktopRootCandidates {
     param([string]$DesktopExecutablePath)
     $null = $DesktopExecutablePath
@@ -284,6 +307,11 @@ try {
             CurrentVersionId = 'b' * 64
             CurrentRoot = 'C:\fixture\runtime'
         }
+        $configuration = [pscustomobject]@{
+            SidecarPort = 18790
+            BrokerPort = 18791
+            BrokerUpstreamPort = 18795
+        }
         $desktopRoot = [pscustomobject]@{
             ProcessId = 1234
             CreationDate = '20260731120000.000000-000'
@@ -300,6 +328,7 @@ try {
             $null = Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier `
                 -Runtime $runtime `
                 -StartupTask ([pscustomobject]@{ State = $startupTaskState }) `
+                -Configuration $configuration `
                 -DesktopRoots @($desktopRoot) `
                 -IndependentStdioProcesses @() `
                 -ExpectedDesktopPath $expectedDesktopPath `
@@ -367,6 +396,7 @@ try {
     NativeDesktopWasClosed = [bool]$script:nativeDesktopWasClosedForOpen
     NativeStartCalls = $script:NativeStartCalls
     OpenContinuationCalls = $script:OpenContinuationCalls
+    PortWaitCalls = $script:PortWaitCalls
     StopCalls = $script:StopCalls
     WaitCalls = $script:WaitCalls
     Succeeded = $succeeded

@@ -3130,6 +3130,295 @@ function Wait-OnDemandTaskState {
     throw "Remote startup task did not enter ${ExpectedState}: $($task.State)"
 }
 
+function Get-OnDemandManagedPortListeners {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [int[]]$Ports
+    )
+
+    if ($env:CODEX_REMOTE_TEST_FIXTURE -ceq '1') {
+        return @(
+            foreach ($port in $Ports) {
+                Get-NetTCPConnection `
+                    -State Listen `
+                    -LocalPort $port `
+                    -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        [pscustomobject]@{
+                            LocalAddress = [string]$_.LocalAddress
+                            LocalPort = $port
+                            OwningProcess = [int]$_.OwningProcess
+                        }
+                    }
+            }
+        )
+    }
+    return @(
+        Get-CodexLocalRemoteTcpListenerSnapshot -LocalPorts $Ports
+    )
+}
+
+function Wait-OnDemandManagedPortsReleased {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [int[]]$Ports,
+
+        [ValidateRange(1, 30)]
+        [int]$TimeoutSeconds = 5
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $emptyObservations = 0
+    do {
+        if (@(Get-OnDemandManagedPortListeners -Ports $Ports).Count -eq 0) {
+            $emptyObservations++
+            if ($emptyObservations -ge 2) {
+                return
+            }
+        } else {
+            $emptyObservations = 0
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw (
+        'The retired managed process tree did not release every managed ' +
+        'listener within the bounded shutdown window.'
+    )
+}
+
+function Open-OnDemandManagedUpstreamProcessTree {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Configuration
+    )
+
+    $receiptPath = Join-Path $resolvedDataDir 'app-server-broker.json'
+    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+        throw 'Active runtime has no Broker receipt for process-tree capture.'
+    }
+    $receiptItem = Get-Item -LiteralPath $receiptPath -Force
+    if ($receiptItem.PSIsContainer -or
+        ($receiptItem.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [long]$receiptItem.Length -lt 64 -or
+        [long]$receiptItem.Length -gt 65536) {
+        throw 'Active Broker receipt is not one bounded regular file.'
+    }
+    $rawBefore = Get-Content `
+        -LiteralPath $receiptPath `
+        -Raw `
+        -Encoding utf8
+    $receipt = $rawBefore |
+        ConvertFrom-Json -Depth 20 -DateKind String -ErrorAction Stop
+    $upstream = $receipt.Upstream
+    if ([string]$receipt.Signature -cne
+            'codex-local-remote/app-server-broker/v3' -or
+        [int]$receipt.Version -ne 3 -or
+        [string]$receipt.RuntimeInvocationId -cnotmatch '^[0-9a-f]{32}$' -or
+        $null -eq $upstream -or
+        [string]$upstream.RuntimeInvocationId -cne
+            [string]$receipt.RuntimeInvocationId -or
+        -not (Test-NonNegativeInteger -Value $upstream.ProcessId) -or
+        [int]$upstream.ProcessId -lt 1 -or
+        -not (Test-NonNegativeInteger `
+            -Value $upstream.CreationDateUtcTicks) -or
+        [long]$upstream.CreationDateUtcTicks -lt 1 -or
+        -not (Test-NonNegativeInteger `
+            -Value $upstream.ProcessStartTimeUtcTicks) -or
+        [long]$upstream.ProcessStartTimeUtcTicks -lt 1) {
+        throw 'Active Broker receipt lacks one exact managed upstream identity.'
+    }
+    $processes = @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "ProcessId = $([int]$upstream.ProcessId)" `
+            -ErrorAction Stop
+    )
+    if ($processes.Count -ne 1) {
+        throw 'Managed upstream disappeared before process-tree capture.'
+    }
+    $process = $processes[0]
+    $creation = Get-ProcessCreationIdentity -CreationDate $process.CreationDate
+    if ([long]$creation.CreationDateUtcTicks -ne
+        [long]$upstream.CreationDateUtcTicks) {
+        throw 'Managed upstream creation identity changed before tree capture.'
+    }
+    $ownership = Test-ManagedAppServerProcess `
+        -CommandLine ([string]$process.CommandLine) `
+        -ExecutablePath ([string]$process.ExecutablePath) `
+        -ExpectedCodexPath ([string]$receipt.CodexPath) `
+        -WebSocketUrl (
+            Get-BrokerWebSocketUrl `
+                -Port ([int]$Configuration.BrokerUpstreamPort)
+        ) `
+        -TokenFilePath (
+            Join-Path $resolvedDataDir 'app-server-upstream.token'
+        )
+    if (-not [bool]$ownership.IsManaged) {
+        throw 'Broker receipt upstream is no longer the exact managed app-server.'
+    }
+    $listeners = @(
+        Get-OnDemandManagedPortListeners `
+            -Ports @([int]$Configuration.BrokerUpstreamPort)
+    )
+    if ($listeners.Count -ne 1 -or
+        -not (Test-IsLoopbackListenerAddress `
+            -Address ([string]$listeners[0].LocalAddress)) -or
+        [int]$listeners[0].OwningProcess -ne [int]$upstream.ProcessId) {
+        throw 'Managed upstream listener identity changed before tree capture.'
+    }
+
+    $snapshot = $null
+    try {
+        $snapshot = Open-ProcessTreeIdentitySnapshot `
+            -RootProcessId ([int]$upstream.ProcessId) `
+            -ExpectedRootCreationDateUtcTicks (
+                [long]$upstream.CreationDateUtcTicks
+            ) `
+            -ExpectedRootStartTimeUtcTicks (
+                [long]$upstream.ProcessStartTimeUtcTicks
+            )
+        $rawAfter = Get-Content `
+            -LiteralPath $receiptPath `
+            -Raw `
+            -Encoding utf8
+        $freshListeners = @(
+            Get-OnDemandManagedPortListeners `
+                -Ports @([int]$Configuration.BrokerUpstreamPort)
+        )
+        if ($rawAfter -cne $rawBefore -or
+            $freshListeners.Count -ne 1 -or
+            [int]$freshListeners[0].OwningProcess -ne
+                [int]$upstream.ProcessId) {
+            throw 'Managed upstream receipt or listener changed during tree capture.'
+        }
+        return $snapshot
+    } catch {
+        Close-ProcessTreeIdentitySnapshot -Snapshot $snapshot
+        throw
+    }
+}
+
+function Repair-OnDemandRecordedOrphanedUpstream {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Runtime,
+
+        [Parameter(Mandatory)]
+        [object]$Configuration,
+
+        [Parameter(Mandatory)]
+        [object]$StartupTask,
+
+        [switch]$AllowActiveTurns
+    )
+
+    if ([string]$StartupTask.State -cne 'Ready') {
+        return $false
+    }
+    $managedPorts = @(
+        [int]$Configuration.SidecarPort,
+        [int]$Configuration.BrokerPort,
+        [int]$Configuration.BrokerUpstreamPort
+    )
+    $listeners = @(Get-OnDemandManagedPortListeners -Ports $managedPorts)
+    if ($listeners.Count -eq 0) {
+        return $false
+    }
+    if (@(
+        $listeners |
+            Where-Object {
+                [int]$_.LocalPort -ne [int]$Configuration.BrokerUpstreamPort
+            }
+    ).Count -ne 0) {
+        return $false
+    }
+    $statePath = Join-Path $resolvedDataDir 'app-server-broker.json'
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        return $false
+    }
+    $state = Get-Content -LiteralPath $statePath -Raw -Encoding utf8 |
+        ConvertFrom-Json -Depth 20 -DateKind String -ErrorAction Stop
+    if ($null -eq $state.Upstream -or
+        -not (Test-NonNegativeInteger -Value $state.Upstream.ProcessId) -or
+        [int]$state.Upstream.ProcessId -lt 1) {
+        return $false
+    }
+    $recordedUpstreamProcesses = @(
+        Get-CimInstance `
+            Win32_Process `
+            -Filter "ProcessId = $([int]$state.Upstream.ProcessId)" `
+            -ErrorAction Stop
+    )
+    if ($recordedUpstreamProcesses.Count -gt 1) {
+        throw 'Recorded orphan upstream PID is ambiguous.'
+    }
+    if ($recordedUpstreamProcesses.Count -eq 1 -and
+        -not $AllowActiveTurns) {
+        throw (
+            'A live receipt-bound orphan app-server requires explicit ' +
+            'Desktop restart authorization before cleanup.'
+        )
+    }
+    $brokerCliSuffix = '\apps\broker\dist\cli.js'
+    $brokerCliPath = [System.IO.Path]::GetFullPath(
+        [string]$state.BrokerCliPath
+    )
+    if ([string]$state.Signature -cne
+            'codex-local-remote/app-server-broker/v3' -or
+        -not $brokerCliPath.EndsWith(
+            $brokerCliSuffix,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        return $false
+    }
+    $brokerRuntimeRoot = $brokerCliPath.Substring(
+        0,
+        $brokerCliPath.Length - $brokerCliSuffix.Length
+    )
+    $brokerVersionId = Split-Path -Leaf $brokerRuntimeRoot
+    $expectedBrokerRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path `
+            (Join-Path $resolvedDataDir 'RuntimeVersions') `
+            $brokerVersionId)
+    )
+    $brokerRuntimeValidation = Get-OnDemandCachedRuntimeValidation `
+        -RuntimeRoot $brokerRuntimeRoot `
+        -ExpectedVersionId $brokerVersionId
+    if ($brokerVersionId -cnotmatch '^[a-f0-9]{64}$' -or
+        -not [string]::Equals(
+            $brokerRuntimeRoot,
+            $expectedBrokerRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or -not [bool]$brokerRuntimeValidation.IsValid) {
+        return $false
+    }
+    $stopScript = Join-Path `
+        ([string]$Runtime.CurrentRoot) `
+        'scripts\windows\Stop-CodexAppServerBroker.ps1'
+    $result = @(
+        & $stopScript `
+            -CodexPath ([string]$state.CodexPath) `
+            -NodePath ([string]$state.NodePath) `
+            -InstallRoot $brokerRuntimeRoot `
+            -DataDir $resolvedDataDir `
+            -BrokerPort ([int]$Configuration.BrokerPort) `
+            -BrokerUpstreamPort ([int]$Configuration.BrokerUpstreamPort) `
+            -AllowActiveTurns:$AllowActiveTurns `
+            -Confirm:$false
+    )
+    if ($result.Count -ne 1 -or
+        [string]$result[0].Status -cnotin @('completed', 'not-found')) {
+        throw 'Receipt-bound retired runtime cleanup did not complete exactly once.'
+    }
+    Wait-OnDemandManagedPortsReleased -Ports $managedPorts
+    return $true
+}
+
 function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
     [CmdletBinding()]
     param(
@@ -3138,6 +3427,9 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
 
         [Parameter(Mandatory)]
         [object]$StartupTask,
+
+        [Parameter(Mandatory)]
+        [object]$Configuration,
 
         [Parameter(Mandatory)]
         [object[]]$DesktopRoots,
@@ -3179,6 +3471,12 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
             'stdio app-server and refused to change Desktop ownership.'
         )
     }
+    $upstreamTree = $null
+    if ($startupTaskWasRunning) {
+        $upstreamTree = Open-OnDemandManagedUpstreamProcessTree `
+            -Configuration $Configuration
+    }
+    try {
     $desiredModeBeforeStop =
         Get-CodexLocalRemoteDesiredMode -DataDir $resolvedDataDir
     if (-not (Test-OnDemandDeferredOpenIntent `
@@ -3218,6 +3516,14 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
         -Name $Name `
         -ExpectedState 'Ready' `
         -TimeoutSeconds $TaskDrainTimeoutSeconds
+    if ($null -ne $upstreamTree) {
+        Stop-ProcessTreeIdentitySnapshot -Snapshot $upstreamTree
+    }
+    Wait-OnDemandManagedPortsReleased -Ports @(
+        [int]$Configuration.SidecarPort,
+        [int]$Configuration.BrokerPort,
+        [int]$Configuration.BrokerUpstreamPort
+    )
 
     $desiredModeAfterStop =
         Get-CodexLocalRemoteDesiredMode -DataDir $resolvedDataDir
@@ -3258,6 +3564,9 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
     $script:openDesiredModeIntentId = [string]$rearmedIntent.IntentId
     $script:openDesiredModeWasCreated = $true
     return $readyTask
+    } finally {
+        Close-ProcessTreeIdentitySnapshot -Snapshot $upstreamTree
+    }
 }
 
 function Set-OnDemandOpenDesiredRemote {
@@ -3418,6 +3727,14 @@ try {
     $startupTask = Get-VerifiedOnDemandStartupTask `
         -Runtime $runtime `
         -Name $TaskName
+    if ($Operation -ceq 'Open' -and
+        [string]$startupTask.State -ceq 'Ready') {
+        $null = Repair-OnDemandRecordedOrphanedUpstream `
+            -Runtime $runtime `
+            -Configuration $configuration `
+            -StartupTask $startupTask `
+            -AllowActiveTurns:$AllowDesktopRestart
+    }
     $packageRuntime = Resolve-CodexDesktopPackageStatusIdentity
     $expectedDesktopPath = [System.IO.Path]::GetFullPath(
         [string]$packageRuntime.DesktopExecutablePath
@@ -3432,6 +3749,7 @@ try {
             Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier `
                 -Runtime $runtime `
                 -StartupTask $startupTask `
+                -Configuration $configuration `
                 -DesktopRoots $desktopRoots `
                 -IndependentStdioProcesses $independentAppServers `
                 -ExpectedDesktopPath $expectedDesktopPath `
