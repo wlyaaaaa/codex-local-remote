@@ -384,16 +384,19 @@ export class SharedRuntime {
         },
       ];
     }
+    const startedItem = queueItem("queue-started", "started", 0, "已由 Codex 接管");
+    delete startedItem.prompt;
     const items = complexState
       ? [
-          queueItem("queue-queued", "queued", 0, "排队消息：等待当前回复结束"),
-          queueItem("queue-paused", "paused", 1, "暂停消息：需要人工恢复"),
-          queueItem("queue-ambiguous", "ambiguous", 2, "未知消息：发送结果需要确认"),
+          startedItem,
+          queueItem("queue-queued", "queued", 1, "排队消息：等待当前回复结束"),
+          queueItem("queue-paused", "paused", 2, "暂停消息：需要人工恢复"),
+          queueItem("queue-ambiguous", "ambiguous", 3, "未知消息：发送结果需要确认"),
         ]
       : [];
     this.queueSnapshot = {
       threadId: this.thread.id,
-      revision: complexState ? 3 : 0,
+      revision: complexState ? 4 : 0,
       items,
     };
     this.approvals = complexState

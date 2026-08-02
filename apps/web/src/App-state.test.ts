@@ -624,6 +624,54 @@ describe("持续目标首次加载", () => {
     expect(helpers.shouldCommitThreadGoalLoad(true, goalResult, false, true)).toBe(false);
   });
 
+  it("首次目标读取不能在编辑器打开或保存忙时覆盖草稿，编辑器关闭后才允许恢复", () => {
+    const goalResult = {
+      goal: {
+        threadId: "thread-goal",
+        objective: "远端首载目标",
+        status: "active" as const,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: "2026-08-02T00:00:00.000Z",
+        updatedAt: "2026-08-02T00:00:01.000Z",
+      },
+    };
+
+    expect(helpers.shouldCommitThreadGoalLoad(false, goalResult, true, false)).toBe(false);
+    expect(helpers.shouldCommitThreadGoalLoad(false, goalResult, false, true)).toBe(false);
+    expect(helpers.shouldCommitThreadGoalLoad(false, goalResult, false, false)).toBe(true);
+  });
+
+  it("只在目标编辑器从打开变为关闭时触发恢复读取", () => {
+    expect(helpers.shouldRefreshThreadGoalAfterEditorClose(true, false)).toBe(true);
+    expect(helpers.shouldRefreshThreadGoalAfterEditorClose(false, false)).toBe(false);
+    expect(helpers.shouldRefreshThreadGoalAfterEditorClose(false, true)).toBe(false);
+    expect(helpers.shouldRefreshThreadGoalAfterEditorClose(true, true)).toBe(false);
+  });
+
+  it("目标编辑或写入期间不启动可能回写旧状态的刷新", () => {
+    expect(helpers.shouldStartThreadGoalRefresh(true, false, false)).toBe(true);
+    expect(helpers.shouldStartThreadGoalRefresh(true, true, false)).toBe(false);
+    expect(helpers.shouldStartThreadGoalRefresh(true, false, true)).toBe(false);
+    expect(helpers.shouldStartThreadGoalRefresh(false, false, false)).toBe(false);
+  });
+
+  it("终态目标刷新只接受当前任务的最新请求，旧请求不能覆盖完成状态", () => {
+    expect(helpers.shouldCommitThreadGoalRefresh("thread", "thread", 3, 3, false, false)).toBe(
+      true,
+    );
+    expect(helpers.shouldCommitThreadGoalRefresh("thread", "thread", 2, 3, false, false)).toBe(
+      false,
+    );
+    expect(helpers.shouldCommitThreadGoalRefresh("old", "thread", 3, 3, false, false)).toBe(false);
+    expect(helpers.shouldCommitThreadGoalRefresh("thread", "thread", 3, 3, true, false)).toBe(
+      false,
+    );
+    expect(helpers.shouldCommitThreadGoalRefresh("thread", "thread", 3, 3, false, true)).toBe(
+      false,
+    );
+  });
+
   it("文件根位置仅显示规范根标签，不重复盘符名称", () => {
     expect(helpers.fileRootDisplayLabel({ name: "C:", rootLabel: "C:\\" })).toBe("C:\\");
     expect(helpers.fileRootDisplayLabel({ name: "V:", rootLabel: "V:\\" })).toBe("V:\\");

@@ -8,6 +8,7 @@ import {
   conversationContentItems,
   currentLivePhase,
   groupConversationItems,
+  latestComposerPlanProgress,
   latestActiveReasoning,
   latestPlanProgress,
   latestReasoningText,
@@ -574,9 +575,9 @@ describe("conversation presentation", () => {
       { status: "inProgress", text: "实现界面" },
     ];
     const items: ConversationItem[] = [
-      { id: "plan-old", kind: "plan-progress", steps },
+      { id: "plan-old", kind: "plan-progress", steps, turnId: "turn-old" },
       { id: "answer", kind: "assistant-message", text: "继续处理中" },
-      { id: "plan-live", kind: "plan-progress", steps },
+      { id: "plan-live", kind: "plan-progress", steps, turnId: "turn-live" },
     ];
 
     expect(latestPlanProgress(items)?.id).toBe("plan-live");
@@ -584,6 +585,9 @@ describe("conversation presentation", () => {
     expect(
       latestPlanProgress([...items, { id: "plan-cleared", kind: "plan-progress", steps: [] }]),
     ).toBeUndefined();
+    expect(latestComposerPlanProgress(items, "turn-live")?.id).toBe("plan-live");
+    expect(latestComposerPlanProgress(items, "turn-new")).toBeUndefined();
+    expect(latestComposerPlanProgress(items, undefined)).toBeUndefined();
   });
 
   it("keeps answered questions and the formal plan while removing only a duplicate plan envelope", () => {

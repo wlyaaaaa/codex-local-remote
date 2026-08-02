@@ -149,7 +149,7 @@ import {
   conversationContentItems,
   currentLivePhase,
   groupConversationItems,
-  latestPlanProgress,
+  latestComposerPlanProgress,
   subagentActivityStatusForDisplay,
   workLogSegmentBelongsToActiveTurn,
   workLogHeadline,
@@ -208,7 +208,7 @@ import {
   writeThreadNavigationCache,
 } from "./thread-navigation";
 import { threadLocationLabelForDisplay, threadTitleForDisplay } from "./thread-title";
-import { UserMessageText } from "./UserMessageText";
+import { UserMessageText, userMessageOriginLabel, visibleUserMessageText } from "./UserMessageText";
 import {
   ComposerContextRows,
   ComposerSettingsButton,
@@ -225,13 +225,16 @@ import {
 } from "./ComposerControls";
 import {
   collaborationModeSetting,
+  collaborationModeDisplayLabel,
   CODEX_DEFAULT_SERVICE_TIER,
   composerCapabilityState,
   composerCanSubmit,
   composerDeliveryDecisionForRuntime,
   composerFeatureSupported,
+  composerGoalForDisplay,
   filterThreadApprovals,
   moveQueueItem,
+  queueIdsForReorder,
   serviceTierDisplayLabel,
   serviceTierSetting,
   serviceTierOptions,
@@ -876,7 +879,7 @@ const effortLabels: Readonly<Record<string, string>> = {
   high: "高",
   max: "最高",
   xhigh: "极高",
-  ultra: "Ultra",
+  ultra: "ultra",
 };
 
 function effortLabel(effort: ReasoningEffort): string {
@@ -1070,12 +1073,43 @@ export function shouldSeedThreadFromLateSummary(
 }
 
 export function shouldCommitThreadGoalLoad(
-  goalLoaded: boolean,
+  _goalLoaded: boolean,
   goalResult: { goal: ThreadGoal | null } | undefined,
   editorOpen = false,
   goalBusy = false,
 ): goalResult is { goal: ThreadGoal | null } {
-  return goalResult !== undefined && (!goalLoaded || (!editorOpen && !goalBusy));
+  return goalResult !== undefined && !editorOpen && !goalBusy;
+}
+
+export function shouldRefreshThreadGoalAfterEditorClose(
+  previousEditorOpen: boolean,
+  editorOpen: boolean,
+): boolean {
+  return previousEditorOpen && !editorOpen;
+}
+
+export function shouldCommitThreadGoalRefresh(
+  requestedThreadId: string,
+  currentThreadId: string,
+  requestedGeneration: number,
+  currentGeneration: number,
+  editorOpen: boolean,
+  goalBusy: boolean,
+): boolean {
+  return (
+    requestedThreadId === currentThreadId &&
+    requestedGeneration === currentGeneration &&
+    !editorOpen &&
+    !goalBusy
+  );
+}
+
+export function shouldStartThreadGoalRefresh(
+  goalReadable: boolean,
+  editorOpen: boolean,
+  goalBusy: boolean,
+): boolean {
+  return goalReadable && !editorOpen && !goalBusy;
 }
 
 export function shouldReadThreadGoal(capabilities: ComposerCapabilities | undefined): boolean {
@@ -3459,6 +3493,8 @@ const MessageItem = memo(function MessageItem({
   );
 
   if (item.kind === "user-message") {
+    const originLabel = userMessageOriginLabel(item.text);
+    const copyText = visibleUserMessageText(item.text);
     const imageAttachments =
       item.attachments?.filter((attachment) => attachment.kind === "image") ?? [];
     const fileAttachments =
@@ -3467,9 +3503,11 @@ const MessageItem = memo(function MessageItem({
       <>
         <article className="message message--user">
           <div className="message__meta">
-            <span>你</span>
+            <span>{originLabel}</span>
             {item.createdAt ? <time>{timeAgo(item.createdAt)}</time> : null}
-            {item.text ? <CopyMessageButton label="复制你的消息" text={item.text} /> : null}
+            {copyText ? (
+              <CopyMessageButton label={`复制${originLabel}的消息`} text={copyText} />
+            ) : null}
           </div>
           <div className="message__bubble">
             {item.text ? <UserMessageText>{item.text}</UserMessageText> : null}
@@ -4878,7 +4916,9 @@ function ConversationPageInstance({
   const usagePanelRef = useRef<HTMLElement>(null);
   const goalLoadedRef = useRef(false);
   const goalEditorOpenRef = useRef(false);
+  const previousGoalEditorOpenRef = useRef(false);
   const goalBusyRef = useRef(false);
+  const goalRefreshGenerationRef = useRef(0);
   const productSettingsDirtyRef = useRef(false);
   const productSettingsGenerationRef = useRef(0);
   const collaborationModeDirtyRef = useRef(false);
@@ -4954,7 +4994,11 @@ function ConversationPageInstance({
     id,
     remoteProjectionRef.current.generation,
   );
-  const composerPlan = useMemo(() => latestPlanProgress(thread?.items ?? []), [thread?.items]);
+  const composerPlan = useMemo(
+    () => latestComposerPlanProgress(thread?.items ?? [], thread?.activeTurnId),
+    [thread?.activeTurnId, thread?.items],
+  );
+  const visibleThreadGoal = composerGoalForDisplay(threadGoal);
   const hiddenItemCount = hiddenConversationItemCount(
     thread?.items.length ?? 0,
     visibleItems.length,
@@ -4976,6 +5020,37 @@ function ConversationPageInstance({
     },
     [],
   );
+
+  const refreshThreadGoal = useCallback(async () => {
+    if (
+      !shouldStartThreadGoalRefresh(goalReadable, goalEditorOpenRef.current, goalBusyRef.current)
+    ) {
+      return;
+    }
+    const requestedThreadId = id;
+    const requestedGeneration = ++goalRefreshGenerationRef.current;
+    try {
+      const result = await apiClient.threadGoal(requestedThreadId);
+      if (
+        !shouldCommitThreadGoalRefresh(
+          requestedThreadId,
+          currentIdRef.current,
+          requestedGeneration,
+          goalRefreshGenerationRef.current,
+          goalEditorOpenRef.current,
+          goalBusyRef.current,
+        )
+      ) {
+        return;
+      }
+      setGoalDraft(result.goal?.objective ?? "");
+      setThreadGoal(result.goal ?? undefined);
+      goalLoadedRef.current = true;
+    } catch {
+      // Goal refresh is advisory to the already authoritative thread stream.
+      // A later terminal event, editor close, or ordinary refresh retries it.
+    }
+  }, [apiClient, goalReadable, id]);
 
   const load = useCallback(
     (silent = false) => {
@@ -5038,6 +5113,7 @@ function ConversationPageInstance({
                 snapshot: { threadId: id, revision: 0, items: [] as QueuedTurnItem[] },
                 error: "",
               });
+          const goalRefreshGeneration = goalRefreshGenerationRef.current;
           const goalResultPromise = goalReadable
             ? apiClient.threadGoal(id).catch(() => undefined)
             : Promise.resolve(undefined);
@@ -5201,6 +5277,7 @@ function ConversationPageInstance({
           setApprovalPolicies(approvalPolicyResult);
           setApprovalReviewers(approvalReviewerResult);
           if (
+            goalRefreshGeneration === goalRefreshGenerationRef.current &&
             shouldCommitThreadGoalLoad(
               goalLoadedRef.current,
               goalResult,
@@ -5313,6 +5390,7 @@ function ConversationPageInstance({
     setInterrupting(false);
     setInterruptRequestedTurnId("");
     goalLoadedRef.current = false;
+    goalRefreshGenerationRef.current += 1;
     productSettingsGenerationRef.current += 1;
     productSettingsDirtyRef.current = false;
     collaborationModeDirtyRef.current = false;
@@ -5654,6 +5732,9 @@ function ConversationPageInstance({
     if (missedBufferedEvents || turnFinished) {
       void load(true);
     }
+    if (turnFinished) {
+      void refreshThreadGoal();
+    }
   }, [
     apiClient,
     approvalPolicies,
@@ -5664,9 +5745,19 @@ function ConversationPageInstance({
     liveEvents,
     load,
     queueSupported,
+    refreshThreadGoal,
     state,
     thread,
   ]);
+
+  useEffect(() => {
+    const editorOpen = composerSheet === "goal";
+    const previousEditorOpen = previousGoalEditorOpenRef.current;
+    previousGoalEditorOpenRef.current = editorOpen;
+    if (shouldRefreshThreadGoalAfterEditorClose(previousEditorOpen, editorOpen)) {
+      void refreshThreadGoal();
+    }
+  }, [composerSheet, refreshThreadGoal]);
 
   useEffect(() => {
     let timer: number | undefined;
@@ -6430,7 +6521,7 @@ function ConversationPageInstance({
     try {
       const authoritative = await apiClient.reorderQueue(thread.id, {
         expectedRevision: queueRevision,
-        queueIds: moved.map((candidate) => candidate.id),
+        queueIds: queueIdsForReorder(moved),
       });
       setQueue(authoritative.items);
       setQueueRevision(authoritative.revision);
@@ -6526,8 +6617,10 @@ function ConversationPageInstance({
   }
 
   async function saveGoal() {
-    if (!thread || !goalDraft.trim() || goalBusy) return;
+    if (!thread || !goalDraft.trim() || goalBusy || goalBusyRef.current) return;
+    goalBusyRef.current = true;
     setGoalBusy(true);
+    goalRefreshGenerationRef.current += 1;
     setActionError("");
     try {
       await apiClient.setThreadGoal(thread.id, { objective: goalDraft.trim() });
@@ -6539,13 +6632,17 @@ function ConversationPageInstance({
     } catch (goalError) {
       setActionError(errorMessage(goalError));
     } finally {
+      goalRefreshGenerationRef.current += 1;
+      goalBusyRef.current = false;
       setGoalBusy(false);
     }
   }
 
   async function clearGoal() {
-    if (!thread || goalBusy) return;
+    if (!thread || goalBusy || goalBusyRef.current) return;
+    goalBusyRef.current = true;
     setGoalBusy(true);
+    goalRefreshGenerationRef.current += 1;
     setActionError("");
     try {
       await apiClient.clearThreadGoal(thread.id);
@@ -6556,13 +6653,17 @@ function ConversationPageInstance({
     } catch (goalError) {
       setActionError(errorMessage(goalError));
     } finally {
+      goalRefreshGenerationRef.current += 1;
+      goalBusyRef.current = false;
       setGoalBusy(false);
     }
   }
 
   async function setGoalStatus(status: "active" | "paused") {
-    if (!thread || !threadGoal || goalBusy) return;
+    if (!thread || !threadGoal || goalBusy || goalBusyRef.current) return;
+    goalBusyRef.current = true;
     setGoalBusy(true);
+    goalRefreshGenerationRef.current += 1;
     setActionError("");
     try {
       await apiClient.setThreadGoal(thread.id, { status });
@@ -6574,6 +6675,8 @@ function ConversationPageInstance({
     } catch (goalError) {
       setActionError(errorMessage(goalError));
     } finally {
+      goalRefreshGenerationRef.current += 1;
+      goalBusyRef.current = false;
       setGoalBusy(false);
     }
   }
@@ -6755,8 +6858,12 @@ function ConversationPageInstance({
     (mode) => mode.id === collaborationMode,
   );
   const selectedCollaborationModeLabel =
-    selectedCollaborationMode?.displayName ??
-    (collaborationMode ? runtimeOptionLabel(collaborationMode) : "标准");
+    (selectedCollaborationMode
+      ? collaborationModeDisplayLabel(
+          selectedCollaborationMode.id,
+          selectedCollaborationMode.displayName,
+        )
+      : undefined) ?? (collaborationMode ? runtimeOptionLabel(collaborationMode) : "标准");
   const collaborationModeSupported = collaborationModes.some((mode) => mode.available);
   const quota = quotaPresentation(threadUsage, thread.model);
   const currentRuntimeDetails = [
@@ -6769,8 +6876,14 @@ function ConversationPageInstance({
     thread.approvalPolicy ? approvalPolicyLabel(thread.approvalPolicy) : undefined,
     thread.approvalsReviewer ? approvalReviewerLabel(thread.approvalsReviewer) : undefined,
     thread.collaborationMode
-      ? (collaborationModes.find((mode) => mode.id === thread.collaborationMode)?.displayName ??
-        runtimeOptionLabel(thread.collaborationMode))
+      ? (() => {
+          const mode = collaborationModes.find(
+            (candidate) => candidate.id === thread.collaborationMode,
+          );
+          return mode
+            ? collaborationModeDisplayLabel(mode.id, mode.displayName)
+            : runtimeOptionLabel(thread.collaborationMode);
+        })()
       : undefined,
   ].filter(Boolean);
   const actionStatusCopy = {
@@ -7350,10 +7463,10 @@ function ConversationPageInstance({
                 ) : undefined
               }
               goal={
-                threadGoal ? (
+                visibleThreadGoal ? (
                   <GoalInlineControl
                     busy={goalBusy}
-                    goal={threadGoal}
+                    goal={visibleThreadGoal}
                     onClear={() => void clearGoal()}
                     onOpen={() => setComposerSheet("goal")}
                     onStatusChange={(status) => void setGoalStatus(status)}
@@ -8131,7 +8244,7 @@ function NewThreadPage({
               >
                 {collaborationModes.map((mode) => (
                   <option disabled={!mode.available} key={mode.id} value={mode.id}>
-                    {mode.displayName}
+                    {collaborationModeDisplayLabel(mode.id, mode.displayName)}
                     {mode.available ? "" : "（不可用）"}
                   </option>
                 ))}

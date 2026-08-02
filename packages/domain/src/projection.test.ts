@@ -1019,6 +1019,131 @@ describe("notification projection", () => {
     ]);
   });
 
+  it("uses notification lifecycle as the authoritative activity status", () => {
+    const dynamicTool = {
+      contentItems: [],
+      id: "gmail-tool",
+      tool: "mcp__gmail__search_messages",
+      type: "dynamicToolCall",
+    };
+    const webSearch = { id: "web-search", type: "webSearch" };
+    const imageView = { id: "image-view", path: "C:\\Temp\\evidence.png", type: "imageView" };
+    const fileChange = {
+      changes: [{ kind: { type: "update" }, path: "src/file.ts" }],
+      id: "file-change",
+      status: "inProgress",
+      type: "fileChange",
+    };
+    const projectStatus = (method: "item/started" | "item/completed", item: object) => {
+      const projected = projectAppServerNotification({
+        method,
+        params: { item, threadId: "thread-1", turnId: "turn-tools" },
+      });
+      const payload = projected[0]?.payload as { item?: Array<{ status?: string }> } | undefined;
+      return payload?.item?.[0]?.status;
+    };
+
+    expect(projectStatus("item/started", dynamicTool)).toBe("running");
+    expect(projectStatus("item/completed", dynamicTool)).toBe("complete");
+    expect(projectStatus("item/started", webSearch)).toBe("running");
+    expect(projectStatus("item/completed", webSearch)).toBe("complete");
+    expect(projectStatus("item/started", imageView)).toBe("running");
+    expect(projectStatus("item/completed", imageView)).toBe("complete");
+    expect(projectStatus("item/started", fileChange)).toBe("inProgress");
+    expect(projectStatus("item/completed", fileChange)).toBe("completed");
+    expect(
+      projectStatus("item/completed", {
+        ...dynamicTool,
+        error: { message: "Gmail 连接失败" },
+        status: "failed",
+      }),
+    ).toBe("failed");
+    expect(projectThreadItem(dynamicTool)[0]).toMatchObject({ title: "使用 Gmail 插件" });
+    expect(projectThreadItem(dynamicTool)[0]).not.toHaveProperty("summary");
+    expect(
+      projectThreadItem({
+        contentItems: [],
+        id: "read-task",
+        status: "completed",
+        success: true,
+        tool: "read_thread",
+        type: "dynamicToolCall",
+      })[0],
+    ).toMatchObject({ title: "读取另一个 Codex 任务" });
+    expect(
+      projectThreadItem({
+        contentItems: [],
+        id: "read-task",
+        status: "completed",
+        success: true,
+        tool: "read_thread",
+        type: "dynamicToolCall",
+      })[0],
+    ).not.toHaveProperty("summary");
+    expect(
+      projectThreadItem({
+        contentItems: [],
+        id: "send-task",
+        status: "completed",
+        success: true,
+        tool: "send_message_to_thread",
+        type: "dynamicToolCall",
+      })[0],
+    ).toMatchObject({ title: "向另一个 Codex 任务发送消息" });
+  });
+
+  it("keeps subagent business lifecycle authoritative when an item envelope completes", () => {
+    const projectStatus = (kind: "started" | "interacted" | "interrupted") => {
+      const projected = projectAppServerNotification({
+        method: "item/completed",
+        params: {
+          item: {
+            agentPath: "agents/worker",
+            agentThreadId: "thread-worker",
+            id: `subagent-${kind}`,
+            kind,
+            type: "subAgentActivity",
+          },
+          threadId: "thread-1",
+          turnId: "turn-subagents",
+        },
+      });
+      const payload = projected[0]?.payload as { item?: Array<{ status?: string }> } | undefined;
+      return payload?.item?.[0]?.status;
+    };
+
+    expect(projectStatus("started")).toBe("running");
+    expect(projectStatus("interacted")).toBe("complete");
+    expect(projectStatus("interrupted")).toBe("failed");
+
+    const projectCollabStatus = (status: "running" | "completed" | "errored") => {
+      const projected = projectAppServerNotification({
+        method: "item/completed",
+        params: {
+          item: {
+            agentsStates: {
+              "thread-worker": { message: null, status },
+            },
+            id: `spawn-${status}`,
+            prompt: "Handle a bounded task",
+            receiverThreadIds: ["thread-worker"],
+            status: "completed",
+            tool: "spawnAgent",
+            type: "collabAgentToolCall",
+          },
+          threadId: "thread-1",
+          turnId: "turn-subagents",
+        },
+      });
+      const payload = projected[0]?.payload as { item?: Array<{ status?: string }> } | undefined;
+      return payload?.item?.[0]?.status;
+    };
+
+    expect(projectCollabStatus("running")).toBe("running");
+    expect(projectCollabStatus("completed")).toBe("complete");
+    expect(projectCollabStatus("errored")).toBe("failed");
+  });
+
   it("projects authoritative plan progress for a clickable step indicator", () => {
     expect(
       projectAppServerNotification({

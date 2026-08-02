@@ -198,6 +198,20 @@ export function latestPlanProgress(
   return undefined;
 }
 
+export function latestComposerPlanProgress(
+  items: readonly ConversationItem[],
+  activeTurnId: string | undefined,
+): Extract<ConversationItem, { kind: "plan-progress" }> | undefined {
+  if (!activeTurnId) return undefined;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item?.kind === "plan-progress" && item.turnId === activeTurnId) {
+      return item.steps.length > 0 ? item : undefined;
+    }
+  }
+  return undefined;
+}
+
 export function latestActiveReasoning(
   items: readonly ConversationItem[],
   activeTurnId: string | undefined,

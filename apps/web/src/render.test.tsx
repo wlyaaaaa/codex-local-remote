@@ -364,6 +364,12 @@ describe("界面基础渲染", () => {
         reasoningEffort: "future-effort",
       }),
     ).toBe("future-model · future-effort思考");
+    expect(
+      threadRuntimeSummary({ mode: "managed", model: "5.6 Sol", reasoningEffort: "max" }),
+    ).toBe("5.6 Sol · 最高");
+    expect(
+      threadRuntimeSummary({ mode: "managed", model: "5.6 Sol", reasoningEffort: "ultra" }),
+    ).toBe("5.6 Sol · ultra");
   });
 
   it("首次设置完成并退出后仍保持已配置状态", () => {

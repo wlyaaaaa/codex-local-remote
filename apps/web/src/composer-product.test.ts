@@ -7,6 +7,8 @@ import type {
 } from "@codex-local-remote/contracts";
 import {
   collaborationModeSetting,
+  collaborationModeDisplayLabel,
+  composerGoalForDisplay,
   composerCapabilityState,
   composerCanSubmit,
   composerDeliveryDecision,
@@ -16,6 +18,7 @@ import {
   filterThreadApprovals,
   modelComposerLabel,
   moveQueueItem,
+  queueIdsForReorder,
   serviceTierChoices,
   serviceTierDisplayLabel,
   serviceTierSetting,
@@ -23,6 +26,30 @@ import {
 } from "./composer-product";
 
 describe("移动端 composer 产品契约", () => {
+  it("把已知默认协作模式统一显示为标准，未知模式保留运行时真值", () => {
+    expect(collaborationModeDisplayLabel("default", "Default")).toBe("标准");
+    expect(collaborationModeDisplayLabel("Default", "默认运行模式")).toBe("标准");
+    expect(collaborationModeDisplayLabel("future-mode", "Future Mode")).toBe("Future Mode");
+  });
+
+  it("完成目标退出输入区，其他状态仍保留可操作目标", () => {
+    const goal = {
+      createdAt: "2026-08-02T00:00:00.000Z",
+      objective: "完成最终发布",
+      status: "active" as const,
+      threadId: "thread",
+      timeUsedSeconds: 10,
+      tokensUsed: 20,
+      updatedAt: "2026-08-02T00:00:10.000Z",
+    };
+
+    expect(composerGoalForDisplay(goal)).toBe(goal);
+    expect(composerGoalForDisplay({ ...goal, status: "paused" })).toMatchObject({
+      status: "paused",
+    });
+    expect(composerGoalForDisplay({ ...goal, status: "complete" })).toBeUndefined();
+  });
+
   it("从服务端名称生成完整而紧凑的模型标签，不维护版本表", () => {
     expect(modelComposerLabel("GPT-5.3-Codex-Spark")).toBe("5.3 Spark");
     expect(modelComposerLabel("OpenAI GPT-5.4 mini")).toBe("5.4 mini");
@@ -226,6 +253,50 @@ describe("移动端 composer 产品契约", () => {
       ["two", 2],
     ]);
     expect(queue.map((item) => item.id)).toEqual(["one", "two", "three"]);
+  });
+
+  it("Remote 队列排序跳过已由 Codex 接管的项目", () => {
+    const base = {
+      threadId: "thread",
+      revision: 1,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    };
+    const queue: QueuedTurnItem[] = [
+      {
+        ...base,
+        id: "started",
+        clientUserMessageId: "client-started",
+        state: "started",
+        position: 0,
+      },
+      {
+        ...base,
+        id: "one",
+        clientUserMessageId: "client-one",
+        state: "queued",
+        prompt: "第一条",
+        position: 1,
+      },
+      {
+        ...base,
+        id: "two",
+        clientUserMessageId: "client-two",
+        state: "queued",
+        prompt: "第二条",
+        position: 2,
+      },
+    ];
+
+    const moved = moveQueueItem(queue, "one", 1);
+
+    expect(moved.map((item) => [item.id, item.position])).toEqual([
+      ["started", 0],
+      ["two", 1],
+      ["one", 2],
+    ]);
+    expect(queueIdsForReorder(moved)).toEqual(["two", "one"]);
+    expect(queue.map((item) => item.id)).toEqual(["started", "one", "two"]);
   });
 
   it("线程内审批不因详情 turn id 延迟而隐藏，并把当前 turn 的问题排在前面", () => {

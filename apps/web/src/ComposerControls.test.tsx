@@ -353,11 +353,11 @@ describe("composer 组件结构", () => {
         onStatusChange={() => undefined}
       />,
     );
-    expect(completedHtml).toContain("开始");
+    expect(completedHtml).toBe("");
   });
 
-  it("Ultra 在默认和已选位置统一只显示 Ultra", () => {
-    expect(reasoningEffortLabel("ultra")).toBe("Ultra");
+  it("Ultra 在默认和已选位置统一只显示 ultra", () => {
+    expect(reasoningEffortLabel("ultra")).toBe("ultra");
     expect(reasoningEffortLabel("max")).toBe("最高");
     expect(
       renderToStaticMarkup(
@@ -373,7 +373,7 @@ describe("composer 组件结构", () => {
           serviceTiersSupported={false}
         />,
       ),
-    ).toContain("Ultra");
+    ).toContain("ultra");
     expect(
       renderToStaticMarkup(
         <ComposerSettingsButton
@@ -528,5 +528,98 @@ describe("composer 组件结构", () => {
     expect(html).toContain('aria-label="将排队消息改为当前引导"');
     expect(html).toContain("改为引导");
     expect(html).not.toContain('aria-label="当前回复结束后可手动发送"');
+  });
+
+  it("已由 Codex 接收的 started 回执不再伪装成可删除的排队消息", () => {
+    const item: QueuedTurnItem = {
+      clientUserMessageId: "client-started",
+      createdAt: "2026-08-02T00:00:00.000Z",
+      id: "queue-started",
+      position: 0,
+      revision: 3,
+      state: "started",
+      threadId: "thread",
+      turnId: "turn-active",
+      updatedAt: "2026-08-02T00:00:01.000Z",
+    };
+    const html = renderToStaticMarkup(
+      <QueueShelf
+        items={[item]}
+        onDelete={() => undefined}
+        onDispatch={() => undefined}
+        onMove={() => undefined}
+        onUpdate={() => undefined}
+        running
+      />,
+    );
+
+    expect(html).toBe("");
+  });
+
+  it("started 回执与待发消息并存时只统计和展示真正待发的消息", () => {
+    const base: QueuedTurnItem = {
+      clientUserMessageId: "client-pending",
+      createdAt: "2026-08-02T00:00:00.000Z",
+      id: "queue-pending",
+      position: 1,
+      prompt: "真正等待发送的消息",
+      revision: 4,
+      state: "queued",
+      threadId: "thread",
+      updatedAt: "2026-08-02T00:00:01.000Z",
+    };
+    const { prompt: _pendingPrompt, ...startedBase } = base;
+    const html = renderToStaticMarkup(
+      <QueueShelf
+        items={[
+          {
+            ...startedBase,
+            clientUserMessageId: "client-started",
+            id: "queue-started",
+            position: 0,
+            state: "started",
+            turnId: "turn-active",
+          },
+          base,
+        ]}
+        onDelete={() => undefined}
+        onDispatch={() => undefined}
+        onMove={() => undefined}
+        onUpdate={() => undefined}
+        running
+      />,
+    );
+
+    expect(html).toContain("1 条");
+    expect(html).toContain("真正等待发送的消息");
+    expect(html).not.toContain("这条消息正在由 Codex 处理");
+  });
+
+  it("dispatching 消息明确说明发送边界，不显示一排无法解释的禁用按钮", () => {
+    const item: QueuedTurnItem = {
+      clientUserMessageId: "client-dispatching",
+      createdAt: "2026-08-02T00:00:00.000Z",
+      id: "queue-dispatching",
+      position: 0,
+      prompt: "正在提交的消息",
+      revision: 5,
+      state: "dispatching",
+      threadId: "thread",
+      updatedAt: "2026-08-02T00:00:01.000Z",
+    };
+    const html = renderToStaticMarkup(
+      <QueueShelf
+        items={[item]}
+        onDelete={() => undefined}
+        onDispatch={() => undefined}
+        onMove={() => undefined}
+        onUpdate={() => undefined}
+        running
+      />,
+    );
+
+    expect(html).toContain("正在发送，结果确认前暂不可修改或删除");
+    expect(html).not.toContain('aria-label="删除排队消息"');
+    expect(html).not.toContain('aria-label="编辑排队消息"');
   });
 });

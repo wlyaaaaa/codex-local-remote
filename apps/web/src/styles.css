@@ -2088,6 +2088,38 @@ a:focus-visible {
   white-space: pre-wrap;
 }
 
+.user-message-delegation {
+  display: grid;
+  gap: 6px;
+}
+
+.user-message-text__plain + .user-message-delegation,
+.user-message-delegation + .user-message-delegation {
+  border-top: 1px solid var(--green-200);
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.user-message-delegation > header {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 8px;
+  justify-content: space-between;
+  line-height: 1.35;
+}
+
+.user-message-delegation > header strong {
+  color: var(--green-800);
+}
+
+.user-message-delegation > header a {
+  color: var(--green-700);
+  font-weight: 700;
+  text-decoration: none;
+}
+
 .message__attachments {
   display: grid;
   gap: 6px;
@@ -3818,6 +3850,14 @@ button.attachment-picker__entry,
   font-size: 0.625rem;
   gap: 5px;
   margin-bottom: 3px;
+}
+
+.queue-item__status {
+  color: var(--text-tertiary);
+  display: block;
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  margin-top: 4px;
 }
 .composer__context-bar {
   align-items: center;
@@ -6476,6 +6516,12 @@ button.attachment-picker__entry,
 }
 
 @media (max-width: 700px) {
+  .user-message-delegation > header a {
+    align-items: center;
+    display: inline-flex;
+    min-height: 44px;
+  }
+
   .activity-record > summary,
   .activity-row,
   .activity-row > summary,

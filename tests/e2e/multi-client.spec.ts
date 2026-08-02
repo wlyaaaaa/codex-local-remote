@@ -788,6 +788,7 @@ test.describe("412×915 动态复杂态 UI", () => {
         const shelf = page.getByTestId("queue-shelf");
         await expect(shelf).toBeVisible();
         await expect(page.getByTestId("queue-item")).toHaveCount(3);
+        await expect(shelf).not.toContainText("这条消息正在由 Codex 处理");
         await expect(shelf).toContainText("暂停消息：需要人工恢复");
         await expect(shelf).toContainText("未知消息：发送结果需要确认");
         await page.getByLabel("编辑排队消息").nth(1).click();

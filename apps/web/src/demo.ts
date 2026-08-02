@@ -332,6 +332,7 @@ export const demoThreadDetail: ThreadDetail = {
     {
       id: "plan-current",
       kind: "plan-progress",
+      turnId: "turn-current",
       explanation: "先完成信息流与输入区，再验证审批、文件和移动端布局。",
       steps: [
         { text: "核对运行时契约", status: "completed" },
@@ -584,7 +585,7 @@ export const demoFiles: Record<string, FileListing> = {
 
 export const demoDiagnostics: DiagnosticSnapshot = {
   generatedAt: new Date(now).toISOString(),
-  version: "0.1.3",
+  version: "0.1.4",
   appServerVersion: "0.78.0",
   capabilities: demoCapabilities,
   listener: {

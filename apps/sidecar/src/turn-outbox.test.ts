@@ -321,6 +321,32 @@ describe("DurableTurnOutbox", () => {
     });
   });
 
+  it("removes a started tombstone when only the terminal notification carries the turn id", async () => {
+    const { outbox } = await openOutbox();
+    const accepted = await outbox.enqueue({
+      idempotencyScope: "terminal-identifies-started-turn",
+      input: { prompt: "客户端确认先到，但没有携带 turn id" },
+      threadId: "thread-1",
+    });
+    await outbox.claimNext("thread-1");
+    await outbox.confirmClientMessage(accepted.clientUserMessageId);
+    const pending = await outbox.enqueue({
+      idempotencyScope: "pending-after-unidentified-started-turn",
+      input: { prompt: "上一轮完成后继续发送" },
+      threadId: "thread-1",
+    });
+
+    await outbox.recordTerminal("thread-1", {
+      status: "completed",
+      turnId: "turn-confirmed-by-terminal",
+    });
+
+    await expect(outbox.snapshot("thread-1")).resolves.toMatchObject({
+      items: [{ id: pending.id, state: "queued" }],
+    });
+    await expect(outbox.authorizeIdleDispatch("thread-1")).resolves.toBe("authorized");
+  });
+
   it("captures items and revision atomically before decrypting a snapshot", async () => {
     const directory = await DurableTurnOutbox.createTemporaryDirectoryForTests(
       path.join(os.tmpdir(), "codex-local-remote-outbox-atomic-"),

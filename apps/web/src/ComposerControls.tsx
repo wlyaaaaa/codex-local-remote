@@ -13,6 +13,7 @@ import { Button, Icon, Sheet, type IconName } from "@codex-local-remote/ui";
 import {
   composerToolActions,
   CODEX_DEFAULT_SERVICE_TIER,
+  collaborationModeDisplayLabel,
   modelComposerLabel,
   serviceTierChoices,
   serviceTierOptions,
@@ -29,7 +30,7 @@ const effortLabels: Readonly<Record<string, string>> = {
   high: "高",
   max: "最高",
   xhigh: "极高",
-  ultra: "Ultra",
+  ultra: "ultra",
 };
 
 export function reasoningEffortLabel(effort: ReasoningEffort | undefined): string {
@@ -77,6 +78,7 @@ export function GoalInlineControl({
   onOpen: () => void;
   onStatusChange: (status: "active" | "paused") => void;
 }) {
+  if (goal.status === "complete") return null;
   const active = goal.status === "active";
   const paused = goal.status === "paused";
   const statusAction = active ? "暂停" : paused ? "继续" : "开始";
@@ -648,7 +650,7 @@ export function PlanModeSheet({
             {...(mode.description ? { description: mode.description } : {})}
             disabled={!mode.available}
             key={mode.id}
-            label={mode.displayName}
+            label={collaborationModeDisplayLabel(mode.id, mode.displayName)}
             onClick={() => {
               onChange(mode.id);
               onClose();
@@ -717,7 +719,8 @@ export function QueueShelf({
 }) {
   const [editingId, setEditingId] = useState("");
   const [editDraft, setEditDraft] = useState("");
-  if (!items.length) return null;
+  const pendingItems = items.filter((item) => item.state !== "started");
+  if (!pendingItems.length) return null;
   return (
     <section className="queue-shelf" data-testid="queue-shelf">
       <header>
@@ -725,12 +728,13 @@ export function QueueShelf({
           <Icon name="clock" size={15} />
           消息队列
         </span>
-        <b>{items.length} 条</b>
+        <b>{pendingItems.length} 条</b>
       </header>
       <div className="queue-shelf__items">
-        {items.map((item, index) => {
+        {pendingItems.map((item, index) => {
           const editing = editingId === item.id;
           const busy = busyId === item.id;
+          const dispatching = item.state === "dispatching";
           const recoverable =
             item.state === "queued" || item.state === "paused" || item.state === "ambiguous";
           const dispatchLabel =
@@ -761,86 +765,91 @@ export function QueueShelf({
                     {item.attachments.length} 个文件或文件夹
                   </small>
                 ) : null}
-                <div className="queue-item__actions">
-                  {editing ? (
-                    <>
-                      <Button
-                        disabled={!editDraft.trim() || busy}
-                        onClick={() => {
-                          onUpdate(item, editDraft.trim());
-                          setEditingId("");
-                        }}
-                        size="compact"
-                        variant="primary"
-                      >
-                        保存
-                      </Button>
-                      <Button onClick={() => setEditingId("")} size="compact" variant="ghost">
-                        取消
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <Button
-                        aria-label="上移排队消息"
-                        disabled={!recoverable || index === 0 || busy}
-                        icon="arrow-up"
-                        onClick={() => onMove(item, -1)}
-                        size="icon"
-                        variant="ghost"
-                      />
-                      <Button
-                        aria-label="下移排队消息"
-                        disabled={!recoverable || index === items.length - 1 || busy}
-                        icon="arrow-down"
-                        onClick={() => onMove(item, 1)}
-                        size="icon"
-                        variant="ghost"
-                      />
-                      <Button
-                        aria-label="编辑排队消息"
-                        disabled={!recoverable || !item.prompt || busy}
-                        icon="edit"
-                        onClick={() => {
-                          setEditingId(item.id);
-                          setEditDraft(item.prompt ?? "");
-                        }}
-                        size="icon"
-                        variant="ghost"
-                      />
-                      <Button
-                        aria-label="删除排队消息"
-                        disabled={!recoverable || busy}
-                        icon="trash"
-                        onClick={() => onDelete(item)}
-                        size="icon"
-                        variant="ghost"
-                      />
-                      {canSteer && item.state !== "ambiguous" && onSteer ? (
+                {dispatching ? (
+                  <small className="queue-item__status">正在发送，结果确认前暂不可修改或删除</small>
+                ) : null}
+                {!dispatching ? (
+                  <div className="queue-item__actions">
+                    {editing ? (
+                      <>
                         <Button
-                          aria-label="将排队消息改为当前引导"
-                          className="queue-item__steer"
-                          disabled={!recoverable || busy}
-                          icon="target"
-                          onClick={() => onSteer(item)}
+                          disabled={!editDraft.trim() || busy}
+                          onClick={() => {
+                            onUpdate(item, editDraft.trim());
+                            setEditingId("");
+                          }}
                           size="compact"
-                          variant="secondary"
+                          variant="primary"
                         >
-                          改为引导
+                          保存
                         </Button>
-                      ) : (
+                        <Button onClick={() => setEditingId("")} size="compact" variant="ghost">
+                          取消
+                        </Button>
+                      </>
+                    ) : (
+                      <>
                         <Button
-                          aria-label={dispatchLabel}
-                          disabled={!recoverable || running || busy}
-                          icon="send"
-                          onClick={() => onDispatch(item)}
+                          aria-label="上移排队消息"
+                          disabled={!recoverable || index === 0 || busy}
+                          icon="arrow-up"
+                          onClick={() => onMove(item, -1)}
                           size="icon"
-                          variant="secondary"
+                          variant="ghost"
                         />
-                      )}
-                    </>
-                  )}
-                </div>
+                        <Button
+                          aria-label="下移排队消息"
+                          disabled={!recoverable || index === pendingItems.length - 1 || busy}
+                          icon="arrow-down"
+                          onClick={() => onMove(item, 1)}
+                          size="icon"
+                          variant="ghost"
+                        />
+                        <Button
+                          aria-label="编辑排队消息"
+                          disabled={!recoverable || !item.prompt || busy}
+                          icon="edit"
+                          onClick={() => {
+                            setEditingId(item.id);
+                            setEditDraft(item.prompt ?? "");
+                          }}
+                          size="icon"
+                          variant="ghost"
+                        />
+                        <Button
+                          aria-label="删除排队消息"
+                          disabled={!recoverable || busy}
+                          icon="trash"
+                          onClick={() => onDelete(item)}
+                          size="icon"
+                          variant="ghost"
+                        />
+                        {canSteer && item.state !== "ambiguous" && onSteer ? (
+                          <Button
+                            aria-label="将排队消息改为当前引导"
+                            className="queue-item__steer"
+                            disabled={!recoverable || busy}
+                            icon="target"
+                            onClick={() => onSteer(item)}
+                            size="compact"
+                            variant="secondary"
+                          >
+                            改为引导
+                          </Button>
+                        ) : (
+                          <Button
+                            aria-label={dispatchLabel}
+                            disabled={!recoverable || running || busy}
+                            icon="send"
+                            onClick={() => onDispatch(item)}
+                            size="icon"
+                            variant="secondary"
+                          />
+                        )}
+                      </>
+                    )}
+                  </div>
+                ) : null}
               </div>
             </article>
           );

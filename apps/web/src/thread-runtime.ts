@@ -6,8 +6,9 @@ const effortLabels: Readonly<Record<string, string>> = {
   low: "低",
   medium: "中",
   high: "高",
+  max: "最高",
   xhigh: "极高",
-  ultra: "Ultra（最高）",
+  ultra: "ultra",
 };
 
 export function threadRuntimeSummary(
@@ -18,8 +19,13 @@ export function threadRuntimeSummary(
     return snapshot ? "模型未知 / 思考等级未知（桌面接口未提供）" : "模型未知 / 思考等级未知";
   }
   const model = thread.model ?? (snapshot ? "模型未知（桌面接口未提供）" : "模型未知");
-  const effort = thread.reasoningEffort
-    ? `${effortLabels[thread.reasoningEffort] ?? thread.reasoningEffort}思考`
+  const effortLabel = thread.reasoningEffort
+    ? (effortLabels[thread.reasoningEffort] ?? thread.reasoningEffort)
+    : undefined;
+  const effort = effortLabel
+    ? thread.reasoningEffort === "max" || thread.reasoningEffort === "ultra"
+      ? effortLabel
+      : `${effortLabel}思考`
     : snapshot
       ? "思考等级未知（桌面接口未提供）"
       : "思考等级未知";

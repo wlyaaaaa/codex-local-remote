@@ -1,7 +1,7 @@
 const AMBIENT_BROWSER_CONTEXT_OPEN = '<in-app-browser-context source="ambient-ui-state">';
 const AMBIENT_BROWSER_CONTEXT_CLOSE = "</in-app-browser-context>";
-const CODEX_DELEGATION_OPEN = "<codex_delegation>";
-const CODEX_DELEGATION_CLOSE = "</codex_delegation>";
+const CODEX_DELEGATION_PATTERN =
+  /^[\t\r\n ]*<codex_delegation>[\t\r\n ]*<source_thread_id>([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})<\/source_thread_id>[\t\r\n ]*<input>([\s\S]*?)<\/input>[\t\r\n ]*<\/codex_delegation>[\t\r\n ]*$/giu;
 const MAX_ADJACENT_SEPARATOR_BREAKS = 2;
 const HOST_FILE_MANIFEST =
   /^[ \t]*#{1,6}[ \t]+Files mentioned by the user:[ \t]*(?:\r\n|\n|\r)(?:(?!^[ \t]*#{1,6}[ \t]+My request for Codex:)[\s\S])*?(?=^[ \t]*#{1,6}[ \t]+My request for Codex:)/gmu;
@@ -11,16 +11,62 @@ const HOST_IMAGE_SCAFFOLDING_LINE =
   /^[ \t]*(<image[ \t]+name=\[Image #[0-9]+\][ \t]+path="[^"\r\n]*">|<\/image>)[ \t]*(?:\r\n|\n|\r|$)/gmu;
 
 export function UserMessageText({ children }: { children: string }) {
-  return <div className="user-message-text">{stripInjectedMessageScaffolding(children)}</div>;
+  const delegations = codexDelegationsFromMessage(children);
+  const visible = stripInjectedMessageScaffolding(children);
+  if (delegations.length === 0) {
+    return <div className="user-message-text">{visible}</div>;
+  }
+  return (
+    <div className="user-message-text">
+      {visible ? <div className="user-message-text__plain">{visible}</div> : null}
+      {delegations.map((delegation, index) => (
+        <section className="user-message-delegation" key={`${delegation.sourceThreadId}-${index}`}>
+          <header>
+            <strong>Codex 任务委托（来源未验证）</strong>
+            <a href={`#/threads/${encodeURIComponent(delegation.sourceThreadId)}`}>打开所示任务</a>
+          </header>
+          <div>{delegation.input}</div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+export interface CodexDelegationMessage {
+  input: string;
+  sourceThreadId: string;
+}
+
+export function codexDelegationsFromMessage(message: string): CodexDelegationMessage[] {
+  return codexDelegationsFromCandidate(stripNonDelegationScaffolding(message));
+}
+
+export function userMessageOriginLabel(message: string): string {
+  const delegations = codexDelegationsFromMessage(message);
+  if (delegations.length === 0) return "你";
+  return stripInjectedMessageScaffolding(message)
+    ? "你与任务委托格式"
+    : "任务委托格式（来源未验证）";
+}
+
+export function visibleUserMessageText(message: string): string {
+  const visible = stripInjectedMessageScaffolding(message);
+  const delegated = codexDelegationsFromMessage(message).map((item) => item.input);
+  return [visible, ...delegated].filter(Boolean).join("\n\n");
 }
 
 export function stripInjectedMessageScaffolding(message: string): string {
+  const visible = stripNonDelegationScaffolding(message);
+  if (codexDelegationsFromCandidate(visible).length > 0) return "";
+  return visible;
+}
+
+function stripNonDelegationScaffolding(message: string): string {
   let visible = stripCompleteTaggedBlocks(
     message,
     AMBIENT_BROWSER_CONTEXT_OPEN,
     AMBIENT_BROWSER_CONTEXT_CLOSE,
   );
-  visible = stripCompleteTaggedBlocks(visible, CODEX_DELEGATION_OPEN, CODEX_DELEGATION_CLOSE);
   visible = visible.replace(HOST_FILE_MANIFEST, "");
   visible = visible.replace(
     HOST_REQUEST_HEADING,
@@ -29,6 +75,14 @@ export function stripInjectedMessageScaffolding(message: string): string {
   );
   visible = stripHostImageScaffolding(visible);
   return trimBlankSeparatorLines(visible);
+}
+
+function codexDelegationsFromCandidate(candidate: string): CodexDelegationMessage[] {
+  return [...candidate.matchAll(CODEX_DELEGATION_PATTERN)].flatMap((match) => {
+    const sourceThreadId = match[1]?.trim();
+    const input = match[2]?.trim();
+    return sourceThreadId && input ? [{ input, sourceThreadId }] : [];
+  });
 }
 
 // Kept as a compatibility export for callers and older tests that used the

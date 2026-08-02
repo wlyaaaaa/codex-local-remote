@@ -44,7 +44,7 @@ import { DurableTurnOutbox } from "./turn-outbox.js";
 import { TurnQueueService } from "./turn-queue.js";
 import { TurnQueueDispatcher } from "./turn-queue-dispatcher.js";
 
-const SIDECAR_VERSION = "0.1.3";
+const SIDECAR_VERSION = "0.1.4";
 const DESKTOP_RECONCILIATION_INTERVAL_MS = 5_000;
 const SHARED_CAPABILITY_PROBE_TIMEOUT_MS = 30_000;
 

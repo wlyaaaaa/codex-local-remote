@@ -13,6 +13,17 @@ import type {
 
 export type { PermissionProfileOption, ThreadGoal, ThreadSettingsInput };
 
+export function composerGoalForDisplay(goal: ThreadGoal | undefined): ThreadGoal | undefined {
+  return goal?.status === "complete" ? undefined : goal;
+}
+
+export function collaborationModeDisplayLabel(id: string, displayName?: string): string {
+  const name = displayName?.trim() || id.trim();
+  return /^(?:default|standard)$/iu.test(id.trim()) || /^(?:default|standard)$/iu.test(name)
+    ? "标准"
+    : name;
+}
+
 export type ComposerFeature =
   | "queue"
   | "settings"
@@ -239,13 +250,21 @@ export function moveQueueItem(
   id: string,
   offset: -1 | 1,
 ): QueuedTurnItem[] {
-  const index = queue.findIndex((item) => item.id === id);
+  const movable = queue.filter((item) => item.state !== "started");
+  const index = movable.findIndex((item) => item.id === id);
   if (index < 0) return [...queue];
   const target = index + offset;
-  if (target < 0 || target >= queue.length) return [...queue];
-  const next = [...queue];
-  [next[index], next[target]] = [next[target]!, next[index]!];
-  return next.map((item, position) => ({ ...item, position }));
+  if (target < 0 || target >= movable.length) return [...queue];
+  [movable[index], movable[target]] = [movable[target]!, movable[index]!];
+  let movableIndex = 0;
+  return queue.map((item, position) => {
+    const candidate = item.state === "started" ? item : movable[movableIndex++]!;
+    return { ...candidate, position };
+  });
+}
+
+export function queueIdsForReorder(queue: readonly QueuedTurnItem[]): string[] {
+  return queue.filter((item) => item.state !== "started").map((item) => item.id);
 }
 
 export function filterThreadApprovals(

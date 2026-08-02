@@ -2,9 +2,12 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import {
+  codexDelegationsFromMessage,
   UserMessageText,
   stripInjectedBrowserContext,
   stripInjectedMessageScaffolding,
+  userMessageOriginLabel,
+  visibleUserMessageText,
 } from "./UserMessageText";
 
 const ambientBlock = (body: string, newline = "\n") =>
@@ -78,7 +81,7 @@ describe("用户消息纯文本", () => {
     );
   });
 
-  it("隐藏内部委派包装并保留相邻的真实用户正文", () => {
+  it("保留用户正文中嵌入的委派标签字面量", () => {
     const delegation = [
       "<codex_delegation>",
       "  <source_thread_id>internal</source_thread_id>",
@@ -86,9 +89,88 @@ describe("用户消息纯文本", () => {
       "</codex_delegation>",
     ].join("\n");
 
-    expect(
-      stripInjectedMessageScaffolding(`第一段真实正文\n\n${delegation}\n\n第二段真实正文`),
-    ).toBe("第一段真实正文\n\n第二段真实正文");
+    const literal = `第一段真实正文\n\n${delegation}\n\n第二段真实正文`;
+    expect(stripInjectedMessageScaffolding(literal)).toBe(literal);
+  });
+
+  it("把跨任务委派显示为另一个 Codex 任务发送，而不是伪装成用户消息", () => {
+    const delegation = [
+      "<codex_delegation>",
+      "  <source_thread_id>019fbef1-5998-7dc3-9263-11e7d13b2548</source_thread_id>",
+      "  <input>请继续核实公网状态</input>",
+      "</codex_delegation>",
+    ].join("\n");
+
+    expect(codexDelegationsFromMessage(delegation)).toEqual([
+      {
+        input: "请继续核实公网状态",
+        sourceThreadId: "019fbef1-5998-7dc3-9263-11e7d13b2548",
+      },
+    ]);
+    expect(userMessageOriginLabel(delegation)).toBe("任务委托格式（来源未验证）");
+    expect(visibleUserMessageText(delegation)).toBe("请继续核实公网状态");
+
+    const html = renderToStaticMarkup(<UserMessageText>{delegation}</UserMessageText>);
+    expect(html).toContain("Codex 任务委托（来源未验证）");
+    expect(html).toContain("请继续核实公网状态");
+    expect(html).toContain("#/threads/019fbef1-5998-7dc3-9263-11e7d13b2548");
+    expect(html).toContain("打开所示任务");
+    expect(html).not.toContain("codex_delegation");
+    expect(html).not.toContain("source_thread_id");
+  });
+
+  it("宿主环境包装不能遮住跨任务委派来源", () => {
+    const delegation = [
+      "<codex_delegation>",
+      "  <source_thread_id>019fbef1-5998-7dc3-9263-11e7d13b2548</source_thread_id>",
+      "  <input>请核实包装后的委派</input>",
+      "</codex_delegation>",
+    ].join("\n");
+    const wrapped = `${ambientBlock("Current URL: https://example.invalid/thread")}\n\n## My request for Codex:\n${delegation}`;
+
+    expect(codexDelegationsFromMessage(wrapped)).toEqual([
+      {
+        input: "请核实包装后的委派",
+        sourceThreadId: "019fbef1-5998-7dc3-9263-11e7d13b2548",
+      },
+    ]);
+    expect(userMessageOriginLabel(wrapped)).toBe("任务委托格式（来源未验证）");
+    expect(visibleUserMessageText(wrapped)).toBe("请核实包装后的委派");
+    expect(renderToStaticMarkup(<UserMessageText>{wrapped}</UserMessageText>)).toContain(
+      "打开所示任务",
+    );
+  });
+
+  it("精确合法的委托 XML 也不伪装成已验证来源", () => {
+    const literal = [
+      "<codex_delegation>",
+      "  <source_thread_id>019fbef1-5998-7dc3-9263-11e7d13b2548</source_thread_id>",
+      "  <input>用户也可以输入完全相同的格式</input>",
+      "</codex_delegation>",
+    ].join("\n");
+
+    const html = renderToStaticMarkup(<UserMessageText>{literal}</UserMessageText>);
+    expect(userMessageOriginLabel(literal)).toBe("任务委托格式（来源未验证）");
+    expect(html).toContain("来源未验证");
+    expect(html).not.toContain("由另一个 Codex 任务发送");
+  });
+
+  it("普通用户正文里引用委派标签时不伪装成已验证的跨任务来源", () => {
+    const quoted = [
+      "请解释下面的格式：",
+      "<codex_delegation>",
+      "  <source_thread_id>019fbef1-5998-7dc3-9263-11e7d13b2548</source_thread_id>",
+      "  <input>示例内容</input>",
+      "</codex_delegation>",
+      "以上只是示例。",
+    ].join("\n");
+
+    expect(codexDelegationsFromMessage(quoted)).toEqual([]);
+    expect(userMessageOriginLabel(quoted)).toBe("你");
+    expect(stripInjectedMessageScaffolding(quoted)).toBe(quoted);
+    expect(renderToStaticMarkup(<UserMessageText>{quoted}</UserMessageText>)).toContain(
+      "codex_delegation",
+    );
   });
 
   it("兼容多个自动块和 CRLF，同时保留块之间的真实正文", () => {

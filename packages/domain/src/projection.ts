@@ -278,6 +278,7 @@ export function projectThreadItem(
       return projectFileChanges(id, rawItem, createdAt);
     case "mcpToolCall": {
       const tool = boundedProductText(rawItem.tool, 1_024);
+      const toolSummary = projectedToolSummary(tool);
       const error = isRecord(rawItem.error) ? rawItem.error : {};
       const detail =
         boundedProductText(error.message, 16_384) ?? projectMcpToolResult(rawItem.result);
@@ -286,8 +287,8 @@ export function projectThreadItem(
           id,
           kind: "tool",
           status: projectToolStatus(rawItem.status),
-          title: "使用连接工具",
-          ...(tool === undefined ? {} : { summary: tool }),
+          title: projectedToolTitle(tool, "使用连接工具"),
+          ...(toolSummary === undefined ? {} : { summary: toolSummary }),
           ...(detail === undefined ? {} : { detail }),
           ...timestamp,
         },
@@ -295,14 +296,15 @@ export function projectThreadItem(
     }
     case "dynamicToolCall": {
       const tool = boundedProductText(rawItem.tool, 1_024);
+      const toolSummary = projectedToolSummary(tool);
       const detail = projectDynamicToolContent(rawItem.contentItems);
       return [
         {
           id,
           kind: "tool",
           status: rawItem.success === false ? "failed" : projectToolStatus(rawItem.status),
-          title: "使用工具",
-          ...(tool === undefined ? {} : { summary: tool }),
+          title: projectedToolTitle(tool, "使用工具"),
+          ...(toolSummary === undefined ? {} : { summary: toolSummary }),
           ...(detail === undefined ? {} : { detail }),
           ...timestamp,
         },
@@ -333,7 +335,7 @@ export function projectThreadItem(
           kind: "subagent-activity",
           action,
           agents: threadIds.map((threadId) => ({ threadId })),
-          status: projectToolStatus(rawItem.status),
+          status: projectCollabAgentStatus(agentsStates, rawItem.status),
           ...(summary === undefined ? {} : { summary }),
           ...timestamp,
         },
@@ -550,12 +552,9 @@ export function projectAppServerNotification(
     }
     case "item/started":
     case "item/completed": {
+      const lifecycle = notification.method === "item/started" ? "started" : "completed";
       const item = projectThreadItem(params.item).map((projected) =>
-        notification.method === "item/completed" &&
-        projected.kind === "tool" &&
-        projected.operation === "context-compaction"
-          ? { ...projected, status: "complete" as const }
-          : projected,
+        normalizeProjectedItemLifecycle(projected, lifecycle),
       );
       return item.length === 0
         ? []
@@ -700,6 +699,63 @@ export function projectAppServerNotification(
     default:
       return [];
   }
+}
+
+function normalizeProjectedItemLifecycle(
+  item: ConversationItem,
+  lifecycle: "started" | "completed",
+): ConversationItem {
+  if (item.kind === "subagent-activity") {
+    return item;
+  }
+  if (item.kind === "tool" || item.kind === "image-activity") {
+    if (item.status === "failed") return item;
+    return { ...item, status: lifecycle === "started" ? "running" : "complete" };
+  }
+  if (item.kind === "file-change") {
+    if (item.status === "failed" || item.status === "declined") return item;
+    return { ...item, status: lifecycle === "started" ? "inProgress" : "completed" };
+  }
+  return item;
+}
+
+function projectCollabAgentStatus(
+  agentsStates: Record<string, unknown>,
+  fallbackStatus: unknown,
+): "running" | "complete" | "failed" {
+  const statuses = Object.values(agentsStates).flatMap((state) => {
+    const status = isRecord(state) ? asNonEmptyString(state.status) : undefined;
+    return status === undefined ? [] : [status];
+  });
+  if (statuses.some((status) => ["interrupted", "errored", "notFound"].includes(status))) {
+    return "failed";
+  }
+  if (statuses.some((status) => status === "pendingInit" || status === "running")) {
+    return "running";
+  }
+  if (statuses.some((status) => status === "completed" || status === "shutdown")) {
+    return "complete";
+  }
+  return projectToolStatus(fallbackStatus);
+}
+
+function projectedToolTitle(tool: string | undefined, fallback: string): string {
+  const normalized = tool?.trim().toLocaleLowerCase("en-US") ?? "";
+  if (/(?:^|__)list_threads$/u.test(normalized)) return "列出 Codex 任务";
+  if (/(?:^|__)read_thread$/u.test(normalized)) return "读取另一个 Codex 任务";
+  if (/(?:^|__)send_message_to_thread$/u.test(normalized)) {
+    return "向另一个 Codex 任务发送消息";
+  }
+  if (/(?:^|__)wait_threads$/u.test(normalized)) return "等待 Codex 任务";
+  if (/(?:^|[._-])gmail(?:[._-]|$)|(?:^|__)gmail__/u.test(normalized)) {
+    return "使用 Gmail 插件";
+  }
+  return fallback;
+}
+
+function projectedToolSummary(tool: string | undefined): string | undefined {
+  if (tool === undefined || projectedToolTitle(tool, "")) return undefined;
+  return tool;
 }
 
 function aggregateToolItems(items: ConversationItem[]): ConversationItem[] {

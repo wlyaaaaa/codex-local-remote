@@ -770,7 +770,9 @@ export class DurableTurnOutbox {
         (item) =>
           item.threadId === normalized &&
           item.state === "started" &&
-          (options.turnId === undefined || item.turnId === options.turnId),
+          (options.turnId === undefined ||
+            item.turnId === undefined ||
+            item.turnId === options.turnId),
       );
       const pending = this.#state.items.filter(
         (item) => item.threadId === normalized && item.state === "queued",
