@@ -12,7 +12,10 @@ export default defineConfig({
     // isolated PowerShell processes. Keep enough parallelism for fast unit
     // tests without exhausting process/ACL resources and creating false
     // timeout failures on high-core Windows hosts.
-    maxWorkers: process.platform === "win32" ? 4 : undefined,
+    // GitHub's Windows runner becomes latency-bound when four fixture files
+    // each launch PowerShell/ACL subprocesses at once. Keep local feedback
+    // fast, but reduce CI contention instead of weakening timeout assertions.
+    maxWorkers: process.platform === "win32" ? (process.env.CI === "true" ? 2 : 4) : undefined,
     passWithNoTests: false,
     // The Windows contract tests launch real, isolated pwsh processes. Under a
     // full parallel suite, process creation and ACL inspection can legitimately

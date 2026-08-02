@@ -395,7 +395,7 @@ windowsOnly("Windows fail-open lifecycle", () => {
     expect(readShortcut(shortcutPath).Arguments).toContain("-AllowDesktopRestart");
     expect(readShortcut(shortcutPath).Arguments).not.toContain("-RequestDesktopLaunch");
     expect(readShortcut(shortcutPath).Arguments).not.toContain("-TakeOverExistingNativeDesktop");
-  }, 30_000);
+  });
 
   it("unregisters only the exact launcher, token, and legacy residue", () => {
     register();
