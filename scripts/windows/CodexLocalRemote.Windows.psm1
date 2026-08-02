@@ -4643,15 +4643,34 @@ function Write-AtomicJsonFile {
         [string]$Path,
 
         [Parameter(Mandatory)]
-        [object]$Value
+        [object]$Value,
+
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$ExpectedCurrentSha256,
+
+        [scriptblock]$VerifyWrittenValue,
+
+        [switch]$PassThru
     )
 
     $resolvedPath = [System.IO.Path]::GetFullPath($Path)
     $parent = [System.IO.Path]::GetDirectoryName($resolvedPath)
+    $conditionalWriteRequested =
+        $PSBoundParameters.ContainsKey('ExpectedCurrentSha256')
+    if (($null -ne $VerifyWrittenValue -or $PassThru) -and
+        -not $conditionalWriteRequested) {
+        throw (
+            'Atomic JSON verification and mutation receipts require one ' +
+            'exact ExpectedCurrentSha256 pre-image.'
+        )
+    }
     $mutexName = Get-CodexLocalRemoteAtomicWriteMutexName -Path $resolvedPath
     $writeMutex = [System.Threading.Mutex]::new($false, $mutexName)
     $lockTaken = $false
     $temporary = $null
+    $preImageBytes = $null
+    $replacementSha256 = $null
+    $replacementCommitted = $false
     try {
         try {
             $lockTaken = $writeMutex.WaitOne([TimeSpan]::FromSeconds(15))
@@ -4669,11 +4688,109 @@ function Write-AtomicJsonFile {
         }
         $null = Assert-CodexLocalRemoteDataDirectoryStartupProtection `
             -DataDir $parent
-        $temporary = Join-Path $parent ".$([System.IO.Path]::GetFileName($resolvedPath)).$([guid]::NewGuid().ToString('N')).tmp"
-        $Value |
-            ConvertTo-Json -Depth 20 |
-            Set-Content -LiteralPath $temporary -Encoding utf8NoBOM
-        [System.IO.File]::Move($temporary, $resolvedPath, $true)
+        if ($conditionalWriteRequested) {
+            if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+                throw 'The conditional Atomic JSON pre-image is absent.'
+            }
+            $preImageItem = Get-Item `
+                -LiteralPath $resolvedPath `
+                -Force `
+                -ErrorAction Stop
+            if ($preImageItem.PSIsContainer -or
+                ($preImageItem.Attributes -band
+                    [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                [long]$preImageItem.Length -gt 1048576) {
+                throw 'The conditional Atomic JSON pre-image is not one ordinary bounded file.'
+            }
+            $preImageSha256 = (
+                Get-FileHash `
+                    -LiteralPath $resolvedPath `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash.ToLowerInvariant()
+            if ($preImageSha256 -cne $ExpectedCurrentSha256) {
+                throw 'The conditional Atomic JSON pre-image changed before mutation.'
+            }
+            $preImageBytes =
+                [System.IO.File]::ReadAllBytes($resolvedPath)
+        }
+
+        try {
+            $temporary = Join-Path $parent ".$([System.IO.Path]::GetFileName($resolvedPath)).$([guid]::NewGuid().ToString('N')).tmp"
+            $Value |
+                ConvertTo-Json -Depth 20 |
+                Set-Content -LiteralPath $temporary -Encoding utf8NoBOM
+            $replacementSha256 = (
+                Get-FileHash `
+                    -LiteralPath $temporary `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash.ToLowerInvariant()
+            [System.IO.File]::Move($temporary, $resolvedPath, $true)
+            $replacementCommitted = $true
+            $committedSha256 = (
+                Get-FileHash `
+                    -LiteralPath $resolvedPath `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash.ToLowerInvariant()
+            if ($committedSha256 -cne $replacementSha256) {
+                throw 'The Atomic JSON replacement failed exact hash verification.'
+            }
+            if ($null -ne $VerifyWrittenValue) {
+                $null = & $VerifyWrittenValue `
+                    $resolvedPath `
+                    $replacementSha256
+            }
+            if ($PassThru) {
+                return [pscustomobject]@{
+                    Path = $resolvedPath
+                    PreImageSha256 = $ExpectedCurrentSha256
+                    WrittenSha256 = $replacementSha256
+                }
+            }
+        } catch {
+            $writeFailure = $_
+            if ($conditionalWriteRequested -and
+                $replacementCommitted) {
+                try {
+                    $currentSha256 = (
+                        Get-FileHash `
+                            -LiteralPath $resolvedPath `
+                            -Algorithm SHA256 `
+                            -ErrorAction Stop
+                    ).Hash.ToLowerInvariant()
+                    if ($currentSha256 -cne $replacementSha256) {
+                        throw 'The replacement changed before Atomic JSON rollback.'
+                    }
+                    $temporary = Join-Path $parent ".$([System.IO.Path]::GetFileName($resolvedPath)).$([guid]::NewGuid().ToString('N')).tmp"
+                    [System.IO.File]::WriteAllBytes(
+                        $temporary,
+                        [byte[]]$preImageBytes
+                    )
+                    [System.IO.File]::Move(
+                        $temporary,
+                        $resolvedPath,
+                        $true
+                    )
+                    $restoredSha256 = (
+                        Get-FileHash `
+                            -LiteralPath $resolvedPath `
+                            -Algorithm SHA256 `
+                            -ErrorAction Stop
+                    ).Hash.ToLowerInvariant()
+                    if ($restoredSha256 -cne $ExpectedCurrentSha256) {
+                        throw 'The Atomic JSON pre-image did not restore exactly.'
+                    }
+                } catch {
+                    throw (
+                        "$($writeFailure.Exception.Message) Atomic JSON " +
+                        "rollback failed: $($_.Exception.Message)"
+                    )
+                }
+            }
+            throw $writeFailure
+        }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($temporary)) {
             Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
@@ -5448,7 +5565,12 @@ function Set-CodexLocalRemoteManagedConfiguration {
         [string]$BasePath,
 
         [Parameter(Mandatory)]
-        [string]$TaskName
+        [string]$TaskName,
+
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$ExpectedCurrentSha256,
+
+        [switch]$PassThruMutationReceipt
     )
 
     Assert-CanonicalBasePath -BasePath $BasePath
@@ -5474,15 +5596,49 @@ function Set-CodexLocalRemoteManagedConfiguration {
         TaskName = $TaskName
         UpdatedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
     }
-    Write-AtomicJsonFile -Path $configurationPath -Value $value
-    $readBack = Get-CodexLocalRemoteManagedConfiguration -DataDir $resolvedDataDir
-    if ($null -eq $readBack -or
-        [int]$readBack.SidecarPort -ne $SidecarPort -or
-        [int]$readBack.BrokerPort -ne $BrokerPort -or
-        [int]$readBack.BrokerUpstreamPort -ne $BrokerUpstreamPort -or
-        [string]$readBack.BasePath -cne $BasePath -or
-        [string]$readBack.TaskName -cne $TaskName) {
-        throw 'Managed configuration failed exact read-back verification.'
+    if ($PassThruMutationReceipt -and
+        -not $PSBoundParameters.ContainsKey('ExpectedCurrentSha256')) {
+        throw (
+            'A managed configuration mutation receipt requires one exact ' +
+            'ExpectedCurrentSha256 pre-image.'
+        )
+    }
+    $verification = [pscustomobject]@{ Value = $null }
+    $verifyWrittenValue = {
+        param([string]$Path, [string]$WrittenSha256)
+
+        $null = $Path
+        $null = $WrittenSha256
+        $readBack = Get-CodexLocalRemoteManagedConfiguration `
+            -DataDir $resolvedDataDir
+        if ($null -eq $readBack -or
+            [int]$readBack.SidecarPort -ne $SidecarPort -or
+            [int]$readBack.BrokerPort -ne $BrokerPort -or
+            [int]$readBack.BrokerUpstreamPort -ne $BrokerUpstreamPort -or
+            [string]$readBack.BasePath -cne $BasePath -or
+            [string]$readBack.TaskName -cne $TaskName) {
+            throw 'Managed configuration failed exact read-back verification.'
+        }
+        $verification.Value = $readBack
+    }.GetNewClosure()
+    $mutationReceipt = $null
+    if ($PSBoundParameters.ContainsKey('ExpectedCurrentSha256')) {
+        $mutationReceipt = Write-AtomicJsonFile `
+            -Path $configurationPath `
+            -Value $value `
+            -ExpectedCurrentSha256 $ExpectedCurrentSha256 `
+            -VerifyWrittenValue $verifyWrittenValue `
+            -PassThru
+    } else {
+        Write-AtomicJsonFile -Path $configurationPath -Value $value
+        $null = & $verifyWrittenValue $configurationPath $null
+    }
+    $readBack = $verification.Value
+    if ($PassThruMutationReceipt) {
+        return [pscustomobject]@{
+            Value = $readBack
+            MutationReceipt = $mutationReceipt
+        }
     }
     return $readBack
 }
@@ -8178,7 +8334,12 @@ function Set-CodexLocalRemoteDesiredMode {
         [string]$RuntimeVersionId,
 
         [Parameter(Mandatory)]
-        [string]$RuntimeRoot
+        [string]$RuntimeRoot,
+
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$ExpectedCurrentSha256,
+
+        [switch]$PassThruMutationReceipt
     )
 
     $resolvedRuntimeRoot =
@@ -8191,21 +8352,51 @@ function Set-CodexLocalRemoteDesiredMode {
         RuntimeRoot = $resolvedRuntimeRoot
         IntentId = [Guid]::NewGuid().ToString('N')
     }
-    Write-AtomicJsonFile `
-        -Path (
-            Get-CodexLocalRemoteDesiredModePath -DataDir $DataDir
-        ) `
-        -Value $receipt
-    $readBack = Get-CodexLocalRemoteDesiredMode -DataDir $DataDir
-    if ([string]$readBack.Mode -cne $Mode -or
-        [string]$readBack.RuntimeVersionId -cne $RuntimeVersionId -or
-        -not [string]::Equals(
-            [string]$readBack.RuntimeRoot,
-            $resolvedRuntimeRoot,
-            [System.StringComparison]::OrdinalIgnoreCase
-        ) -or
-        [string]$readBack.IntentId -cne [string]$receipt.IntentId) {
-        throw 'Remote desired mode failed exact read-back verification.'
+    if ($PassThruMutationReceipt -and
+        -not $PSBoundParameters.ContainsKey('ExpectedCurrentSha256')) {
+        throw (
+            'A desired-mode mutation receipt requires one exact ' +
+            'ExpectedCurrentSha256 pre-image.'
+        )
+    }
+    $path = Get-CodexLocalRemoteDesiredModePath -DataDir $DataDir
+    $verification = [pscustomobject]@{ Value = $null }
+    $verifyWrittenValue = {
+        param([string]$WrittenPath, [string]$WrittenSha256)
+
+        $null = $WrittenPath
+        $null = $WrittenSha256
+        $readBack = Get-CodexLocalRemoteDesiredMode -DataDir $DataDir
+        if ([string]$readBack.Mode -cne $Mode -or
+            [string]$readBack.RuntimeVersionId -cne $RuntimeVersionId -or
+            -not [string]::Equals(
+                [string]$readBack.RuntimeRoot,
+                $resolvedRuntimeRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$readBack.IntentId -cne [string]$receipt.IntentId) {
+            throw 'Remote desired mode failed exact read-back verification.'
+        }
+        $verification.Value = $readBack
+    }.GetNewClosure()
+    $mutationReceipt = $null
+    if ($PSBoundParameters.ContainsKey('ExpectedCurrentSha256')) {
+        $mutationReceipt = Write-AtomicJsonFile `
+            -Path $path `
+            -Value $receipt `
+            -ExpectedCurrentSha256 $ExpectedCurrentSha256 `
+            -VerifyWrittenValue $verifyWrittenValue `
+            -PassThru
+    } else {
+        Write-AtomicJsonFile -Path $path -Value $receipt
+        $null = & $verifyWrittenValue $path $null
+    }
+    $readBack = $verification.Value
+    if ($PassThruMutationReceipt) {
+        return [pscustomobject]@{
+            Value = $readBack
+            MutationReceipt = $mutationReceipt
+        }
     }
     return $readBack
 }

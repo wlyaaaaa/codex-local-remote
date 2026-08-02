@@ -27,6 +27,20 @@ upstream listener handle.
 - Re-reads the receipt, listener owner, dead parent and held child identity
   immediately before cleanup. Any missing, ambiguous, foreign or changed
   evidence remains fail-closed.
+- If Windows keeps a loopback listener after both the exact process root and
+  descendants are gone, an internal offline-only recovery can atomically move
+  the managed upstream to a verified empty registered port. It requires the
+  task to be `Ready`, desired mode `Native`, no active runtime, an exact
+  selected task/pointer binding, and changes no other managed configuration.
+- The port, task definition, selected-runtime binding and configuration use the
+  existing rollback transaction; partial migration restores the exact prior
+  task/pointer/configuration pair.
+- Migration holds the same on-demand control fence used by every supported
+  Open/Close path, then rechecks `Ready`, `Native`, runtime silence and empty
+  target ports immediately before changing the task/runtime binding.
+- Managed configuration and desired-mode updates use mutex-scoped
+  compare-and-swap writes with exact post-write verification. A failed
+  verification restores the original bytes before the writer lock is released.
 - Never scans or stops unrelated console hosts, Desktop stdio app-servers or
   listeners outside the configured managed ports.
 

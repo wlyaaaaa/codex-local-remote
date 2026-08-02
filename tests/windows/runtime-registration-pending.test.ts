@@ -12,6 +12,12 @@ const registration = join(
   "windows",
   "Register-CodexLocalRemoteStartup.ps1",
 );
+const onDemandHandoff = join(
+  repositoryRoot,
+  "scripts",
+  "windows",
+  "Invoke-CodexLocalRemoteOnDemandHandoff.ps1",
+);
 const driver = join(
   import.meta.dirname,
   "fixtures",
@@ -21,6 +27,16 @@ const repairDriver = join(
   import.meta.dirname,
   "fixtures",
   "runtime-registration-repair-driver.ps1",
+);
+const offlinePortMigrationDriver = join(
+  import.meta.dirname,
+  "fixtures",
+  "runtime-registration-offline-port-migration-driver.ps1",
+);
+const onDemandFenceDriver = join(
+  import.meta.dirname,
+  "fixtures",
+  "runtime-registration-on-demand-fence-driver.ps1",
 );
 
 function runGate(mode: string) {
@@ -60,6 +76,46 @@ function runRepair(mode: string) {
       sandbox,
       "-Mode",
       mode,
+    ],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+}
+
+function runOfflinePortMigration(mode: string) {
+  return spawnSync(
+    "pwsh",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-File",
+      offlinePortMigrationDriver,
+      "-RegistrationPath",
+      registration,
+      "-Mode",
+      mode,
+    ],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+}
+
+function runOnDemandFence() {
+  const sandbox = join(
+    process.env.TEMP ?? repositoryRoot,
+    `codex-registration-fence-${process.pid}-${crypto.randomUUID()}`,
+  );
+  return spawnSync(
+    "pwsh",
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-File",
+      onDemandFenceDriver,
+      "-RegistrationPath",
+      registration,
+      "-SandboxRoot",
+      sandbox,
     ],
     { cwd: repositoryRoot, encoding: "utf8" },
   );
@@ -161,6 +217,218 @@ windowsOnly("Windows pending runtime registration gate", () => {
     expect(finalAdmission).toContain("Assert-RegistrationOfflineSelectedSupersession");
     expect(finalAdmission).toContain("Test-RegistrationRuntimePointerSnapshot");
     expect(finalAdmission).toContain("TaskXmlSha256");
+  });
+
+  it("keeps offline upstream-port migration hidden, NoStart-only, and supersession-bound", () => {
+    const source = readFileSync(registration, "utf8");
+    expect(source).toMatch(
+      /\[Parameter\(DontShow\)\]\s+\[ValidateRange\(1, 65535\)\]\s+\[int\]\$MigrateOfflineBrokerUpstreamPortFrom/u,
+    );
+    expect(source).toContain("MigrateOfflineBrokerUpstreamPortFrom requires NoStart");
+    expect(source).toContain("MigrateOfflineBrokerUpstreamPortFrom requires the exact");
+    expect(source).toContain("SupersedeOfflineSelectedRuntimeVersionId");
+  });
+
+  it.each([
+    "config-sidecar-drift",
+    "config-broker-drift",
+    "config-base-path-drift",
+    "config-task-name-drift",
+  ])("permits only BrokerUpstreamPort to differ in the old managed config: %s", (mode) => {
+    const result = runOfflinePortMigration(mode);
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    const receipt = JSON.parse(result.stdout) as {
+      Succeeded: boolean;
+      Failure: string | null;
+    };
+    expect(receipt.Succeeded).toBe(false);
+    expect(receipt.Failure).toContain(
+      "permits only the exact managed BrokerUpstreamPort value to change",
+    );
+  });
+
+  it("admits the exact old config and selected task binding at the old port", () => {
+    const result = runOfflinePortMigration("success");
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      Succeeded: true,
+      Failure: null,
+      ReturnedBrokerUpstreamPort: 18795,
+      ExpectedBrokerUpstreamPorts: [18795, 18795],
+      RequestedPortSets: [
+        [18789, 18790, 18792],
+        [18789, 18790, 18792],
+      ],
+      ConfigurationReads: 2,
+      PointerReads: 1,
+      TaskReads: 2,
+      ListenerReads: 2,
+    });
+  });
+
+  it.each(["task-port-drift", "task-version-drift", "task-root-drift", "task-hash-drift"])(
+    "fails closed when the old task is not exactly bound: %s",
+    (mode) => {
+      const result = runOfflinePortMigration(mode);
+      expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+      const receipt = JSON.parse(result.stdout) as {
+        Succeeded: boolean;
+        Failure: string | null;
+      };
+      expect(receipt.Succeeded).toBe(false);
+      expect(receipt.Failure).toContain(
+        "selected task and runtime pointer are not one exact managed binding",
+      );
+    },
+  );
+
+  it.each([
+    ["occupied-sidecar", "18789"],
+    ["occupied-broker", "18790"],
+    ["occupied-upstream", "18792"],
+  ])("requires each new target port to be empty: %s", (mode, port) => {
+    const result = runOfflinePortMigration(mode);
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    const receipt = JSON.parse(result.stdout) as {
+      Succeeded: boolean;
+      Failure: string | null;
+    };
+    expect(receipt.Succeeded).toBe(false);
+    expect(receipt.Failure).toContain("requires all target ports to be empty");
+    expect(receipt.Failure).toContain(port);
+  });
+
+  it.each([
+    ["pointer-drift-after-read", "changed during its double read-back"],
+    ["config-drift-after-read", "changed during its double read-back"],
+    [
+      "task-drift-after-read",
+      "selected task and runtime pointer are not one exact managed binding",
+    ],
+    ["listener-drift-after-read", "changed during its double read-back"],
+  ])("fails closed on migration admission drift: %s", (mode, failure) => {
+    const result = runOfflinePortMigration(mode);
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    const receipt = JSON.parse(result.stdout) as {
+      Succeeded: boolean;
+      Failure: string | null;
+    };
+    expect(receipt.Succeeded).toBe(false);
+    expect(receipt.Failure).toContain(failure);
+  });
+
+  it("routes migration ownership through the existing binding transaction without lifecycle calls", () => {
+    const source = readFileSync(registration, "utf8");
+    const assertionStart = source.indexOf(
+      "function Assert-RegistrationOfflineBrokerUpstreamPortMigration",
+    );
+    const assertionEnd = source.indexOf("function ", assertionStart + 9);
+    expect(assertionStart).toBeGreaterThanOrEqual(0);
+    expect(assertionEnd).toBeGreaterThan(assertionStart);
+    const assertion = source.slice(assertionStart, assertionEnd);
+    expect(assertion).not.toContain("Stop-ScheduledTask");
+    expect(assertion).not.toContain("Start-ScheduledTask");
+    expect(assertion).not.toContain("Unregister-ScheduledTask");
+
+    const ownershipBranch = source.indexOf("Kind = 'offline-upstream-port-migration'");
+    const shouldProcess = source.indexOf("if ($PSCmdlet.ShouldProcess(", ownershipBranch);
+    const finalAdmission = source.indexOf(
+      "Assert-RegistrationOfflineBrokerUpstreamPortMigration",
+      shouldProcess,
+    );
+    const firstMutation = source.indexOf("Protect-CodexLocalRemoteDataDirectory", shouldProcess);
+    const transaction = source.indexOf(
+      "Complete-RegistrationRuntimeBindingTransaction",
+      shouldProcess,
+    );
+    expect(ownershipBranch).toBeGreaterThanOrEqual(0);
+    expect(source.slice(ownershipBranch, shouldProcess)).toContain(
+      "'offline-upstream-port-migration'",
+    );
+    expect(finalAdmission).toBeGreaterThan(shouldProcess);
+    expect(finalAdmission).toBeLessThan(firstMutation);
+    expect(transaction).toBeGreaterThan(firstMutation);
+  });
+
+  it("captures CAS mutation receipts for exact ancillary rollback", () => {
+    const source = readFileSync(registration, "utf8");
+    const finalMigrationGate = source.lastIndexOf(
+      "Assert-RegistrationOfflineBrokerUpstreamPortMigration",
+    );
+    const configWrite = source.indexOf(
+      "Set-CodexLocalRemoteManagedConfiguration",
+      finalMigrationGate,
+    );
+    const configReceipt = source.indexOf("-PassThruMutationReceipt", configWrite);
+    const desiredWrite = source.indexOf("Set-CodexLocalRemoteDesiredMode", configReceipt);
+    const desiredReceipt = source.indexOf("-PassThruMutationReceipt", desiredWrite);
+    expect(configWrite).toBeGreaterThanOrEqual(0);
+    expect(configReceipt).toBeGreaterThan(configWrite);
+    expect(desiredWrite).toBeGreaterThan(configWrite);
+    expect(desiredReceipt).toBeGreaterThan(desiredWrite);
+    const configMutation = source.slice(configWrite, desiredWrite);
+    const desiredMutation = source.slice(desiredWrite, desiredReceipt + 1500);
+    for (const mutation of [configMutation, desiredMutation]) {
+      expect(mutation).toContain("-ExpectedCurrentSha256");
+      expect(mutation).toContain("-PassThruMutationReceipt");
+      expect(mutation).toContain("WrittenSha256");
+    }
+  });
+
+  it("holds the shared on-demand fence across final admission, transaction, and rollback", () => {
+    const source = readFileSync(registration, "utf8");
+    const handoff = readFileSync(onDemandHandoff, "utf8");
+    const mutexName = "Global\\CodexLocalRemote.OnDemandControl.";
+    expect(handoff).toContain(mutexName);
+    expect(source).toContain(mutexName);
+
+    const enterStart = source.indexOf("function Enter-RegistrationOnDemandControlFence");
+    const exitStart = source.indexOf("function Exit-RegistrationOnDemandControlFence", enterStart);
+    const exitEnd = source.indexOf("# Real registration must cross", exitStart);
+    const enter = source.slice(enterStart, exitStart);
+    const exit = source.slice(exitStart, exitEnd);
+    expect(enter).toContain(mutexName);
+    expect(enter).toContain(".WaitOne(");
+    expect(exit).toContain(".ReleaseMutex()");
+    expect(exit).toContain(".Dispose()");
+
+    const acquire = source.indexOf("Enter-RegistrationOnDemandControlFence", exitEnd);
+    const firstMigrationGate = source.indexOf(
+      "Assert-RegistrationOfflineBrokerUpstreamPortMigration",
+      acquire,
+    );
+    const finalMigrationGate = source.lastIndexOf(
+      "Assert-RegistrationOfflineBrokerUpstreamPortMigration",
+    );
+    const transaction = source.indexOf(
+      "Complete-RegistrationRuntimeBindingTransaction",
+      finalMigrationGate,
+    );
+    const rollback = source.indexOf("Restore-RegistrationAncillaryPreImages", transaction);
+    const release = source.lastIndexOf("Exit-RegistrationOnDemandControlFence");
+    expect(enterStart).toBeGreaterThanOrEqual(0);
+    expect(exitStart).toBeGreaterThan(enterStart);
+    expect(acquire).toBeGreaterThan(exitEnd);
+    expect(firstMigrationGate).toBeGreaterThan(acquire);
+    expect(finalMigrationGate).toBeGreaterThan(firstMigrationGate);
+    expect(transaction).toBeGreaterThan(finalMigrationGate);
+    expect(rollback).toBeGreaterThan(transaction);
+    expect(release).toBeGreaterThan(rollback);
+
+    for (const fenceFunction of [enter, exit]) {
+      expect(fenceFunction).not.toContain("Stop-ScheduledTask");
+      expect(fenceFunction).not.toContain("Stop-Process");
+      expect(fenceFunction).not.toContain("taskkill");
+    }
+  });
+
+  it("blocks the shared on-demand mutex until the offline migration fence releases", () => {
+    const result = runOnDemandFence();
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      BlockedWhileHeld: true,
+      AcquiredAfterRelease: true,
+    });
   });
 
   it("heals the proved A/C/B state to active A before the next registration", () => {

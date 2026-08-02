@@ -17,7 +17,9 @@ afterEach(() => {
   }
 });
 
-function run(mode: "duplicate-port" | "round-trip") {
+function run(
+  mode: "duplicate-port" | "round-trip" | "compare-and-swap" | "write-verification-rollback",
+) {
   const directory = mkdtempSync(join(tmpdir(), "codex-local-remote-managed-config-"));
   temporaryDirectories.push(directory);
   const result = spawnSync(
@@ -48,6 +50,19 @@ function run(mode: "duplicate-port" | "round-trip") {
       Signature: string;
       TaskName: string;
     };
+    ConfigContractAvailable?: boolean;
+    ConfigStaleRejected?: boolean;
+    ConfigConcurrentPreserved?: boolean;
+    ConfigReceiptMatches?: boolean;
+    DesiredContractAvailable?: boolean;
+    DesiredStaleRejected?: boolean;
+    DesiredConcurrentPreserved?: boolean;
+    DesiredReceiptMatches?: boolean;
+    ContractAvailable?: boolean;
+    VerificationCalled?: boolean;
+    ReplacementObserved?: boolean;
+    Failure?: string | null;
+    ExactPreImageRestored?: boolean;
   };
 }
 
@@ -65,5 +80,29 @@ windowsOnly("durable managed runtime configuration", () => {
 
   it("rejects a configuration that aliases two managed listeners", () => {
     expect(run("duplicate-port").Rejected).toBe(true);
+  });
+
+  it("uses one mutex-scoped CAS for managed config and desired mode", () => {
+    expect(run("compare-and-swap")).toMatchObject({
+      ConfigContractAvailable: true,
+      ConfigStaleRejected: true,
+      ConfigConcurrentPreserved: true,
+      ConfigReceiptMatches: true,
+      DesiredContractAvailable: true,
+      DesiredStaleRejected: true,
+      DesiredConcurrentPreserved: true,
+      DesiredReceiptMatches: true,
+    });
+  });
+
+  it("restores the exact pre-image when post-replacement verification throws", () => {
+    const receipt = run("write-verification-rollback");
+    expect(receipt).toMatchObject({
+      ContractAvailable: true,
+      VerificationCalled: true,
+      ReplacementObserved: true,
+      ExactPreImageRestored: true,
+    });
+    expect(receipt.Failure).toContain("fixture read-back failed after atomic replacement");
   });
 });

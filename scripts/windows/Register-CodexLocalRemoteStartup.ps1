@@ -36,6 +36,10 @@ param(
     [string]$SupersedeOfflineSelectedRuntimeVersionId,
 
     [Parameter(DontShow)]
+    [ValidateRange(1, 65535)]
+    [int]$MigrateOfflineBrokerUpstreamPortFrom,
+
+    [Parameter(DontShow)]
     [switch]$SkipEnvironmentConfiguration,
 
     [Parameter(DontShow)]
@@ -62,6 +66,8 @@ if ($null -ne $managedConfiguration) {
         $TaskName = [string]$managedConfiguration.TaskName
     }
 }
+$offlineBrokerUpstreamPortMigrationRequested =
+    $PSBoundParameters.ContainsKey('MigrateOfflineBrokerUpstreamPortFrom')
 Assert-CanonicalBasePath -BasePath $BasePath
 
 if ([string]::IsNullOrWhiteSpace($NodePath)) {
@@ -102,6 +108,31 @@ if (-not [string]::IsNullOrWhiteSpace(
         $SupersedeOfflineSelectedRuntimeVersionId
     ) -and -not $NoStart) {
     throw 'SupersedeOfflineSelectedRuntimeVersionId requires NoStart.'
+}
+if ($offlineBrokerUpstreamPortMigrationRequested -and -not $NoStart) {
+    throw 'MigrateOfflineBrokerUpstreamPortFrom requires NoStart.'
+}
+if ($offlineBrokerUpstreamPortMigrationRequested -and
+    [string]::IsNullOrWhiteSpace(
+        $SupersedeOfflineSelectedRuntimeVersionId
+    )) {
+    throw (
+        'MigrateOfflineBrokerUpstreamPortFrom requires the exact ' +
+        'SupersedeOfflineSelectedRuntimeVersionId.'
+    )
+}
+if ($offlineBrokerUpstreamPortMigrationRequested -and
+    $MigrateOfflineBrokerUpstreamPortFrom -eq $BrokerUpstreamPort) {
+    throw 'The old and new Broker upstream ports must be different.'
+}
+if ($offlineBrokerUpstreamPortMigrationRequested -and
+    @(@(
+        $Port,
+        $BrokerPort,
+        $BrokerUpstreamPort,
+        $MigrateOfflineBrokerUpstreamPortFrom
+    ) | Sort-Object -Unique).Count -ne 4) {
+    throw 'Offline Broker upstream port migration requires distinct managed ports.'
 }
 if ($NoStart -and $StartRemoteNow) {
     throw 'NoStart and StartRemoteNow are mutually exclusive.'
@@ -170,6 +201,7 @@ $legacyExpected = Get-LegacyStartupTaskDefinition `
     -DataDir $DataDir `
     -Port $Port `
     -BasePath $BasePath
+$offlineBrokerUpstreamPortMigrationExpected = $null
 function Get-PreHiddenWindowStartupTaskDefinition {
     param([Parameter(Mandatory)][object]$Definition)
 
@@ -265,6 +297,19 @@ function Test-ExistingTaskOwnership {
     $current = Test-ManagedStartupTask -Task $Task -Expected $expected
     if ($current.IsManaged) {
         return [pscustomobject]@{ IsManaged = $true; Kind = 'current'; Mismatches = @() }
+    }
+    if ($null -ne $offlineBrokerUpstreamPortMigrationExpected) {
+        $offlineBrokerUpstreamPortMigration = Test-ManagedStartupTask `
+            -Task $Task `
+            -Expected $offlineBrokerUpstreamPortMigrationExpected
+        if ($offlineBrokerUpstreamPortMigration.IsManaged) {
+            return [pscustomobject]@{
+                IsManaged = $true
+                Kind = 'offline-upstream-port-migration'
+                Mismatches = @()
+                Definition = $expected
+            }
+        }
     }
     $legacyAutoStartExpected =
         Get-LegacyAutoStartStartupTaskDefinitionV5 -Definition $expected
@@ -3107,7 +3152,10 @@ function Get-RegistrationRepairTaskSnapshot {
 function Get-RegistrationRepairTaskEvidence {
     param(
         [Parameter(Mandatory)]
-        [object]$Pointer
+        [object]$Pointer,
+
+        [ValidateRange(1, 65535)]
+        [int]$ExpectedBrokerUpstreamPort = $BrokerUpstreamPort
     )
 
     $snapshot = Get-RegistrationRepairTaskSnapshot
@@ -3120,7 +3168,7 @@ function Get-RegistrationRepairTaskEvidence {
         -DataDir $expected.DataDir `
         -Port $Port `
         -BrokerPort $BrokerPort `
-        -BrokerUpstreamPort $BrokerUpstreamPort `
+        -BrokerUpstreamPort $ExpectedBrokerUpstreamPort `
         -BasePath $BasePath
     $ownership = Test-ManagedStartupTask `
         -Task $task `
@@ -3161,7 +3209,10 @@ function Assert-RegistrationOfflineSelectedSupersession {
 
         [Parameter(Mandatory)]
         [ValidatePattern('^[a-f0-9]{64}$')]
-        [string]$ExpectedVersionId
+        [string]$ExpectedVersionId,
+
+        [ValidateRange(1, 65535)]
+        [int]$ExpectedBrokerUpstreamPort = $BrokerUpstreamPort
     )
 
     if ([string]$SelectedPointer.CurrentVersionId -cne $ExpectedVersionId -or
@@ -3182,7 +3233,8 @@ function Assert-RegistrationOfflineSelectedSupersession {
         throw 'Offline selected runtime supersession requires Native desired mode.'
     }
     $taskEvidence = Get-RegistrationRepairTaskEvidence `
-        -Pointer $SelectedPointer
+        -Pointer $SelectedPointer `
+        -ExpectedBrokerUpstreamPort $ExpectedBrokerUpstreamPort
     if ([string]$taskEvidence.State -cne 'Ready') {
         throw 'Offline selected runtime supersession requires the selected task to be Ready.'
     }
@@ -3195,7 +3247,8 @@ function Assert-RegistrationOfflineSelectedSupersession {
         throw 'The selected runtime pointer changed during offline supersession admission.'
     }
     $freshTaskEvidence = Get-RegistrationRepairTaskEvidence `
-        -Pointer $freshPointer
+        -Pointer $freshPointer `
+        -ExpectedBrokerUpstreamPort $ExpectedBrokerUpstreamPort
     if ([string]$freshTaskEvidence.State -cne 'Ready' -or
         [string]$freshTaskEvidence.XmlSha256 -cne
             [string]$taskEvidence.XmlSha256) {
@@ -3210,6 +3263,88 @@ function Assert-RegistrationOfflineSelectedSupersession {
         throw 'A live active runtime appeared during offline supersession admission.'
     }
     return $freshPointer
+}
+
+function Assert-RegistrationOfflineBrokerUpstreamPortMigration {
+    param(
+        [Parameter(Mandatory)]
+        [object]$SelectedPointer
+    )
+
+    if (-not $offlineBrokerUpstreamPortMigrationRequested) {
+        throw 'Offline Broker upstream port migration was not explicitly requested.'
+    }
+    $testConfiguration = {
+        param([AllowNull()][object]$Configuration)
+
+        return (
+            $null -ne $Configuration -and
+            [int]$Configuration.SidecarPort -eq $Port -and
+            [int]$Configuration.BrokerPort -eq $BrokerPort -and
+            [int]$Configuration.BrokerUpstreamPort -eq
+                $MigrateOfflineBrokerUpstreamPortFrom -and
+            [string]$Configuration.BasePath -ceq $BasePath -and
+            [string]$Configuration.TaskName -ceq $TaskName
+        )
+    }
+    $configuration = Get-CodexLocalRemoteManagedConfiguration `
+        -DataDir $expected.DataDir
+    if (-not (& $testConfiguration $configuration)) {
+        throw (
+            'Offline Broker upstream port migration permits only the exact ' +
+            'managed BrokerUpstreamPort value to change.'
+        )
+    }
+    $taskEvidence = Get-RegistrationRepairTaskEvidence `
+        -Pointer $SelectedPointer `
+        -ExpectedBrokerUpstreamPort (
+            $MigrateOfflineBrokerUpstreamPortFrom
+        )
+    if ([string]$taskEvidence.State -cne 'Ready') {
+        throw 'Offline Broker upstream port migration requires the selected task to be Ready.'
+    }
+    $targetPorts = @($Port, $BrokerPort, $BrokerUpstreamPort)
+    $listeners = @(
+        Get-CodexLocalRemoteTcpListenerSnapshot -LocalPorts $targetPorts
+    )
+    if ($listeners.Count -ne 0) {
+        $occupiedPorts = @(
+            $listeners | ForEach-Object { [int]$_.LocalPort } |
+                Sort-Object -Unique
+        ) -join ', '
+        throw (
+            'Offline Broker upstream port migration requires all target ' +
+            "ports to be empty; listeners remain on $occupiedPorts."
+        )
+    }
+
+    Start-Sleep -Milliseconds 50
+    $freshPointer = Get-CodexLocalRemoteCurrentRuntime `
+        -DataDir $expected.DataDir
+    $freshConfiguration = Get-CodexLocalRemoteManagedConfiguration `
+        -DataDir $expected.DataDir
+    $freshTaskEvidence = Get-RegistrationRepairTaskEvidence `
+        -Pointer $freshPointer `
+        -ExpectedBrokerUpstreamPort (
+            $MigrateOfflineBrokerUpstreamPortFrom
+        )
+    $freshListeners = @(
+        Get-CodexLocalRemoteTcpListenerSnapshot -LocalPorts $targetPorts
+    )
+    if (-not (Test-RegistrationRuntimePointerSnapshot `
+            -Actual $freshPointer `
+            -Expected $SelectedPointer) -or
+        -not (& $testConfiguration $freshConfiguration) -or
+        [string]$freshTaskEvidence.State -cne 'Ready' -or
+        [string]$freshTaskEvidence.XmlSha256 -cne
+            [string]$taskEvidence.XmlSha256 -or
+        $freshListeners.Count -ne 0) {
+        throw (
+            'Offline Broker upstream port migration admission changed ' +
+            'during its double read-back.'
+        )
+    }
+    return $freshTaskEvidence.Definition
 }
 
 function Repair-RegistrationPendingRuntimeFromActive {
@@ -3724,15 +3859,80 @@ function Invoke-RegistrationPendingRuntimeGate {
         )
     }
     if ([string]$action.Action -ceq 'supersede-offline-selected') {
+        $selectedTaskBrokerUpstreamPort = if (
+            $offlineBrokerUpstreamPortMigrationRequested
+        ) {
+            $MigrateOfflineBrokerUpstreamPortFrom
+        } else {
+            $BrokerUpstreamPort
+        }
         $pointer = Assert-RegistrationOfflineSelectedSupersession `
             -SelectedPointer $pointer `
-            -ExpectedVersionId $SupersedeOfflineSelectedVersionId
+            -ExpectedVersionId $SupersedeOfflineSelectedVersionId `
+            -ExpectedBrokerUpstreamPort (
+                $selectedTaskBrokerUpstreamPort
+            )
     }
     return [pscustomobject]@{
         Action = [string]$action.Action
         ActiveRuntime = $active
         Pointer = $pointer
     }
+}
+
+function Enter-RegistrationOnDemandControlFence {
+    if (-not $offlineBrokerUpstreamPortMigrationRequested -or
+        $WhatIfPreference) {
+        return $null
+    }
+    $identity = (
+        [System.IO.Path]::GetFullPath([string]$expected.DataDir)
+    ).ToUpperInvariant()
+    $digest = [Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData(
+            [System.Text.Encoding]::UTF8.GetBytes($identity)
+        )
+    ).ToLowerInvariant()
+    $mutex = [System.Threading.Mutex]::new(
+        $false,
+        "Global\CodexLocalRemote.OnDemandControl.$digest"
+    )
+    $taken = $false
+    try {
+        try {
+            $taken = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
+        } catch [System.Threading.AbandonedMutexException] {
+            $taken = $true
+        }
+        if (-not $taken) {
+            throw 'Timed out waiting for the Remote control execution fence.'
+        }
+        return [pscustomobject]@{
+            Mutex = $mutex
+            Taken = $true
+        }
+    } catch {
+        if (-not $taken) {
+            $mutex.Dispose()
+        }
+        throw
+    }
+}
+
+function Exit-RegistrationOnDemandControlFence {
+    param([AllowNull()][object]$Fence)
+
+    if ($null -eq $Fence) {
+        return
+    }
+    if ([bool]$Fence.Taken) {
+        try {
+            $Fence.Mutex.ReleaseMutex()
+        } catch [System.ApplicationException] {
+            # An abandoned owner is still safe to dispose.
+        }
+    }
+    $Fence.Mutex.Dispose()
 }
 
 # Real registration must cross the elevation boundary before inspecting any
@@ -3744,6 +3944,8 @@ if (-not $WhatIfPreference) {
     Assert-HighestRunLevelRegistrationAllowed
 }
 
+$registrationControlFence = Enter-RegistrationOnDemandControlFence
+try {
 $registrationPendingGate = $null
 if ($useImmutableRuntime) {
     $registrationPendingGate = Invoke-RegistrationPendingRuntimeGate `
@@ -3792,6 +3994,20 @@ if ($useImmutableRuntime) {
         $SupersedeOfflineSelectedRuntimeVersionId
     )) {
     throw 'Pending runtime recovery requires immutable runtime registration.'
+}
+
+if ($offlineBrokerUpstreamPortMigrationRequested) {
+    if ($null -eq $registrationPendingGate -or
+        [string]$registrationPendingGate.Action -cne
+            'supersede-offline-selected') {
+        throw (
+            'Offline Broker upstream port migration requires one exact ' +
+            'offline selected runtime supersession.'
+        )
+    }
+    $offlineBrokerUpstreamPortMigrationExpected =
+        Assert-RegistrationOfflineBrokerUpstreamPortMigration `
+            -SelectedPointer $registrationPendingGate.Pointer
 }
 
 $existing = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
@@ -4157,7 +4373,8 @@ if ($ownership.Kind -cin @(
     'versioned-v5',
     'versioned-auto-start-v5',
     'versioned-v4',
-    'versioned-v3'
+    'versioned-v3',
+    'offline-upstream-port-migration'
 )) {
     if ($PSCmdlet.ShouldProcess(
         $TaskName,
@@ -4181,7 +4398,14 @@ if ($ownership.Kind -cin @(
                     -SelectedPointer $registrationPendingGate.Pointer `
                     -ExpectedVersionId (
                         $SupersedeOfflineSelectedRuntimeVersionId
-                    )
+                    ) `
+                    -ExpectedBrokerUpstreamPort $(if (
+                        $offlineBrokerUpstreamPortMigrationRequested
+                    ) {
+                        $MigrateOfflineBrokerUpstreamPortFrom
+                    } else {
+                        $BrokerUpstreamPort
+                    })
             if (-not [bool]$runtimeBindingBaseline.PointerPresent -or
                 -not (Test-RegistrationRuntimePointerSnapshot `
                     -Actual $runtimeBindingBaseline.Pointer `
@@ -4194,6 +4418,11 @@ if ($ownership.Kind -cin @(
                 )
             }
             $registrationPendingGate.Pointer = $authorizedPointer
+            if ($offlineBrokerUpstreamPortMigrationRequested) {
+                $offlineBrokerUpstreamPortMigrationExpected =
+                    Assert-RegistrationOfflineBrokerUpstreamPortMigration `
+                        -SelectedPointer $authorizedPointer
+            }
         }
         if (-not $SkipEnvironmentConfiguration) {
             Assert-ManagedLauncherShortcutOwnership `
@@ -4252,6 +4481,63 @@ if ($ownership.Kind -cin @(
                 $launcherStatus = $launcher.Status
             }
 
+            if ($ownership.Kind -ceq 'offline-upstream-port-migration') {
+                $authorizedPointer =
+                    Assert-RegistrationOfflineSelectedSupersession `
+                        -SelectedPointer $registrationPendingGate.Pointer `
+                        -ExpectedVersionId (
+                            $SupersedeOfflineSelectedRuntimeVersionId
+                        ) `
+                        -ExpectedBrokerUpstreamPort (
+                            $MigrateOfflineBrokerUpstreamPortFrom
+                        )
+                $registrationPendingGate.Pointer = $authorizedPointer
+                $offlineBrokerUpstreamPortMigrationExpected =
+                    Assert-RegistrationOfflineBrokerUpstreamPortMigration `
+                        -SelectedPointer $authorizedPointer
+                if (-not [bool]$managedConfigurationPreImage.Present -or
+                    (Get-FileHash `
+                        -LiteralPath (
+                            [string]$managedConfigurationPreImage.Path
+                        ) `
+                        -Algorithm SHA256 `
+                        -ErrorAction Stop
+                    ).Hash.ToLowerInvariant() -cne
+                        [string]$managedConfigurationPreImage.Sha256) {
+                    throw (
+                        'The managed configuration changed before the ' +
+                        'offline upstream-port migration transaction.'
+                    )
+                }
+                if (-not [bool]$desiredModePreImage.Present -or
+                    (Get-FileHash `
+                        -LiteralPath ([string]$desiredModePreImage.Path) `
+                        -Algorithm SHA256 `
+                        -ErrorAction Stop
+                    ).Hash.ToLowerInvariant() -cne
+                        [string]$desiredModePreImage.Sha256) {
+                    throw (
+                        'Desired mode changed before the offline ' +
+                        'upstream-port migration transaction.'
+                    )
+                }
+                $migrationTask = Get-ScheduledTask `
+                    -TaskName $TaskName `
+                    -TaskPath '\' `
+                    -ErrorAction SilentlyContinue
+                $migrationOwnership =
+                    Test-ExistingTaskOwnership -Task $migrationTask
+                if ($null -eq $migrationTask -or
+                    -not $migrationOwnership.IsManaged -or
+                    [string]$migrationOwnership.Kind -cne
+                        'offline-upstream-port-migration' -or
+                    [string]$migrationTask.State -cne 'Ready') {
+                    throw (
+                        'The exact offline Broker upstream port migration ' +
+                        'task changed before the runtime binding transaction.'
+                    )
+                }
+            }
             $runtimePointerCommitted = $false
             if ($useImmutableRuntime -and
                 $ownership.Kind -ceq 'current') {
@@ -4511,23 +4797,46 @@ if ($ownership.Kind -cin @(
                 $resultStatus =
                     "upgraded-$($ownership.Kind)-to-versioned-v5"
             }
-            $null = Set-CodexLocalRemoteManagedConfiguration `
-                -DataDir $expected.DataDir `
-                -SidecarPort $Port `
-                -BrokerPort $BrokerPort `
-                -BrokerUpstreamPort $BrokerUpstreamPort `
-                -BasePath $BasePath `
-                -TaskName $TaskName
+            $managedConfigurationMutation = if ($ownership.Kind -ceq
+                'offline-upstream-port-migration') {
+                Set-CodexLocalRemoteManagedConfiguration `
+                    -DataDir $expected.DataDir `
+                    -SidecarPort $Port `
+                    -BrokerPort $BrokerPort `
+                    -BrokerUpstreamPort $BrokerUpstreamPort `
+                    -BasePath $BasePath `
+                    -TaskName $TaskName `
+                    -ExpectedCurrentSha256 (
+                        [string]$managedConfigurationPreImage.Sha256
+                    ) `
+                    -PassThruMutationReceipt
+            } else {
+                Set-CodexLocalRemoteManagedConfiguration `
+                    -DataDir $expected.DataDir `
+                    -SidecarPort $Port `
+                    -BrokerPort $BrokerPort `
+                    -BrokerUpstreamPort $BrokerUpstreamPort `
+                    -BasePath $BasePath `
+                    -TaskName $TaskName
+            }
             if (-not $SkipEnvironmentConfiguration -and
                 $useImmutableRuntime) {
-                $managedConfigurationMutationSha256 = (
-                    Get-FileHash `
+                $managedConfigurationMutationSha256 = if (
+                    $ownership.Kind -ceq
+                        'offline-upstream-port-migration'
+                ) {
+                    [string](
+                        $managedConfigurationMutation.MutationReceipt.WrittenSha256
+                    )
+                } else {
+                    (Get-FileHash `
                         -LiteralPath (
                             Join-Path $expected.DataDir 'managed-config.json'
                         ) `
                         -Algorithm SHA256 `
                         -ErrorAction Stop
-                ).Hash.ToLowerInvariant()
+                    ).Hash.ToLowerInvariant()
+                }
             }
 
             if (-not $SkipEnvironmentConfiguration -and
@@ -4535,28 +4844,51 @@ if ($ownership.Kind -cin @(
                 $desiredRuntime =
                     Get-CodexLocalRemoteCurrentRuntime `
                         -DataDir $expected.DataDir
-                $null = Set-CodexLocalRemoteDesiredMode `
-                    -DataDir $expected.DataDir `
-                    -Mode $(if ($startAfterRegistration) {
-                        'Remote'
-                    } else {
-                        [string]$desiredModePreflight.Mode
-                    }) `
-                    -RuntimeVersionId (
-                        [string]$desiredRuntime.CurrentVersionId
-                    ) `
-                    -RuntimeRoot (
-                        [string]$desiredRuntime.CurrentRoot
+                $desiredModeMutation = if ($ownership.Kind -ceq
+                    'offline-upstream-port-migration') {
+                    Set-CodexLocalRemoteDesiredMode `
+                        -DataDir $expected.DataDir `
+                        -Mode ([string]$desiredModePreflight.Mode) `
+                        -RuntimeVersionId (
+                            [string]$desiredRuntime.CurrentVersionId
+                        ) `
+                        -RuntimeRoot (
+                            [string]$desiredRuntime.CurrentRoot
+                        ) `
+                        -ExpectedCurrentSha256 (
+                            [string]$desiredModePreImage.Sha256
+                        ) `
+                        -PassThruMutationReceipt
+                } else {
+                    Set-CodexLocalRemoteDesiredMode `
+                        -DataDir $expected.DataDir `
+                        -Mode $(if ($startAfterRegistration) {
+                            'Remote'
+                        } else {
+                            [string]$desiredModePreflight.Mode
+                        }) `
+                        -RuntimeVersionId (
+                            [string]$desiredRuntime.CurrentVersionId
+                        ) `
+                        -RuntimeRoot (
+                            [string]$desiredRuntime.CurrentRoot
+                        )
+                }
+                $desiredModeMutationSha256 = if ($ownership.Kind -ceq
+                    'offline-upstream-port-migration') {
+                    [string](
+                        $desiredModeMutation.MutationReceipt.WrittenSha256
                     )
-                $desiredModeMutationSha256 = (
-                    Get-FileHash `
+                } else {
+                    (Get-FileHash `
                         -LiteralPath (
                             Get-CodexLocalRemoteDesiredModePath `
                                 -DataDir $expected.DataDir
                         ) `
                         -Algorithm SHA256 `
                         -ErrorAction Stop
-                ).Hash.ToLowerInvariant()
+                    ).Hash.ToLowerInvariant()
+                }
             }
             if (-not $SkipEnvironmentConfiguration -and
                 $useImmutableRuntime) {
@@ -4917,4 +5249,8 @@ if ($ownership.Kind -cin @(
     ControlDispatcherPath = $controlDispatcherPath
     DataDirectoryAction = [string]$dataDirectoryPlan.Action
     DataDir = [string]$dataDirectoryPlan.DataDir
+}
+} finally {
+    Exit-RegistrationOnDemandControlFence `
+        -Fence $registrationControlFence
 }

@@ -276,6 +276,7 @@ windowsOnly("Windows script hardening", () => {
 
   function funnelEnvironment(mode?: string): NodeJS.ProcessEnv {
     return {
+      CODEX_REMOTE_TEST_FIXTURE: "1",
       LOCALAPPDATA: localAppData,
       MOCK_TAILSCALE_LOG: logFile,
       MOCK_TAILSCALE_MODE: mode,
