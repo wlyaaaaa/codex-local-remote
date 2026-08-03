@@ -45,6 +45,13 @@ describe("Windows Desktop Owner Coordinator v5", () => {
     expect(module).toContain("TargetRuntimeRoot");
     expect(module).toContain("function Invoke-WithCodexDesktopOwnerMutex");
     expect(module).toContain("function New-CodexDesktopOwnerIntentUnderOwnerLock");
+    expect(module).toContain("function Complete-CodexDesktopOwnerIntentUnderOwnerLock");
+    const completeStart = module.indexOf("function Complete-CodexDesktopOwnerIntent");
+    const completeUnderLockStart = module.indexOf(
+      "function Complete-CodexDesktopOwnerIntentUnderOwnerLock",
+    );
+    const complete = module.slice(completeStart, completeUnderLockStart);
+    expect(complete).toContain("Invoke-WithCodexDesktopOwnerMutex");
     expect(launcher).toContain("[switch]$RequestDesktopLaunch");
     expect(launcher).toContain("New-CodexDesktopOwnerIntentUnderOwnerLock");
     expect(launcher).toContain("Wait-CodexDesktopOwnerRequestAcknowledgement");

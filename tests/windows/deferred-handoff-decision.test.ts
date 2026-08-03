@@ -382,6 +382,24 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
     expect(source.match(/-ReadyWaitSeconds \$VerificationTimeoutSeconds/gu)).toHaveLength(2);
     expect(onDemand).toContain("Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier");
 
+    const freshStart = onDemand.slice(
+      onDemand.lastIndexOf("$desiredMode = Set-OnDemandOpenDesiredRemote"),
+      onDemand.lastIndexOf("$startStatus ="),
+    );
+    const desiredRemote = freshStart.indexOf("$desiredMode = Set-OnDemandOpenDesiredRemote");
+    const ownerIntent = freshStart.indexOf("New-CodexDesktopOwnerIntent", desiredRemote);
+    const selectedStart = freshStart.indexOf("Start-OnDemandSelectedRemoteRuntime", ownerIntent);
+    expect(desiredRemote).toBeGreaterThanOrEqual(0);
+    expect(ownerIntent).toBeGreaterThan(desiredRemote);
+    expect(selectedStart).toBeGreaterThan(ownerIntent);
+    expect(freshStart.slice(desiredRemote, ownerIntent)).toContain(
+      "$ImmediateAuthorizedDesktopRestartForOpen",
+    );
+    expect(freshStart.slice(desiredRemote, ownerIntent)).toContain(
+      "$decision -ceq 'start-without-desktop-restart'",
+    );
+    expect(onDemand).toContain("-OwnerIntent $script:immediateFreshStartOwnerIntent");
+
     const mutexAcquire = onDemand.indexOf("$controlMutex.WaitOne");
     const restartBarrier = onDemand.lastIndexOf(
       "Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier",

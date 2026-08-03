@@ -155,6 +155,43 @@ function New-CodexDesktopOwnerIntent {
     return [pscustomobject]@{ IntentId = 'fixture-intent' }
 }
 
+function Read-CodexDesktopOwnerIntent {
+    param(
+        [string]$DataDir,
+        [string]$ExpectedRuntimeVersionId,
+        [string]$ExpectedRuntimeRoot
+    )
+    $null = @($DataDir, $ExpectedRuntimeVersionId, $ExpectedRuntimeRoot)
+    if ([string]::IsNullOrWhiteSpace(
+        [string]$script:fixtureState.CurrentOwnerIntentId
+    )) {
+        return $null
+    }
+    return [pscustomobject]@{
+        IntentId = [string]$script:fixtureState.CurrentOwnerIntentId
+        TargetRuntimeVersionId = [string]$script:fixtureRuntime.CurrentVersionId
+        TargetRuntimeRoot = [string]$script:fixtureRuntime.CurrentRoot
+    }
+}
+
+function Complete-CodexDesktopOwnerIntent {
+    param(
+        [string]$DataDir,
+        [object]$Intent,
+        [string]$RuntimeInvocationId,
+        [string]$Outcome
+    )
+    $null = @($DataDir, $RuntimeInvocationId, $Outcome)
+    if ([string]$script:fixtureState.CurrentOwnerIntentId -cne
+        [string]$Intent.IntentId) {
+        return $false
+    }
+    $script:fixtureState.OwnerIntentCompleteCalls++
+    $script:fixtureState.CompletedOwnerIntentId = [string]$Intent.IntentId
+    $script:fixtureState.CurrentOwnerIntentId = $null
+    return $true
+}
+
 function Get-CimInstance {
     [CmdletBinding()]
     param(
@@ -238,8 +275,15 @@ function Invoke-FixtureCase {
         RootAssertCalls = 0
         DrainCalls = 0
         NativeStartCalls = 0
+        CurrentOwnerIntentId = switch ($Mode) {
+            'start-failed-owner-intent' { 'f' * 32 }
+            'start-failed-newer-owner-intent' { 'e' * 32 }
+            default { $null }
+        }
+        OwnerIntentCompleteCalls = 0
+        CompletedOwnerIntentId = $null
     }
-    $taskStartAttempted = $Mode -cne 'start-failed'
+    $taskStartAttempted = $Mode -cnotlike 'start-failed*'
     $script:fixtureRuntime = [pscustomobject]@{
         CurrentVersionId = 'a' * 64 -join ''
         CurrentRoot = 'C:\fixture\runtime'
@@ -248,12 +292,22 @@ function Invoke-FixtureCase {
         PreviousRoot = 'C:\fixture\prior-runtime'
         PreviousManifestSha256 = 'e' * 64 -join ''
     }
+    $ownerIntent = if ($Mode -like 'start-failed*owner-intent') {
+        [pscustomobject]@{
+            IntentId = 'f' * 32
+            TargetRuntimeVersionId = [string]$script:fixtureRuntime.CurrentVersionId
+            TargetRuntimeRoot = [string]$script:fixtureRuntime.CurrentRoot
+        }
+    } else {
+        $null
+    }
     $result = Invoke-OnDemandOpenCompensation `
         -Runtime $script:fixtureRuntime `
         -Name 'Codex Local Remote' `
         -BrokerPort 18791 `
         -DesktopExecutablePath 'C:\fixture\ChatGPT.exe' `
-        -TaskStartAttempted $taskStartAttempted
+        -TaskStartAttempted $taskStartAttempted `
+        -OwnerIntent $ownerIntent
     return [pscustomobject]@{
         Result = $result
         State = $script:fixtureState
@@ -877,6 +931,10 @@ if (-not $DefinitionOnly) {
 
 [pscustomobject]@{
     StartFailed = Invoke-FixtureCase -Mode 'start-failed'
+    StartFailedOwnerIntent =
+        Invoke-FixtureCase -Mode 'start-failed-owner-intent'
+    StartFailedNewerOwnerIntent =
+        Invoke-FixtureCase -Mode 'start-failed-newer-owner-intent'
     VerifiedIdle = Invoke-FixtureCase -Mode 'verified-idle'
     RunningNotReady = Invoke-FixtureCase -Mode 'running-not-ready'
     UnknownClients = Invoke-FixtureCase -Mode 'unknown-clients'

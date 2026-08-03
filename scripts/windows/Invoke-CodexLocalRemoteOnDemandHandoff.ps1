@@ -82,6 +82,7 @@ $desktopHandoffPreparation = $null
 $compatibleSupervisorResumeProof = $null
 $preparedAttachCompensationHandled = $false
 $script:preparedAttachIntent = $null
+$script:immediateFreshStartOwnerIntent = $null
 $script:desiredModeBeforeOpen = $null
 $script:openDesiredModeIntentId = $null
 $script:openDesiredModeWasCreated = $false
@@ -992,9 +993,17 @@ function Assert-OnDemandDesktopLaunchNotTerminal {
         [ValidatePattern('^[a-f0-9]{32}$')]
         [string]$ExpectedCorrelationId,
 
+        [AllowEmptyString()]
+        [string]$AlternateCorrelationId = '',
+
         [Parameter(Mandatory)]
         [DateTimeOffset]$NotBeforeUtc
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($AlternateCorrelationId) -and
+        $AlternateCorrelationId -cnotmatch '^[a-f0-9]{32}$') {
+        throw 'Alternate Desktop launch correlation identity is invalid.'
+    }
 
     $receipt = Read-CodexDesktopLaunchReceipt -DataDir $DataDir
     if ($null -eq $receipt) {
@@ -1014,7 +1023,10 @@ function Assert-OnDemandDesktopLaunchNotTerminal {
             'remote-launch-unverified'
         ) -or
         $receipt.RemoteEnabled -ne $false -or
-        [string]$receipt.CorrelationId -cne $ExpectedCorrelationId -or
+        ([string]$receipt.CorrelationId -cne $ExpectedCorrelationId -and
+            ([string]::IsNullOrWhiteSpace($AlternateCorrelationId) -or
+                [string]$receipt.CorrelationId -cne
+                    $AlternateCorrelationId)) -or
         $recordedAt -lt $NotBeforeUtc.ToUniversalTime() -or
         $recordedAt -gt [DateTimeOffset]::UtcNow.AddSeconds(5)) {
         return
@@ -3064,7 +3076,10 @@ function Invoke-OnDemandOpenCompensation {
 
         [bool]$TaskStartAttempted,
 
-        [string]$DeferredIntentId
+        [string]$DeferredIntentId,
+
+        [AllowNull()]
+        [object]$OwnerIntent
     )
 
     $taskStopped = $false
@@ -3181,6 +3196,14 @@ function Invoke-OnDemandOpenCompensation {
                 'desired-mode intent and refused to overwrite it.'
             )
         }
+    }
+
+    if ($null -ne $OwnerIntent) {
+        $null = Complete-CodexDesktopOwnerIntent `
+            -DataDir $resolvedDataDir `
+            -Intent $OwnerIntent `
+            -RuntimeInvocationId ('0' * 32) `
+            -Outcome 'open-compensated'
     }
 
     $desktopRoots = @(
@@ -4651,6 +4674,20 @@ try {
                 -AllowActiveTurns:$allowActiveRuntimeRestart
     }
     $desiredMode = Set-OnDemandOpenDesiredRemote -Runtime $runtime
+    if ($ImmediateAuthorizedDesktopRestartForOpen -and
+        $decision -ceq 'start-without-desktop-restart') {
+        # The immediate barrier has already consumed the native Desktop owner.
+        # Publish one exact lease before task activation so a stale preparation
+        # receipt or a delayed first launch cannot make the new supervisor
+        # revoke Remote before its bounded recovery loop can attach Desktop.
+        $script:immediateFreshStartOwnerIntent =
+            New-CodexDesktopOwnerIntent `
+                -DataDir $resolvedDataDir `
+                -TargetRuntimeVersionId (
+                    [string]$runtime.CurrentVersionId
+                ) `
+                -TargetRuntimeRoot ([string]$runtime.CurrentRoot)
+    }
     Write-OnDemandHandoffStatus `
         -Status 'running' `
         -Stage 'remote-start' `
@@ -4676,6 +4713,13 @@ try {
         Assert-OnDemandDesktopLaunchNotTerminal `
             -DataDir $resolvedDataDir `
             -ExpectedCorrelationId ([string]$desiredMode.IntentId) `
+            -AlternateCorrelationId $(if (
+                $null -ne $script:immediateFreshStartOwnerIntent
+            ) {
+                [string]$script:immediateFreshStartOwnerIntent.IntentId
+            } else {
+                ''
+            }) `
             -NotBeforeUtc $script:onDemandOperationStartedAtUtc
         $remoteState = Get-OnDemandRemoteState `
             -Runtime $runtime `
@@ -4751,7 +4795,8 @@ try {
                  -TaskStartAttempted $remoteTaskStartAttemptedForOpen `
                  -DeferredIntentId (
                     [string]$script:deferredIntentIdForCompensation
-                 )
+                 ) `
+                 -OwnerIntent $script:immediateFreshStartOwnerIntent
             $nativeModeConfirmedAfterFailure = (
                 ([string]$openFailureCompensation.Status -ceq
                     'native-restored' -and

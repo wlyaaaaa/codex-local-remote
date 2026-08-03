@@ -5372,6 +5372,43 @@ function Complete-CodexDesktopOwnerIntent {
     )
 
     $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $null = Invoke-WithCodexDesktopOwnerMutex `
+        -DataDir $resolvedDataDir `
+        -Action {
+            Complete-CodexDesktopOwnerIntentUnderOwnerLock `
+                -DataDir $resolvedDataDir `
+                -Intent $Intent `
+                -RuntimeInvocationId $RuntimeInvocationId `
+                -Outcome $Outcome
+        }
+}
+
+function Complete-CodexDesktopOwnerIntentUnderOwnerLock {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [object]$Intent,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeInvocationId,
+
+        [Parameter(Mandatory)]
+        [string]$Outcome
+    )
+
+    $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)
+    $path = Get-CodexDesktopOwnerIntentPath -DataDir $resolvedDataDir
+    $current = Read-CodexDesktopOwnerIntent `
+        -DataDir $resolvedDataDir `
+        -ExpectedRuntimeVersionId ([string]$Intent.TargetRuntimeVersionId) `
+        -ExpectedRuntimeRoot ([string]$Intent.TargetRuntimeRoot)
+    if ($null -eq $current -or
+        [string]$current.IntentId -cne [string]$Intent.IntentId) {
+        return $false
+    }
     Write-AtomicJsonFile `
         -Path (Join-Path $resolvedDataDir 'desktop-owner-intent-last.json') `
         -Value ([ordered]@{
@@ -5382,15 +5419,8 @@ function Complete-CodexDesktopOwnerIntent {
             Outcome = $Outcome
             RecordedAtUtc = [DateTime]::UtcNow.ToString('O')
         })
-    $path = Get-CodexDesktopOwnerIntentPath -DataDir $resolvedDataDir
-    $current = Read-CodexDesktopOwnerIntent `
-        -DataDir $resolvedDataDir `
-        -ExpectedRuntimeVersionId ([string]$Intent.TargetRuntimeVersionId) `
-        -ExpectedRuntimeRoot ([string]$Intent.TargetRuntimeRoot)
-    if ($null -ne $current -and
-        [string]$current.IntentId -ceq [string]$Intent.IntentId) {
-        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-    }
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+    return $true
 }
 
 function Test-CodexDesktopOwnerResumeGap {

@@ -218,6 +218,20 @@ $wrongCorrelation = Assert-OnDemandDesktopLaunchNotTerminal `
     -DataDir $SandboxRoot `
     -ExpectedCorrelationId $correlationId `
     -NotBeforeUtc $notBefore
+$alternateCorrelationFailedFast = $false
+try {
+    Assert-OnDemandDesktopLaunchNotTerminal `
+        -DataDir $SandboxRoot `
+        -ExpectedCorrelationId $correlationId `
+        -AlternateCorrelationId ('d' * 32) `
+        -NotBeforeUtc $notBefore
+} catch {
+    $alternateCorrelationFailedFast = (
+        [string]$_.Exception.Data[
+            'CodexLocalRemote.DesktopLaunchStatus'
+        ] -ceq 'launched-native'
+    )
+}
 
 Write-FixtureReceipt `
     -Status 'launched-native' `
@@ -236,6 +250,7 @@ $invalidAllowlist = Read-CodexDesktopLaunchReceipt -DataDir $SandboxRoot
     Unverified = $unverified
     Stale = $stale
     WrongCorrelation = $wrongCorrelation
+    AlternateCorrelationFailedFast = $alternateCorrelationFailedFast
     InvalidAllowlist = $invalidAllowlist
     ErrorData = [pscustomobject]@{
         Status = [string]$terminalError.Data[

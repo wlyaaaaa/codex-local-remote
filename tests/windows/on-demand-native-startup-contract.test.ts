@@ -439,6 +439,28 @@ describe("Windows native-default on-demand Remote contract", () => {
         },
         State: { NativeStartCalls: 1 },
       },
+      StartFailedOwnerIntent: {
+        Result: {
+          Status: "native-restored",
+          DesktopRestored: true,
+        },
+        State: {
+          OwnerIntentCompleteCalls: 1,
+          CompletedOwnerIntentId: "f".repeat(32),
+          CurrentOwnerIntentId: null,
+        },
+      },
+      StartFailedNewerOwnerIntent: {
+        Result: {
+          Status: "native-restored",
+          DesktopRestored: true,
+        },
+        State: {
+          OwnerIntentCompleteCalls: 0,
+          CompletedOwnerIntentId: null,
+          CurrentOwnerIntentId: "e".repeat(32),
+        },
+      },
       VerifiedIdle: {
         Result: {
           Status: "native-restored",

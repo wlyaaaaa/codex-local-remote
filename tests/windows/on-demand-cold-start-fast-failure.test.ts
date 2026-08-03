@@ -42,6 +42,7 @@ interface FixtureResult {
   } | null;
   Stale: null;
   WrongCorrelation: null;
+  AlternateCorrelationFailedFast: boolean;
   InvalidAllowlist: null;
   ErrorData: {
     Status: string;
@@ -88,6 +89,7 @@ windowsOnly("Windows cold-start Open fast failure", () => {
       });
       expect(receipt.Stale).toBeNull();
       expect(receipt.WrongCorrelation).toBeNull();
+      expect(receipt.AlternateCorrelationFailedFast).toBe(true);
       expect(receipt.InvalidAllowlist).toBeNull();
       expect(receipt.ErrorData).toEqual({
         Status: "launched-native",
@@ -147,7 +149,23 @@ windowsOnly("Windows cold-start Open fast failure", () => {
     expect(remoteStateRead).toBeGreaterThan(terminalRead);
     expect(coldStart).toContain("Assert-OnDemandDesktopLaunchNotTerminal");
     expect(coldStart.match(/Start-OnDemandSelectedRemoteRuntime/gu)).toHaveLength(1);
-    expect(coldStart).not.toContain("New-CodexDesktopOwnerIntent");
+    const immediateLeaseGate = coldStart.indexOf("if ($ImmediateAuthorizedDesktopRestartForOpen");
+    const immediateOwnerIntent = coldStart.indexOf(
+      "New-CodexDesktopOwnerIntent",
+      immediateLeaseGate,
+    );
+    const taskStart = coldStart.indexOf(
+      "Start-OnDemandSelectedRemoteRuntime",
+      immediateOwnerIntent,
+    );
+    expect(immediateLeaseGate).toBeGreaterThanOrEqual(0);
+    expect(immediateOwnerIntent).toBeGreaterThan(immediateLeaseGate);
+    expect(taskStart).toBeGreaterThan(immediateOwnerIntent);
+    expect(coldStart.slice(immediateLeaseGate, immediateOwnerIntent)).toContain(
+      "$decision -ceq 'start-without-desktop-restart'",
+    );
+    expect(coldStart).toContain("-AlternateCorrelationId");
+    expect(coldStart).toContain("$script:immediateFreshStartOwnerIntent.IntentId");
     expect(initialLaunch).toContain("-LaunchCorrelationId");
     expect(initialLaunch).toContain("$initialDesiredMode.IntentId");
     expect(backgroundRecovery).toContain("$backgroundRecoveryDesiredMode =");
