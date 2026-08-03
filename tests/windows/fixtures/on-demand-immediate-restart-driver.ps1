@@ -6,6 +6,10 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet(
         'barrier-current',
+        'barrier-bound-stdio',
+        'barrier-foreign-stdio',
+        'barrier-multiple-stdio',
+        'barrier-stdio-ownership-drift',
         'barrier-cancelled',
         'barrier-legacy-native-rewrite',
         'barrier-remote-superseded',
@@ -74,6 +78,8 @@ $script:IdentityOpenCalls = 0
 $script:NativeStartCalls = 0
 $script:OpenContinuationCalls = 0
 $script:PortWaitCalls = 0
+$script:RootStopCalls = 0
+$script:GroupStopCalls = 0
 $script:StopCalls = 0
 $script:WaitCalls = 0
 
@@ -192,6 +198,31 @@ function Stop-OnDemandDesktopRoot {
     )
     $null = $DesktopRoot
     $null = $ExpectedDesktopPath
+    $script:RootStopCalls++
+    $script:StopCalls++
+}
+
+function Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot {
+    param([string]$DesktopExecutablePath)
+    $null = $DesktopExecutablePath
+    return [pscustomobject]@{
+        DesktopRootProcessId = 1234
+        DesktopRootStartTimeUtcTicks = 123456789
+        DesktopAppServerProcessId = if (
+            $Mode -ceq 'barrier-stdio-ownership-drift'
+        ) { 3456 } else { 2345 }
+        DesktopAppServerStartTimeUtcTicks = 123456789
+    }
+}
+
+function Stop-OnDemandDesktopProcessGroup {
+    param(
+        [object]$Preparation,
+        [string]$ExpectedDesktopPath
+    )
+    $null = $Preparation
+    $null = $ExpectedDesktopPath
+    $script:GroupStopCalls++
     $script:StopCalls++
 }
 
@@ -317,6 +348,44 @@ try {
             CreationDate = '20260731120000.000000-000'
             ExecutablePath = $expectedDesktopPath
         }
+        $independentStdioProcesses = switch ($Mode) {
+            'barrier-bound-stdio' {
+                @([pscustomobject]@{
+                    ProcessId = 2345
+                    ParentProcessId = 1234
+                    CreationDate = '20260731120000.000000-000'
+                })
+            }
+            'barrier-foreign-stdio' {
+                @([pscustomobject]@{
+                    ProcessId = 2345
+                    ParentProcessId = 9999
+                    CreationDate = '20260731120000.000000-000'
+                })
+            }
+            'barrier-multiple-stdio' {
+                @(
+                    [pscustomobject]@{
+                        ProcessId = 2345
+                        ParentProcessId = 1234
+                        CreationDate = '20260731120000.000000-000'
+                    },
+                    [pscustomobject]@{
+                        ProcessId = 3456
+                        ParentProcessId = 1234
+                        CreationDate = '20260731120000.000000-000'
+                    }
+                )
+            }
+            'barrier-stdio-ownership-drift' {
+                @([pscustomobject]@{
+                    ProcessId = 2345
+                    ParentProcessId = 1234
+                    CreationDate = '20260731120000.000000-000'
+                })
+            }
+            default { @() }
+        }
         try {
             $startupTaskState = if (
                 $Mode -ceq 'barrier-ready-native-superseded'
@@ -330,7 +399,7 @@ try {
                 -StartupTask ([pscustomobject]@{ State = $startupTaskState }) `
                 -Configuration $configuration `
                 -DesktopRoots @($desktopRoot) `
-                -IndependentStdioProcesses @() `
+                -IndependentStdioProcesses @($independentStdioProcesses) `
                 -ExpectedDesktopPath $expectedDesktopPath `
                 -ExpectedIntentId ('a' * 32) `
                 -Name 'Codex Local Remote' `
@@ -397,6 +466,8 @@ try {
     NativeStartCalls = $script:NativeStartCalls
     OpenContinuationCalls = $script:OpenContinuationCalls
     PortWaitCalls = $script:PortWaitCalls
+    RootStopCalls = $script:RootStopCalls
+    GroupStopCalls = $script:GroupStopCalls
     StopCalls = $script:StopCalls
     WaitCalls = $script:WaitCalls
     Succeeded = $succeeded

@@ -186,6 +186,10 @@ function inspectWorkerGuard(
 function inspectImmediateRestart(
   mode:
     | "barrier-current"
+    | "barrier-bound-stdio"
+    | "barrier-foreign-stdio"
+    | "barrier-multiple-stdio"
+    | "barrier-stdio-ownership-drift"
     | "barrier-cancelled"
     | "barrier-legacy-native-rewrite"
     | "barrier-remote-superseded"
@@ -214,6 +218,8 @@ function inspectImmediateRestart(
   NativeStartCalls: number;
   OpenContinuationCalls: number;
   PortWaitCalls: number;
+  RootStopCalls: number;
+  GroupStopCalls: number;
   StopCalls: number;
   WaitCalls: number;
   Succeeded: boolean;
@@ -399,9 +405,51 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
       NativeDesktopWasClosed: true,
       OpenContinuationCalls: 1,
       PortWaitCalls: 1,
+      RootStopCalls: 1,
+      GroupStopCalls: 0,
       StopCalls: 1,
       WaitCalls: 1,
       Succeeded: true,
+    });
+    expect(inspectImmediateRestart("barrier-bound-stdio")).toMatchObject({
+      DesiredModeWrites: ["Native", "Remote"],
+      DrainCalls: 1,
+      NativeDesktopWasClosed: true,
+      OpenContinuationCalls: 1,
+      RootStopCalls: 0,
+      GroupStopCalls: 1,
+      StopCalls: 1,
+      Succeeded: true,
+    });
+    expect(inspectImmediateRestart("barrier-foreign-stdio")).toMatchObject({
+      DesiredModeReadCalls: 0,
+      DesiredModeWrites: [],
+      DrainCalls: 0,
+      Error:
+        "The deferred Desktop restart barrier found a stdio app-server outside the exact package Desktop root.",
+      NativeDesktopWasClosed: false,
+      StopCalls: 0,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("barrier-multiple-stdio")).toMatchObject({
+      DesiredModeReadCalls: 0,
+      DesiredModeWrites: [],
+      DrainCalls: 0,
+      Error:
+        "The deferred Desktop restart barrier found multiple independent stdio app-servers and refused to guess Desktop ownership.",
+      NativeDesktopWasClosed: false,
+      StopCalls: 0,
+      Succeeded: false,
+    });
+    expect(inspectImmediateRestart("barrier-stdio-ownership-drift")).toMatchObject({
+      DesiredModeReadCalls: 0,
+      DesiredModeWrites: [],
+      DrainCalls: 0,
+      Error:
+        "The deferred Desktop restart barrier ownership snapshot changed before Desktop shutdown.",
+      NativeDesktopWasClosed: false,
+      StopCalls: 0,
+      Succeeded: false,
     });
     expect(inspectImmediateRestart("barrier-legacy-native-rewrite")).toMatchObject({
       CompensationCalls: 0,

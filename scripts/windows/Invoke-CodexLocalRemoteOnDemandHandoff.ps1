@@ -3594,11 +3594,46 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
             "verified package root, found $($DesktopRoots.Count)."
         )
     }
-    if ($IndependentStdioProcesses.Count -ne 0) {
+    if ($IndependentStdioProcesses.Count -gt 1) {
         throw (
-            'The deferred Desktop restart barrier found an independent ' +
-            'stdio app-server and refused to change Desktop ownership.'
+            'The deferred Desktop restart barrier found multiple independent ' +
+            'stdio app-servers and refused to guess Desktop ownership.'
         )
+    }
+    $desktopOwnership = $null
+    if ($IndependentStdioProcesses.Count -eq 1 -and
+        [int]$IndependentStdioProcesses[0].ParentProcessId -ne
+            [int]$DesktopRoots[0].ProcessId) {
+        throw (
+            'The deferred Desktop restart barrier found a stdio app-server ' +
+            'outside the exact package Desktop root.'
+        )
+    }
+    if ($IndependentStdioProcesses.Count -eq 1) {
+        $desktopOwnership =
+            Get-CodexLocalRemoteNativeDesktopOwnershipSnapshot `
+                -DesktopExecutablePath $ExpectedDesktopPath
+        $desktopRootCreation = Get-ProcessCreationIdentity `
+            -CreationDate $DesktopRoots[0].CreationDate
+        $desktopAppServerCreation = Get-ProcessCreationIdentity `
+            -CreationDate $IndependentStdioProcesses[0].CreationDate
+        if ([int]$desktopOwnership.DesktopRootProcessId -ne
+                [int]$DesktopRoots[0].ProcessId -or
+            [Math]::Abs(
+                [long]$desktopOwnership.DesktopRootStartTimeUtcTicks -
+                [long]$desktopRootCreation.CreationDateUtcTicks
+            ) -gt [TimeSpan]::FromSeconds(2).Ticks -or
+            [int]$desktopOwnership.DesktopAppServerProcessId -ne
+                [int]$IndependentStdioProcesses[0].ProcessId -or
+            [Math]::Abs(
+                [long]$desktopOwnership.DesktopAppServerStartTimeUtcTicks -
+                [long]$desktopAppServerCreation.CreationDateUtcTicks
+            ) -gt [TimeSpan]::FromSeconds(2).Ticks) {
+            throw (
+                'The deferred Desktop restart barrier ownership snapshot ' +
+                'changed before Desktop shutdown.'
+            )
+        }
     }
     $upstreamTree = $null
     if ($startupTaskWasRunning) {
@@ -3637,9 +3672,15 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
     # two exact intent checks, package-identity stop, task drain, Remote
     # re-arm, and subsequent installed Open in that same critical section.
     $script:nativeDesktopWasClosedForOpen = $true
-    Stop-OnDemandDesktopRoot `
-        -DesktopRoot $DesktopRoots[0] `
-        -ExpectedDesktopPath $ExpectedDesktopPath
+    if ($null -eq $desktopOwnership) {
+        Stop-OnDemandDesktopRoot `
+            -DesktopRoot $DesktopRoots[0] `
+            -ExpectedDesktopPath $ExpectedDesktopPath
+    } else {
+        Stop-OnDemandDesktopProcessGroup `
+            -Preparation $desktopOwnership `
+            -ExpectedDesktopPath $ExpectedDesktopPath
+    }
     Wait-OnDemandDesktopDrain
     $readyTask = Wait-OnDemandTaskState `
         -Name $Name `
