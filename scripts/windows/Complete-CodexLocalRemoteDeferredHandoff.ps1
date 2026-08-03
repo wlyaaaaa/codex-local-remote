@@ -18,7 +18,7 @@ param(
     [ValidateRange(1, 30)]
     [int]$DisconnectDelaySeconds = 5,
 
-    [ValidateRange(10, 600)]
+    [ValidateRange(15, 600)]
     [int]$VerificationTimeoutSeconds = 180,
 
     [ValidatePattern('^[a-f0-9]{64}$')]
@@ -927,6 +927,7 @@ if (-not $DefinitionOnly) {
                     -Operation Open `
                     -DataDir $resolvedDataDir `
                     -AllowDesktopRestart `
+                    -ReadyWaitSeconds $VerificationTimeoutSeconds `
                     -ImmediateAuthorizedDesktopRestartForOpen `
                     -ExpectedDesiredModeIntentId (
                         $ExpectedDesiredModeIntentId
@@ -1098,6 +1099,7 @@ if (-not $DefinitionOnly) {
                     -Operation Open `
                     -DataDir $resolvedDataDir `
                     -AllowDesktopRestart `
+                    -ReadyWaitSeconds $VerificationTimeoutSeconds `
                     -ExpectedDesiredModeIntentId (
                         $ExpectedDesiredModeIntentId
                     )

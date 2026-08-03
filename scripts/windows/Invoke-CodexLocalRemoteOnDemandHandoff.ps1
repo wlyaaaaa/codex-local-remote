@@ -20,7 +20,7 @@ param(
     [ValidateRange(1, 60)]
     [int]$RecoveryWaitSeconds = 20,
 
-    [ValidateRange(15, 180)]
+    [ValidateRange(15, 600)]
     [int]$ReadyWaitSeconds = 120,
 
     [ValidateRange(15, 300)]

@@ -368,10 +368,18 @@ windowsOnly("deferred immutable runtime handoff safety gates", () => {
     expect(immediateBranchEnd).toBeGreaterThan(immediateBranchStart);
     expect(immediateBranch).toContain("& $controlPath");
     expect(immediateBranch).toContain("-AllowDesktopRestart");
+    expect(immediateBranch).toContain("-ReadyWaitSeconds $VerificationTimeoutSeconds");
     expect(immediateBranch).toContain("-ImmediateAuthorizedDesktopRestartForOpen");
     expect(immediateBranch).not.toContain("Stop-DeferredHandoffDesktopImmediately");
     expect(immediateBranch).not.toContain("Start-Sleep -Seconds $DisconnectDelaySeconds");
     expect(control).toContain("ImmediateAuthorizedDesktopRestartForOpen");
+    expect(control).toContain("[ValidateRange(15, 600)]");
+    expect(control).toContain("[int]$ReadyWaitSeconds = 120");
+    expect(control).toContain("-ReadyWaitSeconds $ReadyWaitSeconds");
+    expect(source).toMatch(
+      /\[ValidateRange\(15, 600\)\]\s+\[int\]\$VerificationTimeoutSeconds = 180/u,
+    );
+    expect(source.match(/-ReadyWaitSeconds \$VerificationTimeoutSeconds/gu)).toHaveLength(2);
     expect(onDemand).toContain("Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier");
 
     const mutexAcquire = onDemand.indexOf("$controlMutex.WaitOne");

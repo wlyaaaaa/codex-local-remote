@@ -16,6 +16,10 @@ param(
     [Parameter(DontShow)]
     [switch]$ImmediateAuthorizedDesktopRestartForOpen,
 
+    [Parameter(DontShow)]
+    [ValidateRange(15, 600)]
+    [int]$ReadyWaitSeconds = 120,
+
     [switch]$InteractiveShortcutFeedback
 )
 
@@ -394,6 +398,7 @@ try {
                 ) `
                 -ExpectedSelectedRuntimeRoot $runtimeRoot `
                 -ExpectedSelectedManifestSha256 $manifestSha256 `
+                -ReadyWaitSeconds $ReadyWaitSeconds `
                 -AllowDesktopRestart:$AllowDesktopRestart `
                 @deferredIntentArguments
         }
