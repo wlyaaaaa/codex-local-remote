@@ -58,10 +58,13 @@ $script:workerState = [pscustomobject]@{
 }
 $script:injectWorkerStateReadFailure = $false
 $script:workerStartedForFailure = $false
-$script:killedProcesses = 0
-$script:waitForExitCalls = 0
 $script:releaseMismatchedWorkerAfterReads = 0
+$script:registeredTasks = @{}
+$script:registrationCalls = [Collections.Generic.List[object]]::new()
 $script:startCalls = [Collections.Generic.List[object]]::new()
+$script:stopCalls = [Collections.Generic.List[object]]::new()
+$script:unregisterCalls = [Collections.Generic.List[object]]::new()
+$script:directStartProcessCalls = 0
 
 function Get-OnDemandDeferredHandoffWorkerState {
     if ($script:injectWorkerStateReadFailure -and
@@ -81,6 +84,175 @@ function Get-OnDemandDeferredHandoffWorkerState {
     return $script:workerState
 }
 
+function New-ScheduledTaskAction {
+    param(
+        [string]$Execute,
+        [string]$Argument,
+        [string]$WorkingDirectory
+    )
+
+    return [pscustomobject]@{
+        Execute = $Execute
+        Arguments = $Argument
+        WorkingDirectory = $WorkingDirectory
+    }
+}
+
+function New-ScheduledTaskPrincipal {
+    param(
+        [string]$UserId,
+        [string]$LogonType,
+        [string]$RunLevel
+    )
+
+    return [pscustomobject]@{
+        UserId = $UserId
+        LogonType = $LogonType
+        RunLevel = $RunLevel
+    }
+}
+
+function New-ScheduledTaskSettingsSet {
+    param(
+        [switch]$AllowStartIfOnBatteries,
+        [switch]$DontStopIfGoingOnBatteries,
+        [timespan]$ExecutionTimeLimit,
+        [string]$MultipleInstances,
+        [bool]$StartWhenAvailable,
+        [bool]$DisallowDemandStart,
+        [bool]$RunOnlyIfIdle,
+        [bool]$RunOnlyIfNetworkAvailable,
+        [bool]$Disable
+    )
+
+    return [pscustomobject]@{
+        AllowStartIfOnBatteries = [bool]$AllowStartIfOnBatteries
+        DontStopIfGoingOnBatteries = [bool]$DontStopIfGoingOnBatteries
+        ExecutionTimeLimit = $ExecutionTimeLimit
+        MultipleInstances = $MultipleInstances
+        StartWhenAvailable = $StartWhenAvailable
+        DisallowDemandStart = $DisallowDemandStart
+        RunOnlyIfIdle = $RunOnlyIfIdle
+        RunOnlyIfNetworkAvailable = $RunOnlyIfNetworkAvailable
+        Disable = $Disable
+    }
+}
+
+function Get-ScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$TaskPath,
+        [object]$ErrorAction
+    )
+
+    if (-not $script:registeredTasks.ContainsKey($TaskName)) {
+        return $null
+    }
+    return $script:registeredTasks[$TaskName]
+}
+
+function Register-ScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$TaskPath,
+        [object]$Action,
+        [object]$Principal,
+        [object]$Settings,
+        [string]$Description,
+        [AllowNull()]
+        [object]$Trigger,
+        [object]$ErrorAction
+    )
+
+    $task = [pscustomobject]@{
+        TaskName = $TaskName
+        TaskPath = $TaskPath
+        Actions = @($Action)
+        Principal = $Principal
+        Settings = $Settings
+        Triggers = if ($PSBoundParameters.ContainsKey('Trigger')) {
+            @($Trigger)
+        } else {
+            @()
+        }
+        Description = $Description
+        State = 'Ready'
+    }
+    $script:registeredTasks[$TaskName] = $task
+    $script:registrationCalls.Add([pscustomobject]@{
+        TaskName = $TaskName
+        TaskPath = $TaskPath
+        Action = $Action
+        Principal = $Principal
+        Settings = $Settings
+        Description = $Description
+        TriggerSupplied = $PSBoundParameters.ContainsKey('Trigger')
+    })
+    return $task
+}
+
+function Start-ScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$TaskPath,
+        [object]$ErrorAction
+    )
+
+    if (-not $script:registeredTasks.ContainsKey($TaskName)) {
+        throw 'fixture scheduled task is not registered'
+    }
+    $task = $script:registeredTasks[$TaskName]
+    $task.State = 'Running'
+    $script:startCalls.Add([pscustomobject]@{
+        TaskName = $TaskName
+        TaskPath = $TaskPath
+    })
+    if ($script:injectWorkerStateReadFailure) {
+        $script:workerStartedForFailure = $true
+    }
+    $script:workerState = [pscustomobject]@{
+        Active = $true
+        ClaimValid = $true
+        DesiredModeIntentId = $desiredModeIntentId
+        RuntimeVersionId = $runtimeVersionId
+        RuntimeRoot = $runtimeRoot
+        ProcessId = 8123
+        ProcessStartTimeUtcTicks = [DateTime]::UtcNow.Ticks
+    }
+}
+
+function Stop-ScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$TaskPath,
+        [object]$ErrorAction
+    )
+
+    $script:stopCalls.Add([pscustomobject]@{
+        TaskName = $TaskName
+        TaskPath = $TaskPath
+    })
+    if ($script:registeredTasks.ContainsKey($TaskName)) {
+        $script:registeredTasks[$TaskName].State = 'Ready'
+    }
+}
+
+function Unregister-ScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$TaskPath,
+        [switch]$Confirm,
+        [object]$ErrorAction
+    )
+
+    $script:unregisterCalls.Add([pscustomobject]@{
+        TaskName = $TaskName
+        TaskPath = $TaskPath
+        Confirm = [bool]$Confirm
+    })
+    $script:registeredTasks.Remove($TaskName)
+}
+
 function Start-Process {
     param(
         [string]$FilePath,
@@ -92,42 +264,8 @@ function Start-Process {
         [switch]$PassThru
     )
 
-    $script:startCalls.Add([pscustomobject]@{
-        FilePath = $FilePath
-        ArgumentList = $ArgumentList
-        WorkingDirectory = $WorkingDirectory
-        WindowStyle = $WindowStyle
-        RedirectStandardOutput = $RedirectStandardOutput
-        RedirectStandardError = $RedirectStandardError
-        PassThru = [bool]$PassThru
-    })
-    if ($script:injectWorkerStateReadFailure) {
-        $script:workerStartedForFailure = $true
-    }
-    $script:workerState = [pscustomobject]@{
-        Active = $true
-        ClaimValid = $true
-        DesiredModeIntentId = $desiredModeIntentId
-        RuntimeVersionId = $runtimeVersionId
-        RuntimeRoot = $runtimeRoot
-    }
-    $process = [pscustomobject]@{
-        Id = 8123
-        StartTime = [DateTime]::UtcNow
-        HasExited = $false
-    }
-    $process | Add-Member -MemberType ScriptMethod -Name Refresh -Value {}
-    $process | Add-Member -MemberType ScriptMethod -Name Kill -Value {
-        $script:killedProcesses++
-        $this.HasExited = $true
-    }
-    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
-        param([int]$TimeoutMilliseconds)
-        $script:waitForExitCalls++
-        return $TimeoutMilliseconds -eq 5000
-    }
-    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
-    return $process
+    $script:directStartProcessCalls++
+    throw 'The deferred handoff worker must not inherit the Desktop process job.'
 }
 
 $runtime = [pscustomobject]@{
@@ -222,9 +360,11 @@ try {
     CreatedDesiredModeWasCreated = $createdDesiredModeWasCreated
     DesiredModeSetCalls = $script:desiredModeSetCalls
     WorkerAdmissionFailureCaught = $workerAdmissionFailureCaught
-    KilledProcesses = $script:killedProcesses
-    WaitForExitCalls = $script:waitForExitCalls
+    DirectStartProcessCalls = $script:directStartProcessCalls
+    RegistrationCalls = @($script:registrationCalls)
     StartCalls = @($script:startCalls)
+    StopCalls = @($script:stopCalls)
+    UnregisterCalls = @($script:unregisterCalls)
     RuntimeVersionId = $runtimeVersionId
     RuntimeRoot = $runtimeRoot
     DataDir = $resolvedDataDir

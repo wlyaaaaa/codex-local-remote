@@ -34,6 +34,12 @@ param(
     [string]$PublicReadyUrl,
 
     [Parameter(DontShow)]
+    [ValidatePattern(
+        '^Codex Local Remote Handoff [a-f0-9]{12} [a-f0-9]{8}$'
+    )]
+    [string]$DetachedWorkerTaskName,
+
+    [Parameter(DontShow)]
     [switch]$DefinitionOnly
 )
 
@@ -269,6 +275,233 @@ function Test-DeferredHandoffPathEqual {
         )
     } catch {
         return $false
+    }
+}
+
+function Get-DeferredHandoffDetachedWorkerArguments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkerPath,
+
+        [Parameter(Mandatory)]
+        [string]$DataDir,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 65535)]
+        [int]$BrokerPort,
+
+        [Parameter(Mandatory)]
+        [string]$ManagedTaskName,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 60)]
+        [int]$DesktopShutdownTimeoutSeconds,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(15, 600)]
+        [int]$VerificationTimeoutSeconds,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$RuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{32}$')]
+        [string]$DesiredModeIntentId,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern(
+            '^Codex Local Remote Handoff [a-f0-9]{12} [a-f0-9]{8}$'
+        )]
+        [string]$DetachedTaskName
+    )
+
+    $arguments = @(
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-WindowStyle',
+        'Hidden',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        [System.IO.Path]::GetFullPath($WorkerPath),
+        '-DataDir',
+        [System.IO.Path]::GetFullPath($DataDir),
+        '-BrokerPort',
+        [string]$BrokerPort,
+        '-TaskName',
+        $ManagedTaskName,
+        '-DesktopShutdownTimeoutSeconds',
+        [string]$DesktopShutdownTimeoutSeconds,
+        '-VerificationTimeoutSeconds',
+        [string]$VerificationTimeoutSeconds,
+        '-ExpectedSelectedVersionId',
+        $RuntimeVersionId,
+        '-ExpectedSelectedRuntimeRoot',
+        [System.IO.Path]::GetFullPath($RuntimeRoot),
+        '-InvokeInstalledControl',
+        '-ExpectedDesiredModeIntentId',
+        $DesiredModeIntentId,
+        '-DetachedWorkerTaskName',
+        $DetachedTaskName,
+        '-Confirm:$false'
+    )
+    return (
+        $arguments |
+            ForEach-Object {
+                ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
+            }
+    ) -join ' '
+}
+
+function Test-DeferredHandoffDetachedWorkerTaskIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Task,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern(
+            '^Codex Local Remote Handoff [a-f0-9]{12} [a-f0-9]{8}$'
+        )]
+        [string]$TaskName,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$RuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedArguments
+    )
+
+    $expectedDescription = (
+        'codex-local-remote/deferred-handoff-task/v1 - one ' +
+        'explicitly authorized, runtime-bound Desktop handoff'
+    )
+    $expectedPwshPath = Join-Path $PSHOME 'pwsh.exe'
+    $expectedUserSid = (
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    )
+    $expectedNamePrefix = (
+        'Codex Local Remote Handoff ' +
+        $RuntimeVersionId.Substring(0, 12) +
+        ' '
+    )
+    $actions = @($Task.Actions)
+    if ([string]$Task.TaskName -cne $TaskName -or
+        [string]$Task.TaskPath -cne '\' -or
+        -not $TaskName.StartsWith(
+            $expectedNamePrefix,
+            [System.StringComparison]::Ordinal
+        ) -or
+        [string]$Task.Description -cne $expectedDescription -or
+        @($Task.Triggers).Count -ne 0 -or
+        $actions.Count -ne 1 -or
+        -not (Test-DeferredHandoffPathEqual `
+            -Left ([string]$actions[0].Execute) `
+            -Right $expectedPwshPath) -or
+        [string]$actions[0].Arguments -cne $ExpectedArguments -or
+        -not (Test-DeferredHandoffPathEqual `
+            -Left ([string]$actions[0].WorkingDirectory) `
+            -Right $RuntimeRoot) -or
+        [string]$Task.Principal.UserId -cne $expectedUserSid -or
+        [string]$Task.Principal.LogonType -cne 'Interactive' -or
+        [string]$Task.Principal.RunLevel -cne 'Highest') {
+        return $false
+    }
+    return $true
+}
+
+function Remove-DeferredHandoffDetachedWorkerTask {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern(
+            '^Codex Local Remote Handoff [a-f0-9]{12} [a-f0-9]{8}$'
+        )]
+        [string]$TaskName,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[a-f0-9]{64}$')]
+        [string]$RuntimeVersionId,
+
+        [Parameter(Mandatory)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedArguments,
+
+        [ValidateRange(1, 5)]
+        [int]$MaximumAttempts = 3
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        try {
+            $task = Get-ScheduledTask `
+                -TaskName $TaskName `
+                -TaskPath '\' `
+                -ErrorAction SilentlyContinue
+        } catch {
+            $lastError = $_.Exception.Message
+            if ($attempt -lt $MaximumAttempts) {
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+            return [pscustomobject]@{
+                Status = 'inspection-failed'
+                Attempts = $attempt
+                Message = $lastError
+            }
+        }
+        if ($null -eq $task) {
+            return [pscustomobject]@{
+                Status = if ($attempt -eq 1) { 'absent' } else { 'removed' }
+                Attempts = $attempt
+                Message = $null
+            }
+        }
+        if (-not (Test-DeferredHandoffDetachedWorkerTaskIdentity `
+            -Task $task `
+            -TaskName $TaskName `
+            -RuntimeVersionId $RuntimeVersionId `
+            -RuntimeRoot $RuntimeRoot `
+            -ExpectedArguments $ExpectedArguments)) {
+            return [pscustomobject]@{
+                Status = 'identity-mismatch'
+                Attempts = $attempt
+                Message = (
+                    'The detached task no longer matches its exact ' +
+                    'runtime-bound one-shot identity.'
+                )
+            }
+        }
+        try {
+            Unregister-ScheduledTask `
+                -TaskName $TaskName `
+                -TaskPath '\' `
+                -Confirm:$false `
+                -ErrorAction Stop
+            $lastError = $null
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        if ($attempt -lt $MaximumAttempts) {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    return [pscustomobject]@{
+        Status = 'unregister-failed'
+        Attempts = $MaximumAttempts
+        Message = $lastError
     }
 }
 
@@ -851,6 +1084,26 @@ if (-not $DefinitionOnly) {
     if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
         throw "The runtime-bound Desktop launcher is missing at '$launcherPath'."
     }
+    $detachedWorkerTaskArguments = $null
+    if (-not [string]::IsNullOrWhiteSpace($DetachedWorkerTaskName)) {
+        if (-not $InvokeInstalledControl) {
+            throw 'DetachedWorkerTaskName requires InvokeInstalledControl.'
+        }
+        $detachedWorkerTaskArguments =
+            Get-DeferredHandoffDetachedWorkerArguments `
+                -WorkerPath $PSCommandPath `
+                -DataDir $resolvedDataDir `
+                -BrokerPort $BrokerPort `
+                -ManagedTaskName $TaskName `
+                -DesktopShutdownTimeoutSeconds (
+                    $DesktopShutdownTimeoutSeconds
+                ) `
+                -VerificationTimeoutSeconds $VerificationTimeoutSeconds `
+                -RuntimeVersionId $expectedVersionId `
+                -RuntimeRoot $selectedRoot `
+                -DesiredModeIntentId $ExpectedDesiredModeIntentId `
+                -DetachedTaskName $DetachedWorkerTaskName
+    }
     $receiptPath = Join-Path $resolvedDataDir 'deferred-handoff-last.json'
     $handoffMode = if ($WaitForNaturalDesktopExit) {
         'natural-exit'
@@ -1373,6 +1626,20 @@ if (-not $DefinitionOnly) {
                 # An abandoned owner remains safe to dispose.
             }
             $workerMutex.Dispose()
+        }
+        if (-not [string]::IsNullOrWhiteSpace(
+            $detachedWorkerTaskArguments
+        )) {
+            # The parent normally removes the no-trigger task immediately
+            # after this worker claims its mutex. If Task Scheduler retained
+            # the running definition, the independent worker gets one final,
+            # exact-identity cleanup opportunity without touching foreign
+            # tasks or stopping its own process.
+            $null = Remove-DeferredHandoffDetachedWorkerTask `
+                -TaskName $DetachedWorkerTaskName `
+                -RuntimeVersionId $expectedVersionId `
+                -RuntimeRoot $selectedRoot `
+                -ExpectedArguments $detachedWorkerTaskArguments
         }
     }
 }

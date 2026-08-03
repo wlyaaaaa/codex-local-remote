@@ -211,12 +211,12 @@ describe("Windows native-default on-demand Remote contract", () => {
     }
   });
 
-  it("detaches an authorized busy-generation handoff to one hidden immediate worker", () => {
+  it("detaches every authorized Desktop-closing handoff before inline shutdown", () => {
     const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
 
     expect(handoff).toContain("function Start-OnDemandDeferredRuntimeHandoff");
     expect(handoff).toContain("Complete-CodexLocalRemoteDeferredHandoff.ps1");
-    expect(handoff).toContain("-WindowStyle Hidden");
+    expect(handoff).toContain("'Hidden'");
     expect(handoff).toContain("-Status 'restart-deferred'");
     expect(handoff).toContain("-ExpectedSelectedVersionId");
     expect(handoff).toContain("-ExpectedSelectedRuntimeRoot");
@@ -224,6 +224,57 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(handoff).toContain("Test-OnDemandDeferredHandoffWorkerActive");
     expect(handoff).toContain("WorkerAlreadyActive");
     expect(handoff).toContain("ExpectedDesiredModeIntentId");
+
+    const delegateHelperStart = handoff.indexOf(
+      "function Start-OnDemandDetachedDesktopHandoffIfRequired",
+    );
+    const delegateHelperEnd = handoff.indexOf("function ", delegateHelperStart + 10);
+    const delegateHelper = handoff.slice(delegateHelperStart, delegateHelperEnd);
+    expect(delegateHelper).toContain("'defer-runtime-handoff'");
+    expect(delegateHelper).toContain("'handoff-native-desktop-once'");
+    expect(delegateHelper).toContain("$ImmediateAuthorizedDesktopRestart");
+    expect(delegateHelper).toContain("Set-OnDemandOpenDesiredRemote");
+    expect(delegateHelper).toContain("Start-OnDemandDeferredRuntimeHandoff");
+    expect(delegateHelper).toContain("-Status 'restart-deferred'");
+
+    const closeStart = handoff.indexOf("if ($Operation -ceq 'Close')");
+    const initialNormalize = handoff.indexOf(
+      "$decision = Resolve-OnDemandDesktopHandoffDecision `",
+      closeStart,
+    );
+    const initialDelegate = handoff.indexOf(
+      "Start-OnDemandDetachedDesktopHandoffIfRequired `",
+      initialNormalize,
+    );
+    const firstInlineAttach = handoff.indexOf("Invoke-OnDemandPreparedAttach `", initialDelegate);
+    expect(initialNormalize).toBeGreaterThan(closeStart);
+    expect(initialDelegate).toBeGreaterThan(initialNormalize);
+    expect(initialDelegate).toBeLessThan(firstInlineAttach);
+
+    const recoveryStart = handoff.indexOf(
+      "if ($decision -ceq 'wait-background-recovery')",
+      initialDelegate,
+    );
+    const recoveryRecompute = handoff.indexOf(
+      "$decision = Get-OnDemandHandoffDecision `",
+      recoveryStart,
+    );
+    const recoveryNormalize = handoff.indexOf(
+      "$decision = Resolve-OnDemandDesktopHandoffDecision `",
+      recoveryRecompute,
+    );
+    const recoveryDelegate = handoff.indexOf(
+      "Start-OnDemandDetachedDesktopHandoffIfRequired `",
+      recoveryNormalize,
+    );
+    const recoveryPending = handoff.indexOf(
+      "if ($decision -ceq 'wait-background-recovery')",
+      recoveryDelegate,
+    );
+    expect(recoveryRecompute).toBeGreaterThan(recoveryStart);
+    expect(recoveryNormalize).toBeGreaterThan(recoveryRecompute);
+    expect(recoveryDelegate).toBeGreaterThan(recoveryNormalize);
+    expect(recoveryDelegate).toBeLessThan(recoveryPending);
 
     const deferredWorker = windowsScript("Complete-CodexLocalRemoteDeferredHandoff.ps1");
     expect(deferredWorker).toContain("Invoke-DeferredHandoffBrokerLifecycleReconciliation");
@@ -242,7 +293,7 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(stateHelper).toContain("Get-Process");
   });
 
-  it("spawns one runtime-bound hidden worker and reuses only its exact active claim", () => {
+  it("schedules one runtime-bound detached worker and reuses only its exact active claim", () => {
     const sandbox = mkdtempSync(join(tmpdir(), "codex-on-demand-worker-"));
     try {
       const result = spawnSync(
@@ -275,7 +326,7 @@ describe("Windows native-default on-demand Remote contract", () => {
         DesiredModeSetCalls: number;
         Existing: { AlreadyActive: boolean; ProcessId: number };
         Fresh: { AlreadyActive: boolean; ProcessId: number; ProcessStartTimeUtcTicks: number };
-        KilledProcesses: number;
+        DirectStartProcessCalls: number;
         ReusedDesiredMode: { IntentId: string };
         ReusedDesiredModeWasCreated: boolean;
         Superseded: {
@@ -285,15 +336,16 @@ describe("Windows native-default on-demand Remote contract", () => {
         };
         RuntimeRoot: string;
         RuntimeVersionId: string;
-        StartCalls: Array<{
-          ArgumentList: string;
-          PassThru: boolean;
-          RedirectStandardError: string;
-          RedirectStandardOutput: string;
-          WindowStyle: string;
-          WorkingDirectory: string;
+        RegistrationCalls: Array<{
+          Action: { Arguments: string; Execute: string; WorkingDirectory: string };
+          Principal: { LogonType: string; RunLevel: string; UserId: string };
+          TaskName: string;
+          TaskPath: string;
+          TriggerSupplied: boolean;
         }>;
-        WaitForExitCalls: number;
+        StartCalls: Array<{ TaskName: string; TaskPath: string }>;
+        StopCalls: Array<{ TaskName: string; TaskPath: string }>;
+        UnregisterCalls: Array<{ Confirm: boolean; TaskName: string; TaskPath: string }>;
         WorkerAdmissionFailureCaught: boolean;
       };
 
@@ -309,39 +361,98 @@ describe("Windows native-default on-demand Remote contract", () => {
       expect(receipt.CreatedDesiredModeWasCreated).toBe(true);
       expect(receipt.DesiredModeSetCalls).toBe(1);
       expect(receipt.WorkerAdmissionFailureCaught).toBe(true);
-      expect(receipt.KilledProcesses).toBe(1);
-      expect(receipt.WaitForExitCalls).toBe(1);
+      expect(receipt.DirectStartProcessCalls).toBe(0);
+      expect(receipt.RegistrationCalls).toHaveLength(3);
       expect(receipt.StartCalls).toHaveLength(3);
-      const call = receipt.StartCalls[0];
-      expect(call.WindowStyle).toBe("Hidden");
-      expect(call.PassThru).toBe(true);
-      expect(call.WorkingDirectory).toBe(receipt.RuntimeRoot);
-      expect(call.ArgumentList).toContain(receipt.RuntimeVersionId);
-      expect(call.ArgumentList).toContain("-ExpectedSelectedRuntimeRoot");
-      expect(call.ArgumentList).toContain("-InvokeInstalledControl");
-      expect(call.ArgumentList).toContain("-ExpectedDesiredModeIntentId");
-      expect(call.ArgumentList).toContain("-Confirm:$false");
-      expect(call.RedirectStandardOutput).toMatch(
-        /deferred-handoff-worker-[0-9a-f]{32}\.stdout\.log$/u,
+      expect(receipt.UnregisterCalls).toHaveLength(3);
+      expect(receipt.StopCalls).toHaveLength(1);
+      const registration = receipt.RegistrationCalls[0];
+      expect(registration.TaskName).toMatch(
+        /^Codex Local Remote Handoff [0-9a-f]{12} [0-9a-f]{8}$/u,
       );
-      expect(call.RedirectStandardError).toMatch(
-        /deferred-handoff-worker-[0-9a-f]{32}\.stderr\.log$/u,
-      );
+      expect(registration.TaskPath).toBe("\\");
+      expect(registration.TriggerSupplied).toBe(false);
+      expect(registration.Principal.LogonType).toBe("Interactive");
+      expect(registration.Principal.RunLevel).toBe("Highest");
+      expect(registration.Action.WorkingDirectory).toBe(receipt.RuntimeRoot);
+      expect(registration.Action.Arguments).toContain(receipt.RuntimeVersionId);
+      expect(registration.Action.Arguments).toContain("-ExpectedSelectedRuntimeRoot");
+      expect(registration.Action.Arguments).toContain("-InvokeInstalledControl");
+      expect(registration.Action.Arguments).toContain("-ExpectedDesiredModeIntentId");
+      expect(registration.Action.Arguments).toContain("-DetachedWorkerTaskName");
+      expect(registration.Action.Arguments).toContain(registration.TaskName);
+      expect(registration.Action.Arguments).toContain("-Confirm:$false");
+      expect(receipt.StartCalls[0]).toEqual({
+        TaskName: registration.TaskName,
+        TaskPath: registration.TaskPath,
+      });
+      expect(receipt.UnregisterCalls[0]).toEqual({
+        Confirm: false,
+        TaskName: registration.TaskName,
+        TaskPath: registration.TaskPath,
+      });
 
       const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
       expect(handoff).toContain("$claimWait.Elapsed -lt [TimeSpan]::FromSeconds(30)");
-      expect(handoff).toContain("$worker.Kill()");
-      expect(handoff).toContain("$worker.WaitForExit(5000)");
-      const deferStart = handoff.indexOf("if ($decision -ceq 'defer-runtime-handoff')");
-      const deferEnd = handoff.indexOf("-Status 'restart-deferred'", deferStart);
-      const deferBlock = handoff.slice(deferStart, deferEnd);
-      expect(deferBlock.indexOf("Set-OnDemandOpenDesiredRemote")).toBeGreaterThan(-1);
-      expect(deferBlock.indexOf("Start-OnDemandDeferredRuntimeHandoff")).toBeGreaterThan(
-        deferBlock.indexOf("Set-OnDemandOpenDesiredRemote"),
+      const workerStart = handoff.indexOf("function Start-OnDemandDeferredRuntimeHandoff");
+      const workerEnd = handoff.indexOf("function ", workerStart + 10);
+      const worker = handoff.slice(workerStart, workerEnd);
+      expect(worker).toContain("New-ScheduledTaskAction");
+      expect(worker).toContain("New-ScheduledTaskPrincipal");
+      expect(worker).toContain("-LogonType Interactive");
+      expect(worker).toContain("-RunLevel Highest");
+      expect(worker).toContain("Register-ScheduledTask");
+      expect(worker).toContain("Start-ScheduledTask");
+      expect(worker).toContain("Unregister-ScheduledTask");
+      expect(worker).not.toContain("Start-Process");
+      expect(worker).not.toMatch(/-Trigger\b/u);
+      const delegateStart = handoff.indexOf(
+        "function Start-OnDemandDetachedDesktopHandoffIfRequired",
+      );
+      const delegateEnd = handoff.indexOf("function ", delegateStart + 10);
+      const delegateBlock = handoff.slice(delegateStart, delegateEnd);
+      expect(delegateBlock.indexOf("Set-OnDemandOpenDesiredRemote")).toBeGreaterThan(-1);
+      expect(delegateBlock.indexOf("Start-OnDemandDeferredRuntimeHandoff")).toBeGreaterThan(
+        delegateBlock.indexOf("Set-OnDemandOpenDesiredRemote"),
       );
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
+  });
+
+  it("self-cleans only the exact no-trigger detached task and retries boundedly", () => {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        join(repositoryRoot, "tests", "windows", "fixtures", "detached-task-cleanup-driver.ps1"),
+        "-ScriptPath",
+        windowsPath("Complete-CodexLocalRemoteDeferredHandoff.ps1"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      Absent: { Status: "absent", Attempts: 1, UnregisterCalls: 0, TaskPreserved: false },
+      Exact: { Status: "removed", Attempts: 2, UnregisterCalls: 1, TaskPreserved: false },
+      Retry: { Status: "removed", Attempts: 3, UnregisterCalls: 2, TaskPreserved: false },
+      Foreign: {
+        Status: "identity-mismatch",
+        Attempts: 1,
+        UnregisterCalls: 0,
+        TaskPreserved: true,
+      },
+    });
+
+    const worker = windowsScript("Complete-CodexLocalRemoteDeferredHandoff.ps1");
+    const finallyStart = worker.lastIndexOf("} finally {");
+    expect(
+      worker.indexOf("Remove-DeferredHandoffDetachedWorkerTask `", finallyStart),
+    ).toBeGreaterThan(finallyStart);
   });
 
   it("prepares exact task-bound infrastructure before the attach-only Desktop exit", () => {
@@ -360,6 +471,74 @@ describe("Windows native-default on-demand Remote contract", () => {
     expect(handoff).toContain("Read-CodexLocalRemoteDesktopHandoffPreparation");
     expect(handoff).not.toContain("RequestDesktopLaunch");
     expect(handoff).not.toContain(".lnk");
+  });
+
+  it("retires only the exact drained attaching preparation before waiting for task exit", () => {
+    const handoff = windowsScript("Invoke-CodexLocalRemoteOnDemandHandoff.ps1");
+    const helperStart = handoff.indexOf(
+      "function Complete-OnDemandDrainedDesktopHandoffPreparation",
+    );
+    const helperEnd = handoff.indexOf("function ", helperStart + 10);
+    const helper = handoff.slice(helperStart, helperEnd);
+    const barrierStart = handoff.indexOf(
+      "function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier",
+    );
+    const barrierEnd = handoff.indexOf("function ", barrierStart + 10);
+    const barrier = handoff.slice(barrierStart, barrierEnd);
+    const drain = barrier.indexOf("Wait-OnDemandDesktopDrain");
+    const completion = barrier.indexOf("Complete-OnDemandDrainedDesktopHandoffPreparation", drain);
+    const taskExit = barrier.indexOf("Wait-OnDemandTaskState", completion);
+
+    expect(helper).toContain("-ExpectedRuntimeVersionId");
+    expect(helper).toContain("-ExpectedRuntimeRoot");
+    expect(helper).toContain("-ExpectedManifestSha256");
+    expect(helper).toContain("$preparation.Phase -cne 'attaching'");
+    expect(helper).toContain("$preparation.DesktopRootIdentityKey -cne");
+    expect(helper).not.toContain("DesktopAppServerIdentityKey");
+    expect(helper).toContain("-Outcome 'superseded-by-detached-handoff'");
+    expect(drain).toBeGreaterThan(-1);
+    expect(completion).toBeGreaterThan(drain);
+    expect(taskExit).toBeGreaterThan(completion);
+  });
+
+  it("dynamically preserves non-attaching or foreign preparations when app-server is gone", () => {
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        join(
+          repositoryRoot,
+          "tests",
+          "windows",
+          "fixtures",
+          "drained-preparation-cleanup-driver.ps1",
+        ),
+        "-ScriptPath",
+        windowsPath("Invoke-CodexLocalRemoteOnDemandHandoff.ps1"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      "current-attaching": {
+        ReadCalls: 1,
+        CompleteCalls: 1,
+        Outcome: "superseded-by-detached-handoff",
+      },
+      "previous-attaching": {
+        ReadCalls: 2,
+        CompleteCalls: 1,
+        Outcome: "superseded-by-detached-handoff",
+      },
+      "foreign-root": { ReadCalls: 1, CompleteCalls: 0, Outcome: "" },
+      ready: { ReadCalls: 1, CompleteCalls: 0, Outcome: "" },
+      requested: { ReadCalls: 1, CompleteCalls: 0, Outcome: "" },
+      "no-match": { ReadCalls: 2, CompleteCalls: 0, Outcome: "" },
+    });
   });
 
   it("routes preparation through the transactional runtime-generation activator", () => {

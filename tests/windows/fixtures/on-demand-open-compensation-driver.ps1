@@ -468,7 +468,7 @@ function Set-CodexLocalRemoteDesiredMode {
     $global:OnDemandOpenCatchFixture.DesiredRuntimeRoot = $RuntimeRoot
     if ($Mode -ceq 'Remote') {
         $global:OnDemandOpenCatchFixture.DesiredIntentId =
-            'fixture-open-remote-intent'
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     } else {
         $global:OnDemandOpenCatchFixture.RestoreDesiredCalls++
         $global:OnDemandOpenCatchFixture.DesiredIntentId =
@@ -568,6 +568,7 @@ function Get-CimInstance {
     )
     $null = $ClassName
     if ($Filter -ceq "Name = 'ChatGPT.exe'" -and
+        [bool]$global:OnDemandOpenCatchFixture.ExposeDesktopRoot -and
         -not $global:OnDemandOpenCatchFixture.DesktopClosed) {
         return [pscustomobject]@{
             ProcessId = 41001
@@ -801,9 +802,7 @@ function Start-CodexLocalRemoteRegisteredTask {
             [string]$global:OnDemandOpenCatchFixture.RuntimeRoot -and
         $ExpectedSelectedManifestSha256 -ceq
             [string]$global:OnDemandOpenCatchFixture.ManifestSha256 -and
-        $null -ne $DesktopHandoffPreparation -and
-        [string]$DesktopHandoffPreparation.PreparationId -ceq
-            ('1' * 32)
+        $null -eq $DesktopHandoffPreparation
     )
     $global:OnDemandOpenCatchFixture.TaskStarted = $true
     if ($global:OnDemandOpenCatchFixture.Mode -ceq 'prior-rollback') {
@@ -848,6 +847,7 @@ if (-not $DefinitionOnly) {
         ActivationArgumentsValid = $false
         TaskStopCalls = 0
         TaskStarted = $false
+        ExposeDesktopRoot = $false
         DesktopClosed = $false
         RecoveryIntentCalls = 0
         RecoveryIntentRuntimeVersionId = $null

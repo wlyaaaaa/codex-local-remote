@@ -777,6 +777,13 @@ function Start-OnDemandDeferredRuntimeHandoff {
     if (-not (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
         throw 'The current PowerShell runtime cannot launch the deferred handoff worker.'
     }
+    $workerNonce = [guid]::NewGuid().ToString('N')
+    $workerTaskName = (
+        'Codex Local Remote Handoff ' +
+        ([string]$Runtime.CurrentVersionId).Substring(0, 12) +
+        ' ' +
+        $workerNonce.Substring(0, 8)
+    )
     $workerArguments = @(
         '-NoLogo',
         '-NoProfile',
@@ -804,6 +811,8 @@ function Start-OnDemandDeferredRuntimeHandoff {
         '-InvokeInstalledControl',
         '-ExpectedDesiredModeIntentId',
         $DesiredModeIntentId,
+        '-DetachedWorkerTaskName',
+        $workerTaskName,
         '-Confirm:$false'
     )
     $argumentLine = (
@@ -813,38 +822,77 @@ function Start-OnDemandDeferredRuntimeHandoff {
                     -Value ([string]$_)
             }
     ) -join ' '
-    $workerNonce = [guid]::NewGuid().ToString('N')
-    $stdoutPath = Join-Path `
-        $resolvedDataDir `
-        "deferred-handoff-worker-$workerNonce.stdout.log"
-    $stderrPath = Join-Path `
-        $resolvedDataDir `
-        "deferred-handoff-worker-$workerNonce.stderr.log"
-    $worker = Start-Process `
-        -FilePath $pwshPath `
-        -ArgumentList $argumentLine `
-        -WorkingDirectory $runtimeRoot `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath `
-        -PassThru
+    # This worker is responsible for closing the Desktop that hosts the
+    # requesting Codex turn. A normal child process inherits the Desktop job
+    # and is terminated midway through that close. Task Scheduler is the
+    # already-authorized, interactive-session owner that gives this one
+    # bounded worker an independent lifetime without adding a logon trigger.
+    if ($null -ne (Get-ScheduledTask `
+        -TaskName $workerTaskName `
+        -TaskPath '\' `
+        -ErrorAction SilentlyContinue)) {
+        throw 'The detached handoff task nonce unexpectedly already exists.'
+    }
+    $workerAction = New-ScheduledTaskAction `
+        -Execute $pwshPath `
+        -Argument $argumentLine `
+        -WorkingDirectory $runtimeRoot
+    $workerPrincipal = New-ScheduledTaskPrincipal `
+        -UserId (
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        ) `
+        -LogonType Interactive `
+        -RunLevel Highest
+    $workerSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+        -MultipleInstances IgnoreNew `
+        -StartWhenAvailable:$false `
+        -DisallowDemandStart:$false `
+        -RunOnlyIfIdle:$false `
+        -RunOnlyIfNetworkAvailable:$false `
+        -Disable:$false
+    $workerTaskRegistered = $false
+    $workerClaimed = $false
     try {
-        if ($null -eq $worker -or [int]$worker.Id -lt 1) {
-            throw 'The deferred handoff worker returned no process identity.'
+        Register-ScheduledTask `
+            -TaskName $workerTaskName `
+            -TaskPath '\' `
+            -Action $workerAction `
+            -Principal $workerPrincipal `
+            -Settings $workerSettings `
+            -Description (
+                'codex-local-remote/deferred-handoff-task/v1 - one ' +
+                'explicitly authorized, runtime-bound Desktop handoff'
+            ) `
+            -ErrorAction Stop | Out-Null
+        $workerTaskRegistered = $true
+        $registeredTask = Get-ScheduledTask `
+            -TaskName $workerTaskName `
+            -TaskPath '\' `
+            -ErrorAction Stop
+        if ($registeredTask.Triggers.Count -ne 0 -or
+            $registeredTask.Actions.Count -ne 1 -or
+            [string]$registeredTask.Actions[0].Execute -cne $pwshPath -or
+            [string]$registeredTask.Actions[0].Arguments -cne $argumentLine -or
+            -not [string]::Equals(
+                [string]$registeredTask.Actions[0].WorkingDirectory,
+                $runtimeRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            [string]$registeredTask.Principal.UserId -cne
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or
+            [string]$registeredTask.Principal.RunLevel -cne 'Highest') {
+            throw 'The detached handoff task failed exact registration read-back.'
         }
-        $workerStartTimeUtcTicks =
-            $worker.StartTime.ToUniversalTime().Ticks
+        Start-ScheduledTask `
+            -TaskName $workerTaskName `
+            -TaskPath '\' `
+            -ErrorAction Stop
         $claimWait = [System.Diagnostics.Stopwatch]::StartNew()
-        $workerClaimed = $false
         do {
             Start-Sleep -Milliseconds 100
-            $worker.Refresh()
-            if ($worker.HasExited) {
-                throw (
-                    'The deferred handoff worker exited before accepting ' +
-                    'the idle wait.'
-                )
-            }
             $workerState = Get-OnDemandDeferredHandoffWorkerState
             $workerClaimed = Test-OnDemandDeferredHandoffWorkerMatches `
                 -State $workerState `
@@ -857,26 +905,112 @@ function Start-OnDemandDeferredRuntimeHandoff {
         }
         return [pscustomobject]@{
             AlreadyActive = $false
-            ProcessId = [int]$worker.Id
-            ProcessStartTimeUtcTicks = [long]$workerStartTimeUtcTicks
+            ProcessId = [int]$workerState.ProcessId
+            ProcessStartTimeUtcTicks =
+                [long]$workerState.ProcessStartTimeUtcTicks
         }
     } catch {
-        if ($null -ne $worker) {
+        if ($workerTaskRegistered -and -not $workerClaimed) {
             try {
-                $worker.Refresh()
-                if (-not $worker.HasExited) {
-                    $worker.Kill()
-                    $null = $worker.WaitForExit(5000)
-                }
+                Stop-ScheduledTask `
+                    -TaskName $workerTaskName `
+                    -TaskPath '\' `
+                    -ErrorAction SilentlyContinue
             } catch {
                 # Preserve the worker admission failure.
             }
         }
         throw
     } finally {
-        if ($null -ne $worker) {
-            $worker.Dispose()
+        if ($workerTaskRegistered) {
+            try {
+                # Deleting the registration does not terminate its already
+                # running instance; it only prevents reuse after this intent.
+                Unregister-ScheduledTask `
+                    -TaskName $workerTaskName `
+                    -TaskPath '\' `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+            } catch {
+                if (-not $workerClaimed) {
+                    throw
+                }
+                # A running Task Scheduler instance can transiently retain its
+                # definition. It has no trigger and the exact intent still
+                # gates execution, so admission remains fail-closed.
+            }
         }
+    }
+}
+
+function Resolve-OnDemandDesktopHandoffDecision {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Decision,
+
+        [Parameter(Mandatory)]
+        [int]$DesktopRootCount
+    )
+
+    if ($Decision -ceq 'request-active-lease-recovery' -and
+        $DesktopRootCount -eq 1) {
+        return 'handoff-native-desktop-once'
+    }
+    return $Decision
+}
+
+function Start-OnDemandDetachedDesktopHandoffIfRequired {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Decision,
+
+        [Parameter(Mandatory)]
+        [object]$Runtime,
+
+        [Parameter(Mandatory)]
+        [object]$Configuration,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$RemoteState,
+
+        [switch]$ImmediateAuthorizedDesktopRestart
+    )
+
+    if ($ImmediateAuthorizedDesktopRestart -or
+        $Decision -cnotin @(
+            'defer-runtime-handoff',
+            'handoff-native-desktop-once'
+        )) {
+        return $null
+    }
+    $desiredMode = Set-OnDemandOpenDesiredRemote -Runtime $Runtime
+    $worker = Start-OnDemandDeferredRuntimeHandoff `
+        -Runtime $Runtime `
+        -Configuration $Configuration `
+        -Name $Name `
+        -DesiredModeIntentId ([string]$desiredMode.IntentId)
+    Write-OnDemandHandoffStatus `
+        -Status 'restart-deferred' `
+        -Stage 'restart-handoff' `
+        -Message (
+            'One authorized runtime handoff was delegated to a detached ' +
+            'Task Scheduler worker. It immediately re-enters installed ' +
+            'control and may restart Desktop while observed turns are active.'
+        )
+    return [pscustomobject]@{
+        Status = 'restart-deferred'
+        Operation = 'Open'
+        Decision = $Decision
+        RemoteState = $RemoteState
+        DesktopRestarted = $false
+        WorkerProcessId = [int]$worker.ProcessId
+        WorkerStartTimeUtcTicks =
+            [long]$worker.ProcessStartTimeUtcTicks
+        WorkerAlreadyActive = [bool]$worker.AlreadyActive
+        TaskName = $Name
     }
 }
 
@@ -2698,6 +2832,87 @@ function Stop-OnDemandDesktopProcessGroup {
     }
 }
 
+function Complete-OnDemandDrainedDesktopHandoffPreparation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Runtime,
+
+        [Parameter(Mandatory)]
+        [object]$DesktopRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedDesktopPath
+    )
+
+    Assert-OnDemandDesktopRootExecutable `
+        -DesktopRoot $DesktopRoot `
+        -ExpectedDesktopPath $ExpectedDesktopPath
+    $rootCreation = Get-ProcessCreationIdentity `
+        -CreationDate $DesktopRoot.CreationDate
+    $drainedRootIdentityKey =
+        Get-CodexDesktopOwnerRootIdentityKey `
+            -ProcessId ([int]$DesktopRoot.ProcessId) `
+            -StartTimeUtcTicks (
+                [long]$rootCreation.CreationDateUtcTicks
+            ) `
+            -ExecutablePath $ExpectedDesktopPath
+    $candidateRuntimes = @(
+        [pscustomobject]@{
+            VersionId = [string]$Runtime.CurrentVersionId
+            Root = [string]$Runtime.CurrentRoot
+            ManifestSha256 = [string]$Runtime.CurrentManifestSha256
+        }
+    )
+    if ([string]$Runtime.PreviousVersionId -cmatch '^[a-f0-9]{64}$' -and
+        [string]$Runtime.PreviousManifestSha256 -cmatch '^[a-f0-9]{64}$' -and
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$Runtime.PreviousRoot
+        )) {
+        $candidateRuntimes += [pscustomobject]@{
+            VersionId = [string]$Runtime.PreviousVersionId
+            Root = [string]$Runtime.PreviousRoot
+            ManifestSha256 = [string]$Runtime.PreviousManifestSha256
+        }
+    }
+    $preparation = $null
+    foreach ($candidateRuntime in $candidateRuntimes) {
+        $preparation =
+            Read-CodexLocalRemoteDesktopHandoffPreparation `
+                -DataDir $resolvedDataDir `
+                -ExpectedRuntimeVersionId (
+                    [string]$candidateRuntime.VersionId
+                ) `
+                -ExpectedRuntimeRoot ([string]$candidateRuntime.Root) `
+                -ExpectedManifestSha256 (
+                    [string]$candidateRuntime.ManifestSha256
+                )
+        if ($null -ne $preparation) {
+            break
+        }
+    }
+    if ($null -eq $preparation -or
+        [string]$preparation.Phase -cne 'attaching') {
+        return
+    }
+    if ([string]$preparation.DesktopRootIdentityKey -cne
+            $drainedRootIdentityKey) {
+        # A newer or foreign preparation is never cleanup material.
+        return
+    }
+    $completed =
+        Complete-CodexLocalRemoteDesktopHandoffPreparation `
+            -DataDir $resolvedDataDir `
+            -Preparation $preparation `
+            -Outcome 'superseded-by-detached-handoff'
+    if (-not $completed) {
+        throw (
+            'The exact drained Desktop handoff preparation changed before ' +
+            'detached-worker cleanup.'
+        )
+    }
+}
+
 function Assert-OnDemandPreparedInfrastructureReadyForAttach {
     [CmdletBinding()]
     param(
@@ -3705,6 +3920,10 @@ function Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier {
             -ExpectedDesktopPath $ExpectedDesktopPath
     }
     Wait-OnDemandDesktopDrain
+    Complete-OnDemandDrainedDesktopHandoffPreparation `
+        -Runtime $Runtime `
+        -DesktopRoot $DesktopRoots[0] `
+        -ExpectedDesktopPath $ExpectedDesktopPath
     $readyTask = Wait-OnDemandTaskState `
         -Name $Name `
         -ExpectedState 'Ready' `
@@ -4193,6 +4412,24 @@ try {
         return
     }
 
+    $decision = Resolve-OnDemandDesktopHandoffDecision `
+        -Decision $decision `
+        -DesktopRootCount $desktopRoots.Count
+    $detachedHandoff =
+        Start-OnDemandDetachedDesktopHandoffIfRequired `
+            -Decision $decision `
+            -Runtime $runtime `
+            -Configuration $configuration `
+            -Name $TaskName `
+            -RemoteState $remoteState `
+            -ImmediateAuthorizedDesktopRestart:(
+                $ImmediateAuthorizedDesktopRestartForOpen
+            )
+    if ($null -ne $detachedHandoff) {
+        $detachedHandoff
+        return
+    }
+
     if ([string]$startupTask.State -ceq 'Running' -and
         $remoteState -ceq 'desktop-detached' -and
         $desktopRoots.Count -eq 1) {
@@ -4368,6 +4605,23 @@ try {
             -IndependentStdioCount $independentAppServers.Count `
             -AllowDesktopRestart ([bool]$AllowDesktopRestart) `
             -DesiredMode Remote
+        $decision = Resolve-OnDemandDesktopHandoffDecision `
+            -Decision $decision `
+            -DesktopRootCount $desktopRoots.Count
+        $detachedHandoff =
+            Start-OnDemandDetachedDesktopHandoffIfRequired `
+                -Decision $decision `
+                -Runtime $runtime `
+                -Configuration $configuration `
+                -Name $TaskName `
+                -RemoteState $remoteState `
+                -ImmediateAuthorizedDesktopRestart:(
+                    $ImmediateAuthorizedDesktopRestartForOpen
+                )
+        if ($null -ne $detachedHandoff) {
+            $detachedHandoff
+            return
+        }
         if ($decision -ceq 'wait-background-recovery') {
             Write-OnDemandHandoffStatus `
                 -Status 'repair-pending' `
@@ -4438,10 +4692,6 @@ try {
         }
         return
     }
-    if ($decision -ceq 'request-active-lease-recovery' -and
-        $desktopRoots.Count -eq 1) {
-        $decision = 'handoff-native-desktop-once'
-    }
     if ($decision -ceq 'deferred-handoff-authorization-required') {
         $null = Set-OnDemandOpenDesiredRemote -Runtime $runtime
         Write-OnDemandHandoffStatus `
@@ -4457,36 +4707,6 @@ try {
             Decision = $decision
             RemoteState = $remoteState
             DesktopRestarted = $false
-            TaskName = $TaskName
-        }
-        return
-    }
-    if ($decision -ceq 'defer-runtime-handoff') {
-        $desiredMode =
-            Set-OnDemandOpenDesiredRemote -Runtime $runtime
-        $worker = Start-OnDemandDeferredRuntimeHandoff `
-            -Runtime $runtime `
-            -Configuration $configuration `
-            -Name $TaskName `
-            -DesiredModeIntentId ([string]$desiredMode.IntentId)
-        Write-OnDemandHandoffStatus `
-            -Status 'restart-deferred' `
-            -Stage 'restart-handoff' `
-            -Message (
-                'One authorized runtime handoff was delegated to a detached ' +
-                'worker. It immediately re-enters installed control and may ' +
-                'restart Desktop while observed turns are active.'
-            )
-        [pscustomobject]@{
-            Status = 'restart-deferred'
-            Operation = $Operation
-            Decision = $decision
-            RemoteState = $remoteState
-            DesktopRestarted = $false
-            WorkerProcessId = [int]$worker.ProcessId
-            WorkerStartTimeUtcTicks =
-                [long]$worker.ProcessStartTimeUtcTicks
-            WorkerAlreadyActive = [bool]$worker.AlreadyActive
             TaskName = $TaskName
         }
         return

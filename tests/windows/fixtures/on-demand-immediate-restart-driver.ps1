@@ -40,6 +40,7 @@ foreach ($functionName in @(
     'Assert-OnDemandDesktopRootExecutable',
     'Stop-OnDemandDesktopRoot',
     'Test-OnDemandDeferredOpenIntent',
+    'Complete-OnDemandDrainedDesktopHandoffPreparation',
     'Invoke-OnDemandImmediateAuthorizedDesktopRestartBarrier',
     'Invoke-OnDemandOpenCompensation'
 )) {
@@ -87,6 +88,15 @@ function Get-ProcessCreationIdentity {
     param([object]$CreationDate)
     $null = $CreationDate
     return [pscustomobject]@{ CreationDateUtcTicks = 123456789 }
+}
+
+function Get-CodexDesktopOwnerRootIdentityKey {
+    param(
+        [int]$ProcessId,
+        [long]$StartTimeUtcTicks,
+        [string]$ExecutablePath
+    )
+    return "$ProcessId|$StartTimeUtcTicks|$ExecutablePath"
 }
 
 function Open-ProcessIdentityHandle {
@@ -230,6 +240,14 @@ function Wait-OnDemandDesktopDrain {
     $script:DrainCalls++
 }
 
+function Read-CodexLocalRemoteDesktopHandoffPreparation {
+    return $null
+}
+
+function Complete-CodexLocalRemoteDesktopHandoffPreparation {
+    throw 'A missing fixture preparation must remain a no-op.'
+}
+
 function Wait-OnDemandTaskState {
     param(
         [string]$Name,
@@ -337,6 +355,7 @@ try {
         $runtime = [pscustomobject]@{
             CurrentVersionId = 'b' * 64
             CurrentRoot = 'C:\fixture\runtime'
+            CurrentManifestSha256 = 'c' * 64
         }
         $configuration = [pscustomobject]@{
             SidecarPort = 18790
