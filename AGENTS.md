@@ -4,6 +4,11 @@ This repository is a public, unofficial companion for the Codex desktop app.
 
 ## Product boundaries
 
+- Before changing or re-enabling the Windows Open/restart path, read
+  `docs/failure-postmortem-2026-08-03.md`. The project achieved several real
+  remote starts, but the current handoff design did not meet repeatable
+  recovery requirements; candidate checks or one successful start must not be
+  reported as stable delivery.
 - The browser UI is a product surface, not a raw JSON-RPC or log viewer.
 - The supported control path uses one loopback-only Broker that owns one
   `codex app-server`. Codex Desktop and the Sidecar connect to that Broker as
