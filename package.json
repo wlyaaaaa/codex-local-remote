@@ -1,6 +1,6 @@
 {
   "name": "codex-local-remote",
-  "version": "0.1.6",
+  "version": "0.1.6-unreleased.0",
   "private": true,
   "description": "A polished, self-hosted mobile companion for Codex Desktop.",
   "license": "MIT",

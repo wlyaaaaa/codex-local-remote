@@ -1,14 +1,19 @@
-# ChatGPT / Codex Local Remote v0.1.6
+# ChatGPT / Codex Local Remote 0.1.6 candidate — unreleased
 
-`v0.1.6` fixes an intermittent Windows fast-restart failure in which the
-managed app-server exited but one of its console descendants retained the
-upstream listener handle.
+> **Status (2026-08-03):** This document records the nine local Windows-handoff
+> changes after the public `v0.1.5` release. It is not a GitHub Release, tag,
+> stable Remote build, supported upgrade, or proof that the candidate was
+> adopted by a real runtime. The postmortem records E1 code/static evidence;
+> E3 and E4 real-machine recovery acceptance are incomplete.
 
-> 简体中文：快速切换现在会在关闭旧运行代之前锁定 app-server 的完整进程树，
-> 并在启动新运行代前确认所有受管端口已经连续释放。旧版本已经留下的精确
-> `conhost.exe` 残留也可以通过受保护的运行回执安全恢复。
+> 简体中文：这是 `v0.1.5` 之后九个本地 Windows 交接修复的**未发布候选**记录，
+> 不是 GitHub Release、tag、稳定 Remote 构建、支持升级路径，也不能证明真实运行代
+> 已采用该候选。现有证据仅到 E1；E3、E4 实机恢复验收尚未完成。
 
-## Fast-restart process ownership
+See the [failure postmortem](failure-postmortem-2026-08-03.md) for the evidence
+boundary and the required future publication gates.
+
+## Candidate changes: fast-restart process ownership
 
 - Captures the exact managed app-server root and every existing descendant by
   process creation identity before an authorized Desktop handoff begins.
@@ -32,7 +37,7 @@ upstream listener handle.
   exact module export, so a stale same-named PowerShell module cannot shadow the
   token-bound contract during a runtime handoff.
 
-## Compatibility recovery
+## Candidate changes: compatibility recovery
 
 - Repairs the specific legacy state where the protected Broker receipt still
   binds the dead upstream PID, the TCP row still names that PID, and exactly
@@ -58,15 +63,14 @@ upstream listener handle.
 - Never scans or stops unrelated console hosts, Desktop stdio app-servers or
   listeners outside the configured managed ports.
 
-## Upgrade
+## Static candidate validation (not adoption)
 
 ```powershell
 pnpm install --frozen-lockfile
 pnpm check
-.\scripts\windows\Register-CodexLocalRemoteStartup.ps1 -NoStart
 ```
 
-Registration remains non-disruptive. Adoption is complete only after one
-explicit `Open` operation proves that the selected immutable runtime is also
-the active Broker/Sidecar/Supervisor runtime and both local and public ready
-endpoints return `200`.
+These commands establish only E1 static candidate evidence. Do not register,
+adopt, or invoke `Open` for this candidate from this document, and do not
+create a tag, GitHub Release, or stable-release claim. Any future work must
+have separate authorization and meet the postmortem's E2, E3, and E4 gates.

@@ -14,26 +14,37 @@
 **[Five-minute setup](docs/quickstart.md)** ·
 **[Install with AI](docs/ai-install-prompt.md)** ·
 **[中文介绍](#中文介绍)** ·
-**[Latest release](https://github.com/wlyaaaaa/codex-local-remote/releases/latest)** ·
-**[v0.1.6 notes](docs/release-notes-v0.1.6.md)**
+**[Latest published release: v0.1.5](https://github.com/wlyaaaaa/codex-local-remote/releases/tag/v0.1.5)** ·
+**[Unreleased 0.1.6 candidate (E3/E4 pending)](docs/release-notes-v0.1.6.md)**
 
-## Install with AI — one prompt
+> **Current status (2026-08-03):** `v0.1.5` is the latest published release.
+> The nine subsequent Windows-handoff fixes on `main` are an **unreleased
+> candidate** with E1 code/static evidence only; E3/E4 real-machine recovery
+> acceptance is incomplete. Do not represent that candidate as a release,
+> stable Remote build, or supported upgrade. See the
+> [failure postmortem](docs/failure-postmortem-2026-08-03.md).
 
-Open this repository in ChatGPT / Codex Desktop, or paste this directly into a new Desktop task:
+## Archived installation prompt
+
+The prompt below is retained only for a historical checkout of the published
+`v0.1.5` tag. It is not authorization to install, adopt, or activate the
+untagged `main` candidate.
+
+Open that published tag in ChatGPT / Codex Desktop, or paste this directly into a new Desktop task:
 
 ```text
-Install or upgrade https://github.com/wlyaaaaa/codex-local-remote on this Windows PC.
+Install or upgrade the published v0.1.5 tag of https://github.com/wlyaaaaa/codex-local-remote on this Windows PC.
 Read AGENTS.md and docs/ai-install-prompt.md first. Inspect the existing Desktop runtime, ports,
 Broker, Sidecar, scheduled task and Tailscale before changing anything. Use only the Codex runtime
 bundled with Desktop, keep the scheduled task as the single Desktop owner coordinator, use the
-stable DataDir control dispatcher for explicit Open, Close and Status operations, keep normal
+versioned DataDir control dispatcher for explicit Open, Close and Status operations, keep normal
 Desktop startup, updates, Windows restart and sleep/resume native, launch Desktop from the
 same-session medium-integrity Explorer token only when an authorized Open requires one bounded
 handoff, never persist CODEX_APP_SERVER_WS_URL, run the targeted checks, and verify that Desktop
 and the browser see the same task.
 ```
 
-The full bilingual prompt tells the AI exactly when it must stop for your password, project,
+The full bilingual historical prompt tells the AI exactly when it must stop for your password, project,
 Funnel approval or a real Desktop restart:
 **[copy the complete AI install prompt](docs/ai-install-prompt.md)**.
 
